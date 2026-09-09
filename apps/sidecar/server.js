@@ -23,16 +23,18 @@ const PORT = Number(process.env.SIDECAR_PORT || 8787);
 const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(SELF_DIR, '..', '..');
 
-// Persisted data lives in the user's profile dir (e.g. ~/.config/ninfer-studio
-// on Linux), not next to the checkout, so a person's settings survive a fresh
-// pull of the app. Override with NINFIER_STUDIO_DATA for dev/portable use.
+// Persisted data lives in the user's profile dir, not next to the checkout, so
+// a person's settings survive a fresh pull of the app. Override with
+// NINFIER_STUDIO_DATA for dev/portable use.
+//   Linux:   ~/.config/ninfier-studio
+//   Windows: ~/AppData/Roaming/ninfier-studio
 function resolveDataDir() {
   if (process.env.NINFIER_STUDIO_DATA) return path.resolve(process.env.NINFIER_STUDIO_DATA);
   const home = os.homedir();
-  let base;
-  if (process.platform === 'darwin') base = path.join(home, 'Library', 'Application Support');
-  else if (process.platform === 'win32') base = path.join(home, 'AppData', 'Roaming');
-  else base = path.join(home, '.config');
+  const base =
+    process.platform === 'win32'
+      ? path.join(home, 'AppData', 'Roaming')
+      : path.join(home, '.config');
   return path.join(base, 'ninfer-studio');
 }
 const DATA_DIR = resolveDataDir();

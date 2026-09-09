@@ -563,9 +563,9 @@ pub fn default_data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("NINFIER_STUDIO_DATA") {
         return PathBuf::from(d);
     }
-    // Per-user profile dir: XDG config on Linux (~/.config/ninfier-studio),
-    // ~/Library/Application Support on macOS, AppData/Roaming on Windows. Settings
-    // persist here so they survive a fresh pull / reinstall of the app.
+    // Linux: ~/.config/ninfier-studio · Windows: ~/AppData/Roaming/ninfier-studio
+    // (no macOS build). Settings persist here so they survive a fresh pull /
+    // reinstall of the app.
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ninfier-studio")
