@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
@@ -61,7 +61,14 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean
       </button>
       {open && (
         <div className={cn('border-t border-line px-3 py-2 text-[12.5px] leading-relaxed text-mute', streaming && 'stream-caret')}>
-          <Markdown>{text}</Markdown>
+          {/* While streaming, render reasoning as plain pre-wrapped text instead of
+              re-parsing the whole (growing) markdown on every token — that O(n²)
+              reparse is what froze the chat view on long thinking traces. */}
+          {streaming ? (
+            <div className="whitespace-pre-wrap break-words">{text}</div>
+          ) : (
+            <Markdown>{text}</Markdown>
+          )}
         </div>
       )}
     </div>
@@ -101,7 +108,7 @@ function MessageMeta({ m }: { m: ChatMessage }) {
   );
 }
 
-function MessageRow({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
+const MessageRow = memo(function MessageRow({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
   if (m.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -133,9 +140,16 @@ function MessageRow({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
         {m.error ? (
           <div className="text-[13px] text-danger">{m.content}</div>
         ) : m.content ? (
-          <div className="markdown text-[13.5px] leading-relaxed">
-            <Markdown>{m.content}</Markdown>
-          </div>
+          // Plain text while streaming (see ReasoningBlock): avoids re-parsing the
+          // growing answer through react-markdown on every token. Rendered to
+          // proper markdown once the turn completes (streaming === false).
+          streaming ? (
+            <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
+          ) : (
+            <div className="markdown text-[13.5px] leading-relaxed">
+              <Markdown>{m.content}</Markdown>
+            </div>
+          )
         ) : !streaming && !m.reasoning ? (
           <span className="text-[13px] text-faint">—</span>
         ) : null}
@@ -143,7 +157,7 @@ function MessageRow({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
       <MessageMeta m={m} />
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // Composer parameter popover
@@ -367,8 +381,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   useEffect(() => {
     if (!loaded) return;
-    saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
-  }, [convs, params, loaded]);
+    // Don't persist on every streamed token — that would POST the whole
+    // conversation to the control plane per delta (thrashing the main thread and
+    // the control plane mid-generation). Persist on turn completion (streaming
+    // flips false) and on structural changes like new/delete/rename, debounced.
+    if (streaming) return;
+    const t = setTimeout(() => {
+      saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
+    }, 400);
+    return () => clearTimeout(t);
+  }, [convs, params, loaded, streaming]);
   const setParams = useCallback((p: ChatParams) => setParamsState(p), []);
 
   const active = convs.find((c) => c.id === activeId) || null;

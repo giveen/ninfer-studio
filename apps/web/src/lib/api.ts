@@ -244,54 +244,75 @@ export async function streamChat(
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+
+    // Parse one SSE line (already stripped of its trailing newline). Returns true
+    // when the stream is finished ([DONE] seen).
+    const handleLine = (raw: string): boolean => {
+      const line = raw.replace(/\r$/, '');
+      if (!line.startsWith('data:')) return false; // skip comments / keep-alives / event: lines
+      const payload = line.slice(5).trim();
+      if (!payload) return false;
+      if (payload === '[DONE]') return true;
+      let chunk: Record<string, any>;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        return false;
+      }
+      if (chunk.timings) {
+        const t = chunk.timings;
+        meta.promptTokPerSec = t.prompt_per_second;
+        meta.decodeTokPerSec = t.predicted_per_second;
+        meta.cachedTokens = t.cache_n;
+        meta.promptTokens = t.cache_n + t.prompt_n;
+        meta.completionTokens = t.predicted_n;
+        if (t.draft_n !== undefined) meta.draftN = t.draft_n;
+        if (t.draft_n_accepted !== undefined) meta.draftNAccepted = t.draft_n_accepted;
+      }
+      if (chunk.usage) {
+        meta.promptTokens = chunk.usage.prompt_tokens ?? meta.promptTokens;
+        meta.completionTokens = chunk.usage.completion_tokens ?? meta.completionTokens;
+        meta.cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? meta.cachedTokens;
+        meta.reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens;
+      }
+      const choice = chunk.choices?.[0];
+      if (choice) {
+        const d = choice.delta ?? {};
+        if (d.reasoning_content) cb.onReasoningDelta?.(d.reasoning_content);
+        if (d.content) {
+          if (firstContentAt === null) firstContentAt = performance.now();
+          cb.onContentDelta?.(d.content);
+        }
+        if (choice.finish_reason) meta.finishReason = choice.finish_reason;
+      }
+      if (chunk.usage) cb.onUsage?.(chunk.usage, meta);
+      return false;
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).replace(/\r$/, '');
+        const line = buf.slice(0, idx);
         buf = buf.slice(idx + 1);
-        if (!line.startsWith('data:')) continue; // skip comments / keep-alives / event: lines
-        const payload = line.slice(5).trim();
-        if (!payload) continue;
-        if (payload === '[DONE]') {
+        if (handleLine(line)) {
           finish();
           return;
         }
-        let chunk: Record<string, any>;
-        try {
-          chunk = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-        if (chunk.timings) {
-          const t = chunk.timings;
-          meta.promptTokPerSec = t.prompt_per_second;
-          meta.decodeTokPerSec = t.predicted_per_second;
-          meta.cachedTokens = t.cache_n;
-          meta.promptTokens = t.cache_n + t.prompt_n;
-          meta.completionTokens = t.predicted_n;
-          if (t.draft_n !== undefined) meta.draftN = t.draft_n;
-          if (t.draft_n_accepted !== undefined) meta.draftNAccepted = t.draft_n_accepted;
-        }
-        if (chunk.usage) {
-          meta.promptTokens = chunk.usage.prompt_tokens ?? meta.promptTokens;
-          meta.completionTokens = chunk.usage.completion_tokens ?? meta.completionTokens;
-          meta.cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? meta.cachedTokens;
-          meta.reasoningTokens = chunk.usage.completion_tokens_details?.reasoning_tokens;
-        }
-        const choice = chunk.choices?.[0];
-        if (choice) {
-          const d = choice.delta ?? {};
-          if (d.reasoning_content) cb.onReasoningDelta?.(d.reasoning_content);
-          if (d.content) {
-            if (firstContentAt === null) firstContentAt = performance.now();
-            cb.onContentDelta?.(d.content);
-          }
-          if (choice.finish_reason) meta.finishReason = choice.finish_reason;
-        }
-        if (chunk.usage) cb.onUsage?.(chunk.usage, meta);
+      }
+    }
+    // Flush any trailing bytes not terminated by a newline. Some servers close
+    // the connection without a final LF, which would otherwise drop the last
+    // event — typically the final content delta and [DONE] — leaving the UI
+    // showing an empty/partial response even though the request completed.
+    if (buf.length) {
+      const tail = buf;
+      buf = '';
+      if (handleLine(tail)) {
+        finish();
+        return;
       }
     }
     finish();
