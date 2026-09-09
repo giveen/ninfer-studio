@@ -156,6 +156,9 @@ mod opt_number_or_auto {
         let v: Option<serde_json::Value> = Option::deserialize(d)?;
         match v {
             None => Ok(None),
+            // An empty string is the web UI's "unset" sentinel for kv-capacity
+            // (the Segmented shows "follow" while keeping ''); treat it as None.
+            Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
             Some(serde_json::Value::String(s)) if s == "auto" => Ok(Some(NumberOrAuto::Auto)),
             Some(serde_json::Value::String(s)) => s
                 .parse::<u64>()

@@ -189,22 +189,18 @@ async fn engine_update(AxumState(state): AxumState<S>, req: Request<Body>) -> Re
     Ok(Json(start_update(&state, &action).await))
 }
 
-#[derive(Deserialize)]
-struct StartBody {
-    profile: Option<EngineProfile>,
-    artifact: Option<String>,
-}
-
 async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let parsed: StartBody = serde_json::from_value(body).unwrap_or(StartBody {
-        profile: None,
-        artifact: None,
-    });
-    let profile = parsed.profile.unwrap_or_default();
-    Ok(Json(
-        start_engine(&state, profile, parsed.artifact).await,
-    ))
+    // Parse `profile` and `artifact` independently. A whole-body deserialization
+    // previously fell back to defaults on any profile field error (e.g.
+    // `kvCapacity: ""`), which silently dropped `artifact` and made a valid start
+    // return a misleading `no_artifact`. The Node sidecar already threads them
+    // separately; mirror that here so a malformed profile field can never
+    // discard the chosen artifact.
+    let profile_val = body.get("profile").cloned().unwrap_or(Value::Null);
+    let profile = serde_json::from_value::<EngineProfile>(profile_val).unwrap_or_default();
+    let artifact = body.get("artifact").and_then(|v| v.as_str()).map(|s| s.to_string());
+    Ok(Json(start_engine(&state, profile, artifact).await))
 }
 
 #[derive(Deserialize)]
