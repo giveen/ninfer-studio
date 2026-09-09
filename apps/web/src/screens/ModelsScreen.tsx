@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react';
-import { Download, ExternalLink, FolderOpen, Layers, Play, Trash2 } from 'lucide-react';
+import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
 import { downloadModel } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
 import type { DownloadRec, StatusPayload } from '../lib/types';
-import { Badge, Button, CodeBlock, Field, SectionCard, TextField, cn } from '../components/ui';
+import { Badge, Button, Field, SectionCard, TextField, cn } from '../components/ui';
 
 function DlProgress({ dl }: { dl: DownloadRec }) {
   const pct = dl.totalBytes ? Math.min(100, (dl.downloadedBytes / dl.totalBytes) * 100) : null;
@@ -238,14 +238,6 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
           </div>
         </SectionCard>
 
-        <SectionCard title="Models directory" description="Where Studio scans for artifacts and where downloads land. Change it in Settings." icon={<FolderOpen size={15} />}>
-          <CodeBlock code={modelsDir || 'not configured'} singleLine />
-          {modelsDir && (
-            <p className="mt-2.5 text-[11.5px] text-faint">
-              Tip: keep the directory readable by the engine binary's user. The engine validates the full artifact inventory at startup, so partial downloads will fail readiness.
-            </p>
-          )}
-        </SectionCard>
       </div>
     </div>
   );
