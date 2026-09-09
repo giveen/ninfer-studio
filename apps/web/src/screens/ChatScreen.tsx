@@ -12,15 +12,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { buildChatRequest, streamChat } from '../lib/api';
+import { buildChatRequest, getConversations, saveConversations, streamChat } from '../lib/api';
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
 import { Markdown } from '../components/Markdown';
 import { Badge, Button, cn, NumberField, SelectField, Toggle } from '../components/ui';
-
-const LS_CONVS = 'ninfier.conversations.v1';
-const LS_PARAMS = 'ninfier.chatparams.v1';
 
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
@@ -29,31 +26,20 @@ const DEFAULT_PARAMS: ChatParams = {
   maxTokens: null as unknown as number,
 };
 
-function loadConvs(): Conversation[] {
-  try {
-    const raw = localStorage.getItem(LS_CONVS);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function loadParams(): ChatParams {
-  try {
-    const raw = localStorage.getItem(LS_PARAMS);
-    if (raw) return { ...DEFAULT_PARAMS, ...JSON.parse(raw), maxTokens: undefined, ...pickDefined(JSON.parse(raw)) };
-  } catch {
-    /* noop */
-  }
-  return { ...DEFAULT_PARAMS, maxTokens: undefined, greedy: undefined, seed: undefined, temperature: undefined, topP: undefined, topK: undefined, minP: undefined, presencePenalty: undefined, frequencyPenalty: undefined };
-}
-
 function pickDefined<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
   for (const [k, v] of Object.entries(o)) if (v !== undefined && v !== null && v !== '') (out as any)[k] = v;
   return out;
+}
+
+// Normalize persisted params (from the profile dir) into a valid ChatParams,
+// filling unset sampling fields with undefined so the UI shows "model preset".
+function normalizeParams(raw: unknown): ChatParams {
+  if (raw && typeof raw === 'object') {
+    const p = raw as Record<string, unknown>;
+    return { ...DEFAULT_PARAMS, ...p, maxTokens: undefined, ...pickDefined(p) };
+  }
+  return { ...DEFAULT_PARAMS, maxTokens: undefined, greedy: undefined, seed: undefined, temperature: undefined, topP: undefined, topK: undefined, minP: undefined, presencePenalty: undefined, frequencyPenalty: undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +253,7 @@ function ParamsPopover({
           />
         </div>
         <div className="flex justify-between">
-          <Button size="sm" variant="subtle" onClick={() => set({ ...loadParams() })}>
+          <Button size="sm" variant="subtle" onClick={() => set({ ...DEFAULT_PARAMS, maxTokens: undefined })}>
             reset to defaults
           </Button>
           <Button size="sm" onClick={() => setOpen(false)}>
@@ -326,9 +312,10 @@ function ContextMeter({ used, limit }: { used: number | null; limit: number | nu
 // Screen
 // ---------------------------------------------------------------------------
 export function ChatScreen({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const [convs, setConvs] = useState<Conversation[]>(loadConvs);
-  const [activeId, setActiveId] = useState<string | null>(convs[0]?.id ?? null);
-  const [params, setParamsState] = useState<ChatParams>(loadParams);
+  const [convs, setConvs] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
+  const [loaded, setLoaded] = useState(false);
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -351,17 +338,35 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     .filter((e) => e.value)
     .filter((e, i, arr) => arr.findIndex((x) => x.value === e.value) === i);
 
+  // Hydrate conversations + chat params from the user's profile dir on the
+  // control plane (survives a fresh install / AppImage run). Then keep them in
+  // sync: any change is written back through the API.
+  useEffect(() => {
+    let cancelled = false;
+    getConversations()
+      .then((s) => {
+        if (cancelled) return;
+        const list = Array.isArray(s.conversations) ? s.conversations : [];
+        setConvs(list);
+        setActiveId((cur) => cur ?? list[0]?.id ?? null);
+        if (s.params) setParamsState(normalizeParams(s.params));
+        setLoaded(true);
+      })
+      .catch(() => cancelled || setLoaded(true));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     if (runningModel && !convs.length) setModel(runningModel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runningModel]);
 
   useEffect(() => {
-    localStorage.setItem(LS_CONVS, JSON.stringify(convs.slice(0, 200)));
-  }, [convs]);
-  useEffect(() => {
-    localStorage.setItem(LS_PARAMS, JSON.stringify(params));
-  }, [params]);
+    if (!loaded) return;
+    saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
+  }, [convs, params, loaded]);
   const setParams = useCallback((p: ChatParams) => setParamsState(p), []);
 
   const active = convs.find((c) => c.id === activeId) || null;

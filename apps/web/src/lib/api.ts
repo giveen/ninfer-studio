@@ -51,6 +51,25 @@ export function saveProfileState(
   return postJSON('/api/profile-state', patch, 5000);
 }
 
+// ---------------------------------------------------------------------------
+// Conversations + chat params — persisted by the control plane under the user's
+// profile dir (not the browser), so chat history survives a fresh install.
+// ---------------------------------------------------------------------------
+export interface ConversationsState {
+  conversations: import('./types').Conversation[];
+  params: ChatParams | null;
+}
+
+export function getConversations(): Promise<ConversationsState> {
+  return getJSON<ConversationsState>('/api/conversations', 8000);
+}
+
+export function saveConversations(
+  patch: Partial<{ conversations: import('./types').Conversation[]; params: ChatParams }>,
+): Promise<unknown> {
+  return postJSON('/api/conversations', patch, 20_000);
+}
+
 export interface EngineActionResult {
   ok: boolean;
   code?: string;

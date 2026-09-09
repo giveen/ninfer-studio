@@ -44,6 +44,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/status", get(status))
         .route("/api/config", get(get_config).post(set_config))
         .route("/api/profile-state", get(profile_state_get).post(profile_state_set))
+        .route("/api/conversations", get(conversations_get).post(conversations_set))
         .route("/api/engine/start", post(engine_start))
         .route("/api/engine/stop", post(engine_stop))
         .route("/api/logs", get(logs))
@@ -356,6 +357,48 @@ async fn profile_state_set(
         }
     }
     let p = state.data_dir.join("profile.json");
+    tokio::fs::create_dir_all(&state.data_dir).await.ok();
+    tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await.ok();
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Conversations + chat params. Persisted to <data>/chats.json (web-only shapes
+// stored as raw JSON) so chat history survives a fresh install / AppImage run —
+// previously it lived in the webview localStorage, which is origin-bound.
+// ---------------------------------------------------------------------------
+async fn conversations_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    let p = state.data_dir.join("chats.json");
+    match tokio::fs::read_to_string(&p).await {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => Json(v),
+            Err(_) => Json(json!({ "conversations": [], "params": null })),
+        },
+        Err(_) => Json(json!({ "conversations": [], "params": null })),
+    }
+}
+
+async fn conversations_set(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let body = read_json(req).await?;
+    let mut current: Value = {
+        let p = state.data_dir.join("chats.json");
+        match tokio::fs::read_to_string(&p).await {
+            Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
+            Err(_) => json!({}),
+        }
+    };
+    if let Some(v) = body.get("conversations") {
+        if v.is_array() {
+            current["conversations"] = v.clone();
+        }
+    }
+    if body.get("params").is_some() {
+        current["params"] = body["params"].clone();
+    }
+    let p = state.data_dir.join("chats.json");
     tokio::fs::create_dir_all(&state.data_dir).await.ok();
     tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await.ok();
     Ok(Json(json!({ "ok": true })))

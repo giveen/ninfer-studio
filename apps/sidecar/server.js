@@ -168,6 +168,37 @@ async function saveProfileState(patch) {
 }
 
 // ---------------------------------------------------------------------------
+// Conversations + chat params — persisted to <DATA_DIR>/chats.json so chat
+// history survives a fresh app install / AppImage run (previously localStorage,
+// which is tied to the webview origin and lost across installs).
+// ---------------------------------------------------------------------------
+const CHATS_PATH = path.join(DATA_DIR, 'chats.json');
+let chatsState = { conversations: [], params: null };
+
+async function loadChats() {
+  try {
+    const raw = await fs.readFile(CHATS_PATH, 'utf8');
+    const c = JSON.parse(raw);
+    chatsState = {
+      conversations: Array.isArray(c.conversations) ? c.conversations : [],
+      params: c.params ?? null,
+    };
+  } catch {
+    chatsState = { conversations: [], params: null };
+  }
+  return chatsState;
+}
+
+async function saveChats(patch) {
+  const next = { ...chatsState, ...patch };
+  next.conversations = Array.isArray(next.conversations) ? next.conversations : [];
+  chatsState = next;
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(CHATS_PATH, JSON.stringify(next, null, 2));
+  return next;
+}
+
+// ---------------------------------------------------------------------------
 // Engine child-process management
 // ---------------------------------------------------------------------------
 /**
@@ -1142,6 +1173,16 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, next);
     }
 
+    if (p === '/api/conversations' && req.method === 'GET') {
+      return sendJson(res, 200, chatsState);
+    }
+
+    if (p === '/api/conversations' && req.method === 'POST') {
+      const body = await readBody(req, 8 << 20);
+      const next = await saveChats(body || {});
+      return sendJson(res, 200, next);
+    }
+
     if (p === '/api/engine/start' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
       const result = await startEngine(body?.profile ?? {}, body?.artifact);
@@ -1204,6 +1245,7 @@ const server = createServer(async (req, res) => {
 await fs.mkdir(DATA_DIR, { recursive: true });
 await loadConfig();
 await loadProfileState();
+await loadChats();
 try {
   lastStart = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'last-start.json'), 'utf8'));
 } catch { /* first run */ }
