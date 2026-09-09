@@ -106,9 +106,6 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             <Field label="Ninfer path" hint="NInfer path (editable in Engine paths above).">
               <div className="truncate font-mono text-[12px] text-ink">{form.ninferPath || '—'}</div>
             </Field>
-            <Field label="Build command" hint="Run inside the Ninfer path (editable above).">
-              <div className="truncate font-mono text-[12px] text-ink">{form.buildCommand || '—'}</div>
-            </Field>
           </div>
           {update && (
             <div className="mt-3 h-56">
