@@ -28,6 +28,18 @@ function DlProgress({ dl }: { dl: DownloadRec }) {
   );
 }
 
+// Normalize a catalog `spec` string (e.g. "mtp (1..5) or off" / "mtp (1..5) or
+// dflash2 (1..15) or off") into a short label: "MTP" / "MTP or DFLASH2".
+function formatSpec(spec: string | undefined): string {
+  if (!spec) return '—';
+  return spec
+    .split(' or ')
+    .map((s) => s.trim())
+    .filter((s) => s && s !== 'off')
+    .map((s) => s.replace(/\s*\(.*\)\s*$/, '').toUpperCase())
+    .join(' or ');
+}
+
 export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   const artifacts = status?.artifacts || [];
   const downloads = status?.downloads || [];
@@ -153,7 +165,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                       <td className="py-2.5 pr-4 font-mono text-[12px] text-ink">{c.file}</td>
                       <td className="py-2.5 pr-4">{c.model}</td>
                       <td className="py-2.5 pr-4"><Badge tone="info">{c.weights}</Badge></td>
-                      <td className="py-2.5 pr-4 font-mono text-[11.5px] text-mute">{c.spec}</td>
+                      <td className="py-2.5 pr-4 font-mono text-[11.5px] text-mute">{formatSpec(c.spec)}</td>
                       <td className="py-2.5 pr-4">
                         {local ? (
                           <span className="inline-flex items-center gap-1.5 font-mono text-[11.5px] text-ok">
