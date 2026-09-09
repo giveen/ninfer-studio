@@ -554,7 +554,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         {/* generated command */}
         <SectionCard
           title="Generated launch command"
-          description="Exactly what Studio passes to ninfer-serve. Omitted options fall back to the engine's executable defaults."
+          description="The exact argv Studio sends to ninfer-serve; omitted flags use engine defaults."
           icon={<Terminal size={15} />}
           anchor="command"
           collapsible
@@ -571,7 +571,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* presets */}
-        <SectionCard title="Presets" description="One-click engine profiles. Applying a preset replaces all options below — review the generated command before starting." icon={<Rocket size={15} />} anchor="presets" collapsible>
+        <SectionCard title="Presets" description="One-click profiles. Applying one fills every option below — review the command before starting." icon={<Rocket size={15} />} anchor="presets" collapsible>
           <div className="flex flex-wrap gap-2">
             {PRESETS.map((p) => (
               <button
@@ -588,7 +588,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* artifact + network */}
-        <SectionCard title="Artifact & network" description="One resident model per engine. The public model alias is what chat requests must use." icon={<Box size={15} />} anchor="artifact" collapsible>
+        <SectionCard title="Artifact & network" description="One model per engine. Chat requests address it by the public model alias." icon={<Box size={15} />} anchor="artifact" collapsible>
           <div className={grid3}>
             <Field label="Model artifact" hint="Path to a downloaded .ninfer file. Only explicitly registered artifacts are accepted.">
               <SelectField
@@ -621,7 +621,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* context & memory */}
-        <SectionCard title="Context & memory" description="Per-sequence logical context ceiling and the shared Main Text KV pool. auto sizes the pool from remaining GPU memory after weights (1 GiB headroom)." icon={<Gauge size={15} />} anchor="memory" collapsible>
+        <SectionCard title="Context & memory" description="Per-sequence context ceiling and the shared Main-Text KV pool. 'auto' sizes from free GPU memory (1 GiB headroom)." icon={<Gauge size={15} />} anchor="memory" collapsible>
           <div className={grid3}>
             <Field label="Max context" hint="Per-sequence logical token ceiling. Native model limit is 262,144; practical allocation depends on artifact, media, and KV type.">
               <NumberField value={profile.maxContext ?? null} onChange={(v) => set('maxContext', v)} onEmpty={() => setU('maxContext', undefined)} min={0} placeholder="serve default 8192" />
@@ -688,7 +688,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* scheduling */}
-        <SectionCard title="Scheduling" description="Startup-fixed capacity of 1–8 active request lanes with bounded FIFO ingress. No preemption, no QoS." icon={<Zap size={15} />} anchor="scheduling" collapsible>
+        <SectionCard title="Scheduling" description="Fixed 1–8 request lanes with bounded FIFO ingress. No preemption or QoS." icon={<Zap size={15} />} anchor="scheduling" collapsible>
           <div className={grid3}>
             <Field label="Max concurrency" hint="Maximum admitted concurrent requests (1..8), fixed at startup.">
               <NumberField value={profile.maxConcurrency ?? null} onChange={(v) => set('maxConcurrency', Math.max(1, Math.min(8, v)))} onEmpty={() => setU('maxConcurrency', undefined)} min={1} max={8} placeholder="1" />
@@ -703,7 +703,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* kv cache */}
-        <SectionCard title="KV cache & context cache" description="Storage format for the KV pool, plus Device/Host checkpoint retention tiers for long-context reuse." icon={<Layers3 size={15} />} anchor="kv" collapsible>
+        <SectionCard title="KV cache & context cache" description="KV pool storage format, plus device/host checkpoint tiers for long-context reuse." icon={<Layers3 size={15} />} anchor="kv" collapsible>
           <div className="space-y-4">
             <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
               <Field label="KV dtype" hint="KV-cache storage: bf16, int8, fp8, nvfp4, or k8v4 (INT8 group-64 KV is the published benchmark format).">
@@ -737,7 +737,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* speculative decoding */}
-        <SectionCard title="Speculative decoding" description="Frozen at startup: one backend, one draft window. MTP 1–5 drafts; DFlash/DFlash2 1–15 (7 recommended). Optimized proposal head via --lm-head-draft." icon={<Zap size={15} />} anchor="spec" collapsible>
+        <SectionCard title="Speculative decoding" description="Set at startup: one backend, one draft window. MTP 1–5; DFlash/DFlash2 1–15 (7 recommended)." icon={<Zap size={15} />} anchor="spec" collapsible>
           <div className="space-y-4">
             <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
               <Field label="Backend" hint="Selects which speculative weights are resident at startup. None loads the smallest profile.">
@@ -763,7 +763,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* vision & media */}
-        <SectionCard title="Vision & media" description="Vision residency is frozen at startup: without --vision the engine rejects image/video requests and cannot enable it later." icon={<Video size={15} />} anchor="vision" collapsible>
+        <SectionCard title="Vision & media" description="Vision is fixed at startup; without --vision, image/video requests are rejected." icon={<Video size={15} />} anchor="vision" collapsible>
           <div className={grid3}>
             <div className="flex flex-col gap-2">
               <Toggle checked={!!profile.vision} onChange={(v) => set('vision', v)} label="Enable vision" hint="Loads Vision weights, expands the unified workspace, and enables image/video input. Can combine with DFlash/DFlash2." />
@@ -785,7 +785,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* sampling defaults */}
-        <SectionCard title="Sampling defaults" description="Process-level overrides. Precedence: model/preset defaults → process flags → request fields → --greedy forces temperature 0." icon={<SlidersHorizontal size={15} />} anchor="sampling" collapsible>
+        <SectionCard title="Sampling defaults" description="Process-wide defaults. Order: model/preset → flags → request → --greedy forces temp 0." icon={<SlidersHorizontal size={15} />} anchor="sampling" collapsible>
           <div className="space-y-4">
             <div className="flex flex-wrap gap-x-8 gap-y-3">
               <Toggle checked={!!profile.noThinking} onChange={(v) => set('noThinking', v)} label="Disable thinking by default" hint="Engine-wide default: no chain-of-thought unless a request asks for it." />
@@ -819,7 +819,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </SectionCard>
 
         {/* logging & misc */}
-        <SectionCard title="Logging, storage & misc" description="Diagnostics verbosity, request JSONL log, local Response store budgets, context-cost presets, CORS." icon={<Terminal size={15} />} anchor="misc" collapsible defaultCollapsed>
+        <SectionCard title="Logging, storage & misc" description="Log verbosity, request JSONL, response-store budgets, context-cost presets, CORS." icon={<Terminal size={15} />} anchor="misc" collapsible defaultCollapsed>
           <div className={grid3}>
             <Field label="Log level" hint="Pretty stderr verbosity for operational records.">
               <SelectField value={profile.logLevel || ''} onChange={(v) => setU('logLevel', v || undefined)} options={[{ value: '', label: 'default (info)' }, ...LOG_LEVELS.map((l) => ({ value: l, label: l }))]} />
@@ -845,7 +845,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           </div>
         </SectionCard>
 
-        <SectionCard title="Profiles" description="Saved profiles persist in this browser and map 1:1 to ninfer-serve flags. “load” applies a saved profile to all options below — then stop + start the engine." icon={<BookmarkPlus size={15} />} anchor="profiles" collapsible defaultCollapsed>
+        <SectionCard title="Profiles" description="Browser-saved profiles map 1:1 to ninfer-serve flags. 'load' fills the form — then stop + start." icon={<BookmarkPlus size={15} />} anchor="profiles" collapsible defaultCollapsed>
             <div className="flex items-center gap-2">
               <TextField value={saveName} onChange={setSaveName} placeholder="profile name" className="flex-1" />
               <Button size="sm" variant="primary" onClick={saveCurrent}>
