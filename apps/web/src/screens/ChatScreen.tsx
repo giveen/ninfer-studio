@@ -46,8 +46,12 @@ function normalizeParams(raw: unknown): ChatParams {
 // Message rendering
 // ---------------------------------------------------------------------------
 function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean }) {
-  const [open, setOpen] = useState(true);
+  // Collapsed by default — long chains-of-thought shouldn't dominate the view.
+  // A live pulse shows while it's actively thinking; a short preview is shown so
+  // the gist is visible without expanding.
+  const [open, setOpen] = useState(false);
   if (!text) return null;
+  const preview = !open ? text.replace(/\s+/g, ' ').trim().slice(0, 120) : '';
   return (
     <div className="mb-2 overflow-hidden rounded-lg border border-line bg-inset/60">
       <button
@@ -57,8 +61,14 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean
       >
         <BrainCircuit size={13} className={open ? 'text-accent' : 'text-faint'} />
         thinking
+        {streaming && !open && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
         <ChevronDown size={13} className={cn('ml-auto transition-transform', !open && '-rotate-90')} />
       </button>
+      {!open && preview && (
+        <div className="border-t border-line px-3 py-1.5 text-[12px] leading-snug text-faint line-clamp-2">
+          {preview}…
+        </div>
+      )}
       {open && (
         <div className={cn('border-t border-line px-3 py-2 text-[12.5px] leading-relaxed text-mute', streaming && 'stream-caret')}>
           {/* While streaming, render reasoning as plain pre-wrapped text instead of
