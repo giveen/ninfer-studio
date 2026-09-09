@@ -8,6 +8,8 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
   const [form, setForm] = useState<AppSettings | null>(null);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [needPath, setNeedPath] = useState(false);
+  const [pathInput, setPathInput] = useState('');
 
   useEffect(() => {
     if (!form && status?.config) setForm(status.config);
@@ -83,7 +85,18 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
           collapsible
         >
           <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => runUpdate('pull')} disabled={updating || !status} title="git pull --ff-only in the repository">
+            <Button
+              onClick={() => {
+                if (!form.ninferPath?.trim()) {
+                  setPathInput(form.ninferPath ?? '');
+                  setNeedPath(true);
+                  return;
+                }
+                runUpdate('pull');
+              }}
+              disabled={updating || !status}
+              title="git pull --ff-only in the repository"
+            >
               <span className="inline-flex items-center gap-1.5">
                 <GitBranch size={14} />
                 {updating && update?.action === 'pull' ? 'Pulling…' : 'git pull'}
@@ -102,6 +115,49 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
               <span className="text-[12px] text-accent">Build OK — stop + start the engine to load the new binary.</span>
             )}
           </div>
+          {needPath && (
+            <div className="mt-3 rounded-lg border border-warn/30 bg-warn/8 px-3.5 py-3">
+              <p className="text-[12.5px] text-warn">
+                No NInfer path detected. Would you like to provide a destination to pull into (or clone) for a fresh build?
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <TextField
+                  value={pathInput}
+                  onChange={setPathInput}
+                  placeholder="/path/to/ninfer"
+                  className="font-mono text-[12px] min-w-[240px] flex-1"
+                />
+                <Button
+                  variant="primary"
+                  disabled={!pathInput.trim()}
+                  onClick={async () => {
+                    const p = pathInput.trim();
+                    if (!p) return;
+                    setError(null);
+                    try {
+                      const c = await saveConfig({ ninferPath: p });
+                      setForm(c);
+                      setNeedPath(false);
+                      runUpdate('pull');
+                    } catch (e) {
+                      setError(e instanceof Error ? e.message : String(e));
+                    }
+                  }}
+                >
+                  use &amp; pull
+                </Button>
+                <Button
+                  variant="subtle"
+                  onClick={() => {
+                    setNeedPath(false);
+                    setPathInput('');
+                  }}
+                >
+                  cancel
+                </Button>
+              </div>
+            </div>
+          )}
           <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
             <Field label="Ninfer path" hint="NInfer path (editable in Engine paths above).">
               <div className="truncate font-mono text-[12px] text-ink">{form.ninferPath || '—'}</div>
