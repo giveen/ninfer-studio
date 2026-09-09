@@ -2,14 +2,20 @@ import { useEffect, useRef, useState } from 'react';
 import type { AppSettings, ChatMessage, ChatParams, MessageMeta, ProfileState, SavedProfile, StatusPayload } from './types';
 import type { ChatAttachment } from './types';
 
+// In dev (Vite) the web is served on :5173 and /api is proxied to the sidecar on
+// :8787, so relative paths work. In a bundled desktop build the webview is loaded
+// from the Tauri asset origin (tauri://localhost) and must reach the in-process
+// control plane by its absolute loopback URL instead.
+const API_BASE = import.meta.env.DEV ? '' : 'http://127.0.0.1:8787';
+
 async function getJSON<T>(path: string, timeoutMs = 4000): Promise<T> {
-  const r = await fetch(path, { signal: AbortSignal.timeout(timeoutMs) });
+  const r = await fetch(API_BASE + path, { signal: AbortSignal.timeout(timeoutMs) });
   if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
   return (await r.json()) as T;
 }
 
 async function postJSON<T>(path: string, body: unknown, timeoutMs = 10_000): Promise<T> {
-  const r = await fetch(path, {
+  const r = await fetch(API_BASE + path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body ?? {}),
@@ -216,7 +222,7 @@ export async function streamChat(
   };
 
   try {
-    const r = await fetch('/v1/chat/completions', {
+    const r = await fetch(API_BASE + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),

@@ -58,6 +58,10 @@ pub fn build_router(state: S) -> Router {
         .fallback_service(
             tower_http::services::ServeDir::new(dist).not_found_service(spa),
         )
+        // Allow the bundled webview (origin tauri://localhost) to call the
+        // in-process control plane on 127.0.0.1:8787 (cross-origin in release
+        // builds). Permissive is acceptable for a loopback-only local app.
+        .layer(tower_http::cors::CorsLayer::permissive())
 }
 
 pub async fn serve(state: S, port: u16) -> std::io::Result<()> {
@@ -584,7 +588,6 @@ async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
     if let Some(rid) = request_id {
         resp_headers.insert("x-request-id", rid.parse().unwrap());
     }
-    resp_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     resp_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
 
     // stream the body through (SSE-safe: chunks piped as they arrive)
