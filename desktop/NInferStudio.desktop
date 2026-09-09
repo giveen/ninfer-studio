@@ -2,9 +2,11 @@
 Type=Application
 Name=NInfer Studio
 Comment=Native desktop UI for the NInfer LLM inference engine
-Exec=/mnt/storage/Projects/ninfier-ui/desktop/target/release/ninfier-studio
-Path=/mnt/storage/Projects/ninfier-ui
-Icon=/mnt/storage/Projects/ninfier-ui/desktop/app/icons/icon.png
+# Template — this file is NOT used by the Tauri bundle (which generates its own).
+# For a manual install, point Exec/Icon at your installed binary/icon, or rely on
+# PATH + the icon theme by using the bare names below.
+Exec=ninfier-studio
+Icon=ninfier-studio
 Terminal=false
 StartupNotify=true
 Categories=Development;Science;

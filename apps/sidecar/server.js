@@ -86,13 +86,17 @@ export const ARTIFACTS = [
 // Persistent configuration
 // ---------------------------------------------------------------------------
 const defaultConfig = {
-  engineBinary: '/mnt/storage/ninfer/build/apps/ninfer-serve',
-  engineCli: '/mnt/storage/ninfer/build/apps/ninfer',
-  modelsDir: '/mnt/storage/ninfer/models',
+  // No hardcoded paths: a fresh checkout must not ship a developer's machine
+  // layout. The user sets these in Settings (or config.json). Empty values are
+  // treated as "not configured" so we surface a clear error instead of spawning
+  // a binary that does not exist on their machine.
+  engineBinary: '',
+  engineCli: '',
+  modelsDir: '',
   enginePort: 8080,
   apiKey: '',
   hfCli: 'hf',
-  repoDir: '/mnt/storage/ninfer',
+  repoDir: '',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
 };
 

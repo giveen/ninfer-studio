@@ -1,7 +1,7 @@
 # RESEARCH — NInfer Studio: stack, reference projects, and design assets
 
 Research performed 2026-09-09 for the from-scratch UI of the NInfer LLM inference engine
-(`/mnt/storage/ninfer`). Goal: a **Linux-first desktop app** that (a) exposes every engine option
+(the NInfer source checkout). Goal: a **Linux-first desktop app** that (a) exposes every engine option
 as an easily toggleable/configurable control, (b) shows downloaded models, and (c) provides a
 streaming chat window.
 

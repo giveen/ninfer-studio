@@ -1,7 +1,7 @@
 # DESIGN — NInfer Studio
 
 A from-scratch, Linux-first desktop UI for the **NInfer** C++/CUDA inference engine
-(`/mnt/storage/ninfer`). Three product goals:
+(the NInfer source checkout). Three product goals:
 
 1. **Every engine option is visible and toggleable** — the whole `ninfer-serve` option surface,
    grouped, documented per control, with presets and a live generated launch command.

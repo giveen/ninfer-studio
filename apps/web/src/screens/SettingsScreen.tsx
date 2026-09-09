@@ -63,7 +63,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
               <TextField value={form.hfCli} onChange={(v) => set('hfCli', v)} className="font-mono text-[12px]" />
             </Field>
             <Field label="Engine source repo" hint="Git work tree of the NInfer source. The Engine tab's git pull / rebuild run here.">
-              <TextField value={form.repoDir ?? ''} onChange={(v) => set('repoDir', v)} placeholder="/mnt/storage/ninfer" className="font-mono text-[12px]" />
+              <TextField value={form.repoDir ?? ''} onChange={(v) => set('repoDir', v)} placeholder="/path/to/ninfer" className="font-mono text-[12px]" />
             </Field>
             <Field label="Build command" hint="Run inside the repo dir. NInfer default: Ninja configure + Release build, parallelized over all cores (-j$(nproc)).">
               <TextField value={form.buildCommand ?? ''} onChange={(v) => set('buildCommand', v)} placeholder="cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)" className="font-mono text-[12px]" />
@@ -96,7 +96,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
           <div className="space-y-2 text-[12.5px] leading-relaxed text-mute">
             <p>
               <span className="font-semibold text-ink">NInfer Studio</span> is a from-scratch desktop UI for the{' '}
-              <span className="font-mono text-[12px]">/mnt/storage/ninfer</span> engine: a full configuration surface for every{' '}
+              NInfer engine: a full configuration surface for every{' '}
               <span className="font-mono text-[12px]">ninfer-serve</span> option, artifact management, and a streaming chat window.
             </p>
             <p>
