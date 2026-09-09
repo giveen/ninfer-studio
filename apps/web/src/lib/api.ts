@@ -308,4 +308,91 @@ export function attachmentsToParts(att: ChatAttachment[]): Array<Record<string, 
   );
 }
 
+// ---------------------------------------------------------------------------
+// Conversation compaction (/compact): condense the current chat into a
+// structured checkpoint so context is preserved while token usage drops. The
+// directive + framing mirror the deepseek-harness compaction engine.
+// ---------------------------------------------------------------------------
+const COMPACTION_INSTRUCTION = [
+  'You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.',
+  '',
+  'Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.',
+  '',
+  '## Primary Request and Intent',
+  "- [the user's original and evolving goals; quote verbatim where the exact wording matters]",
+  '',
+  '## Key Technical Concepts',
+  '- [technologies, frameworks, patterns, and conventions in play]',
+  '',
+  '## Files and Code',
+  '- [exact path: why it matters, key changes or snippets]',
+  '',
+  '## Errors and Fixes',
+  '- [error: how it was resolved, plus any related user feedback]',
+  '',
+  '## Pending Jobs',
+  '- [explicitly requested work not yet completed]',
+  '',
+  '## Current Work',
+  '- [precisely what was in progress at this checkpoint]',
+  '',
+  '## Next Step',
+  '- [the single next action, directly in line with the most recent request, or "(none)"]',
+  '',
+  '## Critical Context',
+  '- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]',
+  '',
+  'Rules:',
+  '- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.',
+  '- Capture user feedback and explicit instructions faithfully, especially corrections.',
+  '- Do NOT mention this summarization request or that the context was compacted.',
+  '- Output only the checkpoint text: do not call any tool or take any other action.',
+  '- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.',
+].join('\n');
+
+const SUMMARY_OPEN_TAG = '<compacted-summary>';
+const SUMMARY_CLOSE_TAG = '</compacted-summary>';
+const CHECKPOINT_PREAMBLE =
+  'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.';
+
+/** Wrap a raw summary into the checkpoint framing used as the new chat context. */
+export function frameCompactedSummary(summary: string): string {
+  return `${CHECKPOINT_PREAMBLE}\n\n${SUMMARY_OPEN_TAG}\n${summary.trim()}\n${SUMMARY_CLOSE_TAG}`;
+}
+
+/**
+ * Stream a structured summary of `history` from the engine. The compaction
+ * directive is appended as a final user message (thinking disabled) so the
+ * engine produces the checkpoint text, which we return as a single string.
+ */
+export function summarizeConversation(opts: {
+  model: string;
+  systemPrompt?: string;
+  history: ChatMessage[];
+  onDelta?: (text: string) => void;
+  signal?: AbortSignal;
+  maxTokens?: number;
+}): Promise<string> {
+  const instruction: ChatMessage = { role: 'user', content: COMPACTION_INSTRUCTION };
+  // Thinking off for the condensation pass; bound the output so it can't run away.
+  const summaryParams: ChatParams = {
+    thinking: false,
+    reasoningEffort: '',
+    preserveThinking: false,
+    maxTokens: opts.maxTokens ?? 2048,
+  };
+  const body = buildChatRequest(opts.model, opts.systemPrompt, [...opts.history, instruction], summaryParams);
+  return new Promise<string>((resolve, reject) => {
+    let acc = '';
+    streamChat(body, opts.signal ?? AbortSignal.timeout(180_000), {
+      onContentDelta: (d) => {
+        acc += d;
+        opts.onDelta?.(d);
+      },
+      onDone: () => resolve(acc.trim()),
+      onError: (m) => reject(new Error(m)),
+    });
+  });
+}
+
 export type { ChatAttachment };

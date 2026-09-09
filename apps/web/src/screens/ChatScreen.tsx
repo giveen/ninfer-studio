@@ -12,7 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { buildChatRequest, getConversations, saveConversations, streamChat } from '../lib/api';
+import { buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
@@ -316,6 +316,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
   const [loaded, setLoaded] = useState(false);
+  const [compacting, setCompacting] = useState(false);
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -383,9 +385,50 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   });
 
+  const runCompact = useCallback(async () => {
+    if (compacting) return;
+    setNotice(null);
+    if (!engineUp) {
+      onNavigate('engine');
+      return;
+    }
+    const conv = convs.find((c) => c.id === activeId);
+    if (!conv || conv.messages.length === 0) {
+      setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
+      return;
+    }
+    const useModel = model || runningModel;
+    if (!useModel) return;
+
+    setCompacting(true);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      const summary = await summarizeConversation({
+        model: useModel,
+        systemPrompt: params.systemPrompt,
+        history: conv.messages,
+        signal: ac.signal,
+      });
+      if (!summary) throw new Error('compaction produced no summary');
+      const compacted: Conversation = { ...conv, messages: [{ role: 'user', content: frameCompactedSummary(summary) }] };
+      setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
+      setNotice({ tone: 'ok', text: 'Conversation compacted — context preserved as a checkpoint. Keep chatting from here.' });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : 'compaction failed' });
+    } finally {
+      setCompacting(false);
+      abortRef.current = null;
+    }
+  }, [compacting, engineUp, convs, activeId, model, runningModel, params, onNavigate]);
+
   const send = useCallback(async () => {
     const content = text.trim();
     if (!content && !attachments.length) return;
+    if (content === '/compact') {
+      await runCompact();
+      return;
+    }
     if (!engineUp) {
       onNavigate('engine');
       return;
@@ -674,6 +717,21 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               ))}
             </div>
           )}
+          {notice && (
+            <div
+              className={cn(
+                'mb-2 rounded-lg border px-3 py-2 text-[12.5px]',
+                notice.tone === 'ok' && 'border-ok/30 bg-ok/8 text-ok',
+                notice.tone === 'warn' && 'border-warn/30 bg-warn/8 text-warn',
+                notice.tone === 'danger' && 'border-danger/30 bg-danger/8 text-danger',
+              )}
+            >
+              {notice.text}
+              <button className="ml-3 opacity-60 hover:opacity-100" onClick={() => setNotice(null)}>
+                ✕
+              </button>
+            </div>
+          )}
           <div className="relative rounded-xl border border-line bg-inset focus-within:border-accent/50">
             <textarea
               ref={textareaRef}
@@ -686,7 +744,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  if (!streaming) send();
+                  if (!streaming && !compacting) send();
                 }
               }}
               placeholder={engineUp ? `Message ${model || 'engine'}…  (Enter to send, Shift+Enter for newline)` : 'Engine is offline — open the Engine tab to start it'}
@@ -720,9 +778,9 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 </button>
               )}
               <span className="ml-auto" />
-              {streaming ? (
+              {streaming || compacting ? (
                 <Button variant="danger" size="sm" onClick={stop}>
-                  <Square size={12} /> stop
+                  <Square size={12} /> {compacting ? 'stop compact' : 'stop'}
                 </Button>
               ) : (
                 <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUp}>
