@@ -75,7 +75,7 @@ fn main() {
                 let show_i = MenuItem::with_id(app, "show", "Show NInfer Studio", true, None::<&str>)?;
                 let hide_i = MenuItem::with_id(app, "hide", "Hide to tray", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-                let menu = Menu::new()?;
+                let menu = Menu::new(app)?;
                 menu.append(&show_i)?;
                 menu.append(&hide_i)?;
                 menu.append(&quit_i)?;
