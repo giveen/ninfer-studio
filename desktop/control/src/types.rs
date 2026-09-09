@@ -29,13 +29,14 @@ pub enum AppEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
-    pub engine_binary: String,
-    pub engine_cli: String,
+    /// Root of the NInfer checkout/build. The ninfer-serve binary
+    /// (`build/apps/ninfer-serve`), the ninfer CLI, and the git source for
+    /// pull/build are all derived from this single path.
+    pub ninfer_path: String,
     pub models_dir: String,
     pub engine_port: u16,
     pub api_key: String,
     pub hf_cli: String,
-    pub repo_dir: String,
     pub build_command: String,
     /// JSON object merged (as defaults) into every proxied /v1 request body, so
     /// external clients (e.g. other coding harnesses) inherit these params without
@@ -55,13 +56,11 @@ impl Default for AppSettings {
             // machine layout. The user configures these in Settings; an empty value
             // is treated as "not configured" so we can surface a clear error early
             // instead of spawning a binary that does not exist on their machine.
-            engine_binary: String::new(),
-            engine_cli: String::new(),
+            ninfer_path: String::new(),
             models_dir: String::new(),
             engine_port: 8080,
             api_key: String::new(),
             hf_cli: "hf".into(),
-            repo_dir: String::new(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),

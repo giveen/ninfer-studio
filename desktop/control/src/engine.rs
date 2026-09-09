@@ -257,11 +257,12 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     // distributed build ships an empty default (never the developer's machine
     // path), so a fresh install must point Studio at the user's own
     // ninfer-serve before the engine can start.
-    if cfg.engine_binary.trim().is_empty() {
+    let ninfer_path = cfg.ninfer_path.trim();
+    if ninfer_path.is_empty() {
         let mut eng = state.engine.write().await;
         eng.state = "failed".into();
-        eng.fail_reason = Some("engine binary not configured".into());
-        let reason = "Engine binary not configured — open Settings and set the Engine binary path.".to_string();
+        eng.fail_reason = Some("ninfer path not configured".into());
+        let reason = "Ninfer path not configured — open Settings and set the Ninfer path.".to_string();
         state.emit(AppEvent::EngineFailed {
             reason: Some(reason.clone()),
         });
@@ -271,6 +272,10 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             "message": reason,
         });
     }
+    let engine_binary = std::path::Path::new(ninfer_path)
+        .join("build")
+        .join("apps")
+        .join("ninfer-serve");
 
     let port = profile.port.unwrap_or(cfg.engine_port);
     let artifact = artifact.filter(|a| !a.is_empty());
@@ -361,10 +366,10 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.deadline = Some(now_ms() + 180_000);
     }
 
-    let mut cmd = tokio::process::Command::new(&cfg.engine_binary);
+    let mut cmd = tokio::process::Command::new(&engine_binary);
     cmd.arg(&artifact)
         .current_dir(
-            std::path::Path::new(&cfg.engine_binary)
+            engine_binary
                 .parent()
                 .unwrap_or(std::path::Path::new(".")),
         )

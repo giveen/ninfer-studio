@@ -57,13 +57,13 @@ export interface CatalogEntry {
 }
 
 export interface AppSettings {
-  engineBinary: string;
-  engineCli: string;
+  /** Root of the NInfer checkout/build. The ninfer-serve binary (build/apps/ninfer-serve),
+   * the ninfer CLI, and the git source for pull/build are all derived from this. */
+  ninferPath: string;
   modelsDir: string;
   enginePort: number;
   apiKey: string;
   hfCli: string;
-  repoDir: string;
   buildCommand: string;
   /** JSON object merged (as defaults) into every proxied /v1 request body. */
   defaultRequestParams: string;

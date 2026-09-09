@@ -90,13 +90,11 @@ const defaultConfig = {
   // layout. The user sets these in Settings (or config.json). Empty values are
   // treated as "not configured" so we surface a clear error instead of spawning
   // a binary that does not exist on their machine.
-  engineBinary: '',
-  engineCli: '',
+  ninferPath: '',
   modelsDir: '',
   enginePort: 8080,
   apiKey: '',
   hfCli: 'hf',
-  repoDir: '',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
   reasoningEffort: '',
 };
@@ -329,8 +327,13 @@ async function startEngine(profile, artifactPath) {
     deadline: Date.now() + 180_000,
   };
 
-  const proc = spawn(config.engineBinary, [artifact, ...args], {
-    cwd: path.dirname(config.engineBinary),
+  const engineBinary = config.ninferPath ? path.join(config.ninferPath, 'build', 'apps', 'ninfer-serve') : '';
+  if (!engineBinary) {
+    markFailed('Engine path not configured — open Settings and set the Ninfer path.');
+    return { ok: false, code: 'not_configured', message: 'Engine path not configured — open Settings and set the Ninfer path.' };
+  }
+  const proc = spawn(engineBinary, [artifact, ...args], {
+    cwd: path.dirname(engineBinary),
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, PATH: `${process.env.PATH}:${os.homedir()}/.local/bin` },
   });
@@ -729,8 +732,8 @@ async function startUpdate(action) {
   if (updateJob && !updateJob.done) {
     return { ok: false, message: `an ${updateJob.action} job is already running (pid ${updateJob.pid ?? '?'})` };
   }
-  const repo = config.repoDir || '';
-  if (!repo) return { ok: false, message: 'repoDir is not configured' };
+  const repo = config.ninferPath || '';
+  if (!repo) return { ok: false, message: 'Ninfer path is not configured' };
   try {
     const st = await fs.stat(repo);
     if (!st.isDirectory()) return { ok: false, message: `not a directory: ${repo}` };

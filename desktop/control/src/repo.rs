@@ -28,9 +28,9 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     }
 
     let cfg = state.config.read().await.clone();
-    let repo = cfg.repo_dir.clone();
+    let repo = cfg.ninfer_path.clone();
     if repo.is_empty() {
-        return json!({ "ok": false, "message": "repoDir is not configured" });
+        return json!({ "ok": false, "message": "Ninfer path is not configured" });
     }
 
     let Ok(md) = tokio::fs::metadata(&repo).await else {

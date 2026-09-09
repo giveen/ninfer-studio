@@ -40,13 +40,11 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
     setError(null);
     try {
       const c = await saveConfig({
-        engineBinary: form.engineBinary,
-        engineCli: form.engineCli,
+        ninferPath: form.ninferPath ?? '',
         modelsDir: form.modelsDir,
         enginePort: Number(form.enginePort),
         apiKey: form.apiKey,
         hfCli: form.hfCli,
-        repoDir: form.repoDir ?? '',
         buildCommand: form.buildCommand ?? '',
         defaultRequestParams: form.defaultRequestParams ?? '',
       });
@@ -63,11 +61,8 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
       <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
         <SectionCard title="Engine paths" description="Studio spawns the compiled engine binary and scans the models directory. Both must exist on this machine." icon={<FolderCog size={15} />}>
           <div className="space-y-4">
-            <Field label="ninfer-serve binary" hint="Absolute path to build/apps/ninfer-serve. Requires a CMake Release build of the engine (RTX 5090 / sm_120a target).">
-              <TextField value={form.engineBinary} onChange={(v) => set('engineBinary', v)} className="font-mono text-[12px]" />
-            </Field>
-            <Field label="ninfer CLI (one-shot)" hint="Reserved for future one-shot prompt tooling.">
-              <TextField value={form.engineCli} onChange={(v) => set('engineCli', v)} className="font-mono text-[12px]" />
+            <Field label="Ninfer path" hint="Root of your NInfer checkout/build. Studio derives the ninfer-serve binary (build/apps/ninfer-serve), the ninfer CLI, and the git source for pull/build automatically.">
+              <TextField value={form.ninferPath ?? ''} onChange={(v) => set('ninferPath', v)} placeholder="/path/to/ninfer" className="font-mono text-[12px]" />
             </Field>
             <Field label="Models directory" hint="Scanned for .ninfer artifacts; downloads land here.">
               <TextField value={form.modelsDir} onChange={(v) => set('modelsDir', v)} className="font-mono text-[12px]" />
@@ -75,10 +70,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             <Field label="hf CLI" hint="Hugging Face CLI binary used for downloads.">
               <TextField value={form.hfCli} onChange={(v) => set('hfCli', v)} className="font-mono text-[12px]" />
             </Field>
-            <Field label="Engine source repo" hint="Git work tree of the NInfer source. Git pull / rebuild run from the Engine source section below.">
-              <TextField value={form.repoDir ?? ''} onChange={(v) => set('repoDir', v)} placeholder="/path/to/ninfer" className="font-mono text-[12px]" />
-            </Field>
-            <Field label="Build command" hint="Run inside the repo dir. NInfer default: Ninja configure + Release build, parallelized over all cores (-j$(nproc)).">
+            <Field label="Build command" hint="Run inside the Ninfer path. NInfer default: Ninja configure + Release build, parallelized over all cores (-j$(nproc)).">
               <TextField value={form.buildCommand ?? ''} onChange={(v) => set('buildCommand', v)} placeholder="cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)" className="font-mono text-[12px]" />
             </Field>
           </div>
@@ -111,10 +103,10 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             )}
           </div>
           <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
-            <Field label="Repository" hint="NInfer git work tree (editable above).">
-              <div className="truncate font-mono text-[12px] text-ink">{form.repoDir || '—'}</div>
+            <Field label="Ninfer path" hint="NInfer path (editable in Engine paths above).">
+              <div className="truncate font-mono text-[12px] text-ink">{form.ninferPath || '—'}</div>
             </Field>
-            <Field label="Build command" hint="Run inside the repository directory (editable above).">
+            <Field label="Build command" hint="Run inside the Ninfer path (editable above).">
               <div className="truncate font-mono text-[12px] text-ink">{form.buildCommand || '—'}</div>
             </Field>
           </div>

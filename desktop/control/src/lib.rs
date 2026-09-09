@@ -283,11 +283,8 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
         let c = state.config.read().await.clone();
         c
     };
-    if let Some(v) = body.get("engineBinary").and_then(|v| v.as_str()) {
-        merged.engine_binary = v.into();
-    }
-    if let Some(v) = body.get("engineCli").and_then(|v| v.as_str()) {
-        merged.engine_cli = v.into();
+    if let Some(v) = body.get("ninferPath").and_then(|v| v.as_str()) {
+        merged.ninfer_path = v.into();
     }
     if let Some(v) = body.get("modelsDir").and_then(|v| v.as_str()) {
         merged.models_dir = v.into();
@@ -300,9 +297,6 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     }
     if let Some(v) = body.get("hfCli").and_then(|v| v.as_str()) {
         merged.hf_cli = v.into();
-    }
-    if let Some(v) = body.get("repoDir").and_then(|v| v.as_str()) {
-        merged.repo_dir = v.into();
     }
     if let Some(v) = body.get("buildCommand").and_then(|v| v.as_str()) {
         merged.build_command = v.into();
@@ -549,9 +543,6 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     if let Ok(raw) = tokio::fs::read_to_string(&p).await {
         if let Ok(mut cfg) = serde_json::from_str::<AppSettings>(&raw) {
             let defaults = AppSettings::default();
-            if cfg.engine_binary.is_empty() {
-                cfg.engine_binary = defaults.engine_binary;
-            }
             if cfg.models_dir.is_empty() {
                 cfg.models_dir = defaults.models_dir;
             }
@@ -561,8 +552,8 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
             if cfg.hf_cli.is_empty() {
                 cfg.hf_cli = defaults.hf_cli;
             }
-            if cfg.repo_dir.is_empty() {
-                cfg.repo_dir = defaults.repo_dir;
+            if cfg.ninfer_path.is_empty() {
+                cfg.ninfer_path = defaults.ninfer_path;
             }
             if cfg.build_command.is_empty() {
                 cfg.build_command = defaults.build_command;
