@@ -42,13 +42,17 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            engine_binary: "/mnt/storage/ninfer/build/apps/ninfer-serve".into(),
-            engine_cli: "/mnt/storage/ninfer/build/apps/ninfer".into(),
-            models_dir: "/mnt/storage/ninfer/models".into(),
+            // No hardcoded paths: a distributed build must not ship a developer's
+            // machine layout. The user configures these in Settings; an empty value
+            // is treated as "not configured" so we can surface a clear error early
+            // instead of spawning a binary that does not exist on their machine.
+            engine_binary: String::new(),
+            engine_cli: String::new(),
+            models_dir: String::new(),
             engine_port: 8080,
             api_key: String::new(),
             hf_cli: "hf".into(),
-            repo_dir: "/mnt/storage/ninfer".into(),
+            repo_dir: String::new(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
         }
     }

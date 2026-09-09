@@ -252,6 +252,26 @@ async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
 
 pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<String>) -> Value {
     let cfg = state.config.read().await.clone();
+
+    // Fail fast with a clear message if no engine binary is configured. A
+    // distributed build ships an empty default (never the developer's machine
+    // path), so a fresh install must point Studio at the user's own
+    // ninfer-serve before the engine can start.
+    if cfg.engine_binary.trim().is_empty() {
+        let mut eng = state.engine.write().await;
+        eng.state = "failed".into();
+        eng.fail_reason = Some("engine binary not configured".into());
+        let reason = "Engine binary not configured — open Settings and set the Engine binary path.".to_string();
+        state.emit(AppEvent::EngineFailed {
+            reason: Some(reason.clone()),
+        });
+        return json!({
+            "ok": false,
+            "code": "not_configured",
+            "message": reason,
+        });
+    }
+
     let port = profile.port.unwrap_or(cfg.engine_port);
     let artifact = artifact.filter(|a| !a.is_empty());
 
