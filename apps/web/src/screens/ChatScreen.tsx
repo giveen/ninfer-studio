@@ -1,11 +1,15 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
+  Copy,
   Gauge,
+  GitBranch,
   Paperclip,
+  Pencil,
   Play,
   Plus,
+  RefreshCw,
   Send,
   SlidersHorizontal,
   Square,
@@ -25,6 +29,16 @@ const DEFAULT_PARAMS: ChatParams = {
   preserveThinking: true,
   maxTokens: null as unknown as number,
 };
+
+// Slash-command palette (type `/` in the composer to see suggestions).
+const SLASH_COMMANDS: Array<{ cmd: string; desc: string; needsArg?: boolean }> = [
+  { cmd: '/clear', desc: 'Clear the current chat' },
+  { cmd: '/retry', desc: 'Regenerate the last reply' },
+  { cmd: '/model', desc: 'Switch model', needsArg: true },
+  { cmd: '/think', desc: 'Toggle reasoning on|off', needsArg: true },
+  { cmd: '/params', desc: 'Open the parameter popover' },
+  { cmd: '/compact', desc: 'Summarize chat into a checkpoint' },
+];
 
 function pickDefined<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
@@ -118,53 +132,164 @@ function MessageMeta({ m }: { m: ChatMessage }) {
   );
 }
 
-const MessageRow = memo(function MessageRow({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
+type MsgActions = {
+  onCopy: (m: ChatMessage) => void;
+  onRegenerate: (convId: string, i: number) => void;
+  onEdit: (convId: string, i: number, text: string) => void;
+  onDelete: (convId: string, i: number) => void;
+  onBranch: (convId: string, i: number) => void;
+};
+
+function ActionBtn({ title, onClick, children }: { title: string; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="rounded p-1 text-faint transition-colors hover:bg-panel2 hover:text-ink"
+    >
+      {children}
+    </button>
+  );
+}
+
+const MessageRow = memo(function MessageRow({
+  m,
+  streaming,
+  convId,
+  index,
+  actions,
+}: {
+  m: ChatMessage;
+  streaming?: boolean;
+  convId: string;
+  index: number;
+  actions: MsgActions;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(m.content);
+  const startEdit = () => {
+    setDraft(m.content);
+    setEditing(true);
+  };
+  const commitEdit = () => {
+    const t = draft.trim();
+    if (t) actions.onEdit(convId, index, t);
+    setEditing(false);
+  };
+
+  const toolbar = (
+    <div className="absolute right-1 top-1 z-10 flex items-center gap-0.5 rounded-md border border-line bg-panel/90 p-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+      <ActionBtn title="Copy" onClick={() => actions.onCopy(m)}>
+        <Copy size={13} />
+      </ActionBtn>
+      {m.role === 'assistant' && (
+        <ActionBtn title="Regenerate" onClick={() => actions.onRegenerate(convId, index)}>
+          <RefreshCw size={13} />
+        </ActionBtn>
+      )}
+      {m.role === 'user' && (
+        <ActionBtn title="Edit" onClick={startEdit}>
+          <Pencil size={13} />
+        </ActionBtn>
+      )}
+      <ActionBtn title="Branch from here" onClick={() => actions.onBranch(convId, index)}>
+        <GitBranch size={13} />
+      </ActionBtn>
+      <ActionBtn title="Delete from here" onClick={() => actions.onDelete(convId, index)}>
+        <Trash2 size={13} />
+      </ActionBtn>
+    </div>
+  );
+
   if (m.role === 'user') {
     return (
-      <div className="flex justify-end">
+      <div className="group relative flex justify-end">
+        {toolbar}
         <div className="max-w-[78%] rounded-xl rounded-br-sm border border-line bg-panel2 px-3.5 py-2.5">
-          {m.attachments && m.attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              {m.attachments.map((a, i) => (
-                <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
-                  {a.kind === 'image' ? '🖼' : '🎞'} {a.name}
-                  <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>
-                </span>
-              ))}
+          {editing ? (
+            <div className="w-72 max-w-full">
+              <textarea
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    commitEdit();
+                  } else if (e.key === 'Escape') {
+                    setEditing(false);
+                  }
+                }}
+                rows={3}
+                className="w-full resize-y rounded-lg border border-line bg-inset px-2.5 py-2 text-[13.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+              />
+              <div className="mt-1 flex justify-end gap-2">
+                <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                  cancel
+                </Button>
+                <Button size="sm" onClick={commitEdit}>
+                  save
+                </Button>
+              </div>
             </div>
+          ) : (
+            <>
+              {m.attachments && m.attachments.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {m.attachments.map((a, i) => (
+                    <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
+                      {a.kind === 'image' ? '🖼' : '🎞'} {a.name}
+                      <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {m.content && <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>}
+            </>
           )}
-          {m.content && <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>}
         </div>
       </div>
     );
   }
   return (
-    <div className="max-w-full">
-      <div className="mb-1 flex items-center gap-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-accent">ninfer</span>
-        {m.model && <span className="font-mono text-[10.5px] text-faint">{m.model}</span>}
-        {streaming && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
-      </div>
-      <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} />
-      <div className={cn('rounded-xl rounded-tl-sm border border-line bg-panel px-3.5 py-2.5', streaming && m.content && 'stream-caret')}>
-        {m.error ? (
-          <div className="text-[13px] text-danger">{m.content}</div>
-        ) : m.content ? (
-          // Plain text while streaming (see ReasoningBlock): avoids re-parsing the
-          // growing answer through react-markdown on every token. Rendered to
-          // proper markdown once the turn completes (streaming === false).
-          streaming ? (
-            <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
-          ) : (
-            <div className="markdown text-[13.5px] leading-relaxed">
-              <Markdown>{m.content}</Markdown>
+    <div className="group relative max-w-full">
+      {toolbar}
+      <div className="max-w-full">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-accent">ninfer</span>
+          {m.model && <span className="font-mono text-[10.5px] text-faint">{m.model}</span>}
+          {streaming && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
+        </div>
+        <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} />
+        <div className={cn('rounded-xl rounded-tl-sm border border-line bg-panel px-3.5 py-2.5', streaming && m.content && 'stream-caret')}>
+          {m.error ? (
+            <div>
+              <div className="text-[13px] text-danger">{m.content}</div>
+              <Button size="sm" variant="subtle" className="mt-2" onClick={() => actions.onRegenerate(convId, index)}>
+                <RefreshCw size={12} /> retry
+              </Button>
             </div>
-          )
-        ) : !streaming && !m.reasoning ? (
-          <span className="text-[13px] text-faint">—</span>
-        ) : null}
+          ) : m.content ? (
+            // Plain text while streaming (see ReasoningBlock): avoids re-parsing the
+            // growing answer through react-markdown on every token. Rendered to
+            // proper markdown once the turn completes (streaming === false).
+            streaming ? (
+              <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
+            ) : (
+              <div className="markdown text-[13.5px] leading-relaxed">
+                <Markdown>{m.content}</Markdown>
+              </div>
+            )
+          ) : !streaming && !m.reasoning ? (
+            <span className="text-[13px] text-faint">—</span>
+          ) : null}
+        </div>
+        <MessageMeta m={m} />
       </div>
-      <MessageMeta m={m} />
     </div>
   );
 });
@@ -352,6 +477,9 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Latest conversations snapshot for use inside stable callbacks (avoids stale closures).
+  const convsRef = useRef(convs);
+  convsRef.current = convs;
 
   const engine = status?.engine;
   // every engine Studio knows about (primary + discovered on other ports)
@@ -454,11 +582,83 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     }
   }, [compacting, engineUp, convs, activeId, model, runningModel, params, onNavigate]);
 
+  // Stream an assistant reply into the LAST message of `convId`, given the prior
+  // `history` (everything before the placeholder). Shared by send / regenerate /
+  // edit-and-resend so they stay in lockstep.
+  const runStream = useCallback(
+    async (convId: string, history: ChatMessage[]) => {
+      if (!engineUp) {
+        onNavigate('engine');
+        return;
+      }
+      const useModel = model || runningModel;
+      if (!useModel) return;
+      setStreaming(true);
+      const ac = new AbortController();
+      abortRef.current = ac;
+      await streamChat(
+        buildChatRequest(useModel, params.systemPrompt, history, params),
+        ac.signal,
+        {
+          onReasoningDelta: (d) => {
+            setConvs((cs) =>
+              cs.map((c) =>
+                c.id !== convId
+                  ? c
+                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
+              ),
+            );
+          },
+          onContentDelta: (d) => {
+            setConvs((cs) =>
+              cs.map((c) =>
+                c.id !== convId
+                  ? c
+                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, content: m.content + d } : m)) },
+              ),
+            );
+          },
+          onUsage: (_u, meta) => {
+            setConvs((cs) =>
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+            );
+            setLatestRequestMetrics(meta, useModel);
+          },
+          onDone: (meta) => {
+            setConvs((cs) =>
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+            );
+            setLatestRequestMetrics(meta, useModel);
+            setStreaming(false);
+          },
+          onError: (msg) => {
+            setConvs((cs) =>
+              cs.map((c) =>
+                c.id !== convId
+                  ? c
+                  : {
+                      ...c,
+                      messages: c.messages.map((m, i) =>
+                        i === c.messages.length - 1 ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
+                      ),
+                    },
+              ),
+            );
+            setStreaming(false);
+          },
+        },
+      );
+      abortRef.current = null;
+    },
+    [engineUp, model, runningModel, params, onNavigate],
+  );
+
   const send = useCallback(async () => {
     const content = text.trim();
     if (!content && !attachments.length) return;
-    if (content === '/compact') {
-      await runCompact();
+    if (content.startsWith('/') && runCommand(content)) {
+      setText('');
+      setAttachments([]);
       return;
     }
     if (!engineUp) {
@@ -491,71 +691,116 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setText('');
     setAttachments([]);
     stick.current = true;
-    setStreaming(true);
 
     const history: ChatMessage[] = base.messages.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
-    const ac = new AbortController();
-    abortRef.current = ac;
-
-    await streamChat(
-      buildChatRequest(useModel, params.systemPrompt, history, params),
-      ac.signal,
-      {
-        onReasoningDelta: (d) => {
-          setConvs((cs) =>
-            cs.map((c) =>
-              c.id !== newId
-                ? c
-                : {
-                    ...c,
-                    messages: c.messages.map((m, i) =>
-                      i === c.messages.length - 1 ? { ...m, reasoning: (m.reasoning || '') + d } : m,
-                    ),
-                  },
-            ),
-          );
-        },
-        onContentDelta: (d) => {
-          setConvs((cs) =>
-            cs.map((c) =>
-              c.id !== newId
-                ? c
-                : {
-                    ...c,
-                    messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, content: m.content + d } : m)),
-                  },
-            ),
-          );
-        },
-        onUsage: (_u, meta) => {
-          setConvs((cs) => cs.map((c) => (c.id !== newId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })));
-          setLatestRequestMetrics(meta, useModel);
-        },
-        onDone: (meta) => {
-          setConvs((cs) => cs.map((c) => (c.id !== newId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })));
-          setLatestRequestMetrics(meta, useModel);
-          setStreaming(false);
-        },
-        onError: (msg) => {
-          setConvs((cs) =>
-            cs.map((c) =>
-              c.id !== newId
-                ? c
-                : {
-                    ...c,
-                    messages: c.messages.map((m, i) =>
-                      i === c.messages.length - 1 ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
-                    ),
-                  },
-            ),
-          );
-          setStreaming(false);
-        },
-      },
-    );
-    abortRef.current = null;
+    await runStream(newId, history);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate]);
+  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
+
+  // --- message-level actions (hover toolbar) ---
+  const copyMessage = useCallback((m: ChatMessage) => {
+    const text = m.role === 'assistant' && m.reasoning ? `> reasoning\n\n${m.reasoning}\n\n${m.content}` : m.content;
+    navigator.clipboard?.writeText(text).catch(() => undefined);
+  }, []);
+
+  // Delete this message and everything after it (a chat is a strict linear context).
+  const deleteFrom = useCallback((convId: string, msgIndex: number) => {
+    setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.slice(0, msgIndex) })));
+  }, []);
+
+  // Fork the conversation up to and including this message into a new chat.
+  const branchAt = useCallback((convId: string, msgIndex: number) => {
+    const conv = convsRef.current.find((c) => c.id === convId);
+    if (!conv) return;
+    const fork: Conversation = {
+      ...conv,
+      id: uid(),
+      title: conv.title ? `${conv.title} (branch)` : 'Branch',
+      createdAt: Date.now(),
+      messages: conv.messages.slice(0, msgIndex + 1).map((m) => ({ ...m })),
+    };
+    setConvs((cs) => [fork, ...cs]);
+    setActiveId(fork.id);
+  }, []);
+
+  // Replace the assistant reply at `msgIndex` (and drop everything after) with a fresh one.
+  const regenerate = useCallback(
+    (convId: string, msgIndex: number) => {
+      const conv = convsRef.current.find((c) => c.id === convId);
+      if (!conv) return;
+      const prior = conv.messages.slice(0, msgIndex);
+      const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
+      runStream(convId, prior);
+    },
+    [model, runningModel, runStream],
+  );
+
+  // Edit a user message in place, then re-stream its assistant reply.
+  const editMessage = useCallback(
+    (convId: string, msgIndex: number, newText: string) => {
+      const conv = convsRef.current.find((c) => c.id === convId);
+      if (!conv) return;
+      const msgs = conv.messages.slice();
+      msgs[msgIndex] = { ...msgs[msgIndex], content: newText };
+      const prior = msgs.slice(0, msgIndex + 1);
+      const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
+      runStream(convId, prior);
+    },
+    [model, runningModel, runStream],
+  );
+
+  const msgActions = useMemo(
+    () => ({ onCopy: copyMessage, onRegenerate: regenerate, onEdit: editMessage, onDelete: deleteFrom, onBranch: branchAt }),
+    [copyMessage, regenerate, editMessage, deleteFrom, branchAt],
+  );
+
+  // Slash-command interpreter. Returns true if `raw` was a recognized command
+  // (so the caller can skip sending it to the engine as a normal message).
+  const runCommand = useCallback(
+    (raw: string): boolean => {
+      const parts = raw.trim().split(/\s+/);
+      const cmd = parts[0].toLowerCase();
+      const arg = parts.slice(1).join(' ').trim();
+      switch (cmd) {
+        case '/clear':
+          if (activeId) setConvs((cs) => cs.map((c) => (c.id === activeId ? { ...c, messages: [] } : c)));
+          else setActiveId(null);
+          return true;
+        case '/retry': {
+          const conv = convsRef.current.find((c) => c.id === activeId);
+          if (conv) {
+            for (let i = conv.messages.length - 1; i >= 0; i--) {
+              if (conv.messages[i].role === 'assistant') {
+                regenerate(activeId!, i);
+                break;
+              }
+            }
+          }
+          return true;
+        }
+        case '/model':
+          if (arg) setModel(arg);
+          else setNotice({ tone: 'warn', text: 'usage: /model <id>' });
+          return true;
+        case '/think':
+          if (arg === 'on') setParams({ thinking: true });
+          else if (arg === 'off') setParams({ thinking: false });
+          else setNotice({ tone: 'warn', text: 'usage: /think on|off' });
+          return true;
+        case '/params':
+          setParamsOpen(true);
+          return true;
+        case '/compact':
+          runCompact();
+          return true;
+        default:
+          return false;
+      }
+    },
+    [activeId, regenerate, runCompact, setModel, setParams, setParamsOpen, setNotice],
+  );
 
   const stop = () => abortRef.current?.abort();
 
@@ -729,7 +974,14 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           ) : (
             <div className="mx-auto flex max-w-3xl flex-col gap-5">
               {messages.map((m, i) => (
-                <MessageRow key={i} m={m} streaming={streaming && i === messages.length - 1} />
+                <MessageRow
+                  key={i}
+                  m={m}
+                  convId={activeId ?? ''}
+                  index={i}
+                  streaming={streaming && i === messages.length - 1}
+                  actions={msgActions}
+                />
               ))}
             </div>
           )}
@@ -765,6 +1017,30 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           )}
           <div className="relative rounded-xl border border-line bg-inset focus-within:border-accent/50">
+            {text.startsWith('/') &&
+              (() => {
+                const token = text.split(/\s/)[0].toLowerCase();
+                const matches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(token));
+                if (!matches.length) return null;
+                return (
+                  <div className="absolute bottom-full left-2 z-30 mb-2 w-80 rounded-xl border border-line bg-panel p-1.5 shadow-2xl">
+                    {matches.map((c) => (
+                      <button
+                        key={c.cmd}
+                        type="button"
+                        onClick={() => {
+                          setText(c.needsArg ? `${c.cmd} ` : c.cmd);
+                          textareaRef.current?.focus();
+                        }}
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-panel2"
+                      >
+                        <span className="font-mono text-accent">{c.cmd}</span>
+                        <span className="truncate text-faint">{c.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
             <textarea
               ref={textareaRef}
               value={text}

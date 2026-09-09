@@ -215,6 +215,7 @@ export async function streamChat(
   const t0 = performance.now();
   const meta: MessageMeta = {};
   let firstContentAt: number | null = null;
+  let sawDone = false;
 
   const finish = () => {
     if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
@@ -252,7 +253,7 @@ export async function streamChat(
       if (!line.startsWith('data:')) return false; // skip comments / keep-alives / event: lines
       const payload = line.slice(5).trim();
       if (!payload) return false;
-      if (payload === '[DONE]') return true;
+      if (payload === '[DONE]') { sawDone = true; return true; }
       let chunk: Record<string, any>;
       try {
         chunk = JSON.parse(payload);
@@ -314,6 +315,13 @@ export async function streamChat(
         finish();
         return;
       }
+    }
+    // The SSE stream closed without a [DONE] event — treat it as an interrupted
+    // connection (proxy/engine dropped mid-response) and surface a retry
+    // affordance instead of a silently empty/partial answer.
+    if (!sawDone) {
+      cb.onError?.('The response stream ended before completion — the connection may have dropped.');
+      return;
     }
     finish();
   } catch (e) {
