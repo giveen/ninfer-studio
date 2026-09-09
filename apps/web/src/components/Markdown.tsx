@@ -90,6 +90,23 @@ export function Markdown({ children }: { children: string }) {
           const cls = /language-[\w+-]+/.test(className || '') ? '' : className;
           return <code className={cls}>{children}</code>;
         },
+        img: ({ src, alt }) => {
+          return (
+            <img
+              src={src}
+              alt={alt || ''}
+              className="my-2 max-h-[300px] object-contain rounded-md border border-line bg-panel2 shadow-sm"
+              loading="lazy"
+            />
+          );
+        },
+        a: ({ href, children }) => {
+          return (
+            <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline transition-colors break-words">
+              {children}
+            </a>
+          );
+        },
       }}
     >
       {children}
