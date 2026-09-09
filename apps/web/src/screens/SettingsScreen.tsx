@@ -135,7 +135,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             <Field label="API key" hint="When set, Studio adds it as Authorization: Bearer on all proxied engine requests. Leave empty for an open local server.">
               <TextField value={form.apiKey} onChange={(v) => set('apiKey', v)} placeholder="unset" className="font-mono" />
             </Field>
-            <Field label="Default request params" hint="JSON object merged into every proxied request as defaults (client fields win). e.g. {\"chat_template_kwargs\":{\"preserve_thinking\":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.">
+            <Field label="Default request params" hint={'JSON object merged into every proxied request as defaults (client fields win). e.g. {"chat_template_kwargs":{"preserve_thinking":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.'}>
               <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />
             </Field>
           </div>

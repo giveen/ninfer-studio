@@ -98,6 +98,7 @@ const defaultConfig = {
   hfCli: 'hf',
   repoDir: '',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
+  reasoningEffort: '',
 };
 
 let config = { ...defaultConfig };
@@ -934,20 +935,46 @@ async function proxyToEngine(req, res, targetPath) {
   for await (const chunk of req) chunks.push(chunk);
   let body = Buffer.concat(chunks);
 
-  // Inject configured default request params (client fields win) so external
-  // clients hitting the endpoint inherit them without per-tool configuration.
+  // Inject configured defaults into the request body. Two sources, both with
+  // client fields winning:
+  //   1. defaultRequestParams — a free-form JSON object merged as top-level
+  //      defaults (so external clients inherit per-tool config).
+  //   2. reasoningEffort — a dedicated UI control that sets
+  //      chat_template_kwargs.reasoning_effort for every request. It overrides
+  //      the generic default for this single key (it's the explicit control).
   const drp = (config.defaultRequestParams || '').trim();
-  if (drp) {
+  const re = (config.reasoningEffort || '').trim();
+  if (drp || re) {
     try {
-      const incoming = body.length ? JSON.parse(body.toString('utf8')) : {};
-      if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
-        const defaults = JSON.parse(drp);
-        if (defaults && typeof defaults === 'object' && !Array.isArray(defaults)) {
-          for (const k of Object.keys(defaults)) {
-            if (!(k in incoming)) incoming[k] = defaults[k];
+      const obj = body.length ? JSON.parse(body.toString('utf8')) : {};
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        const clientHasRe =
+          obj.chat_template_kwargs &&
+          typeof obj.chat_template_kwargs === 'object' &&
+          !Array.isArray(obj.chat_template_kwargs) &&
+          'reasoning_effort' in obj.chat_template_kwargs;
+
+        // 1. generic top-level defaults (client fields win)
+        if (drp) {
+          const defaults = JSON.parse(drp);
+          if (defaults && typeof defaults === 'object' && !Array.isArray(defaults)) {
+            for (const k of Object.keys(defaults)) {
+              if (!(k in obj)) obj[k] = defaults[k];
+            }
           }
-          body = Buffer.from(JSON.stringify(incoming));
         }
+
+        // 2. reasoning effort → chat_template_kwargs.reasoning_effort
+        //    (client explicit value wins; the dedicated control beats the
+        //     generic default for this one key)
+        if (re && !clientHasRe) {
+          if (!obj.chat_template_kwargs || typeof obj.chat_template_kwargs !== 'object' || Array.isArray(obj.chat_template_kwargs)) {
+            obj.chat_template_kwargs = {};
+          }
+          obj.chat_template_kwargs.reasoning_effort = re;
+        }
+
+        body = Buffer.from(JSON.stringify(obj));
       }
     } catch { /* leave body untouched on parse error */ }
   }

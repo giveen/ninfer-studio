@@ -67,6 +67,8 @@ export interface AppSettings {
   buildCommand: string;
   /** JSON object merged (as defaults) into every proxied /v1 request body. */
   defaultRequestParams: string;
+  /** Global default reasoning effort injected into chat_template_kwargs.reasoning_effort for every proxied request (client fields win). '' = unset. */
+  reasoningEffort: string;
 }
 
 export interface UpdateJob {

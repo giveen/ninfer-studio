@@ -366,23 +366,63 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
     Ok(state.config.read().await.engine_port)
 }
 
-/// Merge `default_request_params` (a JSON object from settings) into the request
-/// body as defaults. Client-supplied top-level fields always win. Returns the
-/// re-serialized body, or `None` if either side isn't JSON / on any parse error.
-fn merge_default_request_params(body: &[u8], defaults_json: &str) -> Option<Vec<u8>> {
-    if defaults_json.trim().is_empty() {
+/// Merge request defaults into the body. Two sources, both with client fields
+/// winning:
+///   1. `defaults_json` — a free-form JSON object merged as top-level defaults
+///      (so external clients inherit per-tool config).
+///   2. `reasoning_effort` — a dedicated UI control that sets
+///      `chat_template_kwargs.reasoning_effort` for every request. It overrides
+///      the generic default for this single key (it's the explicit control).
+/// Returns the re-serialized body, or `None` if neither source applies / on any
+/// parse error.
+fn merge_default_request_params(
+    body: &[u8],
+    defaults_json: &str,
+    reasoning_effort: &str,
+) -> Option<Vec<u8>> {
+    let defaults_trimmed = defaults_json.trim();
+    let re_trimmed = reasoning_effort.trim();
+    if defaults_trimmed.is_empty() && re_trimmed.is_empty() {
         return None;
     }
     let mut body_val: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let defaults: serde_json::Value = serde_json::from_str(defaults_json).ok()?;
-    let (serde_json::Value::Object(body_map), serde_json::Value::Object(defaults_map)) =
-        (&mut body_val, &defaults)
-    else {
-        return None;
-    };
-    for (k, v) in defaults_map {
-        body_map.entry(k.clone()).or_insert(v.clone());
+
+    // 1. generic top-level defaults (client fields win)
+    if !defaults_trimmed.is_empty() {
+        if let serde_json::Value::Object(defaults_map) =
+            serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
+        {
+            if let serde_json::Value::Object(body_map) = &mut body_val {
+                for (k, v) in defaults_map {
+                    body_map.entry(k).or_insert(v);
+                }
+            }
+        }
     }
+
+    // 2. reasoning effort → chat_template_kwargs.reasoning_effort
+    //    (client explicit value wins; the dedicated control beats the generic
+    //     default for this one key)
+    if !re_trimmed.is_empty() {
+        if let serde_json::Value::Object(body_map) = &mut body_val {
+            let client_has_re = body_map
+                .get("chat_template_kwargs")
+                .and_then(|v| v.get("reasoning_effort"))
+                .is_some();
+            if !client_has_re {
+                let ctk = body_map
+                    .entry("chat_template_kwargs")
+                    .or_insert(serde_json::Value::Object(Default::default()));
+                if let serde_json::Value::Object(m) = ctk {
+                    m.insert(
+                        "reasoning_effort".to_string(),
+                        serde_json::Value::String(reasoning_effort.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
     serde_json::to_vec(&body_val).ok()
 }
 
@@ -396,10 +436,14 @@ async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
     };
 
-    // Inject configured default request params (client fields win) so external
-    // clients hitting the endpoint inherit them without per-tool configuration.
-    let defaults_json = state.config.read().await.default_request_params.clone();
-    let body_bytes = match merge_default_request_params(&body_bytes, &defaults_json) {
+    // Inject configured default request params + reasoning effort (client fields
+    // win) so external clients hitting the endpoint inherit them without
+    // per-tool configuration.
+    let (defaults_json, reasoning_effort) = {
+        let c = state.config.read().await;
+        (c.default_request_params.clone(), c.reasoning_effort.clone())
+    };
+    let body_bytes = match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
         Some(v) => v.into(),
         None => body_bytes,
     };

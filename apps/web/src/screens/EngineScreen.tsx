@@ -15,9 +15,9 @@ import {
   Video,
   Zap,
 } from 'lucide-react';
-import { getLogs, startEngine, stopEngine } from '../lib/api';
+import { getConfig, getLogs, saveConfig, startEngine, stopEngine } from '../lib/api';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
-import type { EngineProfile, StatusPayload } from '../lib/types';
+import type { AppSettings, EngineProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
 import {
   getLatestRequestMetrics,
@@ -186,6 +186,14 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
 
+  // Global request-default settings (reasoning effort). The Engine screen is
+  // where the user picks thinking levels, but the value is applied by the proxy
+  // to every request as a chat_template_kwargs default.
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  useEffect(() => {
+    getConfig().then(setSettings).catch(() => undefined);
+  }, []);
+
   // Live token metrics from the most recent chat request (lifted from the SSE
   // `timings`/`usage` so they show here, not just in the chat footer).
   const [liveMetrics, setLiveMetrics] = useState<LiveRequestMetrics | null>(getLatestRequestMetrics());
@@ -221,6 +229,12 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
       if (v === undefined) delete n[k];
       return n;
     });
+
+  // Persist the global reasoning-effort default and reflect it immediately.
+  const onReasoningEffort = (v: string) => {
+    setSettings((s) => (s ? { ...s, reasoningEffort: v } : s));
+    saveConfig({ reasoningEffort: v }).catch(() => undefined);
+  };
 
   useEffect(() => {
     localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
@@ -654,6 +668,19 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                   { value: '8192', label: '8,192 tokens' },
                   { value: '16384', label: '16,384 tokens' },
                   { value: '32768', label: '32,768 tokens' },
+                ]}
+              />
+            </Field>
+            <Field label="Default reasoning effort" hint="Global default applied to every request via chat_template_kwargs.reasoning_effort. The Studio chat and external clients inherit it unless they set reasoning_effort themselves.">
+              <SelectField
+                value={settings?.reasoningEffort ?? ''}
+                onChange={onReasoningEffort}
+                options={[
+                  { value: '', label: 'unset (request chooses)' },
+                  { value: 'low', label: 'low' },
+                  { value: 'medium', label: 'medium' },
+                  { value: 'high', label: 'high' },
+                  { value: 'xhigh', label: 'x-high' },
                 ]}
               />
             </Field>

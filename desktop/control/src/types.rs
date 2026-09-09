@@ -41,6 +41,11 @@ pub struct AppSettings {
     /// external clients (e.g. other coding harnesses) inherit these params without
     /// configuring each tool. Client-supplied fields win over these defaults.
     pub default_request_params: String,
+    /// Global default reasoning effort injected into
+    /// `chat_template_kwargs.reasoning_effort` for every proxied request
+    /// (client fields win). The dedicated UI control overrides the generic
+    /// default for this single key. Empty = unset.
+    pub reasoning_effort: String,
 }
 
 impl Default for AppSettings {
@@ -59,6 +64,7 @@ impl Default for AppSettings {
             repo_dir: String::new(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
             default_request_params: String::new(),
+            reasoning_effort: String::new(),
         }
     }
 }
