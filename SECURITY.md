@@ -43,13 +43,8 @@ This project takes a pragmatic stance on third-party advisories:
 
 - **Build provenance**: releases are produced by the in-repo GitHub Actions workflow
   (`.github/workflows/release.yml`) on GitHub-hosted runners; artifacts are attached
-  to a draft GitHub Release for review before publishing. **Windows artifacts are
-  Authenticode-signed automatically when the `WINDOWS_CERTIFICATE` and
-  `WINDOWS_CERTIFICATE_PASSWORD` repository secrets are set** (signtool + RFC-3161
-  timestamp); the `.exe` and its NSIS installer are both signed. Without those
-  secrets the Windows build remains unsigned (SmartScreen warning) — the signing step
-  is conditional, so both paths work. Linux (`.deb`/`.AppImage`) does not require
-  code signing.
+  to a draft GitHub Release for review before publishing. Windows artifacts are
+  currently **unsigned** — expect a SmartScreen warning until code-signing is added.
 
 ## Hardening Notes
 

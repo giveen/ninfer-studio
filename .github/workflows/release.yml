@@ -4,14 +4,6 @@ name: Release
 # attaches each artifact to a single GitHub Release.
 #
 # Trigger by pushing a tag `v*`, or run manually from the Actions tab.
-#
-# Windows code signing (optional): add two repo secrets and signed builds happen
-# automatically — see "Windows code signing" below. Without them, the Windows
-# artifact is built unsigned (SmartScreen warning), exactly as before.
-#
-#   WINDOWS_CERTIFICATE        base64 of your .pfx code-signing certificate
-#   WINDOWS_CERTIFICATE_PASSWORD
-#
 # macOS is intentionally omitted (no GPU/engine use case there).
 on:
   push:
@@ -25,10 +17,6 @@ permissions:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  # Empty when the secret is not set -> Windows falls back to an unsigned build.
-  WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
 
 jobs:
   # 1. Create one draft release up-front so every matrix job can append to it.
@@ -101,9 +89,7 @@ jobs:
       - name: Build frontend (apps/web -> dist)
         run: pnpm build
 
-      # ---- Linux: tauri-action builds + uploads ----
-      - name: Build and upload (Linux)
-        if: matrix.os == 'ubuntu-24.04'
+      - name: Build and upload release asset
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -111,49 +97,3 @@ jobs:
           projectPath: desktop/app
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
-
-      # ---- Windows (unsigned): tauri-action builds + uploads ----
-      - name: Build and upload (Windows, unsigned)
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE == ''
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: desktop/app
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: ${{ matrix.args }}
-
-      # ---- Windows (signed): decode cert, sign exe, bundle, upload ----
-      - name: Decode code-signing certificate
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
-        shell: bash
-        run: echo "$WINDOWS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.pfx"
-
-      - name: Locate signtool
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
-        shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.Windows10SDK -property installationPath
-          $st = Get-ChildItem "$vs\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -First 1
-          "SIGNTOOL=$($st.FullName)" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
-
-      - name: Build, sign, and bundle (Windows, signed)
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          cargo build --release --manifest-path desktop/Cargo.toml -p ninfier-studio --features tray
-          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:WINDOWS_CERTIFICATE_PASSWORD" /fd sha256 /tr http://timestamp.digicert.com /td sha256 "desktop\target\release\ninfier-studio.exe"
-          pnpm tauri build --manifest-path desktop/Cargo.toml --features tray --bundles nsis
-          $installer = Get-ChildItem desktop/target/release/bundle/nsis/*.exe | Select-Object -First 1
-          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:WINDOWS_CERTIFICATE_PASSWORD" /fd sha256 /tr http://timestamp.digicert.com /td sha256 $installer.FullName
-
-      - name: Upload signed Windows installer to release
-        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          release_id: ${{ needs.create-release.outputs.release_id }}
-          files: desktop/target/release/bundle/nsis/*.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
