@@ -19,5 +19,16 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     target: 'es2022',
+    // Split heavy vendor libraries into their own chunks so no single file trips
+    // Vite's 500 kB warning and so browsers can cache them independently.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          markdown: ['react-markdown', 'remark-gfm', 'highlight.js'],
+          icons: ['lucide-react'],
+          radix: ['@radix-ui/react-dialog', '@radix-ui/react-popover', '@radix-ui/react-switch'],
+        },
+      },
+    },
   },
 });

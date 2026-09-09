@@ -4,8 +4,6 @@ import {
   Box,
   Cpu,
   Gauge,
-  GitBranch,
-  Hammer,
   Layers3,
   Play,
   Rocket,
@@ -17,7 +15,7 @@ import {
   Video,
   Zap,
 } from 'lucide-react';
-import { getLogs, startEngine, startEngineUpdate, stopEngine } from '../lib/api';
+import { getLogs, startEngine, stopEngine } from '../lib/api';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { EngineProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
@@ -37,7 +35,6 @@ const NAV_SECTIONS = [
   { id: 'command', label: 'Launch command' },
   { id: 'presets', label: 'Presets' },
   { id: 'artifact', label: 'Artifact' },
-  { id: 'source', label: 'Source' },
   { id: 'memory', label: 'Memory' },
   { id: 'scheduling', label: 'Scheduling' },
   { id: 'kv', label: 'KV cache' },
@@ -168,9 +165,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const engine = status?.engine;
   const gpu = status?.gpu;
   const artifacts = status?.artifacts || [];
-  const update = status?.update ?? null;
-  const updating = !!update && !update.done;
-
   const [profile, setProfile] = useState<EngineProfile>(loadProfile);
   const [artifact, setArtifact] = useState<string>(() => {
     try {
@@ -329,24 +323,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
       if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} still held by the old engine after stop — wait a moment and start manually.` });
       else if (!r.ok) setNotice({ tone: 'danger', text: r.message || 'start failed' });
       else setNotice({ tone: 'ok', text: 'engine restarted with the current settings' });
-    } catch (e) {
-      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy('');
-    }
-  };
-
-  const runUpdate = async (action: 'pull' | 'build') => {
-    setBusy(action);
-    setNotice(null);
-    try {
-      const r = await startEngineUpdate(action);
-      if (!r.ok) setNotice({ tone: 'danger', text: r.message || `${action} failed to start` });
-      else
-        setNotice({
-          tone: 'ok',
-          text: action === 'pull' ? 'git pull started — follow the output in the Engine source section.' : 'rebuild started — follow the output in the Engine source section.',
-        });
     } catch (e) {
       setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -609,10 +585,10 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                 ]}
               />
             </Field>
-            <Field label="Public model alias (--model-id)" hint="Override the OpenAI public alias. The loaded artifact is unchanged — this only relabels /v1/models.">
+            <Field label="Public model alias" hint="Override the OpenAI public alias. The loaded artifact is unchanged — this only relabels /v1/models.">
               <TextField value={profile.modelId || ''} onChange={(v) => setU('modelId', v || undefined)} placeholder="artifact identity" />
             </Field>
-            <Field label="API key (--api-key)" hint="When set, requests must send it as Bearer token or x-api-key. Studio injects it on proxied requests.">
+            <Field label="API key" hint="When set, requests must send it as Bearer token or x-api-key. Studio injects it on proxied requests.">
               <TextField value={profile.apiKey || ''} onChange={(v) => setU('apiKey', v || undefined)} placeholder="unset (open)" />
             </Field>
             <Field label="Listen host">
@@ -630,57 +606,14 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           )}
         </SectionCard>
 
-        {/* engine source: git pull + rebuild */}
-        <SectionCard
-          title="Engine source"
-          description="Update the NInfer source and rebuild the engine binary. A running engine keeps the current binary until you stop and start it again."
-          icon={<Hammer size={15} />}
-          anchor="source"
-          collapsible
-        >
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => runUpdate('pull')} disabled={updating || !status} title="git pull --ff-only in the repository">
-              <span className="inline-flex items-center gap-1.5">
-                <GitBranch size={14} />
-                {updating && update?.action === 'pull' ? 'Pulling…' : 'git pull'}
-              </span>
-            </Button>
-            <Button variant="primary" onClick={() => runUpdate('build')} disabled={updating || !status} title="Rebuild the engine binary (incremental)">
-              <span className="inline-flex items-center gap-1.5">
-                <Hammer size={14} />
-                {updating && update?.action === 'build' ? 'Building…' : 'Rebuild engine'}
-              </span>
-            </Button>
-            {update && !update.done && <Badge tone="accent">{update.action} running · pid {update.pid ?? '—'}</Badge>}
-            {update?.done && !update.failed && <Badge tone="ok">{update.action} done (exit {update.exitCode ?? 0})</Badge>}
-            {update?.done && update.failed && <Badge tone="danger">{update.action} failed (exit {update.exitCode ?? '?'})</Badge>}
-            {update?.done && !update.failed && update.action === 'build' && (
-              <span className="text-[12px] text-accent">Build OK — stop + start the engine to load the new binary.</span>
-            )}
-          </div>
-          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
-            <Field label="Repository" hint="NInfer git work tree (editable in Settings).">
-              <div className="truncate font-mono text-[12px] text-ink">{status?.config.repoDir || '—'}</div>
-            </Field>
-            <Field label="Build command" hint="Run inside the repository directory (editable in Settings).">
-              <div className="truncate font-mono text-[12px] text-ink">{status?.config.buildCommand || '—'}</div>
-            </Field>
-          </div>
-          {update && (
-            <div className="mt-3 h-56">
-              <LogPane lines={update.out ? update.out.split('\n') : []} />
-            </div>
-          )}
-        </SectionCard>
-
         {/* context & memory */}
         <SectionCard title="Context & memory" description="Per-sequence logical context ceiling and the shared Main Text KV pool. auto sizes the pool from remaining GPU memory after weights (1 GiB headroom)." icon={<Gauge size={15} />} anchor="memory" collapsible>
           <div className={grid3}>
-            <Field label="Max context (--max-context)" hint="Per-sequence logical token ceiling. Native model limit is 262,144; practical allocation depends on artifact, media, and KV type.">
+            <Field label="Max context" hint="Per-sequence logical token ceiling. Native model limit is 262,144; practical allocation depends on artifact, media, and KV type.">
               <NumberField value={profile.maxContext ?? null} onChange={(v) => set('maxContext', v)} onEmpty={() => setU('maxContext', undefined)} min={0} placeholder="serve default 8192" />
             </Field>
             <div className="flex flex-col gap-1.5">
-              <span className="flex items-center gap-1.5 text-[12px] font-medium uppercase tracking-wider text-mute">KV capacity (--kv-capacity)</span>
+              <span className="flex items-center gap-1.5 text-[12px] font-medium uppercase tracking-wider text-mute">KV capacity</span>
               <div className="flex items-center gap-2">
                 <Segmented
                   value={profile.kvCapacity === 'auto' ? 'auto' : profile.kvCapacity === undefined || profile.kvCapacity === '' ? 'follow' : 'fixed'}
@@ -703,14 +636,26 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               </div>
               <p className="text-[11px] leading-snug text-faint">Serves active requests and retained prefixes. Explicit values stay fixed for the process lifetime.</p>
             </div>
-            <Field label="Prefill chunk (--prefill-chunk)" hint="Positive text-prefill chunk size, in multiples of 128 tokens.">
+            <Field label="Prefill chunk" hint="Positive text-prefill chunk size, in multiples of 128 tokens.">
               <NumberField value={profile.prefillChunk ?? null} onChange={(v) => set('prefillChunk', v)} onEmpty={() => setU('prefillChunk', undefined)} min={128} step={128} placeholder="1024" />
             </Field>
             <Field label="Default max tokens" hint="Output budget applied when a request omits max_tokens.">
               <NumberField value={profile.defaultMaxTokens ?? null} onChange={(v) => set('defaultMaxTokens', v)} onEmpty={() => setU('defaultMaxTokens', undefined)} min={0} placeholder="8192" />
             </Field>
-            <Field label="Default thinking budget" hint="Positive cap on model-origin thinking tokens for thinking-enabled requests.">
-              <NumberField value={profile.defaultThinkingBudget ?? null} onChange={(v) => set('defaultThinkingBudget', v)} onEmpty={() => setU('defaultThinkingBudget', undefined)} min={1} placeholder="unset" />
+            <Field label="Default thinking budget" hint="Cap on model-origin thinking tokens for thinking-enabled requests. Unset lets each request choose.">
+              <SelectField
+                value={profile.defaultThinkingBudget != null ? String(profile.defaultThinkingBudget) : ''}
+                onChange={(v) => setU('defaultThinkingBudget', v ? Number(v) : undefined)}
+                options={[
+                  { value: '', label: 'unset (request chooses)' },
+                  { value: '1024', label: '1,024 tokens' },
+                  { value: '2048', label: '2,048 tokens' },
+                  { value: '4096', label: '4,096 tokens' },
+                  { value: '8192', label: '8,192 tokens' },
+                  { value: '16384', label: '16,384 tokens' },
+                  { value: '32768', label: '32,768 tokens' },
+                ]}
+              />
             </Field>
           </div>
         </SectionCard>
@@ -718,7 +663,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         {/* scheduling */}
         <SectionCard title="Scheduling" description="Startup-fixed capacity of 1–8 active request lanes with bounded FIFO ingress. No preemption, no QoS." icon={<Zap size={15} />} anchor="scheduling" collapsible>
           <div className={grid3}>
-            <Field label="Max concurrency (--max-concurrency)" hint="Maximum admitted concurrent requests (1..8), fixed at startup.">
+            <Field label="Max concurrency" hint="Maximum admitted concurrent requests (1..8), fixed at startup.">
               <NumberField value={profile.maxConcurrency ?? null} onChange={(v) => set('maxConcurrency', Math.max(1, Math.min(8, v)))} onEmpty={() => setU('maxConcurrency', undefined)} min={1} max={8} placeholder="1" />
             </Field>
             <Field label="Max pending requests" hint="Extra requests allowed to wait in the FIFO queue for admission.">
@@ -737,8 +682,8 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               <Field label="KV dtype" hint="KV-cache storage: bf16, int8, fp8, nvfp4, or k8v4 (INT8 group-64 KV is the published benchmark format).">
                 <Segmented value={(profile.kvDtype as string) || 'bf16'} onChange={(v) => set('kvDtype', v as EngineProfile['kvDtype'])} options={[...KV_DTYPE_OPTIONS]} />
               </Field>
-              <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse (--no-prefix-reuse)" hint="Root-only Engine mode. Cannot be combined with explicit context-cache capacity flags." />
-              <Toggle checked={!!profile.noCudaGraph} onChange={(v) => set('noCudaGraph', v)} label="Disable CUDA Graph decode (--no-cuda-graph)" hint="Decode uses eager kernel launches instead of captured graphs." />
+              <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse" hint="Root-only Engine mode. Cannot be combined with explicit context-cache capacity flags." />
+              <Toggle checked={!!profile.noCudaGraph} onChange={(v) => set('noCudaGraph', v)} label="Disable CUDA Graph decode" hint="Decode uses eager kernel launches instead of captured graphs." />
             </div>
             {profile.noPrefixReuse && <p className="text-[12px] text-warn">Prefix reuse disabled: the context-cache tier options below are unavailable and will not be sent.</p>}
             <div className={cn(grid3, profile.noPrefixReuse && 'pointer-events-none opacity-40')}>
@@ -768,7 +713,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         <SectionCard title="Speculative decoding" description="Frozen at startup: one backend, one draft window. MTP 1–5 drafts; DFlash/DFlash2 1–15 (7 recommended). Optimized proposal head via --lm-head-draft." icon={<Zap size={15} />} anchor="spec" collapsible>
           <div className="space-y-4">
             <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
-              <Field label="Backend (--spec)" hint="Selects which speculative weights are resident at startup. None loads the smallest profile.">
+              <Field label="Backend" hint="Selects which speculative weights are resident at startup. None loads the smallest profile.">
                 <Segmented value={(profile.spec as string) || ''} onChange={(v) => { set('spec', v as EngineProfile['spec']); if (!v) { setU('draftTokens', undefined); setU('lmHeadDraft', undefined); } else if (profile.draftTokens === undefined) set('draftTokens', v === 'mtp' ? 3 : 7); }} options={specOptions} />
               </Field>
               {profile.spec && (
@@ -778,7 +723,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                       <NumberField value={profile.draftTokens ?? null} onChange={(v) => set('draftTokens', Math.max(draftRange[0], Math.min(draftRange[1], v)))} onEmpty={() => setU('draftTokens', undefined)} min={draftRange[0]} max={draftRange[1]} placeholder={profile.spec === 'mtp' ? '3' : '7'} />
                     </div>
                   </Field>
-                  <Toggle checked={!!profile.lmHeadDraft} onChange={(v) => set('lmHeadDraft', v)} label="Optimized proposal head (--lm-head-draft)" hint="Loads the optimized proposal head; requires a selected backend." />
+                  <Toggle checked={!!profile.lmHeadDraft} onChange={(v) => set('lmHeadDraft', v)} label="Optimized proposal head" hint="Loads the optimized proposal head; requires a selected backend." />
                 </>
               )}
             </div>
@@ -794,7 +739,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         <SectionCard title="Vision & media" description="Vision residency is frozen at startup: without --vision the engine rejects image/video requests and cannot enable it later." icon={<Video size={15} />} anchor="vision" collapsible>
           <div className={grid3}>
             <div className="flex flex-col gap-2">
-              <Toggle checked={!!profile.vision} onChange={(v) => set('vision', v)} label="Enable vision (--vision)" hint="Loads Vision weights, expands the unified workspace, and enables image/video input. Can combine with DFlash/DFlash2." />
+              <Toggle checked={!!profile.vision} onChange={(v) => set('vision', v)} label="Enable vision" hint="Loads Vision weights, expands the unified workspace, and enables image/video input. Can combine with DFlash/DFlash2." />
             </div>
             <Field label="Media cache (MiB)" hint="LRU-retained prepared BF16 media payloads; 0 disables retention.">
               <NumberField value={profile.mediaCacheMib ?? null} onChange={(v) => set('mediaCacheMib', v)} onEmpty={() => setU('mediaCacheMib', undefined)} min={0} step={128} placeholder="1024" />
@@ -816,9 +761,9 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         <SectionCard title="Sampling defaults" description="Process-level overrides. Precedence: model/preset defaults → process flags → request fields → --greedy forces temperature 0." icon={<SlidersHorizontal size={15} />} anchor="sampling" collapsible>
           <div className="space-y-4">
             <div className="flex flex-wrap gap-x-8 gap-y-3">
-              <Toggle checked={!!profile.noThinking} onChange={(v) => set('noThinking', v)} label="Disable thinking by default (--no-thinking)" hint="Engine-wide default: no chain-of-thought unless a request asks for it." />
-              <Toggle checked={!!profile.preserveThinking} onChange={(v) => set('preserveThinking', v)} label="Preserve closed-turn reasoning (--preserve-thinking)" hint="Keep closed reasoning in served history so follow-ups build on prior thinking." />
-              <Toggle checked={!!profile.greedy} onChange={(v) => set('greedy', v)} label="Greedy decoding (--greedy)" hint="Forces temperature 0 and deterministic decoding; overrides model and request sampling fields." />
+              <Toggle checked={!!profile.noThinking} onChange={(v) => set('noThinking', v)} label="Disable thinking by default" hint="Engine-wide default: no chain-of-thought unless a request asks for it." />
+              <Toggle checked={!!profile.preserveThinking} onChange={(v) => set('preserveThinking', v)} label="Preserve closed-turn reasoning" hint="Keep closed reasoning in served history so follow-ups build on prior thinking." />
+              <Toggle checked={!!profile.greedy} onChange={(v) => set('greedy', v)} label="Greedy decoding" hint="Forces temperature 0 and deterministic decoding; overrides model and request sampling fields." />
             </div>
             <div className={grid3}>
               <Field label="Temperature" hint="Process-level temperature override; unset uses the registered model/prompt-mode preset.">
@@ -868,7 +813,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               <TextField value={profile.contextCostPresets || ''} onChange={(v) => setU('contextCostPresets', v || undefined)} placeholder="compiled defaults" />
             </Field>
             <div className="flex items-end pb-1">
-              <Toggle checked={!!profile.cors} onChange={(v) => set('cors', v)} label="Permissive browser CORS (--cors)" hint="Adds permissive CORS headers for browser clients." />
+              <Toggle checked={!!profile.cors} onChange={(v) => set('cors', v)} label="Permissive browser CORS" hint="Adds permissive CORS headers for browser clients." />
             </div>
           </div>
         </SectionCard>

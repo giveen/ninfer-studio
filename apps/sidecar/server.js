@@ -932,7 +932,26 @@ async function routePort() {
 async function proxyToEngine(req, res, targetPath) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  const body = Buffer.concat(chunks);
+  let body = Buffer.concat(chunks);
+
+  // Inject configured default request params (client fields win) so external
+  // clients hitting the endpoint inherit them without per-tool configuration.
+  const drp = (config.defaultRequestParams || '').trim();
+  if (drp) {
+    try {
+      const incoming = body.length ? JSON.parse(body.toString('utf8')) : {};
+      if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+        const defaults = JSON.parse(drp);
+        if (defaults && typeof defaults === 'object' && !Array.isArray(defaults)) {
+          for (const k of Object.keys(defaults)) {
+            if (!(k in incoming)) incoming[k] = defaults[k];
+          }
+          body = Buffer.from(JSON.stringify(incoming));
+        }
+      }
+    } catch { /* leave body untouched on parse error */ }
+  }
+
   let model = null;
   if (body.length) {
     try {

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { FolderCog, Save } from 'lucide-react';
-import { getConfig, saveConfig } from '../lib/api';
+import { FolderCog, GitBranch, Hammer, Save } from 'lucide-react';
+import { getConfig, saveConfig, startEngineUpdate } from '../lib/api';
 import type { AppSettings, StatusPayload } from '../lib/types';
-import { Button, Field, SectionCard, TextField } from '../components/ui';
+import { Badge, Button, Field, LogPane, SectionCard, TextField } from '../components/ui';
 
 export function SettingsScreen({ status }: { status: StatusPayload | null }) {
   const [form, setForm] = useState<AppSettings | null>(null);
@@ -15,6 +15,18 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
   useEffect(() => {
     getConfig().then(setForm).catch(() => undefined);
   }, []);
+
+  const update = status?.update ?? null;
+  const updating = !!update && !update.done;
+  const runUpdate = async (action: 'pull' | 'build') => {
+    setError(null);
+    try {
+      const r = await startEngineUpdate(action);
+      if (!r.ok) setError(r.message || `${action} failed to start`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   if (!form) {
     return (
@@ -36,6 +48,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
         hfCli: form.hfCli,
         repoDir: form.repoDir ?? '',
         buildCommand: form.buildCommand ?? '',
+        defaultRequestParams: form.defaultRequestParams ?? '',
       });
       setForm(c);
       setSaved(true);
@@ -62,13 +75,54 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             <Field label="hf CLI" hint="Hugging Face CLI binary used for downloads.">
               <TextField value={form.hfCli} onChange={(v) => set('hfCli', v)} className="font-mono text-[12px]" />
             </Field>
-            <Field label="Engine source repo" hint="Git work tree of the NInfer source. The Engine tab's git pull / rebuild run here.">
+            <Field label="Engine source repo" hint="Git work tree of the NInfer source. Git pull / rebuild run from the Engine source section below.">
               <TextField value={form.repoDir ?? ''} onChange={(v) => set('repoDir', v)} placeholder="/path/to/ninfer" className="font-mono text-[12px]" />
             </Field>
             <Field label="Build command" hint="Run inside the repo dir. NInfer default: Ninja configure + Release build, parallelized over all cores (-j$(nproc)).">
               <TextField value={form.buildCommand ?? ''} onChange={(v) => set('buildCommand', v)} placeholder="cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)" className="font-mono text-[12px]" />
             </Field>
           </div>
+        </SectionCard>
+
+        <SectionCard
+          title="Engine source"
+          description="Update the NInfer source and rebuild the engine binary. A running engine keeps the current binary until you stop and start it again."
+          icon={<Hammer size={15} />}
+          collapsible
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={() => runUpdate('pull')} disabled={updating || !status} title="git pull --ff-only in the repository">
+              <span className="inline-flex items-center gap-1.5">
+                <GitBranch size={14} />
+                {updating && update?.action === 'pull' ? 'Pulling…' : 'git pull'}
+              </span>
+            </Button>
+            <Button variant="primary" onClick={() => runUpdate('build')} disabled={updating || !status} title="Rebuild the engine binary (incremental)">
+              <span className="inline-flex items-center gap-1.5">
+                <Hammer size={14} />
+                {updating && update?.action === 'build' ? 'Building…' : 'Rebuild engine'}
+              </span>
+            </Button>
+            {update && !update.done && <Badge tone="accent">{update.action} running · pid {update.pid ?? '—'}</Badge>}
+            {update?.done && !update.failed && <Badge tone="ok">{update.action} done (exit {update.exitCode ?? 0})</Badge>}
+            {update?.done && update.failed && <Badge tone="danger">{update.action} failed (exit {update.exitCode ?? '?'})</Badge>}
+            {update?.done && !update.failed && update.action === 'build' && (
+              <span className="text-[12px] text-accent">Build OK — stop + start the engine to load the new binary.</span>
+            )}
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <Field label="Repository" hint="NInfer git work tree (editable above).">
+              <div className="truncate font-mono text-[12px] text-ink">{form.repoDir || '—'}</div>
+            </Field>
+            <Field label="Build command" hint="Run inside the repository directory (editable above).">
+              <div className="truncate font-mono text-[12px] text-ink">{form.buildCommand || '—'}</div>
+            </Field>
+          </div>
+          {update && (
+            <div className="mt-3 h-56">
+              <LogPane lines={update.out ? update.out.split('\n') : []} />
+            </div>
+          )}
         </SectionCard>
 
         <SectionCard title="Engine defaults" description="Used when a profile omits a value, and for the port Studio probes for an already-running engine.">
@@ -80,6 +134,9 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             </Field>
             <Field label="API key" hint="When set, Studio adds it as Authorization: Bearer on all proxied engine requests. Leave empty for an open local server.">
               <TextField value={form.apiKey} onChange={(v) => set('apiKey', v)} placeholder="unset" className="font-mono" />
+            </Field>
+            <Field label="Default request params" hint="JSON object merged into every proxied request as defaults (client fields win). e.g. {\"chat_template_kwargs\":{\"preserve_thinking\":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.">
+              <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />
             </Field>
           </div>
         </SectionCard>

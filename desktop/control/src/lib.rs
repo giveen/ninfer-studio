@@ -366,6 +366,26 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
     Ok(state.config.read().await.engine_port)
 }
 
+/// Merge `default_request_params` (a JSON object from settings) into the request
+/// body as defaults. Client-supplied top-level fields always win. Returns the
+/// re-serialized body, or `None` if either side isn't JSON / on any parse error.
+fn merge_default_request_params(body: &[u8], defaults_json: &str) -> Option<Vec<u8>> {
+    if defaults_json.trim().is_empty() {
+        return None;
+    }
+    let mut body_val: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let defaults: serde_json::Value = serde_json::from_str(defaults_json).ok()?;
+    let (serde_json::Value::Object(body_map), serde_json::Value::Object(defaults_map)) =
+        (&mut body_val, &defaults)
+    else {
+        return None;
+    };
+    for (k, v) in defaults_map {
+        body_map.entry(k.clone()).or_insert(v.clone());
+    }
+    serde_json::to_vec(&body_val).ok()
+}
+
 async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -374,6 +394,14 @@ async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
     let body_bytes = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+    };
+
+    // Inject configured default request params (client fields win) so external
+    // clients hitting the endpoint inherit them without per-tool configuration.
+    let defaults_json = state.config.read().await.default_request_params.clone();
+    let body_bytes = match merge_default_request_params(&body_bytes, &defaults_json) {
+        Some(v) => v.into(),
+        None => body_bytes,
     };
 
     let port = match route_port(&state, &body_bytes).await {

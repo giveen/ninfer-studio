@@ -37,6 +37,10 @@ pub struct AppSettings {
     pub hf_cli: String,
     pub repo_dir: String,
     pub build_command: String,
+    /// JSON object merged (as defaults) into every proxied /v1 request body, so
+    /// external clients (e.g. other coding harnesses) inherit these params without
+    /// configuring each tool. Client-supplied fields win over these defaults.
+    pub default_request_params: String,
 }
 
 impl Default for AppSettings {
@@ -54,6 +58,7 @@ impl Default for AppSettings {
             hf_cli: "hf".into(),
             repo_dir: String::new(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
+            default_request_params: String::new(),
         }
     }
 }

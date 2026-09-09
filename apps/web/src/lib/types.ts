@@ -65,6 +65,8 @@ export interface AppSettings {
   hfCli: string;
   repoDir: string;
   buildCommand: string;
+  /** JSON object merged (as defaults) into every proxied /v1 request body. */
+  defaultRequestParams: string;
 }
 
 export interface UpdateJob {

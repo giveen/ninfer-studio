@@ -10,7 +10,6 @@ import {
   SlidersHorizontal,
   Square,
   Trash2,
-  Wrench,
   X,
 } from 'lucide-react';
 import { buildChatRequest, streamChat } from '../lib/api';
@@ -560,9 +559,6 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           ))}
         </div>
-        <div className="border-t border-line p-2.5 text-[10.5px] text-faint">
-          stored locally in your browser
-        </div>
       </aside>
 
       {/* chat column */}
@@ -735,10 +731,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </div>
             )}
           </div>
-          <div className="mt-1.5 flex items-center justify-between px-1 text-[10.5px] text-faint">
-            <span className="flex items-center gap-1.5">
-              <Wrench size={11} /> streaming OpenAI-compatible SSE · reasoning shown separately
-            </span>
+          <div className="mt-1.5 flex items-center justify-end px-1 text-[10.5px] text-faint">
             <span>
               last msg: {last?.meta?.decodeTokPerSec ? formatRate(last.meta.decodeTokPerSec) : '—'}
             </span>
