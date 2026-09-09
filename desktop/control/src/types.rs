@@ -47,6 +47,10 @@ pub struct AppSettings {
     /// (client fields win). The dedicated UI control overrides the generic
     /// default for this single key. Empty = unset.
     pub reasoning_effort: String,
+    /// Coding harness: the directory the "Code" mode is allowed to read/write/execute
+    /// within. Every coder filesystem tool is confined to this root (path traversal
+    /// rejected). Empty => no workspace configured. Serializes as `coderWorkspace`.
+    pub coder_workspace: String,
 }
 
 impl Default for AppSettings {
@@ -64,6 +68,7 @@ impl Default for AppSettings {
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),
+            coder_workspace: String::new(),
         }
     }
 }

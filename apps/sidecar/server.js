@@ -18,6 +18,11 @@ import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { PlaywrightCrawler } from 'crawlee';
+import { Readability } from '@mozilla/readability';
+import TurndownService from 'turndown';
+import { JSDOM } from 'jsdom';
+
 
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
 const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -923,6 +928,537 @@ async function tailLog(lines = 400) {
     return { lines: text.split('\n').slice(-lines), size: st.size };
   } catch {
     return { lines: [] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Coding harness — control-plane endpoints
+//
+// The chat "Code" mode drives an agentic loop: it sends the engine an OpenAI
+// tool-calling request, then executes the returned `tool_calls` here. Every
+// filesystem tool is sandboxed to `config.coderWorkspace` (path traversal is
+// rejected) so the model can only touch the chosen project directory. Mirrors
+// the Rust `ninfier-control` `/api/coder/*` routes 1:1.
+// ---------------------------------------------------------------------------
+const CODER_IGNORE = new Set(['node_modules', '.git', 'target', 'dist', 'build', '.next', '.turbo', '.cache', 'vendor', '__pycache__', '.venv', 'venv']);
+const MAX_READ_BYTES = 256 * 1024;
+const MAX_OUTPUT_BYTES = 256 * 1024;
+const MAX_GREP_MATCHES = 300;
+const MAX_GLOB_FILES = 4000;
+const RE_SPECIAL = new Set(['.', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\']);
+
+function coderRoot() {
+  const ws = (config.coderWorkspace || '').trim();
+  return ws ? path.resolve(ws) : null;
+}
+function withinWs(rel) {
+  const root = coderRoot();
+  if (!root) throw Object.assign(new Error('no workspace configured — set a coder workspace in Settings or Code mode'), { status: 400 });
+  const full = path.resolve(root, rel && rel !== '.' ? rel : '.');
+  const rel2 = path.relative(root, full);
+  if (rel2.startsWith('..') || (path.isAbsolute(rel2) && rel2 !== '')) {
+    throw Object.assign(new Error('path escapes the workspace'), { status: 400 });
+  }
+  return full;
+}
+function relOf(full) {
+  const root = coderRoot();
+  return root ? path.relative(root, full) || '.' : '.';
+}
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function capOut(s) {
+  return s.length > MAX_OUTPUT_BYTES ? s.slice(-MAX_OUTPUT_BYTES) : s;
+}
+async function isBinary(buf) {
+  const len = Math.min(buf.length, 8000);
+  for (let i = 0; i < len; i++) if (buf[i] === 0) return true;
+  return false;
+}
+async function treeNodes(root, rel, depth, maxDepth) {
+  if (depth > maxDepth) return [];
+  let entries;
+  try {
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  entries.sort((a, b) =>
+    a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1,
+  );
+  const nodes = [];
+  for (const e of entries) {
+    if (e.isDirectory() && CODER_IGNORE.has(e.name)) continue;
+    const childRel = rel === '.' ? e.name : path.join(rel, e.name);
+    if (e.isDirectory()) {
+      nodes.push({
+        name: e.name,
+        path: childRel,
+        kind: 'dir',
+        children: depth === maxDepth ? undefined : await treeNodes(root, childRel, depth + 1, maxDepth),
+      });
+    } else {
+      let size;
+      try {
+        size = (await fs.stat(path.join(root, childRel))).size;
+      } catch {
+        /* ignore */
+      }
+      nodes.push({ name: e.name, path: childRel, kind: 'file', size });
+    }
+  }
+  return nodes;
+}
+async function walkFiles(root, rel, out, cap) {
+  if (out.length >= cap) return;
+  let entries;
+  try {
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (out.length >= cap) return;
+    const childRel = rel === '.' ? e.name : path.join(rel, e.name);
+    if (e.isDirectory()) {
+      if (CODER_IGNORE.has(e.name)) continue;
+      await walkFiles(root, childRel, out, cap);
+    } else {
+      out.push(childRel);
+    }
+  }
+}
+function globToRegex(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        re += '.*';
+        i++;
+        if (glob[i + 1] === '/') i++;
+      } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else if (RE_SPECIAL.has(c)) re += '\\' + c;
+    else re += c;
+  }
+  return new RegExp('^' + re + '$');
+}
+async function grepSearch(pattern, relRoot, include, ignoreCase, maxMatches) {
+  const root = coderRoot();
+  const base = relRoot ? withinWs(relRoot) : root;
+  let re;
+  try {
+    re = new RegExp(pattern, ignoreCase ? 'i' : '');
+  } catch (e) {
+    throw Object.assign(new Error('invalid regex: ' + e.message), { status: 400 });
+  }
+  const includeRe = include ? globToRegex(include) : null;
+  const files = [];
+  await walkFiles(root, relOf(base), files, 6000);
+  const matches = [];
+  let truncated = false;
+  for (const f of files) {
+    if (matches.length >= maxMatches) {
+      truncated = true;
+      break;
+    }
+    if (includeRe && !includeRe.test(f)) continue;
+    const full = path.join(root, f);
+    let buf;
+    try {
+      buf = await fs.readFile(full);
+    } catch {
+      continue;
+    }
+    if (await isBinary(buf)) continue;
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (matches.length >= maxMatches) {
+        truncated = true;
+        break;
+      }
+      if (re.test(lines[i])) matches.push({ file: f, line: i + 1, text: lines[i].slice(0, 400) });
+    }
+  }
+  return { matches, truncated, count: matches.length };
+}
+async function globSearch(pattern, relRoot) {
+  const root = coderRoot();
+  const base = relRoot ? withinWs(relRoot) : root;
+  const re = globToRegex(pattern);
+  const files = [];
+  await walkFiles(root, relOf(base), files, MAX_GLOB_FILES);
+  return files.filter((f) => re.test(f)).sort().slice(0, MAX_GLOB_FILES);
+}
+function execCommand(command, relCwd, timeoutMs) {
+  const root = coderRoot();
+  const cwd = relCwd ? withinWs(relCwd) : root;
+  const timeout = Math.min(Math.max(timeoutMs || 120000, 1000), 600000);
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn('bash', ['-lc', command], { cwd, env: process.env });
+    } catch (err) {
+      return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: relOf(cwd), error: err.message });
+    }
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: null, timedOut: true, cwd: relOf(cwd) });
+    }, timeout);
+    proc.stdout.on('data', (d) => {
+      stdout += d;
+      if (stdout.length > MAX_OUTPUT_BYTES * 2) stdout = stdout.slice(-MAX_OUTPUT_BYTES * 2);
+    });
+    proc.stderr.on('data', (d) => {
+      stderr += d;
+      if (stderr.length > MAX_OUTPUT_BYTES * 2) stderr = stderr.slice(-MAX_OUTPUT_BYTES * 2);
+    });
+    proc.on('error', (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, cwd: relOf(cwd), error: err.message });
+    });
+    proc.on('close', (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: code, timedOut: false, cwd: relOf(cwd) });
+    });
+  });
+}
+async function webFetch(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw Object.assign(new Error('invalid url'), { status: 400 });
+  }
+
+  let extractedMarkdown = null;
+  let fetchStatus = 200;
+  
+  try {
+    const crawler = new PlaywrightCrawler({
+      requestHandlerTimeoutSecs: 15,
+      maxRequestsPerCrawl: 1,
+      headless: true,
+      requestHandler: async ({ page, request, response }) => {
+        fetchStatus = response?.status() || 200;
+        const html = await page.content();
+        const dom = new JSDOM(html, { url: request.loadedUrl });
+        const reader = new Readability(dom.window.document);
+        const article = reader.parse();
+        if (article && article.content) {
+          const turndownService = new TurndownService();
+          extractedMarkdown = turndownService.turndown(article.content);
+        } else {
+          const turndownService = new TurndownService();
+          extractedMarkdown = turndownService.turndown(html);
+        }
+      },
+    });
+    await crawler.run([u.toString()]);
+  } catch (err) {
+    const resp = await fetch(u, { redirect: 'follow', headers: { 'user-agent': 'ninfier-studio/0.1' } }).catch((e) => {
+      throw Object.assign(new Error('fetch failed: ' + e.message), { status: 502 });
+    });
+    fetchStatus = resp.status;
+    let htmlText = await resp.text().catch(() => '');
+    const dom = new JSDOM(htmlText, { url: u.toString() });
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
+    const turndownService = new TurndownService();
+    extractedMarkdown = turndownService.turndown(article ? article.content : htmlText);
+  }
+  
+  let finalContent = extractedMarkdown || '';
+  const truncated = finalContent.length > 200000;
+  finalContent = finalContent.slice(0, 200000);
+  
+  return { url: u.toString(), status: fetchStatus, contentType: 'text/markdown', content: finalContent, truncated };
+}
+async function webSearch(query) {
+  const url = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+  const resp = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64)' } }).catch((e) => {
+    throw Object.assign(new Error('search failed: ' + e.message), { status: 502 });
+  });
+  const html = await resp.text();
+  const results = [];
+  
+  try {
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    const resultNodes = doc.querySelectorAll('.result');
+    
+    for (const node of resultNodes) {
+      if (results.length >= 8) break;
+      
+      const a = node.querySelector('.result__a');
+      if (!a) continue;
+      
+      let href = a.getAttribute('href') || '';
+      const um = href.match(/uddg=([^&]+)/);
+      if (um) {
+        try {
+          href = decodeURIComponent(um[1]);
+        } catch { /* ignore */ }
+      }
+      
+      const snippetNode = node.querySelector('.result__snippet');
+      const snippet = snippetNode ? snippetNode.textContent.trim().slice(0, 300) : '';
+      
+      results.push({ title: a.textContent.trim(), url: href, snippet });
+    }
+  } catch (err) {
+    // Ignore JSDOM parse errors
+  }
+  
+  return { results, query };
+}
+
+async function handleCoder(req, res, p, url) {
+  try {
+    if (p === '/api/coder/workspace' && req.method === 'GET') {
+      const root = coderRoot();
+      let exists = false;
+      if (root) {
+        try {
+          exists = (await fs.stat(root)).isDirectory();
+        } catch {
+          /* not there */
+        }
+      }
+      return sendJson(res, 200, { workspace: root || '', exists });
+    }
+    if (p === '/api/coder/workspace' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      const raw = (body?.path || '').trim();
+      if (raw) {
+        const ws = path.resolve(raw);
+        await fs.mkdir(ws, { recursive: true });
+        const exists = (await fs.stat(ws)).isDirectory();
+        config = { ...config, coderWorkspace: ws };
+        await saveConfig({ coderWorkspace: ws });
+        return sendJson(res, 200, { workspace: ws, exists });
+      }
+      config = { ...config, coderWorkspace: '' };
+      await saveConfig({ coderWorkspace: '' });
+      return sendJson(res, 200, { workspace: '', exists: false });
+    }
+    if (p === '/api/coder/tree' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const depth = Math.min(Math.max(Number(url.searchParams.get('depth') || 3), 1), 6);
+      const rel = url.searchParams.get('root') || '.';
+      let base;
+      try {
+        base = withinWs(rel);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      const nodes = await treeNodes(root, relOf(base), 1, depth);
+      return sendJson(res, 200, { root: relOf(base), nodes });
+    }
+    if (p === '/api/coder/repo_map' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      try {
+        const r = await execCommand(`rg '^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)' -g '*.{ts,tsx,js,jsx,rs,py,go,c,cpp,h,java}' --no-heading --line-number`, '.', 10000);
+        let map = r.stdout;
+        if (map.length > 15000) {
+            map = map.slice(0, 15000) + "
+... (repo map truncated)";
+        }
+        return sendJson(res, 200, { map });
+      } catch (err) {
+        return sendJson(res, 200, { map: "" });
+      }
+    }
+    if (p === '/api/coder/fs/read' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      let buf;
+      try {
+        buf = await fs.readFile(full);
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      if (await isBinary(buf)) return sendJson(res, 200, { path: body.path, binary: true, note: 'binary file — not shown' });
+      const text = buf.toString('utf8');
+      const totalLines = text.split('\n').length;
+      let content = text;
+      if (body?.offset != null || body?.limit != null) {
+        const lines = text.split('\n');
+        const off = Math.max(0, body.offset || 0);
+        const lim = body.limit != null ? body.limit : lines.length;
+        content = lines.slice(off, off + lim).join('\n');
+      }
+      const truncated = content.length > MAX_READ_BYTES;
+      if (truncated) content = content.slice(0, MAX_READ_BYTES);
+      return sendJson(res, 200, { path: body.path, content, totalLines, truncated, lineCount: content.split('\n').length });
+    }
+    if (p === '/api/coder/fs/write' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      if (typeof body?.content !== 'string') return sendJson(res, 400, { error: 'content must be a string' });
+      await fs.mkdir(path.dirname(full), { recursive: true });
+      const existed = await fs.stat(full).then((s) => s.isFile()).catch(() => false);
+      await fs.writeFile(full, body.content);
+      return sendJson(res, 200, { path: body.path, bytes: Buffer.byteLength(body.content), created: !existed });
+    }
+    if (p === '/api/coder/fs/edit' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      if (typeof body?.old !== 'string' || typeof body?.new !== 'string') {
+        return sendJson(res, 400, { error: 'old and new strings required' });
+      }
+      let fileText;
+      try {
+        fileText = await fs.readFile(full, 'utf8');
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      
+      let replaced = fileText;
+      let count = 0;
+      const exactIdx = fileText.indexOf(body.old);
+      
+      if (exactIdx !== -1) {
+        if (!body.replaceAll && fileText.indexOf(body.old, exactIdx + 1) !== -1) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string is not unique — pass replaceAll:true to replace all' });
+        }
+        replaced = body.replaceAll ? fileText.split(body.old).join(body.new) : fileText.replace(body.old, body.new);
+        count = body.replaceAll ? (fileText.match(new RegExp(escapeRe(body.old), 'g')) || []).length : 1;
+      } else {
+        const oldLines = body.old.split('
+');
+        while (oldLines.length > 0 && oldLines[0].trim() === '') oldLines.shift();
+        while (oldLines.length > 0 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
+        
+        if (oldLines.length === 0) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string is empty or only whitespace' });
+        }
+        
+        const fileLines = fileText.split('
+');
+        let matchIndex = -1;
+        let matchCount = 0;
+        
+        for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+          let matches = true;
+          for (let j = 0; j < oldLines.length; j++) {
+            if (fileLines[i + j].trim() !== oldLines[j].trim()) {
+              matches = false;
+              break;
+            }
+          }
+          if (matches) {
+            matchIndex = i;
+            matchCount++;
+          }
+        }
+        
+        if (matchCount === 0) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string not found (even with fuzzy whitespace matching)' });
+        }
+        if (matchCount > 1 && !body.replaceAll) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true' });
+        }
+        
+        if (!body.replaceAll) {
+          fileLines.splice(matchIndex, oldLines.length, body.new);
+          replaced = fileLines.join('
+');
+          count = 1;
+        } else {
+          let matches = [];
+          for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+            let isMatch = true;
+            for (let j = 0; j < oldLines.length; j++) {
+              if (fileLines[i + j].trim() !== oldLines[j].trim()) {
+                isMatch = false; break;
+              }
+            }
+            if (isMatch) matches.push(i);
+          }
+          count = matches.length;
+          for (let i = matches.length - 1; i >= 0; i--) {
+            fileLines.splice(matches[i], oldLines.length, body.new);
+          }
+          replaced = fileLines.join('
+');
+        }
+      }
+      
+      await fs.writeFile(full, replaced);
+      return sendJson(res, 200, { path: body.path, replacements: count });
+    }
+    if (p === '/api/coder/exec' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.command || typeof body.command !== 'string') return sendJson(res, 400, { error: 'command required' });
+      const r = await execCommand(body.command, body.cwd, body.timeoutMs);
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/grep' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const r = await grepSearch(body.pattern, body.path, body.include, !!body.ignoreCase, Math.min(body.maxMatches || MAX_GREP_MATCHES, 2000));
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/glob' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const files = await globSearch(body.pattern, body.path);
+      return sendJson(res, 200, { files });
+    }
+    if (p === '/api/coder/web/fetch' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.url) return sendJson(res, 400, { error: 'url required' });
+      const r = await webFetch(body.url);
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/web/search' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.query) return sendJson(res, 400, { error: 'query required' });
+      const r = await webSearch(body.query);
+      return sendJson(res, 200, r);
+    }
+    return sendJson(res, 404, { error: 'unknown coder endpoint' });
+  } catch (err) {
+    const code = err.status || 500;
+    if (!res.headersSent) sendJson(res, code, { error: err.message });
+    else res.end();
   }
 }
 

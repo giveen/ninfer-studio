@@ -7,5 +7,12 @@
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "crawlee": "^3.18.1",
+    "jsdom": "^30.0.1",
+    "playwright": "^1.63.0",
+    "turndown": "^7.2.4"
   }
 }

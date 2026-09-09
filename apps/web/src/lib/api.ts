@@ -1,5 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppSettings, ChatMessage, ChatParams, MessageMeta, ProfileState, SavedProfile, StatusPayload } from './types';
+import type {
+  AgentToolCall,
+  AppSettings,
+  ChatMessage,
+  ChatParams,
+  CoderEditResult,
+  CoderExecResult,
+  CoderGlobResult,
+  CoderGrepResult,
+  CoderMessage,
+  CoderReadResult,
+  CoderTodo,
+  CoderTree,
+  CoderWebFetch,
+  CoderWebSearch,
+  CoderWorkspace,
+  CoderWriteResult,
+  FileNode,
+  MessageMeta,
+  ProfileState,
+  SavedProfile,
+  StatusPayload,
+} from './types';
 import type { ChatAttachment } from './types';
 
 // In dev (Vite) the web is served on :5173 and /api is proxied to the sidecar on
@@ -144,6 +166,8 @@ export interface ChatStreamCallbacks {
   onUsage?: (usage: Record<string, unknown>, meta: MessageMeta) => void;
   onDone?: (meta: MessageMeta) => void;
   onError?: (message: string) => void;
+  /** Coding harness: tool calls assembled from streamed `delta.tool_calls`. Fires at finish. */
+  onToolCalls?: (calls: import('./types').AgentToolCall[]) => void;
 }
 
 export function buildChatRequest(
@@ -166,11 +190,16 @@ export function buildChatRequest(
       }
       messages.push({ role: 'user', content });
     } else {
-      messages.push({
-        role: m.role,
-        content: m.content,
-        ...(m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {}),
-      });
+      const msg: Record<string, unknown> = { role: m.role, content: m.content };
+      if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
+      if (m.tool_calls) msg.tool_calls = m.tool_calls.map(tc => ({
+        id: tc.id,
+        type: 'function',
+        function: { name: tc.name, arguments: tc.arguments }
+      }));
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+      if (m.name) msg.name = m.name;
+      messages.push(msg);
     }
   }
   // Thinking switch + effort: a contradictory enable_thinking/reasoning_effort
@@ -216,9 +245,15 @@ export async function streamChat(
   const meta: MessageMeta = {};
   let firstContentAt: number | null = null;
   let sawDone = false;
+  // Accumulate streamed tool calls (native OpenAI function calling).
+  const toolAcc: Array<{ id: string; type: string; name: string; arguments: string }> = [];
 
   const finish = () => {
     if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
+    const calls = toolAcc
+      .filter(Boolean)
+      .map((t, i) => ({ id: t.id || `call_${i}`, name: t.name, arguments: t.arguments }));
+    if (calls.length) cb.onToolCalls?.(calls);
     cb.onDone?.(meta);
   };
 
@@ -283,6 +318,18 @@ export async function streamChat(
         if (d.content) {
           if (firstContentAt === null) firstContentAt = performance.now();
           cb.onContentDelta?.(d.content);
+        }
+        // Native tool calling: accumulate streamed tool_call deltas by index.
+        const tcs = (choice.delta as { tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }> } | undefined)?.tool_calls;
+        if (Array.isArray(tcs)) {
+          for (const tc of tcs) {
+            const idx = tc.index ?? toolAcc.length;
+            if (!toolAcc[idx]) toolAcc[idx] = { id: '', type: 'function', name: '', arguments: '' };
+            if (tc.id) toolAcc[idx].id = tc.id;
+            if (tc.type) toolAcc[idx].type = tc.type;
+            if (tc.function?.name) toolAcc[idx].name = tc.function.name;
+            if (tc.function?.arguments) toolAcc[idx].arguments += tc.function.arguments;
+          }
         }
         if (choice.finish_reason) meta.finishReason = choice.finish_reason;
       }
@@ -428,6 +475,96 @@ export function summarizeConversation(opts: {
       onError: (m) => reject(new Error(m)),
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Coding harness control-plane endpoints (sandboxed to the workspace)
+// ---------------------------------------------------------------------------
+export function getCoderWorkspace(): Promise<CoderWorkspace> {
+  return getJSON<CoderWorkspace>('/api/coder/workspace');
+}
+export function coderRepoMap(): Promise<{ map: string }> {
+  return getJSON<{ map: string }>('/api/coder/repo_map');
+}
+export function setCoderWorkspace(path: string): Promise<CoderWorkspace> {
+  return postJSON<CoderWorkspace>('/api/coder/workspace', { path }, 8000);
+}
+export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
+  return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}`);
+}
+export function coderRead(path: string, offset?: number, limit?: number): Promise<CoderReadResult> {
+  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000);
+}
+export function coderWrite(path: string, content: string): Promise<CoderWriteResult> {
+  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000);
+}
+export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000);
+}
+export function coderExec(command: string, cwd?: string, timeoutMs?: number): Promise<CoderExecResult> {
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs }, 15_000);
+}
+export function coderGrep(pattern: string, path?: string, include?: string, ignoreCase?: boolean): Promise<CoderGrepResult> {
+  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase }, 15_000);
+}
+export function coderGlob(pattern: string, path?: string): Promise<CoderGlobResult> {
+  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path }, 15_000);
+}
+export function coderWebFetch(url: string): Promise<CoderWebFetch> {
+  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000);
+}
+export function coderWebSearch(query: string): Promise<CoderWebSearch> {
+  return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000);
+}
+
+/**
+ * Build an OpenAI-style chat completion body for the coding agent. Converts the
+ * CoderMessage history (user / assistant-with-tool_calls / tool) into the wire
+ * format and attaches the tool schema + `tool_choice: auto`. The engine executes
+ * no tools itself — it returns `tool_calls`, which the agent loop runs locally.
+ */
+export function buildCoderRequest(
+  model: string,
+  systemPrompt: string | undefined,
+  history: CoderMessage[],
+  tools: unknown[],
+  params: ChatParams,
+): Record<string, unknown> {
+  const messages: Array<Record<string, unknown>> = [];
+  if (systemPrompt?.trim()) messages.push({ role: 'system', content: systemPrompt.trim() });
+  for (const m of history) {
+    if (m.role === 'user') {
+      messages.push({ role: 'user', content: m.content });
+    } else if (m.role === 'tool') {
+      messages.push({ role: 'tool', tool_call_id: m.toolCallId, name: m.name, content: m.content });
+    } else {
+      const a = m as Extract<CoderMessage, { role: 'assistant' }>;
+      const o: Record<string, unknown> = { role: 'assistant', content: a.content || '' };
+      if (a.toolCalls && a.toolCalls.length) {
+        o.tool_calls = a.toolCalls.map((t) => ({ id: t.id, type: 'function', function: { name: t.name, arguments: t.arguments } }));
+      }
+      messages.push(o);
+    }
+  }
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+    tools,
+    tool_choice: 'auto',
+    enable_thinking: params.thinking,
+  };
+  if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
+  if (params.greedy) body.temperature = 0;
+  if (params.temperature !== undefined) body.temperature = params.temperature;
+  if (params.topP !== undefined) body.top_p = params.topP;
+  if (params.topK !== undefined) body.top_k = params.topK;
+  if (params.minP !== undefined) body.min_p = params.minP;
+  if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
+  if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
+  if (params.seed !== undefined) body.seed = params.seed;
+  return body;
 }
 
 export type { ChatAttachment };

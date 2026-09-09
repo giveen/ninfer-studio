@@ -16,12 +16,13 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { buildChatRequest, frameCompactedSummary, getCoderWorkspace, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
 import { Markdown } from '../components/Markdown';
-import { Badge, Button, cn, NumberField, SelectField, Toggle } from '../components/ui';
+import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
+import { CoderScreen } from './CoderScreen';
 
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
@@ -471,6 +472,13 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [paramsOpen, setParamsOpen] = useState(false);
+  const [mode, setMode] = useState<'chat' | 'code'>('chat');
+  const [coderWs, setCoderWs] = useState<string>('');
+  useEffect(() => {
+    getCoderWorkspace()
+      .then((w) => setCoderWs(w.workspace))
+      .catch(() => undefined);
+  }, []);
   const [model, setModel] = useState<string>(status?.engine?.modelId || 'qwen3.8-27b');
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -841,9 +849,26 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
-    <div className="flex h-full">
-      {/* conversation rail */}
-      <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
+    <div className="flex h-full flex-col">
+      {/* Chat / Code mode toggle */}
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3">
+        <Segmented
+          value={mode}
+          onChange={(v) => setMode(v)}
+          options={[
+            { value: 'chat', label: 'Chat' },
+            { value: 'code', label: 'Code', hint: 'Coding harness — agentic file editing, shell, search, and web tools' },
+          ]}
+        />
+        {mode === 'code' && coderWs && (
+          <span className="truncate font-mono text-[11px] text-faint">workspace: {coderWs}</span>
+        )}
+      </div>
+      <div className="flex min-h-0 flex-1">
+        {mode === 'chat' ? (
+          <>
+            {/* conversation rail */}
+            <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
         <div className="p-2.5">
           <Button variant="primary" size="sm" className="w-full" onClick={newChat}>
             <Plus size={14} /> new chat
@@ -1108,6 +1133,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </span>
           </div>
         </div>
+      </div>
+          </>
+        ) : (
+          <CoderScreen coderWs={coderWs} />
+        )}
       </div>
     </div>
   );

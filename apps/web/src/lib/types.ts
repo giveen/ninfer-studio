@@ -69,6 +69,8 @@ export interface AppSettings {
   defaultRequestParams: string;
   /** Global default reasoning effort injected into chat_template_kwargs.reasoning_effort for every proxied request (client fields win). '' = unset. */
   reasoningEffort: string;
+  /** Coding harness: the directory the "Code" mode may read/write/execute within. Empty = not configured. */
+  coderWorkspace: string;
 }
 
 export interface UpdateJob {
@@ -224,13 +226,19 @@ export interface MessageMeta {
 }
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   reasoning?: string;
   attachments?: ChatAttachment[];
   meta?: MessageMeta;
   model?: string;
   error?: boolean;
+  /** Agent tool calls (assistant role). */
+  tool_calls?: AgentToolCall[];
+  /** Tool call ID (tool role). */
+  tool_call_id?: string;
+  /** Tool name (tool role). */
+  name?: string;
 }
 
 export interface Conversation {
@@ -255,4 +263,118 @@ export interface ChatParams {
   frequencyPenalty?: number;
   seed?: number;
   greedy?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Coding harness ("Code" mode under Chat) — an agentic loop driven by the
+// engine's native OpenAI tool-calling. The control plane executes the tools.
+// ---------------------------------------------------------------------------
+export interface AgentToolCall {
+  id: string;
+  name: string;
+  /** Raw JSON arguments emitted by the model. */
+  arguments: string;
+}
+
+export interface CoderToolCall extends AgentToolCall {
+  status?: 'running' | 'done' | 'error';
+  result?: string;
+  error?: string;
+}
+
+export interface CoderUserMsg {
+  role: 'user';
+  id: string;
+  content: string;
+}
+export interface CoderAssistantMsg {
+  role: 'assistant';
+  id: string;
+  content: string;
+  reasoning?: string;
+  toolCalls?: CoderToolCall[];
+  meta?: MessageMeta;
+  error?: boolean;
+}
+export interface CoderToolMsg {
+  role: 'tool';
+  id: string;
+  toolCallId: string;
+  name: string;
+  content: string;
+}
+export type CoderMessage = CoderUserMsg | CoderAssistantMsg | CoderToolMsg;
+
+export interface CoderTodo {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  activeForm?: string;
+}
+
+// Control-plane response shapes (mirrors apps/sidecar/server.js / Rust coder.rs).
+export interface FileNode {
+  name: string;
+  path: string;
+  kind: 'dir' | 'file';
+  size?: number;
+  children?: FileNode[];
+}
+export interface CoderWorkspace {
+  workspace: string;
+  exists: boolean;
+}
+export interface CoderTree {
+  root: string;
+  nodes: FileNode[];
+}
+export interface CoderReadResult {
+  path: string;
+  content?: string;
+  totalLines?: number;
+  truncated?: boolean;
+  lineCount?: number;
+  binary?: boolean;
+  note?: string;
+}
+export interface CoderWriteResult {
+  path: string;
+  bytes: number;
+  created: boolean;
+}
+export interface CoderEditResult {
+  path: string;
+  replacements: number;
+  error?: string;
+}
+export interface CoderExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  cwd: string;
+  error?: string;
+}
+export interface GrepMatch {
+  file: string;
+  line: number;
+  text: string;
+}
+export interface CoderGrepResult {
+  matches: GrepMatch[];
+  truncated: boolean;
+  count: number;
+}
+export interface CoderGlobResult {
+  files: string[];
+}
+export interface CoderWebFetch {
+  url: string;
+  status: number;
+  contentType: string;
+  content: string;
+  truncated: boolean;
+}
+export interface CoderWebSearch {
+  results: Array<{ title: string; url: string; snippet: string }>;
+  query: string;
 }
