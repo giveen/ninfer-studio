@@ -115,7 +115,14 @@ pub async fn discover_engines() -> Vec<DiscoveredEngine> {
 
 /// Reconcile in-memory state with reality (health, child liveness, external adoption).
 pub async fn refresh_engine_status(state: &State) {
-    let has_child = state.child.try_lock().map(|g| g.is_some()).unwrap_or(false);
+    // Liveness of a Studio-spawned child: the slot is occupied while the process
+    // is alive (the reaper only clears it on actual exit). Treat a briefly-busy
+    // lock as "alive" so a refresh racing the reaper's poll never flips the
+    // engine to failed/external.
+    let has_child = match state.child.try_lock() {
+        Ok(g) => g.is_some(),
+        Err(_) => true,
+    };
     let mut eng = state.engine.write().await;
     let prev_state = eng.state.clone();
 
@@ -424,24 +431,33 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.pid = pid.map(|p| p as u32);
     }
 
-    // reaper: clear the child slot and record the exit as soon as the process dies
+    // reaper: watch the spawned child and record its exit. The handle stays in
+    // `state.child` (cleared only once the process is actually gone) so the
+    // liveness checks in `refresh_engine_status` and the health poller keep
+    // seeing a *live* child instead of a false "process exited" / "external".
     {
         let st = state.clone();
         tokio::spawn(async move {
-            // take ownership of the child (stop_engine may have taken it first)
-            let child = st.child.lock().await.take();
-            let Some(mut child) = child else { return };
-            let status = child.wait().await.ok().and_then(|s| s.code());
-            let mut eng = st.engine.write().await;
-            if eng.state == "starting" || eng.state == "running" {
-                eng.state = "failed".into();
-                eng.fail_reason = Some(match status {
-                    Some(0) => "engine exited normally".into(),
-                    Some(c) => format!("engine exited with code {c}"),
-                    None => "engine terminated by signal".into(),
-                });
-                eng.pid = None;
-                eng.adopted = false;
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let exited = {
+                    let mut g = st.child.lock().await;
+                    match g.as_mut() {
+                        Some(c) => c.try_wait().ok().flatten().is_some(),
+                        None => return, // slot cleared (e.g. by stop_engine) — nothing to watch
+                    }
+                };
+                if exited {
+                    let mut eng = st.engine.write().await;
+                    if eng.state == "starting" || eng.state == "running" {
+                        eng.state = "failed".into();
+                        eng.fail_reason = Some("engine process exited".into());
+                        eng.pid = None;
+                        eng.adopted = false;
+                    }
+                    *st.child.lock().await = None;
+                    return;
+                }
             }
         });
     }
@@ -452,12 +468,6 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(2000)).await;
-            {
-                let g = st.child.try_lock().ok();
-                if g.as_ref().map(|c| c.is_some()).unwrap_or(false) != true {
-                    return;
-                }
-            }
             if engine_health(port2).await {
                 let mut eng = st.engine.write().await;
                 if eng.state == "starting" || eng.state == "running" {
