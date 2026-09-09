@@ -1,7 +1,7 @@
 # NInfer Studio
 
 A from-scratch, **native Linux desktop app** (Tauri 2 / WebKitGTK) for the
-[NInfer](https://github.com/giveen/ninfer) local LLM inference engine — turning a raw
+[NInfer](https://github.com/ninfer/ninfer) local LLM inference engine — turning a raw
 `ninfer-serve` binary into a product.
 
 > NInfer Studio is the **desktop shell**: engine configuration, model management,
