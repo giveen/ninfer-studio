@@ -103,7 +103,7 @@ export function App() {
         <header className="flex h-12 shrink-0 items-center gap-3 border-b border-line bg-panel px-4">
           <div className="flex items-center gap-2">
             <span className="text-[14px] font-semibold tracking-tight">NInfer Studio</span>
-            <span className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] text-faint">0.1</span>
+            <span className="rounded border border-line px-1.5 py-0.5 font-mono text-[10px] text-faint">0.1.1</span>
           </div>
           <div className="ml-2 flex items-center gap-2">
             <EnginePill status={status} />

@@ -1,6 +1,7 @@
 # NInfer Studio
 
-A from-scratch, **native Linux desktop app** (Tauri 2 / WebKitGTK) for the
+A from-scratch, **native Linux & Windows desktop app** (Tauri 2 — WebKitGTK on
+Linux, WebView2 on Windows) for the
 [NInfer](https://github.com/Neroued/ninfer) local LLM inference engine — turning a raw
 `ninfer-serve` binary into a product.
 
@@ -29,7 +30,10 @@ A from-scratch, **native Linux desktop app** (Tauri 2 / WebKitGTK) for the
 - **Chat** — streaming chat over the engine's OpenAI-compatible API: reasoning shown in
   a collapsible thinking block, per-message engine metrics (TTFT, prompt/decode tok/s,
   cached tokens, MTP draft acceptance), sampling/thinking overrides per conversation,
-  image/video attachments (vision engines), stop button, local conversation history.
+  image/video attachments (vision engines), stop button, and persisted conversation
+  history. Type `/compact` to ask the engine to condense the whole conversation into a
+  structured checkpoint summary, which replaces the thread and becomes its starting
+  context (handy before a context-limit warning).
 - **Engine supervision** — starts/stops `ninfer-serve` from the UI, adopts
   already-running engines (never double-spawns), tails the engine log, and reports GPU
   state via `nvidia-smi`.
@@ -39,6 +43,10 @@ A from-scratch, **native Linux desktop app** (Tauri 2 / WebKitGTK) for the
   to the tray and keeps a spawned engine alive, rather than killing it), **single-instance**
   launch (a second launch focuses the existing window), and **native OS notifications**
   for engine ready/stopped, download finished, and build finished.
+- **Per-user persistence** — app settings, the engine profile, saved named profiles, and
+  chat conversations all persist to a per-user config dir (`~/.config/ninfier-studio` on
+  Linux, `AppData/Roaming/ninfier-studio` on Windows) so they survive a restart and roam
+  with the user's home. Override the location with `NINFIER_STUDIO_DATA`.
 
 ## Architecture
 
@@ -49,7 +57,9 @@ desktop/         Rust control plane + Tauri 2 desktop shell
   app/           ninfier-studio: Tauri 2 window hosting the control plane
 apps/web         React 19 + Vite + Tailwind 4 frontend (Chat / Engine / Models / Settings)
 apps/sidecar     zero-dependency Node 22 dev-mode server implementing the same control-plane API
-data/            runtime state (config.json, engine-<port>.log) — gitignored
+~/.config/ninfier-studio/   per-user runtime state (CONFIG_HOME); AppData/Roaming/ninfier-studio
+                 on Windows — config.json, profile.json, chats.json, last-start.json,
+                 engine-<port>.log. Override location with NINFIER_STUDIO_DATA.
 ```
 
 The **control plane** (`desktop/control`, or `apps/sidecar` in browser dev mode) is the
@@ -66,7 +76,9 @@ so the engine's parent is the app itself — a single process supervises the eng
 | `GET /api/models` | scan `modelsDir` for `*.ninfer` + registered catalog |
 | `POST /api/models/download` | `hf download <repo> <file> --local-dir` |
 | `GET /api/gpu` | `nvidia-smi` memory/util/process list |
-| `GET/POST /api/config` | app settings (`data/config.json`) |
+| `GET/POST /api/config` | app settings (config dir / config.json) |
+| `GET/POST /api/profile-state` | engine profile, chosen artifact, saved named profiles (profile.json) |
+| `GET/POST /api/conversations` | chat conversations + per-conversation params (chats.json) |
 | `GET /health`, `/v1/*` | SSE-safe proxy to the engine port (injects API key) |
 
 ## Prerequisites
@@ -126,8 +138,9 @@ pnpm control:run    # headless: Rust control plane only, no window
 pnpm desktop:run    # native window + Rust control plane (dist from apps/web/dist)
 ```
 
-`NINFIER_STUDIO_DATA` (default `./data`) and `NINFIER_STUDIO_DIST` (default
-`apps/web/dist`) override the data/dist locations.
+`NINFIER_STUDIO_DATA` overrides the per-user config dir (default
+`~/.config/ninfier-studio` on Linux, `AppData/Roaming/ninfier-studio` on Windows) and
+`NINFIER_STUDIO_DIST` (default `apps/web/dist`) overrides the dist location.
 
 ## Packaging & CI Releases
 
@@ -138,7 +151,7 @@ and each platform uploads its artifact into it.
 Trigger a release by pushing a version tag:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 (or run the workflow manually from the Actions tab). Windows artifacts are currently
@@ -146,7 +159,20 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Configuration
 
-Settings live in `data/config.json` (created on first save). Key fields:
+Settings, the engine profile, saved profiles, and conversations all live in the
+per-user config dir (default `~/.config/ninfier-studio` on Linux,
+`AppData/Roaming/ninfier-studio` on Windows; override with `NINFIER_STUDIO_DATA`),
+created on first save. Key files:
+
+| File | Meaning |
+|---|---|
+| `config.json` | app settings — key fields below |
+| `profile.json` | engine profile, chosen artifact, and saved named profiles |
+| `chats.json` | chat conversations + per-conversation sampling/thinking params |
+| `last-start.json` | last engine start record (dirty indicator for the Engine tab) |
+| `engine-<port>.log` | tailed engine stdout/stderr |
+
+`config.json` key fields:
 
 | Field | Default | Meaning |
 |---|---|---|
