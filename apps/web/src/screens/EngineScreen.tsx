@@ -15,9 +15,9 @@ import {
   Video,
   Zap,
 } from 'lucide-react';
-import { getConfig, getLogs, saveConfig, startEngine, stopEngine } from '../lib/api';
+import { getConfig, getLogs, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine } from '../lib/api';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
-import type { AppSettings, EngineProfile, StatusPayload } from '../lib/types';
+import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
 import {
   getLatestRequestMetrics,
@@ -25,10 +25,6 @@ import {
   type LiveRequestMetrics,
 } from '../lib/liveMetrics';
 import { Badge, Button, CodeBlock, Field, LogPane, NumberField, SectionCard, Segmented, SelectField, Stat, TextField, Toggle, cn } from '../components/ui';
-
-const LS_PROFILE = 'ninfier.profile.v1';
-const LS_SAVED = 'ninfier.savedprofiles.v1';
-const LS_ARTIFACT = 'ninfier.artifact.v1';
 
 const NAV_SECTIONS = [
   { id: 'top', label: 'Status' },
@@ -140,18 +136,6 @@ function argsEqual(a: string[], b: string[]): boolean {
 
 const baseName = (p: string | null) => (p ? p.split('/').pop() || p : null);
 
-function loadProfile(): EngineProfile {
-  try {
-    const raw = localStorage.getItem(LS_PROFILE);
-    if (raw) return { ...BLANK_PROFILE, ...JSON.parse(raw) };
-  } catch {
-    /* noop */
-  }
-  return { ...PRESETS[1].profile }; // long-context MTP3 — the published 5090 profile
-}
-
-type SavedProfile = { name: string; profile: EngineProfile };
-
 function MiniStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex flex-col gap-0.5">
@@ -165,22 +149,10 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const engine = status?.engine;
   const gpu = status?.gpu;
   const artifacts = status?.artifacts || [];
-  const [profile, setProfile] = useState<EngineProfile>(loadProfile);
-  const [artifact, setArtifact] = useState<string>(() => {
-    try {
-      return localStorage.getItem(LS_ARTIFACT) || '';
-    } catch {
-      return '';
-    }
-  });
-  const [saved, setSaved] = useState<SavedProfile[]>(() => {
-    try {
-      const raw = localStorage.getItem(LS_SAVED);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [profile, setProfile] = useState<EngineProfile>(() => ({ ...PRESETS[1].profile }));
+  const [artifact, setArtifact] = useState<string>('');
+  const [saved, setSaved] = useState<SavedProfile[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [saveName, setSaveName] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
   const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
@@ -192,6 +164,25 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   useEffect(() => {
     getConfig().then(setSettings).catch(() => undefined);
+  }, []);
+
+  // Hydrate the engine profile, chosen artifact, and saved named profiles from
+  // the user's profile dir on the control plane (survives app restarts).
+  useEffect(() => {
+    let cancelled = false;
+    getProfileState()
+      .then((s) => {
+        if (cancelled) return;
+        if (s.profile) setProfile({ ...BLANK_PROFILE, ...s.profile });
+        else setProfile({ ...PRESETS[1].profile });
+        if (s.artifact !== null && s.artifact !== undefined) setArtifact(s.artifact);
+        if (s.saved) setSaved(s.saved);
+        setLoaded(true);
+      })
+      .catch(() => cancelled || setLoaded(true));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Live token metrics from the most recent chat request (lifted from the SSE
@@ -236,15 +227,14 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     saveConfig({ reasoningEffort: v }).catch(() => undefined);
   };
 
+  // Persist the engine profile, chosen artifact, and saved named profiles to the
+  // user's profile dir on the control plane. Skipped until the initial hydrate
+  // completes so we never clobber disk with the first-render defaults.
   useEffect(() => {
-    localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
-  }, [profile]);
-  useEffect(() => {
-    if (artifact) localStorage.setItem(LS_ARTIFACT, artifact);
-  }, [artifact]);
-  useEffect(() => {
-    localStorage.setItem(LS_SAVED, JSON.stringify(saved));
-  }, [saved]);
+    if (!loaded) return;
+    const snapshot = { profile, artifact, saved };
+    saveProfileState(snapshot).catch(() => undefined);
+  }, [profile, artifact, saved, loaded]);
 
   useEffect(() => {
     if (!engine?.logPath && engine?.state !== 'stopped') return;
@@ -845,7 +835,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           </div>
         </SectionCard>
 
-        <SectionCard title="Profiles" description="Browser-saved profiles map 1:1 to ninfer-serve flags. 'load' fills the form — then stop + start." icon={<BookmarkPlus size={15} />} anchor="profiles" collapsible defaultCollapsed>
+        <SectionCard title="Profiles" description="Saved profiles map 1:1 to ninfer-serve flags and persist with your Studio profile. 'load' fills the form — then stop + start." icon={<BookmarkPlus size={15} />} anchor="profiles" collapsible defaultCollapsed>
             <div className="flex items-center gap-2">
               <TextField value={saveName} onChange={setSaveName} placeholder="profile name" className="flex-1" />
               <Button size="sm" variant="primary" onClick={saveCurrent}>

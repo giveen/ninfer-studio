@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppSettings, ChatMessage, ChatParams, MessageMeta, StatusPayload } from './types';
+import type { AppSettings, ChatMessage, ChatParams, MessageMeta, ProfileState, SavedProfile, StatusPayload } from './types';
 import type { ChatAttachment } from './types';
 
 async function getJSON<T>(path: string, timeoutMs = 4000): Promise<T> {
@@ -35,6 +35,20 @@ export function getConfig(): Promise<AppSettings> {
 
 export function saveConfig(patch: Partial<AppSettings>): Promise<AppSettings> {
   return postJSON<AppSettings>('/api/config', patch, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Per-user profile state (engine profile + artifact + saved named profiles).
+// Persisted by the control plane under the user's profile dir, not the browser.
+// ---------------------------------------------------------------------------
+export function getProfileState(): Promise<ProfileState> {
+  return getJSON<ProfileState>('/api/profile-state', 5000);
+}
+
+export function saveProfileState(
+  patch: Partial<{ profile: import('./types').EngineProfile; artifact: string; saved: SavedProfile[] }>,
+): Promise<unknown> {
+  return postJSON('/api/profile-state', patch, 5000);
 }
 
 export interface EngineActionResult {

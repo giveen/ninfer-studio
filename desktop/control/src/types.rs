@@ -440,6 +440,28 @@ pub struct LastStart {
     pub at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Per-user profile state — the live engine profile, the chosen artifact, and the
+// named saved profiles. Persisted to <data>/profile.json (mirrors the web app's
+// former browser-localStorage blob) so the settings survive a restart.
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProfile {
+    pub name: String,
+    pub profile: EngineProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProfileState {
+    /// `None` ⇒ no profile persisted yet; the UI falls back to its built-in preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<EngineProfile>,
+    pub artifact: String,
+    pub saved: Vec<SavedProfile>,
+}
+
 pub struct State {
     pub config: tokio::sync::RwLock<AppSettings>,
     pub engine: tokio::sync::RwLock<EngineInner>,

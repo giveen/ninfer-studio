@@ -187,6 +187,21 @@ export interface EngineProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Persisted engine profile state (per-user profile dir, not localStorage).
+// Holds the live form, the chosen artifact, and the named saved profiles.
+// ---------------------------------------------------------------------------
+export interface SavedProfile {
+  name: string;
+  profile: EngineProfile;
+}
+
+export interface ProfileState {
+  profile: EngineProfile | null;
+  artifact: string | null;
+  saved: SavedProfile[];
+}
+
+// ---------------------------------------------------------------------------
 // Chat (OpenAI-compatible) — client-side message model
 // ---------------------------------------------------------------------------
 export interface ChatAttachment {

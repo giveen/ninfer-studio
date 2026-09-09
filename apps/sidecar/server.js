@@ -22,7 +22,20 @@ import os from 'node:os';
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
 const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
 const ROOT = path.resolve(SELF_DIR, '..', '..');
-const DATA_DIR = path.join(ROOT, 'data');
+
+// Persisted data lives in the user's profile dir (e.g. ~/.config/ninfer-studio
+// on Linux), not next to the checkout, so a person's settings survive a fresh
+// pull of the app. Override with NINFIER_STUDIO_DATA for dev/portable use.
+function resolveDataDir() {
+  if (process.env.NINFIER_STUDIO_DATA) return path.resolve(process.env.NINFIER_STUDIO_DATA);
+  const home = os.homedir();
+  let base;
+  if (process.platform === 'darwin') base = path.join(home, 'Library', 'Application Support');
+  else if (process.platform === 'win32') base = path.join(home, 'AppData', 'Roaming');
+  else base = path.join(home, '.config');
+  return path.join(base, 'ninfer-studio');
+}
+const DATA_DIR = resolveDataDir();
 const DIST_DIR = path.join(ROOT, 'apps', 'web', 'dist');
 const ENGINE_LOG_DIR = DATA_DIR;
 
@@ -115,6 +128,41 @@ async function saveConfig(patch) {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(path.join(DATA_DIR, 'config.json'), JSON.stringify(config, null, 2));
   return config;
+}
+
+// ---------------------------------------------------------------------------
+// Per-user profile state — the live engine profile, the chosen artifact, and the
+// named saved profiles. Persisted to <DATA_DIR>/profile.json so they survive a
+// restart (previously kept in browser localStorage).
+// ---------------------------------------------------------------------------
+const PROFILE_PATH = path.join(DATA_DIR, 'profile.json');
+let profileState = { profile: null, artifact: null, saved: [] };
+
+async function loadProfileState() {
+  try {
+    const raw = await fs.readFile(PROFILE_PATH, 'utf8');
+    const p = JSON.parse(raw);
+    profileState = {
+      profile: p.profile ?? null,
+      artifact: p.artifact ?? null,
+      saved: Array.isArray(p.saved) ? p.saved : [],
+    };
+  } catch {
+    profileState = { profile: null, artifact: null, saved: [] };
+  }
+  return profileState;
+}
+
+async function saveProfileState(patch) {
+  const next = { ...profileState, ...patch };
+  // keep shape explicit so older/partial payloads can't wedge the file
+  next.profile = next.profile ?? null;
+  next.artifact = next.artifact ?? null;
+  next.saved = Array.isArray(next.saved) ? next.saved : [];
+  profileState = next;
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(PROFILE_PATH, JSON.stringify(next, null, 2));
+  return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1130,16 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, c);
     }
 
+    if (p === '/api/profile-state' && req.method === 'GET') {
+      return sendJson(res, 200, profileState);
+    }
+
+    if (p === '/api/profile-state' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      const next = await saveProfileState(body || {});
+      return sendJson(res, 200, next);
+    }
+
     if (p === '/api/engine/start' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
       const result = await startEngine(body?.profile ?? {}, body?.artifact);
@@ -1143,6 +1201,7 @@ const server = createServer(async (req, res) => {
 
 await fs.mkdir(DATA_DIR, { recursive: true });
 await loadConfig();
+await loadProfileState();
 try {
   lastStart = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'last-start.json'), 'utf8'));
 } catch { /* first run */ }

@@ -18,7 +18,7 @@ use crate::engine::{
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models, start_download};
 use crate::repo::{start_update, update_public};
-use crate::types::{AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, State};
+use crate::types::{AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, ProfileState, SavedProfile, State};
 use tokio::sync::mpsc::UnboundedSender;
 use axum::body::Body;
 use axum::extract::{Query, Request, State as AxumState};
@@ -43,6 +43,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/api/config", get(get_config).post(set_config))
+        .route("/api/profile-state", get(profile_state_get).post(profile_state_set))
         .route("/api/engine/start", post(engine_start))
         .route("/api/engine/stop", post(engine_stop))
         .route("/api/logs", get(logs))
@@ -312,6 +313,55 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// Per-user profile state (engine profile + artifact + saved named profiles).
+// Persisted to <data>/profile.json so it survives a restart; mirrors the web
+// app's former browser-localStorage blob.
+// ---------------------------------------------------------------------------
+async fn profile_state_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    let p = state.data_dir.join("profile.json");
+    match tokio::fs::read_to_string(&p).await {
+        Ok(raw) => match serde_json::from_str::<ProfileState>(&raw) {
+            Ok(ps) => Json(serde_json::to_value(&ps).unwrap_or_else(|_| json!({}))),
+            Err(_) => Json(json!({ "profile": null, "artifact": "", "saved": [] })),
+        },
+        Err(_) => Json(json!({ "profile": null, "artifact": "", "saved": [] })),
+    }
+}
+
+async fn profile_state_set(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let body = read_json(req).await?;
+    let mut current: ProfileState = {
+        let p = state.data_dir.join("profile.json");
+        match tokio::fs::read_to_string(&p).await {
+            Ok(raw) => serde_json::from_str::<ProfileState>(&raw).unwrap_or_default(),
+            Err(_) => ProfileState::default(),
+        }
+    };
+    if let Some(v) = body.get("profile") {
+        if let Ok(p) = serde_json::from_value::<EngineProfile>(v.clone()) {
+            current.profile = Some(p);
+        }
+    }
+    if let Some(v) = body.get("artifact") {
+        if let Some(s) = v.as_str() {
+            current.artifact = s.to_string();
+        }
+    }
+    if let Some(v) = body.get("saved") {
+        if let Ok(s) = serde_json::from_value::<Vec<SavedProfile>>(v.clone()) {
+            current.saved = s;
+        }
+    }
+    let p = state.data_dir.join("profile.json");
+    tokio::fs::create_dir_all(&state.data_dir).await.ok();
+    tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await.ok();
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
 // Engine API proxy (SSE-safe)
 // ---------------------------------------------------------------------------
 /// Choose the engine port for a proxied request. When the JSON body names a
@@ -513,12 +563,10 @@ pub fn default_data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("NINFIER_STUDIO_DATA") {
         return PathBuf::from(d);
     }
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let candidate = cwd.join("data");
-    if candidate.is_dir() {
-        return candidate;
-    }
-    dirs::data_local_dir()
+    // Per-user profile dir: XDG config on Linux (~/.config/ninfier-studio),
+    // ~/Library/Application Support on macOS, AppData/Roaming on Windows. Settings
+    // persist here so they survive a fresh pull / reinstall of the app.
+    dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ninfier-studio")
 }
