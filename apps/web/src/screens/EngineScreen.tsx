@@ -637,7 +637,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                     else set('kvCapacity', profile.kvCapacity && profile.kvCapacity !== 'auto' ? profile.kvCapacity : 32768);
                   }}
                   options={[
-                    { value: 'follow', label: 'follow ctx', hint: 'omit flag: pool follows --max-context' },
+                    { value: 'follow', label: 'follow', hint: 'omit flag: pool follows --max-context' },
                     { value: 'auto', label: 'auto', hint: 'maximize from remaining GPU memory, 1 GiB headroom' },
                     { value: 'fixed', label: 'fixed', hint: 'explicit token capacity (rounded to 64-token pages)' },
                   ]}
