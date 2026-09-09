@@ -175,7 +175,10 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         if (cancelled) return;
         if (s.profile) setProfile({ ...BLANK_PROFILE, ...s.profile });
         else setProfile({ ...PRESETS[1].profile });
-        if (s.artifact !== null && s.artifact !== undefined) setArtifact(s.artifact);
+        // Only restore a *non-empty* artifact. A persisted "" means "no explicit
+        // choice", and restoring it would clobber the auto-selected artifact if
+        // this fetch resolves after the status feed has already filled it in.
+        if (s.artifact) setArtifact(s.artifact);
         if (s.saved) setSaved(s.saved);
         setLoaded(true);
       })
@@ -249,11 +252,12 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     return () => clearInterval(t);
   }, [engine?.logPath, engine?.state, engine?.startedAt]);
 
-  // pick first downloaded artifact when none chosen
+  // Pick the most recently added artifact when none is explicitly chosen. Depends
+  // on `artifact` too, so if it ever gets cleared (e.g. via loaded profile state)
+  // it is re-selected instead of leaving the Start button disabled.
   useEffect(() => {
     if (!artifact && artifacts.length) setArtifact(artifacts[artifacts.length - 1].path);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [artifacts.length]);
+  }, [artifact, artifacts.length]);
 
   const generatedCommand = useMemo(() => {
     const args = buildArgs(profile, true);
