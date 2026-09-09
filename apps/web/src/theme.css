@@ -1,0 +1,244 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/inter';
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+
+@theme {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+
+  --color-bg: #0a0c10;
+  --color-panel: #10141b;
+  --color-panel2: #161b25;
+  --color-inset: #0d1017;
+  --color-line: rgba(255, 255, 255, 0.08);
+  --color-line2: rgba(255, 255, 255, 0.14);
+  --color-ink: #e9edf5;
+  --color-mute: #8b94a7;
+  --color-faint: #5c6577;
+  --color-accent: #b7f04a;
+  --color-accent-deep: #7fae2c;
+  --color-ok: #59d499;
+  --color-warn: #e8b34b;
+  --color-danger: #f0625f;
+  --color-info: #5cb2f0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+::selection {
+  background: rgba(183, 240, 74, 0.28);
+}
+
+/* slim scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* numeric inputs: hide spinners, we render our own affordances */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+/* markdown (chat) */
+.markdown {
+  overflow-wrap: break-word;
+}
+.markdown p {
+  margin: 0.4em 0;
+}
+.markdown p:first-child {
+  margin-top: 0;
+}
+.markdown p:last-child {
+  margin-bottom: 0;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  font-weight: 650;
+  margin: 0.9em 0 0.4em;
+  color: var(--color-ink);
+}
+.markdown h1 {
+  font-size: 1.25em;
+}
+.markdown h2 {
+  font-size: 1.15em;
+}
+.markdown h3 {
+  font-size: 1.05em;
+}
+.markdown ul,
+.markdown ol {
+  margin: 0.4em 0;
+  padding-left: 1.4em;
+}
+.markdown ul {
+  list-style: disc;
+}
+.markdown ol {
+  list-style: decimal;
+}
+.markdown li {
+  margin: 0.15em 0;
+}
+.markdown a {
+  color: var(--color-info);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--color-inset);
+  border: 1px solid var(--color-line);
+  border-radius: 5px;
+  padding: 0.08em 0.35em;
+}
+.markdown .mdcode pre {
+  margin: 0;
+  padding: 0.7em 1em;
+  overflow-x: auto;
+  background: transparent;
+}
+.markdown .mdcode pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+/* highlight.js tokens (scoped to chat code blocks) */
+.markdown .mdcode .hljs-keyword,
+.markdown .mdcode .hljs-selector-tag,
+.markdown .mdcode .hljs-meta,
+.markdown .mdcode .hljs-name {
+  color: var(--color-info);
+}
+.markdown .mdcode .hljs-string,
+.markdown .mdcode .hljs-attr,
+.markdown .mdcode .hljs-regexp,
+.markdown .mdcode .hljs-symbol {
+  color: var(--color-ok);
+}
+.markdown .mdcode .hljs-number,
+.markdown .mdcode .hljs-literal,
+.markdown .mdcode .hljs-constant {
+  color: var(--color-warn);
+}
+.markdown .mdcode .hljs-title,
+.markdown .mdcode .hljs-section {
+  color: var(--color-accent);
+}
+.markdown .mdcode .hljs-type,
+.markdown .mdcode .hljs-built_in,
+.markdown .mdcode .hljs-class {
+  color: var(--color-info);
+}
+.markdown .mdcode .hljs-comment,
+.markdown .mdcode .hljs-quote,
+.markdown .mdcode .hljs-bullet {
+  color: var(--color-faint);
+  font-style: italic;
+}
+.markdown .mdcode .hljs-variable,
+.markdown .mdcode .hljs-attribute,
+.markdown .mdcode .hljs-params,
+.markdown .mdcode .hljs-property {
+  color: var(--color-ink);
+}
+.markdown .mdcode .hljs-tag {
+  color: var(--color-mute);
+}
+.markdown table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.95em;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid var(--color-line2);
+  padding: 0.35em 0.7em;
+}
+.markdown th {
+  background: var(--color-panel2);
+  font-weight: 600;
+}
+.markdown blockquote {
+  border-left: 2px solid var(--color-line2);
+  margin: 0.5em 0;
+  padding-left: 0.9em;
+  color: var(--color-mute);
+}
+.markdown img {
+  max-width: 100%;
+  border-radius: 8px;
+}
+.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 0.8em 0;
+}
+
+@keyframes stream-caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+.stream-caret::after {
+  content: '▍';
+  color: var(--color-accent);
+  animation: stream-caret 0.9s step-end infinite;
+}

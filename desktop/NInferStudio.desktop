@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NInfer Studio
+Comment=Native desktop UI for the NInfer LLM inference engine
+Exec=/mnt/storage/Projects/ninfier-ui/desktop/target/release/ninfier-studio
+Path=/mnt/storage/Projects/ninfier-ui
+Icon=/mnt/storage/Projects/ninfier-ui/desktop/app/icons/icon.png
+Terminal=false
+StartupNotify=true
+Categories=Development;Science;

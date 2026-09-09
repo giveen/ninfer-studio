@@ -1,0 +1,920 @@
+import { useEffect, useMemo, useState } from 'react';
+import {
+  BookmarkPlus,
+  Box,
+  Cpu,
+  Gauge,
+  GitBranch,
+  Hammer,
+  Layers3,
+  Play,
+  Rocket,
+  RefreshCw,
+  Save,
+  SlidersHorizontal,
+  Square,
+  Terminal,
+  Video,
+  Zap,
+} from 'lucide-react';
+import { getLogs, startEngine, startEngineUpdate, stopEngine } from '../lib/api';
+import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
+import type { EngineProfile, StatusPayload } from '../lib/types';
+import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
+import {
+  getLatestRequestMetrics,
+  subscribeLatestRequestMetrics,
+  type LiveRequestMetrics,
+} from '../lib/liveMetrics';
+import { Badge, Button, CodeBlock, Field, LogPane, NumberField, SectionCard, Segmented, SelectField, Stat, TextField, Toggle, cn } from '../components/ui';
+
+const LS_PROFILE = 'ninfier.profile.v1';
+const LS_SAVED = 'ninfier.savedprofiles.v1';
+const LS_ARTIFACT = 'ninfier.artifact.v1';
+
+const NAV_SECTIONS = [
+  { id: 'top', label: 'Status' },
+  { id: 'command', label: 'Launch command' },
+  { id: 'presets', label: 'Presets' },
+  { id: 'artifact', label: 'Artifact' },
+  { id: 'source', label: 'Source' },
+  { id: 'memory', label: 'Memory' },
+  { id: 'scheduling', label: 'Scheduling' },
+  { id: 'kv', label: 'KV cache' },
+  { id: 'spec', label: 'Speculation' },
+  { id: 'vision', label: 'Vision' },
+  { id: 'sampling', label: 'Sampling' },
+  { id: 'misc', label: 'Misc' },
+  { id: 'profiles', label: 'Profiles' },
+  { id: 'log', label: 'Log' },
+] as const;
+
+function jumpTo(id: string) {
+  const target = id === 'top' ? 'engine-top' : id;
+  document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// Mirror of the control plane's arg builder — used for the generated-command
+// display (maskKey=true) and the dirty comparison (maskKey=false).
+function buildArgs(p: EngineProfile, maskKey: boolean): string[] {
+  const args: string[] = [];
+  const kv = (flag: string, v: unknown) => {
+    if (v === undefined || v === null || v === '') return;
+    args.push(flag, String(v));
+  };
+  const flag = (f: string, v: unknown) => {
+    if (v) args.push(f);
+  };
+  kv('--host', p.host);
+  kv('--port', p.port);
+  kv('--api-key', p.apiKey && (maskKey ? '••••••••' : p.apiKey));
+  kv('--model-id', p.modelId);
+  kv('--max-context', p.maxContext);
+  kv('--kv-capacity', p.kvCapacity);
+  kv('--max-concurrency', p.maxConcurrency);
+  kv('--max-pending-requests', p.maxPendingRequests);
+  kv('--pending-timeout-ms', p.pendingTimeoutMs);
+  kv('--prefill-chunk', p.prefillChunk);
+  kv('--log-stats-interval-ms', p.logStatsIntervalMs);
+  kv('--log-level', p.logLevel);
+  kv('--device', p.device);
+  kv('--context-cost-presets', p.contextCostPresets);
+  kv('--max-request-mib', p.maxRequestMib);
+  kv('--media-cache-mib', p.mediaCacheMib);
+  kv('--media-live-mib', p.mediaLiveMib);
+  kv('--media-preprocess-threads', p.mediaPreprocessThreads);
+  kv('--request-log-jsonl', p.requestLogJsonl);
+  kv('--response-store-max-records', p.responseStoreMaxRecords);
+  kv('--response-store-max-mib', p.responseStoreMaxMib);
+  kv('--kv-dtype', p.kvDtype);
+  if (p.spec) {
+    args.push('--spec', String(p.spec));
+    kv('--draft-tokens', p.draftTokens);
+  }
+  flag('--lm-head-draft', p.lmHeadDraft);
+  kv('--default-max-tokens', p.defaultMaxTokens);
+  kv('--default-thinking-budget', p.defaultThinkingBudget);
+  flag('--vision', p.vision);
+  flag('--no-cuda-graph', p.noCudaGraph);
+  flag('--no-prefix-reuse', p.noPrefixReuse);
+  kv('--device-state-slots', p.deviceStateSlots);
+  kv('--host-state-slots', p.hostStateSlots);
+  kv('--host-kv-mib', p.hostKvMib);
+  kv('--max-private-continuations', p.maxPrivateContinuations);
+  kv('--max-shared-prefixes', p.maxSharedPrefixes);
+  kv('--max-long-anchors-per-continuation', p.maxLongAnchorsPerContinuation);
+  flag('--no-thinking', p.noThinking);
+  flag('--preserve-thinking', p.preserveThinking);
+  kv('--temperature', p.temperature);
+  kv('--top-p', p.topP);
+  kv('--top-k', p.topK);
+  kv('--min-p', p.minP);
+  kv('--presence-penalty', p.presencePenalty);
+  kv('--frequency-penalty', p.frequencyPenalty);
+  kv('--seed', p.seed);
+  flag('--greedy', p.greedy);
+  flag('--cors', p.cors);
+  return args;
+}
+
+// Order-insensitive flag/value comparison for two argv lists (positional
+// args like the artifact path are ignored — compared separately).
+function argsEqual(a: string[], b: string[]): boolean {
+  const norm = (xs: string[]) => {
+    const m = new Map<string, string>();
+    for (let i = 0; i < xs.length; i++) {
+      const x = xs[i];
+      if (!x.startsWith('-')) continue;
+      if (i + 1 < xs.length && !xs[i + 1].startsWith('-')) {
+        m.set(x, xs[i + 1]);
+        i++;
+      } else {
+        m.set(x, '');
+      }
+    }
+    return m;
+  };
+  const ma = norm(a);
+  const mb = norm(b);
+  if (ma.size !== mb.size) return false;
+  for (const [k, v] of ma) if (mb.get(k) !== v) return false;
+  return true;
+}
+
+const baseName = (p: string | null) => (p ? p.split('/').pop() || p : null);
+
+function loadProfile(): EngineProfile {
+  try {
+    const raw = localStorage.getItem(LS_PROFILE);
+    if (raw) return { ...BLANK_PROFILE, ...JSON.parse(raw) };
+  } catch {
+    /* noop */
+  }
+  return { ...PRESETS[1].profile }; // long-context MTP3 — the published 5090 profile
+}
+
+type SavedProfile = { name: string; profile: EngineProfile };
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10.5px] uppercase tracking-wider text-faint">{label}</span>
+      <span className="font-mono text-[14px] leading-none text-ink">{value}</span>
+    </div>
+  );
+}
+
+export function EngineScreen({ status }: { status: StatusPayload | null }) {
+  const engine = status?.engine;
+  const gpu = status?.gpu;
+  const artifacts = status?.artifacts || [];
+  const update = status?.update ?? null;
+  const updating = !!update && !update.done;
+
+  const [profile, setProfile] = useState<EngineProfile>(loadProfile);
+  const [artifact, setArtifact] = useState<string>(() => {
+    try {
+      return localStorage.getItem(LS_ARTIFACT) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [saved, setSaved] = useState<SavedProfile[]>(() => {
+    try {
+      const raw = localStorage.getItem(LS_SAVED);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [saveName, setSaveName] = useState('');
+  const [logs, setLogs] = useState<string[]>([]);
+  const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
+
+  // Live token metrics from the most recent chat request (lifted from the SSE
+  // `timings`/`usage` so they show here, not just in the chat footer).
+  const [liveMetrics, setLiveMetrics] = useState<LiveRequestMetrics | null>(getLatestRequestMetrics());
+  useEffect(() => subscribeLatestRequestMetrics(setLiveMetrics), []);
+
+  const running = engine?.state === 'running' || engine?.state === 'external';
+  const starting = engine?.state === 'starting' || engine?.state === 'stopping';
+
+  // dirty = the engine running on the form's port was started with a different
+  // (profile, artifact) than the form holds. The running command is read from
+  // the process list, so this works for external engines too.
+  const lastStart = status?.lastStart ?? null;
+  const portMatch = !engine?.port || engine.port === profile.port;
+  // empty/missing argv = command not readable (e.g. adopted engine without a
+  // --port flag) — never treat that as "different settings"
+  const runningArgs = engine?.argv?.length ? engine.argv : null;
+  const formArgs = buildArgs(profile, false);
+  const runningArtifact = runningArgs?.find((x) => !x.startsWith('-')) ?? null;
+  const dirty =
+    !!engine &&
+    (engine.state === 'running' || engine.state === 'external') &&
+    portMatch &&
+    (runningArgs !== null
+      ? !argsEqual(formArgs, runningArgs) || baseName(artifact) !== baseName(runningArtifact)
+      : !!lastStart &&
+        (lastStart.artifact !== (artifact || null) ||
+          JSON.stringify(lastStart.profile) !== JSON.stringify(profile)));
+  const otherEngines = (status?.engines ?? []).filter((e) => e.port !== engine?.port && e.pid !== engine?.pid);
+  const set = <K extends keyof EngineProfile>(k: K, v: EngineProfile[K]) => setProfile((p) => ({ ...p, [k]: v }));
+  const setU = <K extends keyof EngineProfile>(k: K, v: EngineProfile[K] | undefined) =>
+    setProfile((p) => {
+      const n = { ...p, [k]: v };
+      if (v === undefined) delete n[k];
+      return n;
+    });
+
+  useEffect(() => {
+    localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
+  }, [profile]);
+  useEffect(() => {
+    if (artifact) localStorage.setItem(LS_ARTIFACT, artifact);
+  }, [artifact]);
+  useEffect(() => {
+    localStorage.setItem(LS_SAVED, JSON.stringify(saved));
+  }, [saved]);
+
+  useEffect(() => {
+    if (!engine?.logPath && engine?.state !== 'stopped') return;
+    const t = setInterval(async () => {
+      try {
+        const r = await getLogs(300);
+        setLogs(r.lines);
+      } catch {
+        /* sidecar busy */
+      }
+    }, 2000);
+    return () => clearInterval(t);
+  }, [engine?.logPath, engine?.state, engine?.startedAt]);
+
+  // pick first downloaded artifact when none chosen
+  useEffect(() => {
+    if (!artifact && artifacts.length) setArtifact(artifacts[artifacts.length - 1].path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [artifacts.length]);
+
+  const generatedCommand = useMemo(() => {
+    const args = buildArgs(profile, true);
+    const command = [
+      `ninfer-serve ${artifact ? artifact.split('/').pop() : '<artifact>.ninfer'}`,
+      ...(args.length ? ['  ' + args.join(' \\\n  ')] : []),
+    ].join('\n');
+    return { command, argCount: args.length };
+  }, [profile, artifact]);
+
+  const doStart = async () => {
+    setBusy('start');
+    setNotice(null);
+    try {
+      const r = await startEngine(profile, artifact || null);
+      if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} already serves an engine — adopted as external (see Engine status).` });
+      else if (!r.ok) setNotice({ tone: 'danger', text: r.message || 'start failed' });
+      else setNotice({ tone: 'ok', text: 'engine starting — watch the log below; it takes a while to load weights.' });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const doStop = async () => {
+    setBusy('stop');
+    setNotice(null);
+    try {
+      const r = await stopEngine();
+      setNotice({ tone: r.ok ? 'ok' : 'danger', text: r.message || 'stop failed' });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // stop a non-primary (discovered) engine by its pid
+  const stopOther = async (pid: number | null) => {
+    setBusy('stop');
+    setNotice(null);
+    try {
+      const r = await stopEngine(pid ?? undefined);
+      setNotice({ tone: r.ok ? 'ok' : 'danger', text: r.message || 'stop failed' });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // stop + start with the current form. The old engine may still be releasing
+  // its port when the start lands, so retry `already_serving` a few times.
+  const doRestart = async () => {
+    setBusy('restart');
+    setNotice(null);
+    try {
+      const s = await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
+      if (!s.ok) {
+        setNotice({ tone: 'danger', text: s.message || 'stop failed — engine not restarted' });
+        return;
+      }
+      let r = await startEngine(profile, artifact || null);
+      let tries = 0;
+      while (r.code === 'already_serving' && tries < 4) {
+        tries++;
+        await new Promise((res) => setTimeout(res, 2500));
+        r = await startEngine(profile, artifact || null);
+      }
+      if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} still held by the old engine after stop — wait a moment and start manually.` });
+      else if (!r.ok) setNotice({ tone: 'danger', text: r.message || 'start failed' });
+      else setNotice({ tone: 'ok', text: 'engine restarted with the current settings' });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const runUpdate = async (action: 'pull' | 'build') => {
+    setBusy(action);
+    setNotice(null);
+    try {
+      const r = await startEngineUpdate(action);
+      if (!r.ok) setNotice({ tone: 'danger', text: r.message || `${action} failed to start` });
+      else
+        setNotice({
+          tone: 'ok',
+          text: action === 'pull' ? 'git pull started — follow the output in the Engine source section.' : 'rebuild started — follow the output in the Engine source section.',
+        });
+    } catch (e) {
+      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const applyPreset = (id: string) => {
+    const p = PRESETS.find((x) => x.id === id);
+    if (!p) return;
+    setProfile({ ...BLANK_PROFILE, ...p.profile, port: profile.port });
+    setNotice({ tone: 'ok', text: `preset “${p.name}” applied — review the generated command before starting.` });
+  };
+
+  const saveCurrent = () => {
+    const name = saveName.trim() || `profile-${saved.length + 1}`;
+    setSaved((s) => [...s.filter((x) => x.name !== name), { name, profile: { ...profile } }]);
+    setSaveName('');
+    setNotice({ tone: 'ok', text: `saved profile “${name}”` });
+  };
+
+  const draftRange = profile.spec === 'mtp' ? [1, 5] : [1, 15];
+  // Real per-artifact capability comes from the catalog's `spec` string
+  // (e.g. "mtp (1..5) or dflash2 (1..15) or off"), not a filename heuristic.
+  const specSupported = useMemo(() => {
+    const a = artifacts.find((x) => x.path === artifact)?.known;
+    if (!a?.spec) return null;
+    const s = ` ${a.spec.toLowerCase()} `;
+    return {
+      mtp: /\bmtp\b/.test(s),
+      dflash: /\bdflash\b(?!2)/.test(s),
+      dflash2: /\bdflash2\b/.test(s),
+    };
+  }, [artifacts, artifact]);
+
+  // Disable backends the selected artifact's catalog entry does not support.
+  const specOptions = useMemo(
+    () =>
+      SPEC_BACKEND_OPTIONS.map((o) => ({
+        value: o.id,
+        label: o.name,
+        hint: o.hint,
+        disabled: !!specSupported && o.id !== '' && !specSupported[o.id as 'mtp' | 'dflash' | 'dflash2'],
+      })),
+    [specSupported],
+  );
+
+  const grid2 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2';
+  const grid3 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-3';
+
+  return (
+    <div className="h-full overflow-y-auto">
+      <nav className="sticky top-0 z-20 border-b border-line bg-panel/95 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl gap-1 overflow-x-auto px-5 py-1.5">
+          {NAV_SECTIONS.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => jumpTo(s.id)}
+              className="shrink-0 rounded-full border border-line bg-inset px-2.5 py-1 text-[11px] text-mute transition-colors hover:border-line2 hover:text-ink"
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </nav>
+      <div className="mx-auto max-w-5xl space-y-4 px-5 py-4" id="engine-top">
+        {/* status row */}
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <Stat
+            label="engine"
+            tone={engine?.state === 'running' ? 'ok' : engine?.state === 'external' ? 'accent' : engine?.state === 'starting' ? 'warn' : engine?.state === 'failed' ? 'danger' : 'neutral' as never}
+            value={
+              <span className="flex items-center gap-2">
+                <span className={cn('h-2 w-2 rounded-full', engine?.state === 'running' ? 'bg-ok' : engine?.state === 'external' ? 'bg-info' : engine?.state === 'starting' || engine?.state === 'stopping' ? 'bg-warn pulse-dot' : engine?.state === 'failed' ? 'bg-danger' : 'bg-faint')} />
+                {engine?.state || 'unknown'}
+              </span>
+            }
+            sub={
+              engine?.state === 'external'
+                ? `external process (pid ${engine.pid || '?'}) — not spawned by Studio`
+                : engine?.artifact
+                  ? engine.artifact.split('/').pop()
+                  : 'no artifact selected'
+            }
+          />
+          <Stat
+            label="model"
+            value={<span className="break-all text-[15px]">{engine?.modelId || '—'}</span>}
+            sub={engine?.startedAt ? `up ${formatUptime(engine.startedAt)} · :${engine.port}` : `port :${engine?.port || status?.config.enginePort || 8080}`}
+          />
+          <Stat
+            label="gpu memory"
+            tone={(gpu?.memUsedMiB ?? 0) > (gpu?.memTotalMiB ?? 1) * 0.9 ? 'danger' : 'accent'}
+            value={
+              gpu?.available ? (
+                <span className="flex items-center gap-2">
+                  <span>{gpu.memUsedMiB ? formatBytes(gpu.memUsedMiB! * 1024 * 1024) : '—'}</span>
+                  <span className="text-[12px] text-faint">/ {gpu.memTotalMiB ? formatBytes(gpu.memTotalMiB! * 1024 * 1024) : ''}</span>
+                </span>
+              ) : (
+                'no gpu'
+              )
+            }
+            sub={gpu?.available ? `${gpu.name} · ${gpu.utilPct ?? 0}% util` : 'nvidia-smi not found'}
+          />
+          <div className="flex flex-col items-center justify-center gap-1.5 rounded-lg border border-line bg-inset px-3.5 py-3">
+            <div className="flex items-center gap-2">
+              {running ? (
+                <>
+                  <Button
+                    variant={dirty ? 'primary' : 'subtle'}
+                    size="md"
+                    onClick={doRestart}
+                    disabled={busy !== '' || starting || !dirty}
+                    title={dirty ? 'Stop + start the engine with the settings in this form' : 'The running engine matches this form'}
+                  >
+                    <RefreshCw size={14} /> {busy === 'restart' ? 'restarting…' : 'restart'}
+                  </Button>
+                  <Button variant="danger" size="md" onClick={doStop} disabled={busy !== ''}>
+                    <Square size={14} /> stop
+                  </Button>
+                </>
+              ) : (
+                <Button variant="primary" size="md" onClick={doStart} disabled={busy !== '' || !artifact || starting}>
+                  <Play size={14} /> {starting ? 'working…' : 'start engine'}
+                </Button>
+              )}
+            </div>
+            {running && (
+              <p className={cn('text-[11px] leading-tight', dirty ? 'text-warn' : 'text-faint')}>
+                {!portMatch
+                  ? `form targets :${profile.port} — engine serves :${engine?.port}`
+                  : runningArgs === null && engine?.adopted
+                    ? 'external engine — running command not readable'
+                    : dirty
+                      ? 'settings changed — restart to apply'
+                      : 'running engine matches this form'}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* live token metrics from the most recent chat request */}
+        {liveMetrics?.meta && (
+          <div className="rounded-lg border border-line bg-inset px-3.5 py-3">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-faint">last request metrics</span>
+              <span className="font-mono text-[10.5px] text-faint">{liveMetrics.model} · {formatTime(liveMetrics.at)}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <MiniStat label="TTFT" value={formatMs(liveMetrics.meta.ttftMs)} />
+              <MiniStat label="prompt" value={formatRate(liveMetrics.meta.promptTokPerSec)} />
+              <MiniStat label="decode" value={formatRate(liveMetrics.meta.decodeTokPerSec)} />
+              <MiniStat
+                label="draft"
+                value={
+                  liveMetrics.meta.draftN
+                    ? `${liveMetrics.meta.draftNAccepted}/${liveMetrics.meta.draftN} (${Math.round(((liveMetrics.meta.draftNAccepted ?? 0) / liveMetrics.meta.draftN) * 100)}%)`
+                    : '—'
+                }
+              />
+            </div>
+          </div>
+        )}
+
+        {otherEngines.length > 0 && (
+          <div className="overflow-hidden rounded-lg border border-line">
+            {otherEngines.map((e) => (
+              <div key={`${e.port ?? 0}-${e.pid ?? 0}`} className="flex items-center gap-3 border-b border-line bg-inset px-3 py-2 last:border-b-0">
+                <span className="h-2 w-2 shrink-0 rounded-full bg-ok" />
+                <span className="min-w-0 truncate text-[12.5px] font-medium">{e.modelId || 'unknown model'}</span>
+                <span className="shrink-0 font-mono text-[11px] text-faint">:{e.port}</span>
+                {e.artifact && (
+                  <span className="hidden shrink-0 font-mono text-[11px] text-faint lg:inline">{e.artifact.split('/').pop()}</span>
+                )}
+                <span className="shrink-0 text-[10.5px] text-faint">external · pid {e.pid || '?'}</span>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  <Button variant="danger" size="sm" onClick={() => stopOther(e.pid)} disabled={busy !== ''}>
+                    <Square size={12} /> stop
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {engine?.state === 'failed' && engine?.failReason && (
+          <div className="rounded-lg border border-danger/30 bg-danger/8 px-3.5 py-2.5 text-[12.5px] text-danger">
+            {engine.failHint ? (
+              <>
+                <div className="font-medium leading-snug">{engine.failHint}</div>
+                <div className="mt-1 text-[11px] text-danger/80">{engine.failReason}</div>
+              </>
+            ) : (
+              <>{engine.failReason} — check the log below, or fix the profile and start again.</>
+            )}
+          </div>
+        )}
+        {notice && (
+          <div
+            className={cn(
+              'rounded-lg border px-3.5 py-2.5 text-[12.5px]',
+              notice.tone === 'ok' && 'border-ok/30 bg-ok/8 text-ok',
+              notice.tone === 'warn' && 'border-warn/30 bg-warn/8 text-warn',
+              notice.tone === 'danger' && 'border-danger/30 bg-danger/8 text-danger',
+            )}
+          >
+            {notice.text}
+            <button className="ml-3 opacity-60 hover:opacity-100" onClick={() => setNotice(null)}>
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* generated command */}
+        <SectionCard
+          title="Generated launch command"
+          description="Exactly what Studio passes to ninfer-serve. Omitted options fall back to the engine's executable defaults."
+          icon={<Terminal size={15} />}
+          anchor="command"
+          collapsible
+          actions={
+            <div className="flex items-center gap-2">
+              {running && engine?.argv && <Badge tone="ok">running</Badge>}
+              <Button size="sm" variant="subtle" onClick={() => applyPreset('long-context-mtp3')}>
+                long-context preset
+              </Button>
+            </div>
+          }
+        >
+          <CodeBlock code={generatedCommand.command} />
+        </SectionCard>
+
+        {/* presets */}
+        <SectionCard title="Presets" description="One-click engine profiles. Applying a preset replaces all options below — review the generated command before starting." icon={<Rocket size={15} />} anchor="presets" collapsible>
+          <div className="flex flex-wrap gap-2">
+            {PRESETS.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => applyPreset(p.id)}
+                title={p.description}
+                className="rounded-lg border border-line bg-inset px-3 py-2 text-left transition-colors hover:border-accent/40 hover:bg-panel2"
+              >
+                <div className="text-[12.5px] font-semibold text-ink">{p.name}</div>
+                <div className="mt-0.5 max-w-[220px] text-[11px] leading-snug text-faint">{p.description}</div>
+              </button>
+            ))}
+          </div>
+        </SectionCard>
+
+        {/* artifact + network */}
+        <SectionCard title="Artifact & network" description="One resident model per engine. The public model alias is what chat requests must use." icon={<Box size={15} />} anchor="artifact" collapsible>
+          <div className={grid3}>
+            <Field label="Model artifact" hint="Path to a downloaded .ninfer file. Only explicitly registered artifacts are accepted.">
+              <SelectField
+                value={artifact}
+                onChange={setArtifact}
+                options={[
+                  ...artifacts.map((a) => ({ value: a.path, label: `${a.file}${a.weights ? ` · ${a.weights}` : ''}` })),
+                ]}
+              />
+            </Field>
+            <Field label="Public model alias (--model-id)" hint="Override the OpenAI public alias. The loaded artifact is unchanged — this only relabels /v1/models.">
+              <TextField value={profile.modelId || ''} onChange={(v) => setU('modelId', v || undefined)} placeholder="artifact identity" />
+            </Field>
+            <Field label="API key (--api-key)" hint="When set, requests must send it as Bearer token or x-api-key. Studio injects it on proxied requests.">
+              <TextField value={profile.apiKey || ''} onChange={(v) => setU('apiKey', v || undefined)} placeholder="unset (open)" />
+            </Field>
+            <Field label="Listen host">
+              <TextField value={profile.host || ''} onChange={(v) => setU('host', v || undefined)} placeholder="127.0.0.1" />
+            </Field>
+            <Field label="Port" hint="HTTP port the engine listens on. Studio proxies /v1 to this port.">
+              <NumberField value={profile.port} onChange={(v) => set('port', v)} min={1} max={65535} />
+            </Field>
+            <Field label="CUDA device" hint="CUDA device index. NInfer is a single-GPU engine (RTX 5090 target).">
+              <NumberField value={profile.device ?? null} onChange={(v) => set('device', v)} onEmpty={() => setU('device', undefined)} min={0} placeholder="0" />
+            </Field>
+          </div>
+          {artifacts.length === 0 && (
+            <p className="mt-3 text-[12px] text-warn">No .ninfer artifacts found in {status?.config.modelsDir} — download one from the Models tab first.</p>
+          )}
+        </SectionCard>
+
+        {/* engine source: git pull + rebuild */}
+        <SectionCard
+          title="Engine source"
+          description="Update the NInfer source and rebuild the engine binary. A running engine keeps the current binary until you stop and start it again."
+          icon={<Hammer size={15} />}
+          anchor="source"
+          collapsible
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={() => runUpdate('pull')} disabled={updating || !status} title="git pull --ff-only in the repository">
+              <span className="inline-flex items-center gap-1.5">
+                <GitBranch size={14} />
+                {updating && update?.action === 'pull' ? 'Pulling…' : 'git pull'}
+              </span>
+            </Button>
+            <Button variant="primary" onClick={() => runUpdate('build')} disabled={updating || !status} title="Rebuild the engine binary (incremental)">
+              <span className="inline-flex items-center gap-1.5">
+                <Hammer size={14} />
+                {updating && update?.action === 'build' ? 'Building…' : 'Rebuild engine'}
+              </span>
+            </Button>
+            {update && !update.done && <Badge tone="accent">{update.action} running · pid {update.pid ?? '—'}</Badge>}
+            {update?.done && !update.failed && <Badge tone="ok">{update.action} done (exit {update.exitCode ?? 0})</Badge>}
+            {update?.done && update.failed && <Badge tone="danger">{update.action} failed (exit {update.exitCode ?? '?'})</Badge>}
+            {update?.done && !update.failed && update.action === 'build' && (
+              <span className="text-[12px] text-accent">Build OK — stop + start the engine to load the new binary.</span>
+            )}
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+            <Field label="Repository" hint="NInfer git work tree (editable in Settings).">
+              <div className="truncate font-mono text-[12px] text-ink">{status?.config.repoDir || '—'}</div>
+            </Field>
+            <Field label="Build command" hint="Run inside the repository directory (editable in Settings).">
+              <div className="truncate font-mono text-[12px] text-ink">{status?.config.buildCommand || '—'}</div>
+            </Field>
+          </div>
+          {update && (
+            <div className="mt-3 h-56">
+              <LogPane lines={update.out ? update.out.split('\n') : []} />
+            </div>
+          )}
+        </SectionCard>
+
+        {/* context & memory */}
+        <SectionCard title="Context & memory" description="Per-sequence logical context ceiling and the shared Main Text KV pool. auto sizes the pool from remaining GPU memory after weights (1 GiB headroom)." icon={<Gauge size={15} />} anchor="memory" collapsible>
+          <div className={grid3}>
+            <Field label="Max context (--max-context)" hint="Per-sequence logical token ceiling. Native model limit is 262,144; practical allocation depends on artifact, media, and KV type.">
+              <NumberField value={profile.maxContext ?? null} onChange={(v) => set('maxContext', v)} onEmpty={() => setU('maxContext', undefined)} min={0} placeholder="serve default 8192" />
+            </Field>
+            <div className="flex flex-col gap-1.5">
+              <span className="flex items-center gap-1.5 text-[12px] font-medium uppercase tracking-wider text-mute">KV capacity (--kv-capacity)</span>
+              <div className="flex items-center gap-2">
+                <Segmented
+                  value={profile.kvCapacity === 'auto' ? 'auto' : profile.kvCapacity === undefined || profile.kvCapacity === '' ? 'follow' : 'fixed'}
+                  onChange={(v) => {
+                    if (v === 'auto') set('kvCapacity', 'auto');
+                    else if (v === 'follow') setU('kvCapacity', undefined);
+                    else set('kvCapacity', profile.kvCapacity && profile.kvCapacity !== 'auto' ? profile.kvCapacity : 32768);
+                  }}
+                  options={[
+                    { value: 'follow', label: 'follow ctx', hint: 'omit flag: pool follows --max-context' },
+                    { value: 'auto', label: 'auto', hint: 'maximize from remaining GPU memory, 1 GiB headroom' },
+                    { value: 'fixed', label: 'fixed', hint: 'explicit token capacity (rounded to 64-token pages)' },
+                  ]}
+                />
+                {typeof profile.kvCapacity === 'number' ? (
+                  <div className="w-32">
+                    <NumberField value={profile.kvCapacity} onChange={(v) => set('kvCapacity', v)} onEmpty={() => setU('kvCapacity', undefined)} min={0} />
+                  </div>
+                ) : null}
+              </div>
+              <p className="text-[11px] leading-snug text-faint">Serves active requests and retained prefixes. Explicit values stay fixed for the process lifetime.</p>
+            </div>
+            <Field label="Prefill chunk (--prefill-chunk)" hint="Positive text-prefill chunk size, in multiples of 128 tokens.">
+              <NumberField value={profile.prefillChunk ?? null} onChange={(v) => set('prefillChunk', v)} onEmpty={() => setU('prefillChunk', undefined)} min={128} step={128} placeholder="1024" />
+            </Field>
+            <Field label="Default max tokens" hint="Output budget applied when a request omits max_tokens.">
+              <NumberField value={profile.defaultMaxTokens ?? null} onChange={(v) => set('defaultMaxTokens', v)} onEmpty={() => setU('defaultMaxTokens', undefined)} min={0} placeholder="8192" />
+            </Field>
+            <Field label="Default thinking budget" hint="Positive cap on model-origin thinking tokens for thinking-enabled requests.">
+              <NumberField value={profile.defaultThinkingBudget ?? null} onChange={(v) => set('defaultThinkingBudget', v)} onEmpty={() => setU('defaultThinkingBudget', undefined)} min={1} placeholder="unset" />
+            </Field>
+          </div>
+        </SectionCard>
+
+        {/* scheduling */}
+        <SectionCard title="Scheduling" description="Startup-fixed capacity of 1–8 active request lanes with bounded FIFO ingress. No preemption, no QoS." icon={<Zap size={15} />} anchor="scheduling" collapsible>
+          <div className={grid3}>
+            <Field label="Max concurrency (--max-concurrency)" hint="Maximum admitted concurrent requests (1..8), fixed at startup.">
+              <NumberField value={profile.maxConcurrency ?? null} onChange={(v) => set('maxConcurrency', Math.max(1, Math.min(8, v)))} onEmpty={() => setU('maxConcurrency', undefined)} min={1} max={8} placeholder="1" />
+            </Field>
+            <Field label="Max pending requests" hint="Extra requests allowed to wait in the FIFO queue for admission.">
+              <NumberField value={profile.maxPendingRequests ?? null} onChange={(v) => set('maxPendingRequests', v)} onEmpty={() => setU('maxPendingRequests', undefined)} min={0} placeholder="16" />
+            </Field>
+            <Field label="Pending timeout (ms)" hint="Maximum preparation-plus-admission wait before a queued request is rejected.">
+              <NumberField value={profile.pendingTimeoutMs ?? null} onChange={(v) => set('pendingTimeoutMs', v)} onEmpty={() => setU('pendingTimeoutMs', undefined)} min={0} placeholder="30000" />
+            </Field>
+          </div>
+        </SectionCard>
+
+        {/* kv cache */}
+        <SectionCard title="KV cache & context cache" description="Storage format for the KV pool, plus Device/Host checkpoint retention tiers for long-context reuse." icon={<Layers3 size={15} />} anchor="kv" collapsible>
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
+              <Field label="KV dtype" hint="KV-cache storage: bf16, int8, fp8, nvfp4, or k8v4 (INT8 group-64 KV is the published benchmark format).">
+                <Segmented value={(profile.kvDtype as string) || 'bf16'} onChange={(v) => set('kvDtype', v as EngineProfile['kvDtype'])} options={[...KV_DTYPE_OPTIONS]} />
+              </Field>
+              <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse (--no-prefix-reuse)" hint="Root-only Engine mode. Cannot be combined with explicit context-cache capacity flags." />
+              <Toggle checked={!!profile.noCudaGraph} onChange={(v) => set('noCudaGraph', v)} label="Disable CUDA Graph decode (--no-cuda-graph)" hint="Decode uses eager kernel launches instead of captured graphs." />
+            </div>
+            {profile.noPrefixReuse && <p className="text-[12px] text-warn">Prefix reuse disabled: the context-cache tier options below are unavailable and will not be sent.</p>}
+            <div className={cn(grid3, profile.noPrefixReuse && 'pointer-events-none opacity-40')}>
+              <Field label="Device state slots" hint="Extra Device checkpoint StateImages beyond the active-lane guarantee (default = max-concurrency).">
+                <NumberField value={profile.deviceStateSlots ?? null} onChange={(v) => set('deviceStateSlots', v)} onEmpty={() => setU('deviceStateSlots', undefined)} min={0} placeholder="= C" />
+              </Field>
+              <Field label="Host state slots" hint="Pinned Host StateImage capacity for inactive continuations under Device pressure.">
+                <NumberField value={profile.hostStateSlots ?? null} onChange={(v) => set('hostStateSlots', v)} onEmpty={() => setU('hostStateSlots', undefined)} min={0} placeholder="8" />
+              </Field>
+              <Field label="Host KV (MiB)" hint="Shared pinned Host Main/Backend KV capacity beyond active StateImages.">
+                <NumberField value={profile.hostKvMib ?? null} onChange={(v) => set('hostKvMib', v)} onEmpty={() => setU('hostKvMib', undefined)} min={0} step={512} placeholder="8192" />
+              </Field>
+              <Field label="Max private continuations" hint="Private continuation descriptor capacity (default 2 × max-concurrency).">
+                <NumberField value={profile.maxPrivateContinuations ?? null} onChange={(v) => set('maxPrivateContinuations', v)} onEmpty={() => setU('maxPrivateContinuations', undefined)} min={0} placeholder="auto" />
+              </Field>
+              <Field label="Max shared prefixes" hint="Engine-wide shared stable-prefix descriptor capacity (default max(C, 4)).">
+                <NumberField value={profile.maxSharedPrefixes ?? null} onChange={(v) => set('maxSharedPrefixes', v)} onEmpty={() => setU('maxSharedPrefixes', undefined)} min={0} placeholder="auto" />
+              </Field>
+              <Field label="Long anchors / continuation" hint="Private long-anchor limit per continuation (default 2).">
+                <NumberField value={profile.maxLongAnchorsPerContinuation ?? null} onChange={(v) => set('maxLongAnchorsPerContinuation', v)} onEmpty={() => setU('maxLongAnchorsPerContinuation', undefined)} min={0} placeholder="2" />
+              </Field>
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* speculative decoding */}
+        <SectionCard title="Speculative decoding" description="Frozen at startup: one backend, one draft window. MTP 1–5 drafts; DFlash/DFlash2 1–15 (7 recommended). Optimized proposal head via --lm-head-draft." icon={<Zap size={15} />} anchor="spec" collapsible>
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
+              <Field label="Backend (--spec)" hint="Selects which speculative weights are resident at startup. None loads the smallest profile.">
+                <Segmented value={(profile.spec as string) || ''} onChange={(v) => { set('spec', v as EngineProfile['spec']); if (!v) { setU('draftTokens', undefined); setU('lmHeadDraft', undefined); } else if (profile.draftTokens === undefined) set('draftTokens', v === 'mtp' ? 3 : 7); }} options={specOptions} />
+              </Field>
+              {profile.spec && (
+                <>
+                  <Field label={`Draft tokens (${draftRange[0]}..${draftRange[1]})`} hint={profile.spec === 'mtp' ? 'MTP draft positions 1..5. Published results use 3.' : profile.spec === 'dflash' ? 'DFlash drafts 1..15; 7 → measured block length 8.' : 'DFlash2 drafts 1..15; 7 is the checkpoint recommendation.'}>
+                    <div className="w-28">
+                      <NumberField value={profile.draftTokens ?? null} onChange={(v) => set('draftTokens', Math.max(draftRange[0], Math.min(draftRange[1], v)))} onEmpty={() => setU('draftTokens', undefined)} min={draftRange[0]} max={draftRange[1]} placeholder={profile.spec === 'mtp' ? '3' : '7'} />
+                    </div>
+                  </Field>
+                  <Toggle checked={!!profile.lmHeadDraft} onChange={(v) => set('lmHeadDraft', v)} label="Optimized proposal head (--lm-head-draft)" hint="Loads the optimized proposal head; requires a selected backend." />
+                </>
+              )}
+            </div>
+            {specSupported && (
+              <p className="text-[11.5px] text-faint">
+                For the selected artifact: {Object.entries(specSupported).map(([k, v]) => `${k}${v ? ' ✓' : ' ✗'}`).join('  ·  ')} — {profile.spec && !specSupported[profile.spec as 'mtp' | 'dflash' | 'dflash2'] && <span className="text-warn">the selected backend is not supported by this artifact.</span>}
+              </p>
+            )}
+          </div>
+        </SectionCard>
+
+        {/* vision & media */}
+        <SectionCard title="Vision & media" description="Vision residency is frozen at startup: without --vision the engine rejects image/video requests and cannot enable it later." icon={<Video size={15} />} anchor="vision" collapsible>
+          <div className={grid3}>
+            <div className="flex flex-col gap-2">
+              <Toggle checked={!!profile.vision} onChange={(v) => set('vision', v)} label="Enable vision (--vision)" hint="Loads Vision weights, expands the unified workspace, and enables image/video input. Can combine with DFlash/DFlash2." />
+            </div>
+            <Field label="Media cache (MiB)" hint="LRU-retained prepared BF16 media payloads; 0 disables retention.">
+              <NumberField value={profile.mediaCacheMib ?? null} onChange={(v) => set('mediaCacheMib', v)} onEmpty={() => setU('mediaCacheMib', undefined)} min={0} step={128} placeholder="1024" />
+            </Field>
+            <Field label="Media live budget (MiB)" hint="All live prepared BF16 payloads (cache, request, or runtime-referenced).">
+              <NumberField value={profile.mediaLiveMib ?? null} onChange={(v) => set('mediaLiveMib', v)} onEmpty={() => setU('mediaLiveMib', undefined)} min={0} step={128} placeholder="2048" />
+            </Field>
+            <Field label="Media preprocess threads" hint="Bounded host worker pool for media cache misses (decode → resize → BF16-pack). 0 = up to 16 from host concurrency.">
+              <NumberField value={profile.mediaPreprocessThreads ?? null} onChange={(v) => set('mediaPreprocessThreads', v)} onEmpty={() => setU('mediaPreprocessThreads', undefined)} min={0} max={16} placeholder="auto" />
+            </Field>
+            <Field label="Max request size (MiB)" hint="Body-size limit enforced before JSON parsing (413 request_too_large).">
+              <NumberField value={profile.maxRequestMib ?? null} onChange={(v) => set('maxRequestMib', v)} onEmpty={() => setU('maxRequestMib', undefined)} min={1} placeholder="384" />
+            </Field>
+            <div />
+          </div>
+        </SectionCard>
+
+        {/* sampling defaults */}
+        <SectionCard title="Sampling defaults" description="Process-level overrides. Precedence: model/preset defaults → process flags → request fields → --greedy forces temperature 0." icon={<SlidersHorizontal size={15} />} anchor="sampling" collapsible>
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-x-8 gap-y-3">
+              <Toggle checked={!!profile.noThinking} onChange={(v) => set('noThinking', v)} label="Disable thinking by default (--no-thinking)" hint="Engine-wide default: no chain-of-thought unless a request asks for it." />
+              <Toggle checked={!!profile.preserveThinking} onChange={(v) => set('preserveThinking', v)} label="Preserve closed-turn reasoning (--preserve-thinking)" hint="Keep closed reasoning in served history so follow-ups build on prior thinking." />
+              <Toggle checked={!!profile.greedy} onChange={(v) => set('greedy', v)} label="Greedy decoding (--greedy)" hint="Forces temperature 0 and deterministic decoding; overrides model and request sampling fields." />
+            </div>
+            <div className={grid3}>
+              <Field label="Temperature" hint="Process-level temperature override; unset uses the registered model/prompt-mode preset.">
+                <NumberField value={profile.temperature ?? null} onChange={(v) => set('temperature', v)} onEmpty={() => setU('temperature', undefined)} min={0} max={2} step={0.1} placeholder="model preset" />
+              </Field>
+              <Field label="Top-p">
+                <NumberField value={profile.topP ?? null} onChange={(v) => set('topP', v)} onEmpty={() => setU('topP', undefined)} min={0} max={1} step={0.05} placeholder="model preset" />
+              </Field>
+              <Field label="Top-k" hint="0..20; zero selects the top-20 cap.">
+                <NumberField value={profile.topK ?? null} onChange={(v) => set('topK', v)} onEmpty={() => setU('topK', undefined)} min={0} max={20} placeholder="model preset" />
+              </Field>
+              <Field label="Min-p">
+                <NumberField value={profile.minP ?? null} onChange={(v) => set('minP', v)} onEmpty={() => setU('minP', undefined)} min={0} max={1} step={0.05} placeholder="model preset" />
+              </Field>
+              <Field label="Presence penalty">
+                <NumberField value={profile.presencePenalty ?? null} onChange={(v) => set('presencePenalty', v)} onEmpty={() => setU('presencePenalty', undefined)} step={0.1} placeholder="model preset" />
+              </Field>
+              <Field label="Frequency penalty">
+                <NumberField value={profile.frequencyPenalty ?? null} onChange={(v) => set('frequencyPenalty', v)} onEmpty={() => setU('frequencyPenalty', undefined)} step={0.1} placeholder="0" />
+              </Field>
+              <Field label="Seed" hint="Fixed seed when a request omits one; unset = fresh random seed per request.">
+                <NumberField value={profile.seed ?? null} onChange={(v) => set('seed', v)} onEmpty={() => setU('seed', undefined)} min={0} placeholder="random" />
+              </Field>
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* logging & misc */}
+        <SectionCard title="Logging, storage & misc" description="Diagnostics verbosity, request JSONL log, local Response store budgets, context-cost presets, CORS." icon={<Terminal size={15} />} anchor="misc" collapsible defaultCollapsed>
+          <div className={grid3}>
+            <Field label="Log level" hint="Pretty stderr verbosity for operational records.">
+              <SelectField value={profile.logLevel || ''} onChange={(v) => setU('logLevel', v || undefined)} options={[{ value: '', label: 'default (info)' }, ...LOG_LEVELS.map((l) => ({ value: l, label: l }))]} />
+            </Field>
+            <Field label="Stats interval (ms)" hint="Aggregate throughput report interval on stderr; 0 disables.">
+              <NumberField value={profile.logStatsIntervalMs ?? null} onChange={(v) => set('logStatsIntervalMs', v)} onEmpty={() => setU('logStatsIntervalMs', undefined)} min={0} step={500} placeholder="5000" />
+            </Field>
+            <Field label="Request log (JSONL file)" hint="Append full-precision server/request records (schema v20). Parent directory must exist.">
+              <TextField value={profile.requestLogJsonl || ''} onChange={(v) => setU('requestLogJsonl', v || undefined)} placeholder="disabled" />
+            </Field>
+            <Field label="Response store records" hint="Maximum locally retained Responses objects (LRU).">
+              <NumberField value={profile.responseStoreMaxRecords ?? null} onChange={(v) => set('responseStoreMaxRecords', v)} onEmpty={() => setU('responseStoreMaxRecords', undefined)} min={1} placeholder="1024" />
+            </Field>
+            <Field label="Response store budget (MiB)">
+              <NumberField value={profile.responseStoreMaxMib ?? null} onChange={(v) => set('responseStoreMaxMib', v)} onEmpty={() => setU('responseStoreMaxMib', undefined)} min={1} placeholder="256" />
+            </Field>
+            <Field label="Context-cost presets (file)" hint="Optional runtime context-cost preset registry; malformed file aborts startup.">
+              <TextField value={profile.contextCostPresets || ''} onChange={(v) => setU('contextCostPresets', v || undefined)} placeholder="compiled defaults" />
+            </Field>
+            <div className="flex items-end pb-1">
+              <Toggle checked={!!profile.cors} onChange={(v) => set('cors', v)} label="Permissive browser CORS (--cors)" hint="Adds permissive CORS headers for browser clients." />
+            </div>
+          </div>
+        </SectionCard>
+
+        <SectionCard title="Profiles" description="Saved profiles persist in this browser and map 1:1 to ninfer-serve flags. “load” applies a saved profile to all options below — then stop + start the engine." icon={<BookmarkPlus size={15} />} anchor="profiles" collapsible defaultCollapsed>
+            <div className="flex items-center gap-2">
+              <TextField value={saveName} onChange={setSaveName} placeholder="profile name" className="flex-1" />
+              <Button size="sm" variant="primary" onClick={saveCurrent}>
+                <Save size={13} /> save current
+              </Button>
+            </div>
+            <div className="mt-3 space-y-1.5">
+              {saved.length === 0 && <p className="text-[12px] text-faint">Nothing saved yet.</p>}
+              {saved.map((s) => {
+                const p = s.profile;
+                const bits = [
+                  p.spec ? `${p.spec} ${p.draftTokens ?? ''}`.trim() : 'no spec',
+                  p.maxContext ? `ctx ${p.maxContext}` : 'ctx default',
+                  p.kvDtype ? `KV ${p.kvDtype}` : '',
+                  p.maxConcurrency ? `C=${p.maxConcurrency}` : '',
+                  p.vision ? 'vision' : '',
+                ].filter(Boolean);
+                return (
+                  <div key={s.name} className="flex items-center gap-2 rounded-lg border border-line bg-inset px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-mono text-[12px] text-ink">{s.name}</p>
+                      <p className="truncate text-[11px] text-faint">{bits.join(' · ')}</p>
+                    </div>
+                    <Button size="sm" variant="primary" onClick={() => { setProfile({ ...BLANK_PROFILE, ...s.profile, port: profile.port }); setNotice({ tone: 'ok', text: `loaded “${s.name}” — review the generated command, then stop + start the engine` }); }}>
+                      load
+                    </Button>
+                    <button className="text-faint hover:text-danger" title="Delete profile" onClick={() => setSaved((x) => x.filter((y) => y.name !== s.name))}>
+                      ✕
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </SectionCard>
+
+        <SectionCard title="Engine log" description={engine?.logPath ? engine.logPath : 'log appears when the engine starts'} icon={<Cpu size={15} />} anchor="log" collapsible>
+          <div className="h-64">
+            <LogPane lines={logs} />
+          </div>
+        </SectionCard>
+      </div>
+    </div>
+  );
+}

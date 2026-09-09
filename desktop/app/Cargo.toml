@@ -1,0 +1,21 @@
+[package]
+name = "ninfier-studio"
+version = "0.1.0"
+edition = "2021"
+description = "NInfer Studio — native Linux desktop shell (Tauri 2) hosting the NInfer control plane + web UI."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = []
+# Enabled for the packaged build (needs libappindicator3-dev on Linux).
+tray = ["tauri/tray-icon"]
+
+[dependencies]
+tauri = { version = "2", features = ["image-png", "image-ico"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+ninfier-control = { path = "../control" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "fs", "io-util"] }
+serde_json = "1"

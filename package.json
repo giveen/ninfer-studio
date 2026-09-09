@@ -1,0 +1,27 @@
+{
+  "name": "ninfier-ui",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "description": "Native Linux desktop UI (Tauri 2) for the NInfer local LLM inference engine: engine configuration, model management, and streaming chat.",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @ninfier/sidecar --filter @ninfier/web run dev",
+    "dev:sidecar": "pnpm --filter @ninfier/sidecar dev",
+    "dev:web": "pnpm --filter @ninfier/web dev",
+    "build": "pnpm --filter @ninfier/web build",
+    "start": "pnpm --filter @ninfier/sidecar start",
+    "control:build": "cargo build --manifest-path desktop/Cargo.toml -p ninfier-control",
+    "control:start": "NINFIER_STUDIO_DATA=$PWD/data cargo run --manifest-path desktop/Cargo.toml -p ninfier-control",
+    "desktop:build": "pnpm build && cargo build --manifest-path desktop/Cargo.toml -p ninfier-studio",
+    "desktop:run": "NINFIER_STUDIO_DATA=$PWD/data cargo run --manifest-path desktop/Cargo.toml -p ninfier-studio",
+    "desktop:build:tray": "pnpm build && cargo build --manifest-path desktop/Cargo.toml -p ninfier-studio --features tray",
+    "desktop:run:tray": "NINFIER_STUDIO_DATA=$PWD/data cargo run --manifest-path desktop/Cargo.toml -p ninfier-studio --features tray",
+    "desktop:bundle": "pnpm build && pnpm tauri build --manifest-path desktop/Cargo.toml --features tray --bundles deb appimage"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
