@@ -285,7 +285,7 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
         <div className="p-3 border-t border-line space-y-3 bg-panel">
           {items.map((m, i) => (
             <div key={i} className={cn("p-2 rounded border", m.role === 'tool' ? 'bg-inset border-transparent' : 'bg-panel border-accent/20')}>
-              <div className="font-semibold text-[10px] text-faint mb-1 uppercase tracking-wider">{m.role} {m.name ? `· ${m.name}` : ''}</div>
+              <div className="font-semibold text-[10px] text-faint mb-1 uppercase tracking-wider">{m.role === 'assistant' ? 'Garrulous' : m.role} {m.name ? `· ${m.name}` : ''}</div>
               {m.reasoning && (
                 <div className="text-[11px] text-mute border-l-2 border-accent/50 pl-2 mb-2 italic whitespace-pre-wrap">{m.reasoning}</div>
               )}
@@ -667,7 +667,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 <TrajectoryBlock items={g.items} />
               ) : (
                 <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
-                  <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role}</div>
+                  <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role}</div>
                   {g.items[0].content && (
                     g.items[0].role === 'assistant'
                       ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
