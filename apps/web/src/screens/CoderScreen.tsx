@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download } from 'lucide-react';
-import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus } from 'lucide-react';
+import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
@@ -499,6 +499,17 @@ interface ConvMeta {
   todos: TodoItem[];
   lastPromptTokens: number;
   archived?: boolean;
+  checkpoints?: Checkpoint[];
+}
+/** A restore point: transcript/todo snapshot + the workspace commit to reset to. */
+interface Checkpoint {
+  id: string;
+  time: number;
+  label: string;
+  commit: string;
+  messages: number;
+  ledger: number;
+  todos: TodoItem[];
 }
 interface WsData {
   expanded: boolean;
@@ -643,6 +654,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [permsOpen, setPermsOpen] = useState(true);
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
+  // Background shell jobs started by the agent (tracked per workspace so the
+  // sidebar panel can poll + kill them without digging through the transcript).
+  const [bgJobs, setBgJobs] = useState<{ id: string; command: string; ws: string }[]>([]);
+  const [jobStatus, setJobStatus] = useState<Record<string, CoderJob>>({});
+  const [jobsOpen, setJobsOpen] = useState(true);
+  /** Poll unfinished jobs while the panel is open (3s cadence, stops when all done). */
+  useEffect(() => {
+    if (!jobsOpen) return;
+    const pending = bgJobs.filter((j) => !(jobStatus[j.id]?.done ?? false));
+    if (pending.length === 0) return;
+    let cancelled = false;
+    const poll = async () => {
+      for (const j of pending) {
+        try {
+          const s = await coderJob(j.id);
+          if (!cancelled) setJobStatus((prev) => ({ ...prev, [j.id]: s }));
+        } catch { /* job expired server-side; leave last status */ }
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 3000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [jobsOpen, bgJobs, activeWs, jobStatus]);
 
   // Coder "safe mode": the sidecar refuses clearly destructive shell commands
   // (release blocker #2). Surfaced as a toggle + warning banner.
@@ -740,7 +774,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const title = firstUser
         ? firstUser.content.replace(/\s+/g, ' ').trim().slice(0, 48) || (meta?.title ?? 'New conversation')
         : (meta?.title ?? 'New conversation');
-      const updated: ConvMeta = { id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current };
+      const updated: ConvMeta = { id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current, checkpoints: meta?.checkpoints ?? [] };
       const order = wsd.order.includes(activeConv) ? wsd.order : [...wsd.order, activeConv];
       return {
         ...prev,
@@ -1065,6 +1099,72 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       refreshRepoMap();
     }
   }, [running, activeWs, commits, loadCommits, refreshRepoMap]);
+  // ---- Checkpoints: transcript + workspace restore points ----
+  const [showCheckpoints, setShowCheckpoints] = useState(false);
+  const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
+  /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
+  const createCheckpoint = async () => {
+    if (!activeWs || !activeConv) return;
+    let commit = '';
+    try {
+      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWs);
+      if (r.exitCode === 0 && /^[0-9a-f]{5,40}$/i.test((r.stdout || '').trim())) commit = (r.stdout || '').trim();
+    } catch { /* not a git repo — transcript-only checkpoint */ }
+    const cp: Checkpoint = {
+      id: 'cp-' + Math.random().toString(36).slice(2, 10),
+      time: Date.now(), label: commit ? commit.slice(0, 7) : 'transcript',
+      commit, messages: messages.length, ledger: ledger.length, todos,
+    };
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      const meta = wsd?.conversations[activeConv];
+      if (!wsd || !meta) return prev;
+      const next = { ...meta, checkpoints: [...(meta.checkpoints ?? []), cp] };
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: next } } } };
+    });
+    addLog({ type: 'compact', label: 'checkpoint', detail: `saved (${cp.messages} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})` });
+    setShowCheckpoints(true);
+  };
+  /** Restore a checkpoint: hard-reset the workspace, then truncate transcript + todos. */
+  const restoreCheckpoint = async (cp: Checkpoint) => {
+    if (running || !activeWs || !activeConv) return;
+    const wsFiles = cp.commit
+      ? `Workspace files reset to ${cp.label} (git reset --hard). Uncommitted changes will be lost.`
+      : 'No git commit recorded — only the transcript will be truncated.';
+    if (!window.confirm(`Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${cp.messages} messages.`)) return;
+    if (cp.commit) {
+      if (!/^[0-9a-f]{5,40}$/i.test(cp.commit)) return;
+      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWs);
+      if (r.exitCode !== 0) {
+        addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
+        return;
+      }
+      loadCommits();
+      refreshRepoMap();
+    }
+    const keptMessages = messages.slice(0, cp.messages);
+    const keptLedger = ledger.slice(0, cp.ledger);
+    setMessages(keptMessages);
+    setTodos(cp.todos);
+    setLedger([...keptLedger, { id: Math.random().toString(36).slice(2), time: Date.now(), type: 'compact', label: 'restore', detail: `restored checkpoint ${cp.label}` }]);
+    // Write the store explicitly: restoring to an empty transcript would trip
+    // the L1 anti-clobber guard in the persist effect and lose the restore.
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      const meta = wsd?.conversations[activeConv];
+      if (!wsd || !meta) return prev;
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, messages: keptMessages, todos: cp.todos, updatedAt: Date.now() } } } } };
+    });
+  };
+  const deleteCheckpoint = (id: string) => {
+    if (!activeWs || !activeConv) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      const meta = wsd?.conversations[activeConv];
+      if (!wsd || !meta) return prev;
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, checkpoints: (meta.checkpoints ?? []).filter((c) => c.id !== id) } } } } };
+    });
+  };
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
   const setPerms = (next: PermConfig) => {
@@ -1178,11 +1278,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs, args.background === true);
           result = JSON.stringify(res);
           if (args.background === true) mutated = true;
+          if (res.jobId) {
+            const id = res.jobId;
+            const cmd = String(args.command || '');
+            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWs }]));
+          }
         } else if (call.name === 'bash_poll') {
           logType = 'bash'; logDetail = `poll ${args.jobId}`;
           try {
             const res = await coderJob(String(args.jobId || ''));
             result = JSON.stringify(res);
+            setJobStatus((prev) => ({ ...prev, [res.jobId]: res }));
           } catch (e) {
             result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
           }
@@ -2087,6 +2193,80 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             </div>
           )}
         </div>
+        {/* Background Jobs — live view of detached shell jobs for this workspace */}
+        <div className="shrink-0 border-t border-line p-2">
+          <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+            <Terminal size={13} /> Jobs
+            <button
+              type="button"
+              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
+              title={jobsOpen ? 'Collapse' : 'Expand'}
+              onClick={() => setJobsOpen((o) => !o)}
+            >
+              {jobsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            </button>
+          </div>
+          {jobsOpen && (() => {
+            const wsJobs = bgJobs.filter((j) => j.ws === activeWs);
+            if (wsJobs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
+            return (
+              <div className="max-h-40 space-y-1 overflow-auto">
+                {wsJobs.map((j) => {
+                  const s = jobStatus[j.id];
+                  const done = s?.done ?? false;
+                  const ok = done && (s?.exitCode === 0);
+                  return (
+                    <div key={j.id} className="rounded border border-line px-2 py-1">
+                      <div className="flex items-center gap-2">
+                        <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', !done ? 'animate-pulse bg-accent' : ok ? 'bg-ok' : 'bg-danger')} />
+                        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={j.command}>{j.command || j.id}</span>
+                        <span className="shrink-0 text-[10px] text-faint">{!done ? 'running' : s?.exitCode === null ? (s?.killed ? 'killed' : 'done') : `exit ${s?.exitCode}`}</span>
+                        {!done ? (
+                          <button
+                            type="button"
+                            title="Kill job"
+                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
+                            onClick={async () => {
+                              try {
+                                const k = await coderJobKill(j.id);
+                                setJobStatus((prev) => ({ ...prev, [j.id]: k }));
+                              } catch (e) {
+                                addLog({ type: 'error', label: 'job', detail: e instanceof Error ? e.message : String(e) });
+                              }
+                            }}
+                          >
+                            <Square size={11} />
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            title="Dismiss"
+                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-ink"
+                            onClick={() => {
+                              setBgJobs((prev) => prev.filter((x) => x.id !== j.id));
+                              setJobStatus((prev) => {
+                                const next = { ...prev };
+                                delete next[j.id];
+                                return next;
+                              });
+                            }}
+                          >
+                            <X size={11} />
+                          </button>
+                        )}
+                      </div>
+                      {s && (s.stdout || s.stderr) && (
+                        <div className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all border-t border-line pt-1 font-mono text-[10px] text-mute">
+                          {redactSecrets((s.stdout + (s.stderr ? `\n${s.stderr}` : '')).slice(-2000))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
       </div>
 
       {/* Center: conversation messages */}
@@ -2149,6 +2329,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             <Undo2 size={13} />
           </button>
           <button
+            type="button"
+            className={cn('rounded border px-2 py-0.5 text-[11px] disabled:opacity-40', showCheckpoints ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+            onClick={() => setShowCheckpoints((o) => !o)}
+            disabled={!activeWs}
+            title="Checkpoints — snapshot transcript + workspace, restore on a wrong turn"
+          >
+            <BookmarkPlus size={13} />
+          </button>
+          <button
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={() => newChat(activeWs)}
             disabled={!activeWs}
@@ -2157,6 +2346,51 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             + chat
           </button>
         </div>
+        {showCheckpoints && activeWs && (
+          <div className="shrink-0 border-b border-line bg-panel px-4 py-2">
+            <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+              <BookmarkPlus size={13} /> Checkpoints
+              <button
+                type="button"
+                className="ml-auto rounded border border-line px-2 py-px text-[10.5px] normal-case tracking-normal text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+                onClick={createCheckpoint}
+                disabled={!activeConv || running}
+                title="Snapshot the transcript and workspace HEAD"
+              >
+                + checkpoint
+              </button>
+            </div>
+            {checkpoints.length === 0 ? (
+              <div className="text-[11px] italic text-faint">No checkpoints yet — snapshot before a risky run, restore when the loop goes off a cliff.</div>
+            ) : (
+              <div className="max-h-36 space-y-1 overflow-auto">
+                {checkpoints.map((cp) => (
+                  <div key={cp.id} className="flex items-center gap-2 rounded border border-line px-2 py-1">
+                    <span className="shrink-0 font-mono text-[10.5px] text-accent">{cp.label}</span>
+                    <span className="min-w-0 flex-1 truncate text-[11px] text-mute">{new Date(cp.time).toLocaleString()} · {cp.messages} msgs · {cp.todos.length} todos</span>
+                    <button
+                      type="button"
+                      title={`Restore checkpoint ${cp.label}`}
+                      onClick={() => restoreCheckpoint(cp)}
+                      disabled={running}
+                      className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-ok disabled:opacity-40"
+                    >
+                      <RotateCcw size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      title="Delete checkpoint"
+                      onClick={() => deleteCheckpoint(cp.id)}
+                      className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
           {planMode && (
