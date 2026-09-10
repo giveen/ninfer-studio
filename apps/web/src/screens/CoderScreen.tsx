@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -214,6 +214,20 @@ const TOOLS = [
         required: []
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "ask_user",
+      description: "Pause and ask the user a clarifying question or request approval before proceeding (e.g. which approach to take, confirmation for an irreversible action). Use sparingly — only when you genuinely cannot continue without the user's input. The run will pause until they answer.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "The question or request to show the user." }
+        },
+        required: ["question"]
+      }
+    }
   }
 ];
 
@@ -299,6 +313,17 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
        )
     }
 
+    if (name === 'ask_user') {
+      return (
+        <div className="mt-1 p-2 bg-accent/10 border border-accent/30 rounded-md text-[11px] text-ink">
+          <div className="font-semibold text-accent mb-0.5 flex items-center gap-1">
+            <HelpCircle size={12} /> Agent asked:
+          </div>
+          <div className="whitespace-pre-wrap">{data?.question || content}</div>
+        </div>
+      );
+    }
+
   } catch {
     // fallback
   }
@@ -364,7 +389,7 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
  * hop between threads and come back to them later.
  * ------------------------------------------------------------------ */
 
-type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact'; label: string; detail?: string; durationMs?: number };
+type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number };
 type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
 
 interface ConvMeta {
@@ -483,6 +508,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
+  // When the agent pauses via ask_user, this holds the question and the run halts
+  // until the user answers (release blocker #5 — human-in-the-loop).
+  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
+  const askRef = useRef<string | null>(null);
   const [ledger, setLedger] = useState<LogEntry[]>(initialMeta?.ledger ?? []);
   const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
   const [wsBusy, setWsBusy] = useState(false);
@@ -870,6 +899,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
           const diffRes = await coderExec(cmd, undefined, 30000);
           result = JSON.stringify(diffRes);
+        } else if (call.name === 'ask_user') {
+          // Pause the run and surface the question to the user. We record the
+          // question in askRef; runAgent detects it after the tool pass and stops,
+          // leaving the conversation ready for the user's answer (release #5).
+          logType = 'ask'; logDetail = args.question || '(no question)';
+          askRef.current = String(args.question || '');
+          result = JSON.stringify({ question: args.question, status: 'awaiting_user' });
         } else if (call.name === 'todo_write') {
           logType = 'todo'; logDetail = 'Updated task list';
           setTodos(args.todos || []);
@@ -1084,6 +1120,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           loadCommits();
           // Append only the new tool results to the visible transcript.
           setMessages((prev) => [...prev, ...currentMessages.slice(before)]);
+          // Human-in-the-loop pause: if the agent asked the user a question, stop
+          // the run and surface it. The (already-visible) transcript includes the
+          // question; the user's answer resumes the run (#5).
+          if (askRef.current) {
+            const q = askRef.current;
+            askRef.current = null;
+            setPendingQuestion(q);
+            addLog({ type: 'ask', label: 'ask_user', detail: q });
+            return;
+          }
         } else {
           break; // Done!
         }
@@ -1101,6 +1147,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const onSubmit = () => {
     if ((!input.trim() && attachments.length === 0) || running || !activeWs) return;
+    // Answering a pending ask_user question: clear the pause and continue. The
+    // answer is just a normal user message that resumes the run (#5).
+    if (pendingQuestion) setPendingQuestion(null);
     const msg: ChatMessage = { role: 'user', content: input.trim(), attachments: attachments.length ? attachments : undefined };
     const next = [...messages, msg];
     setMessages(next);
@@ -1538,6 +1587,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               ))}
             </div>
           )}
+          {pendingQuestion && (
+            <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 mb-2 text-[12px]">
+              <div className="flex items-center gap-1.5 font-semibold text-accent mb-1">
+                <HelpCircle size={13} /> Agent is waiting for your answer
+              </div>
+              <div className="text-ink/90 whitespace-pre-wrap">{pendingQuestion}</div>
+            </div>
+          )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files">
               <Paperclip size={14} />
@@ -1547,7 +1604,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && onSubmit()}
-              placeholder={activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
+              placeholder={pendingQuestion ? "Type your answer and press Enter…" : activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
               disabled={running || !activeWs}
             />
             {running ? (
