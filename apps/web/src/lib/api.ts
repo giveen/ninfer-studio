@@ -554,6 +554,38 @@ export function coderWebSearch(query: string): Promise<CoderWebSearch> {
   return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000);
 }
 
+export interface CoderCommit {
+  hash: string;
+  author: string;
+  /** Human-friendly relative date, e.g. "3 hours ago" (git %ar). */
+  relDate: string;
+  /** ISO-ish commit date (git %ad). */
+  date: string;
+  /** First line of the commit message (git %s). */
+  subject: string;
+  /** Full commit message body (git %b), may be empty. */
+  body: string;
+}
+
+/**
+ * List recent commits in the active Coder workspace via `git log`. Runs through
+ * `coderExec` (which executes in the workspace root), so no sidecar change is
+ * needed. Returns [] when the workspace isn't a git repo or has no commits yet.
+ */
+export async function coderGitLog(limit = 100): Promise<CoderCommit[]> {
+  const fmt = '%H%x1f%an%x1f%ar%x1f%ad%x1f%s%x1f%b%x1e';
+  const r = await coderExec(`git log --pretty=format:${fmt} -n ${limit}`);
+  if (r.exitCode !== 0 || !r.stdout.trim()) return [];
+  return r.stdout
+    .split('\x1e')
+    .map((rec) => rec.trim())
+    .filter(Boolean)
+    .map((rec) => {
+      const [hash, author, relDate, date, subject, body] = rec.split('\x1f');
+      return { hash, author, relDate, date, subject, body: (body || '').trim() };
+    });
+}
+
 /**
  * Build an OpenAI-style chat completion body for the coding agent. Converts the
  * CoderMessage history (user / assistant-with-tool_calls / tool) into the wire

@@ -1,10 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, type CoderCommit } from '../lib/api';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
@@ -460,6 +460,28 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [pickerSelected, setPickerSelected] = useState<Record<string, boolean>>({});
   const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
   const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
+
+  // Commit history of the active workspace (populated from `git log`).
+  const [commits, setCommits] = useState<CoderCommit[]>([]);
+  const [commitsOpen, setCommitsOpen] = useState(true);
+  const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
+  const [commitsLoading, setCommitsLoading] = useState(false);
+
+  const loadCommits = useCallback(async () => {
+    setCommitsLoading(true);
+    try {
+      setCommits(await coderGitLog(100));
+    } catch {
+      setCommits([]);
+    } finally {
+      setCommitsLoading(false);
+    }
+  }, []);
+
+  // Refresh the commit history whenever the active workspace changes.
+  useEffect(() => {
+    if (activeWs) loadCommits();
+  }, [activeWs, loadCommits]);
 
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
 
@@ -1166,6 +1188,58 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             ))}
             {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
           </div>
+        </div>
+
+        {/* Commit History — git log of the active workspace */}
+        <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
+          <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+            <GitCommit size={13} /> Commit History
+            <button
+              type="button"
+              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
+              title="Refresh"
+              onClick={() => loadCommits()}
+            >
+              <RefreshCw size={12} className={commitsLoading ? 'animate-spin' : ''} />
+            </button>
+            <button
+              type="button"
+              className="rounded p-0.5 text-faint hover:text-ink"
+              title={commitsOpen ? 'Collapse' : 'Expand'}
+              onClick={() => setCommitsOpen((o) => !o)}
+            >
+              {commitsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            </button>
+          </div>
+          {commitsOpen && (
+            <div className="max-h-40 space-y-1 overflow-auto">
+              {commitsLoading ? (
+                <div className="text-faint italic text-[11px]">Loading…</div>
+              ) : commits.length === 0 ? (
+                <div className="text-faint italic text-[11px]">No commits yet.</div>
+              ) : (
+                commits.map((c) => (
+                  <div key={c.hash} className="rounded border border-line">
+                    <button
+                      type="button"
+                      onClick={() => setExpandedCommit(expandedCommit === c.hash ? null : c.hash)}
+                      className="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-panel2"
+                    >
+                      <span className="shrink-0 font-mono text-[10.5px] text-accent">{c.hash.slice(0, 7)}</span>
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-ink">{c.subject}</span>
+                      <span className="shrink-0 text-[10px] text-faint">{c.relDate}</span>
+                    </button>
+                    {expandedCommit === c.hash && (
+                      <div className="whitespace-pre-wrap border-t border-line px-2 py-1.5 text-[10.5px] leading-relaxed text-mute">
+                        <div className="mb-1 text-faint">{c.author} · {c.date}</div>
+                        {c.body || c.subject}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
       </div>
 
