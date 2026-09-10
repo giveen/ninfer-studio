@@ -824,15 +824,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify(res);
         } else if (call.name === 'git_commit') {
           logType = 'bash'; logDetail = `git commit ${args.files}`;
-          const files = (args.files || '-A').trim() || '-A';
-          const commitRes = await coderExec(`git add ${files} && git commit -m "${String(args.message || 'Agent commit').replace(/"/g, '\\"')}" && git rev-parse HEAD`, undefined, 30000);
+          // Safely quote each workspace path / flag; only bare flags (e.g. -A)
+          // are passed through unquoted so git globs/flags still work.
+          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+          const fileTokens = args.files && String(args.files).trim()
+            ? String(args.files).trim().split(/\s+/)
+            : ['-A'];
+          const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
+          const message = args.message || 'Agent commit';
+          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000);
           result = JSON.stringify(commitRes);
           mutated = true;
         } else if (call.name === 'git_diff') {
           logType = 'bash'; logDetail = `git diff ${args.ref || ''}`.trim();
+          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           const ref = (args.ref || '').trim();
           const path = (args.path || '').trim();
-          const cmd = `git --no-pager diff ${ref} ${path}`.replace(/\s+/g, ' ').trim();
+          const refArg = ref ? q(ref) : '';
+          const pathArg = path ? q(path) : '';
+          const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
           const diffRes = await coderExec(cmd, undefined, 30000);
           result = JSON.stringify(diffRes);
         } else if (call.name === 'todo_write') {
