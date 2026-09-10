@@ -4,7 +4,7 @@ import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment,
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, type CoderCommit } from '../lib/api';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
@@ -793,6 +793,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const toggleSafeMode = useCallback(async (next: boolean) => {
     setCoderSafeMode(next);
     try { await coderSafeModeSet(next); } catch { /* keep UI state as-is */ }
+  }, []);
+  const [coderSandbox, setCoderSandbox] = useState(false);
+  const toggleSandbox = useCallback(async (next: boolean) => {
+    setCoderSandbox(next);
+    try { await coderSandboxSet(next); } catch { /* keep UI state as-is */ }
   }, []);
   // Plan mode: read-only agent (no mutating tools), toggled per run.
   const [planMode, setPlanMode] = useState(false);
@@ -2386,6 +2391,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             </button>
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>
+        </div>
+        {/* Sandbox — wraps the agent shell in bwrap (workspace read-write, host read-only) */}
+        <div className="shrink-0 border-t border-line p-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+              <Shield size={13} /> Sandbox
+            </div>
+            <button
+              type="button"
+              onClick={() => toggleSandbox(!coderSandbox)}
+              className={cn('rounded px-2 py-0.5 text-[11px] font-medium', coderSandbox ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              title={coderSandbox ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)' : 'Agent shell runs directly on the host'}
+            >
+              {coderSandbox ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="mt-1 text-[10.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
         </div>
         {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
         <div className="shrink-0 border-t border-line p-2">

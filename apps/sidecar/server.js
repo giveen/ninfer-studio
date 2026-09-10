@@ -13,7 +13,7 @@
 // core (tauri commands + state); this file is the reference implementation.
 
 import { createServer, request as httpRequest } from 'node:http';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, execFileSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -29,6 +29,16 @@ import { JSDOM } from 'jsdom';
 // simply mistaken — cannot wipe the user's machine. Users can disable it for
 // trusted workflows via the Coder UI toggle (persisted only for the session).
 let coderSafeMode = true;
+// Filesystem sandbox: when enabled, agent shell commands run inside bwrap with the
+// whole host mounted read-only and only the workspace bind-mounted read-write. This
+// is the real safety net behind "Safe mode OFF" — even a jailbroken model can only
+// scribble inside its workspace. Network stays up so builds can fetch.
+let coderSandbox = false;
+let bwrapAvailable = null;
+let sandboxWarned = false;
+function checkBwrap() {
+  try { execFileSync('bwrap', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+}
 
 // Per-session working directories so the agent's shell calls behave like a
 // stateful terminal (cd / navigation persists across calls). Keyed by an
@@ -208,6 +218,8 @@ const defaultConfig = {
   lintCommand: '',
   testCommand: '',
   reasoningEffort: '',
+  coderSandbox: false,
+  sandboxBinds: [],
 };
 
 let config = { ...defaultConfig };
@@ -216,6 +228,7 @@ async function loadConfig() {
   try {
     const raw = await fs.readFile(path.join(DATA_DIR, 'config.json'), 'utf8');
     config = { ...defaultConfig, ...JSON.parse(raw) };
+    coderSandbox = !!config.coderSandbox;
   } catch {
     /* first run: defaults */
   }
@@ -1390,11 +1403,33 @@ function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
     cwd = root;
   }
   const resultCwd = sessionId ? sessionCwd(sessionId) : relOf(cwd);
+  // Optional filesystem sandbox: wrap the shell in bwrap so the agent can only
+  // write inside the workspace (the rest of the host is read-only). Network stays
+  // available so builds can fetch; this is the real safety net behind "Safe mode
+  // OFF", containing a jailbroken/mistaken model to its workspace.
+  let sandboxOk = false;
+  let sandboxBindArgs = [];
+  if (coderSandbox) {
+    const ws = coderRoot() || '';
+    sandboxBindArgs = (config.sandboxBinds || []).filter(Boolean).flatMap((p) => ['--bind', p, p]);
+    if (ws) {
+      if (bwrapAvailable === null) bwrapAvailable = checkBwrap();
+      sandboxOk = bwrapAvailable;
+      if (!sandboxOk && !sandboxWarned) {
+        console.warn('[coder] sandbox enabled but bwrap not found; running unsandboxed');
+        sandboxWarned = true;
+      }
+    }
+  }
   const timeout = Math.min(Math.max(timeoutMs || 120000, 1000), 600000);
   return new Promise((resolve) => {
     let proc;
     try {
-      proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
+      if (sandboxOk) {
+        proc = spawn('bwrap', ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '-lc', runCmd, ...sandboxBindArgs], { cwd, env: process.env });
+      } else {
+        proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
+      }
       if (hooks?.onSpawn) hooks.onSpawn(proc);
     } catch (err) {
       return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: resultCwd, error: err.message });
@@ -1548,6 +1583,17 @@ async function handleCoder(req, res, p, url) {
       const body = await readBody(req, 1 << 10);
       if (typeof body?.enabled === 'boolean') coderSafeMode = body.enabled;
       return sendJson(res, 200, { enabled: coderSafeMode });
+    }
+    if (p === '/api/coder/sandbox' && req.method === 'GET') {
+      return sendJson(res, 200, { enabled: coderSandbox });
+    }
+    if (p === '/api/coder/sandbox' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 10);
+      if (typeof body?.enabled === 'boolean') {
+        coderSandbox = body.enabled;
+        await saveConfig({ coderSandbox });
+      }
+      return sendJson(res, 200, { enabled: coderSandbox });
     }
     if (p === '/api/coder/workspace' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

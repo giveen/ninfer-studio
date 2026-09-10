@@ -577,6 +577,12 @@ export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
 export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
   return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
 }
+export function coderSandboxGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/coder/sandbox', 5000);
+}
+export function coderSandboxSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/coder/sandbox', { enabled }, 5000);
+}
 
 export interface CoderCommit {
   hash: string;
