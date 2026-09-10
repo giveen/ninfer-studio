@@ -489,6 +489,16 @@ export function coderRepoMap(): Promise<{ map: string }> {
 export function setCoderWorkspace(path: string): Promise<CoderWorkspace> {
   return postJSON<CoderWorkspace>('/api/coder/workspace', { path }, 8000);
 }
+export interface CoderDirs {
+  root: string;
+  exists: boolean;
+  isDir: boolean;
+  dirs: string[];
+  error?: string;
+}
+export function coderDirs(root: string): Promise<CoderDirs> {
+  return getJSON<CoderDirs>(`/api/coder/dirs?root=${encodeURIComponent(root)}`);
+}
 export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
   return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}`);
 }

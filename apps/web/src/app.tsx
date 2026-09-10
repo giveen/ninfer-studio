@@ -1,18 +1,20 @@
-import { useState } from 'react';
-import { Activity, Cpu, MessagesSquare, Settings2, Layers } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Activity, Code2, Cpu, MessagesSquare, Settings2, Layers } from 'lucide-react';
 import { cn } from './components/ui';
-import { useStatus } from './lib/api';
+import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
 import { formatBytes, formatPct } from './lib/format';
 import { ChatScreen } from './screens/ChatScreen';
 import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
+import { CoderScreen } from './screens/CoderScreen';
 
-type Screen = 'chat' | 'engine' | 'models' | 'settings';
+type Screen = 'chat' | 'code' | 'engine' | 'models' | 'settings';
 
 const NAV: Array<{ id: Screen; label: string; icon: typeof MessagesSquare }> = [
   { id: 'chat', label: 'Chat', icon: MessagesSquare },
+  { id: 'code', label: 'Code', icon: Code2 },
   { id: 'engine', label: 'Engine', icon: Cpu },
   { id: 'models', label: 'Models', icon: Layers },
   { id: 'settings', label: 'Settings', icon: Settings2 },
@@ -69,7 +71,14 @@ function GpuChip({ status }: { status: StatusPayload | null }) {
 
 export function App() {
   const [screen, setScreen] = useState<Screen>('chat');
+  const [coderWs, setCoderWs] = useState('');
   const { status, error } = useStatus(2500);
+
+  useEffect(() => {
+    getCoderWorkspace()
+      .then((w) => setCoderWs(w.workspace))
+      .catch(() => undefined);
+  }, []);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -130,6 +139,7 @@ export function App() {
 
         <main className="min-h-0 flex-1 overflow-hidden">
           {screen === 'chat' && <ChatScreen status={status} onNavigate={setScreen} />}
+          {screen === 'code' && <CoderScreen coderWs={coderWs} />}
           {screen === 'engine' && <EngineScreen status={status} />}
           {screen === 'models' && <ModelsScreen status={status} />}
           {screen === 'settings' && <SettingsScreen status={status} />}

@@ -12,7 +12,7 @@
 // In the production Tauri build the same responsibilities move into the Rust
 // core (tauri commands + state); this file is the reference implementation.
 
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { execFile, spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
@@ -22,6 +22,49 @@ import { PlaywrightCrawler } from 'crawlee';
 import { Readability } from '@mozilla/readability';
 import TurndownService from 'turndown';
 import { JSDOM } from 'jsdom';
+
+// ---------------------------------------------------------------------------
+// Loopback HTTP helper. We deliberately avoid the global `fetch` (undici) for
+// engine calls: inside the sandbox undici fails to connect to 127.0.0.1 (it
+// returns ECONNREFUSED while `curl` on the same loopback works), so the sidecar
+// could never reach the local engine. Node's `http` module connects fine, so we
+// use it for every request to 127.0.0.1:<enginePort>.
+// ---------------------------------------------------------------------------
+function loopbackSimple(method, url, { body, headers, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = httpRequest(
+      {
+        method,
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        headers: headers || {},
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            text: async () => text,
+            json: async () => JSON.parse(text || 'null'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (signal) {
+      const onAbort = () => req.destroy(new Error('aborted'));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (body) req.write(body);
+    req.end();
+  });
+}
 
 
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
@@ -285,7 +328,7 @@ export function buildServeArgs(profile) {
 
 async function engineHealth(port) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
+    const r = await loopbackSimple('GET', `http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return false;
     const body = await r.json().catch(() => null);
     return body?.status === 'ok';
@@ -296,7 +339,7 @@ async function engineHealth(port) {
 
 async function engineModelId(port) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+    const r = await loopbackSimple('GET', `http://127.0.0.1:${port}/v1/models`, {
       signal: AbortSignal.timeout(1500),
       headers: config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {},
     });
@@ -1278,8 +1321,7 @@ async function handleCoder(req, res, p, url) {
         const r = await execCommand(`rg '^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)' -g '*.{ts,tsx,js,jsx,rs,py,go,c,cpp,h,java}' --no-heading --line-number`, '.', 10000);
         let map = r.stdout;
         if (map.length > 15000) {
-            map = map.slice(0, 15000) + "
-... (repo map truncated)";
+            map = map.slice(0, 15000) + "\n... (repo map truncated)";
         }
         return sendJson(res, 200, { map });
       } catch (err) {
@@ -1357,8 +1399,7 @@ async function handleCoder(req, res, p, url) {
         replaced = body.replaceAll ? fileText.split(body.old).join(body.new) : fileText.replace(body.old, body.new);
         count = body.replaceAll ? (fileText.match(new RegExp(escapeRe(body.old), 'g')) || []).length : 1;
       } else {
-        const oldLines = body.old.split('
-');
+        const oldLines = body.old.split('\n');
         while (oldLines.length > 0 && oldLines[0].trim() === '') oldLines.shift();
         while (oldLines.length > 0 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
         
@@ -1366,8 +1407,7 @@ async function handleCoder(req, res, p, url) {
           return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string is empty or only whitespace' });
         }
         
-        const fileLines = fileText.split('
-');
+        const fileLines = fileText.split('\n');
         let matchIndex = -1;
         let matchCount = 0;
         
@@ -1394,8 +1434,7 @@ async function handleCoder(req, res, p, url) {
         
         if (!body.replaceAll) {
           fileLines.splice(matchIndex, oldLines.length, body.new);
-          replaced = fileLines.join('
-');
+          replaced = fileLines.join('\n');
           count = 1;
         } else {
           let matches = [];
@@ -1412,8 +1451,7 @@ async function handleCoder(req, res, p, url) {
           for (let i = matches.length - 1; i >= 0; i--) {
             fileLines.splice(matches[i], oldLines.length, body.new);
           }
-          replaced = fileLines.join('
-');
+          replaced = fileLines.join('\n');
         }
       }
       
@@ -1623,40 +1661,44 @@ async function proxyToEngine(req, res, targetPath) {
     headers.authorization = `Bearer ${config.apiKey}`;
   }
 
-  const upstream = await fetch(`http://127.0.0.1:${port}${targetPath}`, {
-    method: req.method,
-    headers: { ...headers, 'content-type': req.headers['content-type'] || 'application/json' },
-    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-    duplex: 'half',
-    redirect: 'manual',
-  }).catch((err) => {
-    sendJson(res, 502, { error: 'engine unreachable', detail: err.message });
-    return null;
-  });
-  if (!upstream) return;
+  // Use Node's http module (not undici fetch) — fetch cannot connect to the
+  // loopback engine inside the sandbox, while http.request works like curl.
+  const target = new URL(req.url, 'http://127.0.0.1');
+  const fwdHeaders = { ...headers };
+  delete fwdHeaders['content-length'];
+  delete fwdHeaders['transfer-encoding'];
 
-  res.writeHead(upstream.status, {
-    'content-type': upstream.headers.get('content-type') || 'application/json',
-    'cache-control': 'no-cache',
-    'x-request-id': upstream.headers.get('x-request-id') || '',
-    'access-control-allow-origin': '*',
+  const upstreamReq = httpRequest(
+    {
+      method: req.method,
+      hostname: '127.0.0.1',
+      port,
+      path: target.pathname + target.search,
+      headers: { ...fwdHeaders, 'content-type': req.headers['content-type'] || 'application/json' },
+    },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode || 502, {
+        'content-type': upstreamRes.headers['content-type'] || 'application/json',
+        'cache-control': 'no-cache',
+        'x-request-id': upstreamRes.headers['x-request-id'] || '',
+        'access-control-allow-origin': '*',
+      });
+      if (req.method === 'HEAD') return res.end();
+      upstreamRes.on('data', (chunk) => {
+        res.write(chunk);
+        if (typeof res.flush === 'function') res.flush();
+      });
+      upstreamRes.on('end', () => res.end());
+      upstreamRes.on('error', () => { try { res.end(); } catch { /* already closed */ } });
+    },
+  );
+  upstreamReq.on('error', (err) => {
+    console.error('[proxyToEngine] upstream http failed:', err?.message, '| port=', port, '| path=', target.pathname);
+    if (!res.headersSent) sendJson(res, 502, { error: 'engine unreachable', detail: err.message });
+    else try { res.end(); } catch { /* already closed */ }
   });
-  if (req.method === 'HEAD') return res.end();
-
-  if (!upstream.body) return res.end();
-  // SSE-safe: pipe chunks as they arrive
-  try {
-    const reader = upstream.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-      if (typeof res.flush === 'function') res.flush();
-    }
-  } catch (err) {
-    // client aborted
-  }
-  res.end();
+  if (req.method !== 'GET' && req.method !== 'HEAD') upstreamReq.write(body);
+  upstreamReq.end();
 }
 
 const server = createServer(async (req, res) => {
@@ -1756,6 +1798,35 @@ const server = createServer(async (req, res) => {
 
     if (p === '/api/gpu' && req.method === 'GET') {
       return sendJson(res, 200, await gpuStats());
+    }
+
+    // List subdirectories of a host path so the web UI can browse and point a
+    // workspace at an existing directory. Unreadable/missing roots return
+    // exists:false rather than an error so the picker can still render.
+    if (p === '/api/coder/dirs' && req.method === 'GET') {
+      const root = (url.searchParams.get('root') || '/').trim() || '/';
+      try {
+        const st = await fs.stat(root);
+        if (!st.isDirectory()) {
+          return sendJson(res, 200, { root, exists: true, isDir: false, dirs: [] });
+        }
+        const entries = await fs.readdir(root, { withFileTypes: true });
+        const dirs = entries
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name)
+          .sort((a, b) => a.localeCompare(b));
+        return sendJson(res, 200, { root, exists: true, isDir: true, dirs });
+      } catch (e) {
+        return sendJson(res, 200, { root, exists: false, isDir: false, dirs: [], error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    // Delegate the remaining /api/coder/* routes to the sidecar's own coder
+    // implementation (filesystem tools, exec, grep/glob, web) so the web UI's
+    // coding agent can actually act on the selected workspace. (/api/coder/dirs
+    // above is handled explicitly before this fallback.)
+    if (p.startsWith('/api/coder')) {
+      return handleCoder(req, res, p, url);
     }
 
     // Engine API passthrough (OpenAI / Anthropic / health)

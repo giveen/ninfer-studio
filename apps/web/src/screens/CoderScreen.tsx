@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
-import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig } from '../lib/api';
+import { Workspaces } from '../components/Workspaces';
+import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace } from '../lib/api';
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
 
@@ -312,14 +313,115 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
 }
 
 export function CoderScreen({ coderWs }: { coderWs: string }) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error'; label: string; detail?: string; durationMs?: number };
+  type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
+  type CoderConv = { messages: ChatMessage[]; ledger: LogEntry[]; todos: TodoItem[] };
+
+  const WS_STORAGE_KEY = 'ninfier.coder.workspaces.v1';
+  const CONV_KEY = 'ninfier.coder.conversations.v1';
+  const EMPTY_CONV: CoderConv = { messages: [], ledger: [], todos: [] };
+
+  // Every workspace keeps its own conversation (mirrors deepseek-harness's
+  // Sessions-per-Workspace model), keyed by absolute workspace path.
+  const [conversations, setConversations] = useState<Record<string, CoderConv>>(() => {
+    try {
+      const raw = localStorage.getItem(CONV_KEY);
+      if (raw) return JSON.parse(raw) as Record<string, CoderConv>;
+    } catch { /* ignore */ }
+    return {};
+  });
+  const [activeWs, setActiveWs] = useState<string>(() => {
+    try {
+      const raw = localStorage.getItem(WS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { list?: string[]; active?: string };
+        if (parsed.active) return parsed.active;
+      }
+    } catch { /* ignore */ }
+    return coderWs;
+  });
+  const [workspaces, setWorkspaces] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(WS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { list?: string[]; active?: string };
+        if (Array.isArray(parsed.list)) return parsed.list;
+      }
+    } catch { /* ignore */ }
+    return coderWs ? [coderWs] : [];
+  });
+
+  // Live state for the active workspace's conversation.
+  const [messages, setMessages] = useState<ChatMessage[]>(() => conversations[activeWs]?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
-  
-  type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error'; label: string; detail?: string; durationMs?: number };
-  const [ledger, setLedger] = useState<LogEntry[]>([]);
-  const [todos, setTodos] = useState<{content: string, status: 'pending' | 'in_progress' | 'completed'}[]>([]);
-  
+  const [ledger, setLedger] = useState<LogEntry[]>(() => conversations[activeWs]?.ledger ?? []);
+  const [todos, setTodos] = useState<TodoItem[]>(() => conversations[activeWs]?.todos ?? []);
+  const [wsBusy, setWsBusy] = useState(false);
+
+  // Persist the active workspace's conversation whenever it (or the active
+  // workspace) changes.
+  useEffect(() => {
+    setConversations((c) => {
+      const next = { ...c, [activeWs]: { messages, ledger, todos } };
+      try { localStorage.setItem(CONV_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, [messages, ledger, todos, activeWs]);
+
+  const loadConv = (ws: string) => {
+    const c = conversations[ws] ?? EMPTY_CONV;
+    setMessages(c.messages);
+    setLedger(c.ledger);
+    setTodos(c.todos);
+  };
+  const persistWs = (list: string[], active: string) => {
+    try { localStorage.setItem(WS_STORAGE_KEY, JSON.stringify({ list, active })); } catch { /* ignore */ }
+  };
+  const syncActiveWs = async (path: string) => {
+    setWsBusy(true);
+    try { await setCoderWorkspace(path); } catch (e) { console.warn('Failed to set coder workspace on sidecar:', e); }
+    finally { setWsBusy(false); }
+  };
+  const handleSelectWorkspace = (path: string) => {
+    if (path === activeWs) return;
+    setActiveWs(path);
+    loadConv(path);
+    persistWs(workspaces, path);
+    void syncActiveWs(path);
+  };
+  const handleAddWorkspace = (path: string) => {
+    const next = workspaces.includes(path) ? workspaces : [...workspaces, path];
+    setWorkspaces(next);
+    setActiveWs(path);
+    loadConv(path);
+    persistWs(next, path);
+    void syncActiveWs(path);
+  };
+  const handleRemoveWorkspace = (path: string) => {
+    const next = workspaces.filter((w) => w !== path);
+    setWorkspaces(next);
+    setConversations((c) => {
+      const copy = { ...c };
+      delete copy[path];
+      try { localStorage.setItem(CONV_KEY, JSON.stringify(copy)); } catch { /* ignore */ }
+      return copy;
+    });
+    let nextActive = activeWs;
+    if (activeWs === path) {
+      nextActive = next[0] ?? '';
+      setActiveWs(nextActive);
+      loadConv(nextActive);
+      void syncActiveWs(nextActive);
+    }
+    persistWs(next, nextActive);
+  };
+  const newChat = () => {
+    setMessages([]);
+    setLedger([]);
+    setTodos([]);
+  };
+
   const abortRef = useRef<AbortController | null>(null);
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
@@ -514,12 +616,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       <div className="flex w-64 flex-col border-r border-line bg-panel">
         <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
           <Terminal size={14} /> File Tree & Ledger
+          <button
+            className="ml-auto rounded border border-line px-2 py-0.5 text-[11px] font-normal text-mute hover:bg-panel2 hover:text-ink"
+            title="Start a new chat in this workspace"
+            onClick={newChat}
+          >
+            + chat
+          </button>
         </div>
         <div className="flex-1 flex flex-col min-h-0">
-          <div className="p-2 text-xs text-mute font-mono overflow-auto whitespace-pre-wrap shrink-0 border-b border-line">
-            {coderWs ? `workspace:
-${coderWs}` : 'No workspace selected'}
-          </div>
+          <Workspaces
+            workspaces={workspaces}
+            active={activeWs}
+            onSelect={handleSelectWorkspace}
+            onAdd={handleAddWorkspace}
+            onRemove={handleRemoveWorkspace}
+            busy={wsBusy}
+          />
           <div className="flex-1 overflow-auto p-2">
             <div className="text-[11px] font-semibold text-faint mb-2 uppercase tracking-wider">Session Ledger</div>
             <div className="space-y-1.5">

@@ -16,13 +16,13 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { buildChatRequest, frameCompactedSummary, getCoderWorkspace, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
 import { Markdown } from '../components/Markdown';
 import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
-import { CoderScreen } from './CoderScreen';
+
 
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
@@ -30,6 +30,33 @@ const DEFAULT_PARAMS: ChatParams = {
   preserveThinking: true,
   maxTokens: null as unknown as number,
 };
+
+const CHAT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description: "Fetch web content (extracts Markdown).",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web for up-to-date information.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"]
+      }
+    }
+  }
+];
 
 // Slash-command palette (type `/` in the composer to see suggestions).
 const SLASH_COMMANDS: Array<{ cmd: string; desc: string; needsArg?: boolean }> = [
@@ -256,6 +283,21 @@ const MessageRow = memo(function MessageRow({
       </div>
     );
   }
+  
+  if (m.role === 'tool') {
+    return (
+      <div className="group relative max-w-full my-2">
+        <div className="flex items-center gap-2 mb-1">
+           <span className="text-[10px] font-mono text-faint uppercase bg-inset px-1.5 py-0.5 rounded border border-line">Tool Result</span>
+           <span className="text-[11px] font-semibold text-accent">{m.name}</span>
+        </div>
+        <div className="text-[12px] font-mono whitespace-pre-wrap bg-panel2 border border-line rounded p-2 overflow-auto max-h-48 text-mute">
+           {m.content}
+        </div>
+      </div>
+    );
+  }
+  
   return (
     <div className="group relative max-w-full">
       {toolbar}
@@ -285,9 +327,20 @@ const MessageRow = memo(function MessageRow({
                 <Markdown>{m.content}</Markdown>
               </div>
             )
-          ) : !streaming && !m.reasoning ? (
+          ) : !streaming && !m.reasoning && !m.tool_calls ? (
             <span className="text-[13px] text-faint">—</span>
           ) : null}
+          {m.tool_calls && m.tool_calls.length > 0 && (
+            <div className="mt-3 space-y-1.5 border-t border-line pt-2">
+              <div className="text-[10px] font-semibold text-faint uppercase tracking-wider">Tool Calls</div>
+              {m.tool_calls.map((tc, j) => (
+                <div key={j} className="text-[11.5px] font-mono text-accent bg-accent/10 p-1.5 rounded-md flex items-start gap-1">
+                  <span className="mt-0.5">⚡</span>
+                  <span className="break-all">{tc.name}({tc.arguments})</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <MessageMeta m={m} />
       </div>
@@ -472,13 +525,6 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [paramsOpen, setParamsOpen] = useState(false);
-  const [mode, setMode] = useState<'chat' | 'code'>('chat');
-  const [coderWs, setCoderWs] = useState<string>('');
-  useEffect(() => {
-    getCoderWorkspace()
-      .then((w) => setCoderWs(w.workspace))
-      .catch(() => undefined);
-  }, []);
   const [model, setModel] = useState<string>(status?.engine?.modelId || 'qwen3.8-27b');
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -594,7 +640,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
-    async (convId: string, history: ChatMessage[]) => {
+    async (convId: string, history: ChatMessage[], depth = 0) => {
       if (!engineUp) {
         onNavigate('engine');
         return;
@@ -604,8 +650,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       setStreaming(true);
       const ac = new AbortController();
       abortRef.current = ac;
+      
+      let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
+
       await streamChat(
-        buildChatRequest(useModel, params.systemPrompt, history, params),
+        buildChatRequest(useModel, params.systemPrompt, history, params, { tools: CHAT_TOOLS }),
         ac.signal,
         {
           onReasoningDelta: (d) => {
@@ -632,12 +681,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             );
             setLatestRequestMetrics(meta, useModel);
           },
+          onToolCalls: (calls) => {
+            capturedToolCalls = calls;
+            setConvs((cs) =>
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, tool_calls: calls } : m)) })),
+            );
+          },
           onDone: (meta) => {
             setConvs((cs) =>
               cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
             );
             setLatestRequestMetrics(meta, useModel);
-            setStreaming(false);
           },
           onError: (msg) => {
             setConvs((cs) =>
@@ -652,10 +706,39 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                     },
               ),
             );
-            setStreaming(false);
           },
         },
       );
+      if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
+         if (depth >= 5) {
+           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => i === c.messages.length - 1 ? { ...m, content: m.content + `\n\n[System: Tool execution depth limit reached.]`, error: true } : m) }));
+           setStreaming(false);
+           return;
+         }
+         const toolResults: ChatMessage[] = [];
+         for (const call of capturedToolCalls) {
+             let result = '';
+             try {
+                const args = JSON.parse(call.arguments);
+                if (call.name === 'web_fetch') result = JSON.stringify(await coderWebFetch(args.url));
+                else if (call.name === 'web_search') result = JSON.stringify(await coderWebSearch(args.query));
+             } catch(e) {
+                result = JSON.stringify({error: String(e)});
+             }
+             toolResults.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: result });
+         }
+         
+         const asstMsg: ChatMessage = { role: 'assistant', content: '', model: useModel, meta: {} };
+         setConvs(cs => cs.map(c => c.id !== convId ? c : { ...c, messages: [...c.messages, ...toolResults, asstMsg] }));
+         const updatedConv = convsRef.current.find(c => c.id === convId);
+         if (updatedConv && !ac.signal.aborted) {
+             const newHistory = [...updatedConv.messages, ...toolResults];
+             await runStream(convId, newHistory, depth + 1);
+         }
+         return;
+      }
+      
+      setStreaming(false);
       abortRef.current = null;
     },
     [engineUp, model, runningModel, params, onNavigate],
@@ -850,22 +933,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   return (
     <div className="flex h-full flex-col">
-      {/* Chat / Code mode toggle */}
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3">
-        <Segmented
-          value={mode}
-          onChange={(v) => setMode(v)}
-          options={[
-            { value: 'chat', label: 'Chat' },
-            { value: 'code', label: 'Code', hint: 'Coding harness — agentic file editing, shell, search, and web tools' },
-          ]}
-        />
-        {mode === 'code' && coderWs && (
-          <span className="truncate font-mono text-[11px] text-faint">workspace: {coderWs}</span>
-        )}
-      </div>
       <div className="flex min-h-0 flex-1">
-        {mode === 'chat' ? (
           <>
             {/* conversation rail */}
             <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
@@ -1135,9 +1203,6 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         </div>
       </div>
           </>
-        ) : (
-          <CoderScreen coderWs={coderWs} />
-        )}
       </div>
     </div>
   );
