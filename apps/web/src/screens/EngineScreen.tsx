@@ -378,6 +378,43 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     [specSupported],
   );
 
+  // KV-cache dtype support, derived from the selected artifact's weight family
+  // (the catalog's `weights` field). The accepted KV dtype is the one that does
+  // NOT collide with the artifact's own weights: a groupwise-int (bf16-weight)
+  // artifact only honors bf16 KV, and an nvfp4-weight artifact silently falls
+  // back to bf16 (and drops the KV-capacity override -> 8,192 tokens) when given
+  // `--kv-dtype nvfp4`. The portable compressed KV dtype for nvfp4-weight
+  // artifacts is fp8. See engine logs: nvfp4 artifact + `--kv-dtype nvfp4`
+  // reported `bf16` + `8,192 tokens` despite `--kv-capacity 240000`, while
+  // `--kv-dtype fp8` reported `KV 240,000 tokens, fp8`. `null` means "don't
+  // restrict" (unknown artifact -> allow every KV dtype).
+  const kvDtypeSupport = useMemo(() => {
+    const w = artifacts.find((x) => x.path === artifact)?.known?.weights;
+    if (!w) return null;
+    if (w === 'groupwise-int') return new Set<string>(['bf16']);
+    if (w === 'nvfp4') return new Set<string>(['bf16', 'int8', 'fp8', 'k8v4']);
+    return null; // unknown weight family: don't second-guess the engine
+  }, [artifacts, artifact]);
+
+  // True when the selected artifact silently ignores explicit --max-context /
+  // --kv-capacity overrides (observed for groupwise-int weights).
+  const contextOverridesIgnored = useMemo(() => {
+    const w = artifacts.find((x) => x.path === artifact)?.known?.weights;
+    return w === 'groupwise-int';
+  }, [artifacts, artifact]);
+
+  // Disable KV dtypes the selected artifact's weight family can't honor.
+  const kvDtypeOptions = useMemo(
+    () =>
+      KV_DTYPE_OPTIONS.map((o) => ({
+        value: o.value,
+        label: o.label,
+        hint: o.hint,
+        disabled: !!kvDtypeSupport && !kvDtypeSupport.has(o.value),
+      })),
+    [kvDtypeSupport],
+  );
+
   const grid2 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2';
   const grid3 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-3';
 
@@ -679,6 +716,11 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               />
             </Field>
           </div>
+          {contextOverridesIgnored && ((profile.maxContext && profile.maxContext > 0) || (typeof profile.kvCapacity === 'number' && profile.kvCapacity > 0)) && (
+            <p className="text-[11.5px] text-warn">
+              The selected artifact ignores explicit <code className="font-mono">--max-context</code> / <code className="font-mono">--kv-capacity</code> overrides and uses its compiled context window — your settings won&apos;t take effect. Use the nvfp4 artifact for large contexts.
+            </p>
+          )}
         </SectionCard>
 
         {/* scheduling */}
@@ -701,11 +743,20 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           <div className="space-y-4">
             <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
               <Field label="KV dtype" hint="KV-cache storage: bf16, int8, fp8, nvfp4, or k8v4 (INT8 group-64 KV is the published benchmark format).">
-                <Segmented value={(profile.kvDtype as string) || 'bf16'} onChange={(v) => set('kvDtype', v as EngineProfile['kvDtype'])} options={[...KV_DTYPE_OPTIONS]} />
+                <Segmented value={(profile.kvDtype as string) || 'bf16'} onChange={(v) => set('kvDtype', v as EngineProfile['kvDtype'])} options={kvDtypeOptions} />
               </Field>
               <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse" hint="Root-only Engine mode. Cannot be combined with explicit context-cache capacity flags." />
               <Toggle checked={!!profile.noCudaGraph} onChange={(v) => set('noCudaGraph', v)} label="Disable CUDA Graph decode" hint="Decode uses eager kernel launches instead of captured graphs." />
             </div>
+            {kvDtypeSupport && profile.kvDtype && !kvDtypeSupport.has(profile.kvDtype) && (
+              <p className="text-[11.5px] text-warn">
+                The selected artifact ({artifacts.find((x) => x.path === artifact)?.known?.weights}) does not support{' '}
+                <code className="font-mono">--kv-dtype {profile.kvDtype}</code> — the engine silently falls back to bf16 and ignores your KV capacity.{' '}
+                {profile.kvDtype === 'nvfp4'
+                  ? 'Use fp8 (or bf16) KV on an nvfp4-weight artifact.'
+                  : 'Use bf16 KV on a groupwise-int artifact.'}
+              </p>
+            )}
             {profile.noPrefixReuse && <p className="text-[12px] text-warn">Prefix reuse disabled: the context-cache tier options below are unavailable and will not be sent.</p>}
             <div className={cn(grid3, profile.noPrefixReuse && 'pointer-events-none opacity-40')}>
               <Field label="Device state slots" hint="Extra Device checkpoint StateImages beyond the active-lane guarantee (default = max-concurrency).">
