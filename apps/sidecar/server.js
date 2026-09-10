@@ -256,7 +256,7 @@ async function saveChats(patch) {
  *   adopted: boolean  (running but not spawned by us)
  * }
  */
-let engine = { state: 'stopped', pid: null, port: null, artifact: null, modelId: null, argv: null, startedAt: null, logPath: null, adopted: false, failReason: null, failHint: null };
+let engine = { state: 'stopped', pid: null, port: null, artifact: null, modelId: null, maxContext: null, argv: null, startedAt: null, logPath: null, adopted: false, failReason: null, failHint: null };
 let engineProc = null;
 let engineLogStream = null;
 const healthPollers = new Set();
@@ -337,7 +337,7 @@ async function engineHealth(port) {
   }
 }
 
-async function engineModelId(port) {
+async function engineModelInfo(port) {
   try {
     const r = await loopbackSimple('GET', `http://127.0.0.1:${port}/v1/models`, {
       signal: AbortSignal.timeout(1500),
@@ -345,20 +345,26 @@ async function engineModelId(port) {
     });
     if (!r.ok) return null;
     const body = await r.json();
-    return body?.data?.[0]?.id || null;
+    const m = body?.data?.[0];
+    return m ? { modelId: m.id || null, maxContext: m.max_model_len ?? null } : null;
   } catch {
     return null;
   }
 }
+async function engineModelId(port) {
+  return (await engineModelInfo(port))?.modelId ?? null;
+}
 
 async function adoptExternal(port) {
   const d = (await discoverEngines()).find((x) => x.port === port);
+  const info = await engineModelInfo(port);
   engine.state = 'external';
   engine.adopted = true;
   engine.pid = d?.pid ?? (await findExternalServePids())[0] ?? null;
   engine.argv = d?.argv ?? null;
   engine.artifact = engine.artifact ?? d?.artifact ?? null;
-  engine.modelId = await engineModelId(port);
+  engine.modelId = info?.modelId ?? (await engineModelId(port));
+  engine.maxContext = info?.maxContext ?? null;
   engine.failReason = null;
   engine.failHint = null;
 }
@@ -382,7 +388,7 @@ async function refreshEngineStatus() {
   if (engine.state === 'starting' && engine.deadline && Date.now() > engine.deadline) {
     markFailed('engine did not become healthy within 3 minutes');
   }
-  if (engine.state === 'stopped' && engine.port) {
+  if ((engine.state === 'stopped' || engine.state === 'failed') && engine.port) {
     const healthy = await engineHealth(engine.port);
     if (healthy) {
       await adoptExternal(engine.port);
@@ -392,12 +398,15 @@ async function refreshEngineStatus() {
     if (healthy) {
       const d = (await discoverEngines()).find((x) => x.port === engine.port);
       if (d) engine.pid = d.pid;
-      engine.modelId = engine.modelId || (await engineModelId(engine.port));
+      const info = await engineModelInfo(engine.port);
+      engine.modelId = engine.modelId || info?.modelId || null;
+      engine.maxContext = info?.maxContext ?? engine.maxContext ?? null;
     } else {
       engine.state = 'stopped';
       engine.adopted = false;
       engine.pid = null;
       engine.argv = null;
+      engine.maxContext = null;
     }
   }
 }
@@ -408,12 +417,14 @@ async function startEngine(profile, artifactPath) {
 
   if (await engineHealth(port)) {
     // something already serves this port — adopt, do not double-spawn
+    const info = await engineModelInfo(port);
     engine = {
       state: 'external',
       pid: (await findExternalServePids())[0] ?? null,
       port,
       artifact,
-      modelId: await engineModelId(port),
+      modelId: info?.modelId ?? (await engineModelId(port)),
+      maxContext: info?.maxContext ?? null,
       argv: null,
       startedAt: null,
       logPath: logPathFor(port),
@@ -655,7 +666,11 @@ function publicEngine() {
     failHint: engine.failHint ?? null,
     // The --max-context the engine was started with (the chat uses this to show
     // a context-limit indicator). Unknown for externally-adopted engines.
-    maxContext: !engine.adopted && lastStart?.profile ? (lastStart.profile.maxContext ?? null) : null,
+    // Live context length: for an adopted/external engine we report what the
+    // engine actually advertises via /v1/models (so a manually-relaunched engine
+    // with a new --max-context shows the real value). For engines we spawned, we
+    // report the profile value we started them with.
+    maxContext: engine.adopted ? (engine.maxContext ?? null) : (lastStart?.profile ? (lastStart.profile.maxContext ?? null) : null),
   };
 }
 
@@ -1355,6 +1370,31 @@ async function handleCoder(req, res, p, url) {
       const truncated = content.length > MAX_READ_BYTES;
       if (truncated) content = content.slice(0, MAX_READ_BYTES);
       return sendJson(res, 200, { path: body.path, content, totalLines, truncated, lineCount: content.split('\n').length });
+    }
+    if (p === '/api/coder/fs/b64' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      let buf;
+      try {
+        buf = await fs.readFile(full);
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      const MAX_ATTACH_BYTES = 5 * 1024 * 1024;
+      if (buf.length > MAX_ATTACH_BYTES) {
+        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 5 MB` });
+      }
+      const ext = (body?.path || full).split('.').pop()?.toLowerCase() || '';
+      const mime = (
+        { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon' }
+      )[ext] || 'application/octet-stream';
+      const dataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+      return sendJson(res, 200, { path: body.path, mime, dataUrl, size: buf.length });
     }
     if (p === '/api/coder/fs/write' && req.method === 'POST') {
       const body = await readBody(req, 32 << 20);

@@ -6,3 +6,7 @@ data/
 *.tsbuildinfo
 desktop/target/
 *.deb
+
+# Runtime sidecar / local storage (not source)
+storage/
+apps/sidecar/storage/

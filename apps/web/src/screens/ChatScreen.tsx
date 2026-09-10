@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
@@ -17,6 +17,33 @@ import {
   X,
 } from 'lucide-react';
 import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+
+// A legacy compaction checkpoint message (raw <compacted-summary> block).
+function isCompactedMsg(m: ChatMessage): boolean {
+  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
+}
+
+// Build the model context for a conversation. When compacted, prepend the summary
+// as leading context and keep only the messages added after compaction; the full
+// visible history is preserved separately for browsing.
+function modelHistory(conv: Conversation): ChatMessage[] {
+  if (conv.compactedSummary) {
+    const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
+    return [prefix, ...conv.messages.slice(conv.compactedCount ?? 0)];
+  }
+  return conv.messages;
+}
+
+// Subtle divider shown in place of the verbose compaction summary.
+function CompactDivider() {
+  return (
+    <div className="my-3 flex items-center gap-2 text-[11px] text-faint">
+      <span className="h-px flex-1 bg-line" />
+      <span>✂ Context compacted</span>
+      <span className="h-px flex-1 bg-line" />
+    </div>
+  );
+}
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
@@ -270,8 +297,8 @@ const MessageRow = memo(function MessageRow({
                 <div className="mb-2 flex flex-wrap gap-1.5">
                   {m.attachments.map((a, i) => (
                     <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
-                      {a.kind === 'image' ? '🖼' : '🎞'} {a.name}
-                      <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>
+                      {a.kind === 'image' ? '🖼' : a.kind === 'video' ? '🎞' : '📄'} {a.name}
+                      {a.dataUrl && <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>}
                     </span>
                   ))}
                 </div>
@@ -525,7 +552,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [paramsOpen, setParamsOpen] = useState(false);
-  const [model, setModel] = useState<string>(status?.engine?.modelId || 'qwen3.8-27b');
+  const [model, setModel] = useState<string>(status?.engine?.modelId || '');
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -567,9 +594,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   }, []);
 
   useEffect(() => {
-    if (runningModel && !convs.length) setModel(runningModel);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runningModel]);
+    // Keep the selector pointed at the running engine's actual id. The engine
+    // only answers to the id it was started with (e.g. "qwen-coder"); never leave
+    // a stale catalog fallback (e.g. "qwen3.8-27b") selected, which 404s.
+    if (runningModel && !model) setModel(runningModel);
+  }, [runningModel, model]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -618,16 +647,23 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     const ac = new AbortController();
     abortRef.current = ac;
     try {
+      // On a re-compaction, prepend the prior checkpoint so the engine can merge
+      // it instead of discarding everything compacted earlier. This is what keeps
+      // the summary (and the context it carries) injected back into the model
+      // after the visible context is cleared.
+      const prior: ChatMessage[] = conv.compactedSummary
+        ? [{ role: 'user', content: frameCompactedSummary(conv.compactedSummary) }]
+        : [];
       const summary = await summarizeConversation({
         model: useModel,
         systemPrompt: params.systemPrompt,
-        history: conv.messages,
+        history: [...prior, ...conv.messages],
         signal: ac.signal,
       });
       if (!summary) throw new Error('compaction produced no summary');
-      const compacted: Conversation = { ...conv, messages: [{ role: 'user', content: frameCompactedSummary(summary) }] };
+      const compacted: Conversation = { ...conv, compactedSummary: summary, compactedCount: conv.messages.length };
       setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
-      setNotice({ tone: 'ok', text: 'Conversation compacted — context preserved as a checkpoint. Keep chatting from here.' });
+      setNotice({ tone: 'ok', text: 'Conversation compacted — prior messages stay on screen and the summary is injected as context. Keep chatting from here.' });
     } catch (e) {
       setNotice({ tone: 'danger', text: e instanceof Error ? e.message : 'compaction failed' });
     } finally {
@@ -710,8 +746,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         },
       );
       if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
-         if (depth >= 5) {
-           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => i === c.messages.length - 1 ? { ...m, content: m.content + `\n\n[System: Tool execution depth limit reached.]`, error: true } : m) }));
+         if (depth >= 12) {
+           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => i === c.messages.length - 1 ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
            setStreaming(false);
            return;
          }
@@ -733,7 +769,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
          const updatedConv = convsRef.current.find(c => c.id === convId);
          if (updatedConv && !ac.signal.aborted) {
              const newHistory = [...updatedConv.messages, ...toolResults];
-             await runStream(convId, newHistory, depth + 1);
+             await runStream(convId, modelHistory({ ...updatedConv, messages: newHistory }), depth + 1);
          }
          return;
       }
@@ -783,7 +819,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setAttachments([]);
     stick.current = true;
 
-    const history: ChatMessage[] = base.messages.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+    const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
     await runStream(newId, history);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
@@ -822,7 +858,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = conv.messages.slice(0, msgIndex);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, prior);
+      runStream(convId, modelHistory({ ...conv, messages: prior }));
     },
     [model, runningModel, runStream],
   );
@@ -837,7 +873,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = msgs.slice(0, msgIndex + 1);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, prior);
+      runStream(convId, modelHistory({ ...conv, messages: prior }));
     },
     [model, runningModel, runStream],
   );
@@ -1066,16 +1102,22 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           ) : (
             <div className="mx-auto flex max-w-3xl flex-col gap-5">
-              {messages.map((m, i) => (
-                <MessageRow
-                  key={i}
-                  m={m}
-                  convId={activeId ?? ''}
-                  index={i}
-                  streaming={streaming && i === messages.length - 1}
-                  actions={msgActions}
-                />
-              ))}
+              {messages.map((m, i) => {
+                if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
+                return (
+                  <Fragment key={i}>
+                    {showDivider && <CompactDivider />}
+                    <MessageRow
+                      m={m}
+                      convId={activeId ?? ''}
+                      index={i}
+                      streaming={streaming && i === messages.length - 1}
+                      actions={msgActions}
+                    />
+                  </Fragment>
+                );
+              })}
             </div>
           )}
         </div>

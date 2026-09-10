@@ -207,9 +207,14 @@ export interface ProfileState {
 // Chat (OpenAI-compatible) — client-side message model
 // ---------------------------------------------------------------------------
 export interface ChatAttachment {
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'file';
   name: string;
-  dataUrl: string;
+  /** image/video: a data URL. Omitted for kind 'file'. */
+  dataUrl?: string;
+  /** file: workspace-relative path of the attached source file. */
+  path?: string;
+  /** file: text content of the attached source file. */
+  content?: string;
 }
 
 export interface MessageMeta {
@@ -244,6 +249,12 @@ export interface ChatMessage {
 export interface Conversation {
   id: string;
   title: string;
+  /** Structured compaction summary (set by /compact). When present, the model
+   * context is rebuilt from this summary + post-compaction messages, while the
+   * full message history stays visible in the UI. */
+  compactedSummary?: string;
+  /** Number of messages in `messages` at compaction time (the split point). */
+  compactedCount?: number;
   model: string;
   createdAt: number;
   messages: ChatMessage[];

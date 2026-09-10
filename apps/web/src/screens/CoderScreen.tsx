@@ -1,10 +1,14 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw } from 'lucide-react';
-import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/types';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image } from 'lucide-react';
+import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary } from '../lib/api';
+
+const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
+const isImagePath = (p: string) => IMAGE_EXT.has((p.split('.').pop() || '').toLowerCase());
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
 
@@ -378,6 +382,15 @@ function relTime(ts: number): string {
 function isCompactedMsg(m: ChatMessage): boolean {
   return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
 }
+/** Model context for a loaded transcript: from the most recent compaction
+ *  checkpoint onward, so reloading a conversation never re-inflates the full
+ *  context. */
+function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (isCompactedMsg(msgs[i])) return msgs.slice(i);
+  }
+  return msgs;
+}
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
   let activeWs = s.activeWs;
@@ -439,6 +452,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
   const [wsBusy, setWsBusy] = useState(false);
   const [showDir, setShowDir] = useState(false);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [showPicker, setShowPicker] = useState(false);
+  const [pickerNodes, setPickerNodes] = useState<FileNode[]>([]);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerExpanded, setPickerExpanded] = useState<Record<string, boolean>>({});
+  const [pickerSelected, setPickerSelected] = useState<Record<string, boolean>>({});
   const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
   const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
 
@@ -449,7 +468,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const meta = storeRef.current.workspaces[ws]?.conversations[convId];
     const m = meta ?? emptyConv(convId);
     lastPromptTokensRef.current = m.lastPromptTokens ?? 0;
-    setMessages(m.messages ?? []);
+    const msgs = m.messages ?? [];
+    setMessages(msgs);
     setLedger(m.ledger ?? []);
     setTodos(m.todos ?? []);
   };
@@ -752,7 +772,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       });
     }
     
-    setMessages(nextMessages);
     return nextMessages;
   };
   const runAgent = async (initialMessages: ChatMessage[]) => {
@@ -802,7 +821,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             });
             if (summary) {
               currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
-              setMessages(currentMessages);
+              // Keep the full transcript on screen; only the model context is
+              // cleared down to the summary checkpoint (re-injected as leading
+              // context on the next turn).
+              setMessages((prev) => [...prev, ...currentMessages]);
               lastPromptTokensRef.current = 0;
               continue;
             }
@@ -832,10 +854,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         };
         
         currentMessages = [...currentMessages, assistantMsg];
-        setMessages(currentMessages);
+        setMessages((prev) => [...prev, assistantMsg]);
         
         if (toolCalls.length > 0) {
+          const before = currentMessages.length;
           currentMessages = await handleToolCalls(toolCalls, currentMessages);
+          // Append only the new tool results to the visible transcript.
+          setMessages((prev) => [...prev, ...currentMessages.slice(before)]);
         } else {
           break; // Done!
         }
@@ -852,17 +877,58 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const onSubmit = () => {
-    if (!input.trim() || running || !activeWs) return;
-    const msg: ChatMessage = { role: 'user', content: input.trim() };
+    if ((!input.trim() && attachments.length === 0) || running || !activeWs) return;
+    const msg: ChatMessage = { role: 'user', content: input.trim(), attachments: attachments.length ? attachments : undefined };
     const next = [...messages, msg];
     setMessages(next);
     setInput('');
-    runAgent(next);
+    setAttachments([]);
+    // Seed the model context from the most recent compaction checkpoint onward.
+    // The visible transcript keeps the full history; only the engine's context is
+    // cleared to the summary and re-injected as leading context.
+    runAgent(compactedContext(messages).concat(msg));
   };
 
   const stop = () => {
     abortRef.current?.abort();
   };
+
+  // ---- Workspace file attachments -------------------------------------------
+  const openPicker = async () => {
+    setPickerSelected({});
+    setShowPicker(true);
+    setPickerLoading(true);
+    try {
+      const tree = await coderTree(4, '.');
+      setPickerNodes(tree.nodes ?? []);
+    } catch {
+      setPickerNodes([]);
+    } finally {
+      setPickerLoading(false);
+    }
+  };
+  const toggleNode = (path: string) =>
+    setPickerExpanded((e) => ({ ...e, [path]: !e[path] }));
+  const attachSelected = async (nodes: FileNode[]) => {
+    for (const node of nodes) {
+      if (attachments.some((a) => a.path === node.path)) continue;
+      try {
+        if (isImagePath(node.path)) {
+          const res = await coderReadBase64(node.path);
+          setAttachments((cur) => [...cur, { kind: 'image', name: node.name, path: node.path, dataUrl: res.dataUrl }]);
+        } else {
+          const res = await coderRead(node.path);
+          setAttachments((cur) => [...cur, { kind: 'file', name: node.name, path: node.path, content: res.content ?? '' }]);
+        }
+      } catch {
+        /* ignore unreadable file */
+      }
+    }
+    setShowPicker(false);
+    setPickerSelected({});
+  };
+  const removeAttachment = (path?: string) =>
+    setAttachments((cur) => cur.filter((a) => a.path !== path));
 
   const messageGroups = useMemo(() => {
     const groups: { type: 'message' | 'trajectory' | 'compact', items: ChatMessage[] }[] = [];
@@ -1142,6 +1208,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 ) : (
                   <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
                     <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role}</div>
+                    {g.items[0].attachments?.length ? (
+                      <div className="flex flex-wrap gap-1.5 mb-1.5">
+                        {g.items[0].attachments.map((a, i) => (
+                          <span key={i} className="inline-flex items-center gap-1 rounded-full border border-line bg-panel2 px-2 py-0.5 text-[11.5px] text-ink">{a.kind === 'image' ? <Image size={11} /> : <File size={11} />} {a.name}</span>
+                        ))}
+                      </div>
+                    ) : null}
                     {g.items[0].content && (
                       g.items[0].role === 'assistant'
                         ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
@@ -1153,20 +1226,37 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             ))
           )}
         </div>
-        <div className="flex gap-2 border-t border-line bg-panel p-3">
-          <input 
-            className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50" 
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && onSubmit()}
-            placeholder={activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
-            disabled={running || !activeWs}
-          />
-          {running ? (
-             <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
-          ) : (
-             <Button variant="primary" onClick={onSubmit} disabled={!activeWs}><Play size={14} /> Run</Button>
+        <div className="border-t border-line bg-panel p-3">
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {attachments.map((a) => (
+                <span key={a.path} className="inline-flex items-center gap-1 rounded-full border border-line bg-panel2 px-2 py-0.5 text-[11.5px] text-ink">
+                  {a.kind === 'image' ? <Image size={11} /> : <File size={11} />} {a.name}
+                  <button type="button" onClick={() => removeAttachment(a.path)} className="text-faint hover:text-danger" title="Remove">
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
           )}
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files">
+              <Paperclip size={14} />
+            </Button>
+            <input 
+              className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50" 
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && onSubmit()}
+              placeholder={activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
+              disabled={running || !activeWs}
+            />
+            {running ? (
+               <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
+            ) : (
+               <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0}><Play size={14} /> Run</Button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1198,6 +1288,118 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           onClose={() => setShowDir(false)}
         />
       )}
+
+      {showPicker && (
+        <FilePickerModal
+          nodes={pickerNodes}
+          loading={pickerLoading}
+          expanded={pickerExpanded}
+          selected={pickerSelected}
+          onToggle={toggleNode}
+          onToggleSelect={(p) => setPickerSelected((s) => ({ ...s, [p]: !s[p] }))}
+          onAttachSelected={attachSelected}
+          onClose={() => setShowPicker(false)}
+          attached={attachments}
+          maxBytes={ATTACH_MAX_BYTES}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Workspace file picker — attach project files to a Coder message.
+// ---------------------------------------------------------------------------
+function FilePickerModal({
+  nodes,
+  loading,
+  expanded,
+  selected,
+  onToggle,
+  onToggleSelect,
+  onAttachSelected,
+  onClose,
+  attached,
+  maxBytes,
+}: {
+  nodes: FileNode[];
+  loading: boolean;
+  expanded: Record<string, boolean>;
+  selected: Record<string, boolean>;
+  onToggle: (path: string) => void;
+  onToggleSelect: (path: string) => void;
+  onAttachSelected: (nodes: FileNode[]) => void;
+  onClose: () => void;
+  attached: ChatAttachment[];
+  maxBytes: number;
+}) {
+  const attachedPaths = new Set(attached.map((a) => a.path));
+  const collectFiles = (list: FileNode[]): FileNode[] => {
+    const out: FileNode[] = [];
+    for (const n of list) {
+      if (n.kind === 'file') out.push(n);
+      if (n.children) out.push(...collectFiles(n.children));
+    }
+    return out;
+  };
+  const allFiles = collectFiles(nodes);
+  const selectedNodes = allFiles.filter((n) => selected[n.path]);
+  const renderNodes = (list: FileNode[], depth: number): React.ReactNode => (
+    <div>
+      {list.map((n) => (
+        <div key={n.path}>
+          <div className="flex items-center gap-1 py-0.5 hover:bg-panel2 rounded px-1" style={{ paddingLeft: depth * 12 }}>
+            {n.kind === 'dir' ? (
+              <button type="button" onClick={() => onToggle(n.path)} className="flex items-center gap-1 text-ink">
+                {expanded[n.path] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                <Folder size={13} className="text-accent" /> {n.name}
+              </button>
+            ) : (
+              <label className={cn('flex items-center gap-1 text-ink', attachedPaths.has(n.path) ? 'opacity-50' : '')}>
+                <input
+                  type="checkbox"
+                  checked={!!selected[n.path]}
+                  disabled={attachedPaths.has(n.path) || (n.size ?? 0) > maxBytes}
+                  onChange={() => onToggleSelect(n.path)}
+                />
+                {isImagePath(n.path) ? <Image size={13} /> : <File size={13} />} {n.name}
+                {n.size != null &&
+                  (n.size > maxBytes ? (
+                    <span className="text-danger text-[10px]">over 5 MB</span>
+                  ) : (
+                    <span className="text-faint text-[10px]">{Math.ceil(n.size / 1024)} KB</span>
+                  ))}
+              </label>
+            )}
+          </div>
+          {n.kind === 'dir' && expanded[n.path] && n.children && renderNodes(n.children, depth + 1)}
+        </div>
+      ))}
+    </div>
+  );
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <div className="w-[520px] max-h-[70vh] flex flex-col rounded-xl border border-line bg-panel shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-line p-3">
+          <div className="text-sm font-semibold flex items-center gap-2"><Paperclip size={14} /> Attach workspace files</div>
+          <button type="button" onClick={onClose} className="text-faint hover:text-ink"><X size={16} /></button>
+        </div>
+        <div className="flex-1 overflow-auto p-2 text-[12.5px]">
+          {loading ? (
+            <div className="p-3 text-faint">Loading tree…</div>
+          ) : nodes.length ? (
+            renderNodes(nodes, 0)
+          ) : (
+            <div className="p-3 text-faint">No files.</div>
+          )}
+        </div>
+        <div className="flex items-center justify-between border-t border-line p-2">
+          <span className="text-[11px] text-faint">Select files (≤5 MB each). Images embed as pictures; others inline as text.</span>
+          <Button variant="primary" size="sm" disabled={selectedNodes.length === 0} onClick={() => onAttachSelected(selectedNodes)}>
+            Attach {selectedNodes.length || ''} selected
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

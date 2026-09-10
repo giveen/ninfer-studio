@@ -199,8 +199,12 @@ export function buildChatRequest(
       const content: Array<Record<string, unknown>> = [];
       if (m.content.trim()) content.push({ type: 'text', text: m.content });
       for (const a of m.attachments) {
-        if (a.kind === 'image') content.push({ type: 'image_url', image_url: { url: a.dataUrl } });
-        else content.push({ type: 'video_url', video_url: { url: a.dataUrl } });
+        if (a.kind === 'image') content.push({ type: 'image_url', image_url: { url: a.dataUrl! } });
+        else if (a.kind === 'video') content.push({ type: 'video_url', video_url: { url: a.dataUrl! } });
+        else if (a.kind === 'file') {
+          const p = a.path ?? a.name;
+          content.push({ type: 'text', text: `\n\n[Attached file: ${p}]\n\`\`\`\n${a.content ?? ''}\n\`\`\`\n` });
+        }
       }
       messages.push({ role: 'user', content });
     } else {
@@ -518,6 +522,15 @@ export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
 }
 export function coderRead(path: string, offset?: number, limit?: number): Promise<CoderReadResult> {
   return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000);
+}
+export interface CoderBase64Result {
+  path: string;
+  mime: string;
+  dataUrl: string;
+  size: number;
+}
+export function coderReadBase64(path: string): Promise<CoderBase64Result> {
+  return postJSON<CoderBase64Result>('/api/coder/fs/b64', { path }, 15_000);
 }
 export function coderWrite(path: string, content: string): Promise<CoderWriteResult> {
   return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000);
