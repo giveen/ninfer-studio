@@ -362,6 +362,8 @@ export interface CoderExecResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  /** True when stdout/stderr exceeded the sidecar's output cap and was truncated. */
+  truncated?: boolean;
   cwd: string;
   error?: string;
 }

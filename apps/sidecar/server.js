@@ -1164,6 +1164,7 @@ function execCommand(command, relCwd, timeoutMs) {
     let stdout = '';
     let stderr = '';
     let done = false;
+    let truncated = false;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
@@ -1172,27 +1173,29 @@ function execCommand(command, relCwd, timeoutMs) {
       } catch {
         /* ignore */
       }
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: null, timedOut: true, cwd: relOf(cwd) });
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, cwd: relOf(cwd) });
     }, timeout);
     proc.stdout.on('data', (d) => {
       stdout += d;
+      if (stdout.length > MAX_OUTPUT_BYTES) truncated = true;
       if (stdout.length > MAX_OUTPUT_BYTES * 2) stdout = stdout.slice(-MAX_OUTPUT_BYTES * 2);
     });
     proc.stderr.on('data', (d) => {
       stderr += d;
+      if (stderr.length > MAX_OUTPUT_BYTES) truncated = true;
       if (stderr.length > MAX_OUTPUT_BYTES * 2) stderr = stderr.slice(-MAX_OUTPUT_BYTES * 2);
     });
     proc.on('error', (err) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, cwd: relOf(cwd), error: err.message });
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, cwd: relOf(cwd), error: err.message });
     });
     proc.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: code, timedOut: false, cwd: relOf(cwd) });
+      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, cwd: relOf(cwd) });
     });
   });
 }

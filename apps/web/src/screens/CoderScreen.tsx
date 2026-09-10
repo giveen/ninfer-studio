@@ -546,6 +546,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   /** Create a fresh conversation inside a workspace and make it active. */
   const newChat = (ws: string = activeWs) => {
+    if (running) return; // don't start a new conversation mid-run (P0 #2)
     if (!ws) return;
     const id = newConvId();
     setStore((prev) => {
@@ -564,6 +565,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const handleSelectConv = (ws: string, convId: string) => {
+    if (running) return; // don't switch conversations mid-run (P0 #2: avoids corrupting the in-flight transcript)
     if (ws === activeWs && convId === activeConv) return;
     setStore((prev) => ({ ...prev, activeWs: ws, activeConv: convId }));
     loadConv(ws, convId);
@@ -810,12 +812,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
     abortRef.current = new AbortController();
 
+    // Resolve the model the engine is actually serving — don't assume 'qwen-coder'
+    // (P0 #1). Used for every request, the summarizer, and the context-size lookup.
+    let model = 'qwen-coder';
+    try {
+      const s = await getStatus();
+      if (s?.engine?.modelId) model = s.engine.modelId;
+    } catch { /* ignore */ }
+
     // Read the engine's context window so we can auto-compact once usage crosses
     // 80% of max. Prefer the engine's own /v1/models advertisement, falling back
     // to the sidecar-reported maxContext.
     let maxContext = 0;
     try {
-      maxContext = (await getEngineContextSize('qwen-coder')) ?? 0;
+      maxContext = (await getEngineContextSize(model)) ?? 0;
     } catch { /* ignore */ }
     if (!maxContext) {
       try {
@@ -824,34 +834,59 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } catch { /* ignore */ }
     }
     const COMPACT_AT = 0.8;
+
+    // Rough token estimate (~4 chars/token) used as a safety net so a single turn
+    // whose tool results push past the window is caught before we send it (P1 #4).
+    const sysTokenEstimate = Math.ceil(dynamicSystem.length / 4);
+    const estimateTokens = (msgs: ChatMessage[]): number => {
+      let n = sysTokenEstimate;
+      for (const m of msgs) {
+        n += typeof m.content === 'string' ? m.content.length : 0;
+        if (m.tool_calls) n += JSON.stringify(m.tool_calls).length;
+      }
+      return Math.ceil(n / 4);
+    };
     
     try {
       while (true) {
         if (abortRef.current?.signal.aborted) break;
 
-        // Auto-compact: if the last turn already consumed >= 80% of the engine
-        // context window, summarize the conversation into a checkpoint before
-        // continuing so we never silently truncate mid-task.
-        if (maxContext > 0 && lastPromptTokensRef.current >= COMPACT_AT * maxContext) {
-          addLog({ type: 'compact', label: 'compact', detail: `context ${lastPromptTokensRef.current}/${maxContext} ≥ 80% — summarizing` });
+        // Auto-compact when the model context is near (>=80%) or past (estimate
+        // >=100%) the window limit, so we never silently truncate mid-task.
+        const overBudget =
+          maxContext > 0 &&
+          (lastPromptTokensRef.current >= COMPACT_AT * maxContext ||
+            estimateTokens(currentMessages) >= maxContext);
+        if (overBudget) {
+          addLog({ type: 'compact', label: 'compact', detail: `context ${lastPromptTokensRef.current}/${maxContext} — summarizing` });
           try {
             const summary = await summarizeConversation({
-              model: 'qwen-coder',
+              model,
               systemPrompt: dynamicSystem,
               history: currentMessages,
               maxTokens: 2048,
             });
-            if (summary) {
-              currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
-              // Keep the full transcript on screen; only the model context is
-              // cleared down to the summary checkpoint (re-injected as leading
-              // context on the next turn).
-              setMessages((prev) => [...prev, ...currentMessages]);
-              lastPromptTokensRef.current = 0;
-              continue;
-            }
+            if (!summary) throw new Error('compaction produced no summary');
+            currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
+            // Keep the full transcript on screen; only the model context is
+            // cleared down to the summary checkpoint (re-injected as leading
+            // context on the next turn).
+            setMessages((prev) => [...prev, ...currentMessages]);
+            lastPromptTokensRef.current = 0;
+            continue;
           } catch (e) {
+            // Compaction is our only guard against context overflow — if it fails
+            // we must stop rather than send an oversized payload (P1 #3).
             addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: 'system',
+                content:
+                  '⚠ Auto-compaction failed, so the run was stopped to avoid exceeding the model context window. Start a new conversation or compact manually.',
+              },
+            ]);
+            break;
           }
         }
         
@@ -859,7 +894,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
         
-        const req = buildChatRequest('qwen-coder', dynamicSystem, currentMessages, { thinking: true, maxTokens: 8192 } as ChatParams, { tools: TOOLS });
+        const req = buildChatRequest(model, dynamicSystem, currentMessages, { thinking: true, maxTokens: 8192 } as ChatParams, { tools: TOOLS });
         
         await streamChat(req, abortRef.current.signal, {
           onContentDelta: (text) => { content += text; },
