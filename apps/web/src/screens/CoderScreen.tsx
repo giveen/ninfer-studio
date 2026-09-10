@@ -642,6 +642,53 @@ function loadStore(): CoderStore {
   return { activeWs: '', activeConv: '', workspaces: {} };
 }
 
+// ---- Verification gate helpers ------------------------------------------------
+/** Parse common linter/test output into structured {file,line,col,message} diagnostics. */
+function parseDiagnostics(cmd: string, output: string): Array<{ file?: string; line?: number; col?: number; severity?: string; message: string }> {
+  const out: Array<{ file?: string; line?: number; col?: number; severity?: string; message: string }> = [];
+  const lines = (output || '').split('\n');
+  for (const raw of lines) {
+    let m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+)\((\d+),(\d+)\):\s*(error|warning):\s*(.+)$/);
+    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
+    m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+):\s*(error|warning):\s*(.+)$/);
+    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
+    m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+)\s+(error|warning)\s+(.+?)\s+\S+$/);
+    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
+    m = raw.match(/error(?:\[[^\]]+\])?:\s*(.+?)\s*\(([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+)\)/);
+    if (m) { out.push({ file: m[2], line: +m[3], col: +m[4], severity: 'error', message: m[1] }); continue; }
+  }
+  for (const raw of lines) {
+    const m = raw.match(/^(FAILED|ERROR)\s+([^\s()]+\.[A-Za-z0-9]+)::(.+)$/);
+    if (m) out.push({ file: m[2], message: `${m[1]} ${m[3]}` });
+  }
+  return out.slice(0, 100);
+}
+
+/** Detect lint/test/build commands: explicit config first, else infer from manifests. */
+async function detectCommands(): Promise<{ lint?: string; test?: string; build?: string }> {
+  try {
+    const cfg = await getConfig();
+    if (cfg.lintCommand || cfg.testCommand || cfg.buildCommand) {
+      return { lint: cfg.lintCommand, test: cfg.testCommand, build: cfg.buildCommand };
+    }
+  } catch { /* ignore */ }
+  const read = async (p: string): Promise<string | null> => {
+    try { const r = await coderRead(p, 0, 200); return r.binary ? null : (r.content || null); } catch { return null; }
+  };
+  const pkg = await read('package.json');
+  if (pkg) { try { const s = (JSON.parse(pkg).scripts) || {}; return { lint: s.lint, test: s.test, build: s.build }; } catch { /* not json */ } }
+  const cargo = await read('Cargo.toml');
+  if (cargo) return { build: 'cargo build', test: 'cargo test', lint: 'cargo clippy -- -D warnings' };
+  const mk = await read('Makefile');
+  if (mk) {
+    const has = (t: string) => new RegExp(`^${t}:`, 'm').test(mk);
+    return { lint: has('lint') ? 'make lint' : undefined, test: has('test') ? 'make test' : undefined, build: has('build') ? 'make build' : undefined };
+  }
+  const py = await read('pyproject.toml');
+  if (py) return { test: 'pytest', lint: 'ruff check .' };
+  return {};
+}
+
 export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [store, setStore] = useState<CoderStore>(loadStore);
   const storeRef = useRef(store);
@@ -736,6 +783,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [planMode, setPlanMode] = useState(false);
   // Read-only scout pre-pass (auto, concurrency-gated — see runAgent).
   const [scoutOn, setScoutOn] = useState(true);
+  const [verifyMode, setVerifyMode] = useState(true);
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`).
   const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
   const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
@@ -1070,6 +1118,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
   };
   const abortRef = useRef<AbortController | null>(null);
+  const modelRef = useRef<string>('qwen-coder');
+  /** Lint/test/build commands resolved once per run (config, else manifest detection). */
+  const detectedCmdsRef = useRef<{ lint?: string; test?: string; build?: string }>({});
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
@@ -1368,18 +1419,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
    * model sees one error to fix at a time. */
   const runPostEditChecks = async (res: unknown, preview: string): Promise<Record<string, unknown>> => {
     const out: Record<string, unknown> = { ...(res as Record<string, unknown>), ...(preview ? { preview_diff: preview } : {}) };
-    const cfg = await getConfig();
-    const lintCmd = cfg.lintCommand || cfg.buildCommand;
+    const cmds = detectedCmdsRef.current;
+    const lintCmd = cmds.lint || cmds.build;
     if (lintCmd) {
-      const check = await coderExec(lintCmd, undefined, 60000);
+      const check = await coderExec(lintCmd, undefined, 120000);
       if (check.exitCode !== 0) {
-        return { ...out, linter_error: check.stderr || check.stdout };
+        const diags = parseDiagnostics(lintCmd, check.stderr || check.stdout || '');
+        return { ...out, linter_error: (check.stderr || check.stdout || '').slice(0, 8000), diagnostics: diags };
       }
     }
-    if (cfg.testCommand) {
-      const t = await coderExec(cfg.testCommand, undefined, 120000);
+    if (cmds.test) {
+      const t = await coderExec(cmds.test, undefined, 180000);
       if (t.exitCode !== 0) {
-        return { ...out, test_error: t.stderr || t.stdout };
+        const diags = parseDiagnostics(cmds.test, t.stderr || t.stdout || '');
+        return { ...out, test_error: (t.stderr || t.stdout || '').slice(0, 8000), diagnostics: diags };
       }
     }
     return out;
@@ -1682,6 +1735,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
     // after file mutations during the run (P1 #6).
     await refreshRepoMap();
+    // Auto-detect lint/test/build commands once per run (config, else manifests).
+    detectedCmdsRef.current = await detectCommands();
 
     abortRef.current = new AbortController();
 
@@ -1774,7 +1829,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     try {
       let agentSteps = 0;
       setAgentSteps(0);
-      let lastFailed = false;
       let repairCount = 0;
       while (true) {
         if (abortRef.current?.signal.aborted) break;
@@ -1918,6 +1972,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             return;
           }
         } else {
+          // Verification gate: before declaring done, confirm lint/test pass. If
+          // they fail, send the run back to fix them (bounded by MAX_REPAIR) rather
+          // than finishing with broken code.
+          if (verifyMode && repairCount < MAX_REPAIR) {
+            const v = await runPostEditChecks({}, '');
+            if (v.linter_error || v.test_error) {
+              repairCount++;
+              const summary = String(v.linter_error || v.test_error || '').slice(0, 2500);
+              addLog({ type: 'error', label: 'verify', detail: `checks failing — sending back to fix (${repairCount}/${MAX_REPAIR})` });
+              currentMessages = [...currentMessages, {
+                role: 'user',
+                content: `VERIFICATION GATE: the project's lint/test checks are still failing. You must fix them before the task is complete — do not declare success. Re-run the checks after fixing.\n\n${summary}`,
+              }];
+              setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
+              continue;
+            }
+          }
           break; // Done!
         }
       }
@@ -2564,6 +2635,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', scoutOn ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
           >
             Scout
+          </button>
+          <button
+            type="button"
+            onClick={() => setVerifyMode((v) => !v)}
+            disabled={running}
+            title={verifyMode ? 'Verify mode ON: the run must pass lint/test before it can finish' : 'Verify mode OFF'}
+            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', verifyMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            Verify
           </button>
           <button
             type="button"
