@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
-import { Workspaces } from '../components/Workspaces';
+import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
 import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary } from '../lib/api';
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
@@ -315,126 +315,264 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
   );
 }
 
+/* ------------------------------------------------------------------ *
+ * Multi-conversation-per-workspace model.
+ *
+ * Each workspace is a collapsible "folder" (mirrors deepseek-harness's
+ * Sessions-per-Workspace tree) that holds an ordered list of independent
+ * conversations. Selecting a workspace expands it; clicking a conversation
+ * row loads that conversation's messages, ledger, and todos, so you can
+ * hop between threads and come back to them later.
+ * ------------------------------------------------------------------ */
+
+type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact'; label: string; detail?: string; durationMs?: number };
+type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
+
+interface ConvMeta {
+  id: string;
+  title: string;
+  updatedAt: number;
+  messages: ChatMessage[];
+  ledger: LogEntry[];
+  todos: TodoItem[];
+  lastPromptTokens: number;
+}
+interface WsData {
+  expanded: boolean;
+  conversations: Record<string, ConvMeta>;
+  order: string[];
+  activeConv?: string;
+}
+interface CoderStore {
+  activeWs: string;
+  activeConv: string;
+  workspaces: Record<string, WsData>;
+}
+
+const CONV_KEY = 'ninfier.coder.conversations.v2';
+const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
+
+function newConvId(): string {
+  return 'conv-' + Math.random().toString(36).slice(2, 10);
+}
+function emptyConv(id: string): ConvMeta {
+  return { id, title: 'New conversation', updatedAt: Date.now(), messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
+}
+function baseName(p: string): string {
+  const t = p.replace(/[/\\]+$/, '');
+  const parts = t.split(/[/\\]/);
+  return parts[parts.length - 1] || t || p || '(root)';
+}
+function relTime(ts: number): string {
+  const diff = Date.now() - ts;
+  const MIN = 60_000, HOUR = 3_600_000, DAY = 86_400_000;
+  if (diff < MIN) return 'now';
+  if (diff < HOUR) return `${Math.floor(diff / MIN)}m`;
+  if (diff < DAY) return `${Math.floor(diff / HOUR)}h`;
+  if (diff < 30 * DAY) return `${Math.floor(diff / DAY)}d`;
+  if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
+  return `${Math.floor(diff / (365 * DAY))}y`;
+}
+function normalizeStore(s: CoderStore): CoderStore {
+  const workspaces = { ...s.workspaces };
+  let activeWs = s.activeWs;
+  let activeConv = s.activeConv;
+  if (!activeWs || !workspaces[activeWs]) {
+    activeWs = Object.keys(workspaces)[0] ?? '';
+    activeConv = activeWs ? (workspaces[activeWs].activeConv ?? workspaces[activeWs].order[0] ?? '') : '';
+  } else {
+    const wsd = workspaces[activeWs];
+    activeConv = wsd.activeConv ?? wsd.order[0] ?? '';
+    if (activeConv && !wsd.conversations[activeConv]) activeConv = wsd.order[0] ?? '';
+  }
+  return { activeWs, activeConv, workspaces };
+}
+function loadStore(): CoderStore {
+  try {
+    const raw = localStorage.getItem(CONV_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as CoderStore;
+      if (parsed && parsed.workspaces) return normalizeStore(parsed);
+    }
+  } catch { /* ignore */ }
+  // Migrate the previous single-conversation-per-workspace format.
+  try {
+    const raw = localStorage.getItem(CONV_V1_KEY);
+    if (raw) {
+      const v1 = JSON.parse(raw) as Record<string, { messages: ChatMessage[]; ledger: LogEntry[]; todos: TodoItem[]; lastPromptTokens: number }>;
+      const workspaces: Record<string, WsData> = {};
+      for (const [ws, conv] of Object.entries(v1)) {
+        const id = newConvId();
+        workspaces[ws] = {
+          expanded: true,
+          conversations: { [id]: { id, title: 'Conversation', updatedAt: Date.now(), messages: conv.messages || [], ledger: conv.ledger || [], todos: conv.todos || [], lastPromptTokens: conv.lastPromptTokens || 0 } },
+          order: [id],
+          activeConv: id,
+        };
+      }
+      const first = Object.keys(workspaces)[0] ?? '';
+      const activeConv = first ? workspaces[first].activeConv! : '';
+      return { activeWs: first, activeConv, workspaces };
+    }
+  } catch { /* ignore */ }
+  return { activeWs: '', activeConv: '', workspaces: {} };
+}
+
 export function CoderScreen({ coderWs }: { coderWs: string }) {
-  type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact'; label: string; detail?: string; durationMs?: number };
-  type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
-  type CoderConv = { messages: ChatMessage[]; ledger: LogEntry[]; todos: TodoItem[]; lastPromptTokens: number };
+  const [store, setStore] = useState<CoderStore>(loadStore);
+  const storeRef = useRef(store);
+  storeRef.current = store;
 
-  const WS_STORAGE_KEY = 'ninfier.coder.workspaces.v1';
-  const CONV_KEY = 'ninfier.coder.conversations.v1';
-  const EMPTY_CONV: CoderConv = { messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
+  const activeWs = store.activeWs;
+  const activeConv = store.activeConv;
 
-  // Every workspace keeps its own conversation (mirrors deepseek-harness's
-  // Sessions-per-Workspace model), keyed by absolute workspace path.
-  const [conversations, setConversations] = useState<Record<string, CoderConv>>(() => {
-    try {
-      const raw = localStorage.getItem(CONV_KEY);
-      if (raw) return JSON.parse(raw) as Record<string, CoderConv>;
-    } catch { /* ignore */ }
-    return {};
-  });
-  const [activeWs, setActiveWs] = useState<string>(() => {
-    try {
-      const raw = localStorage.getItem(WS_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as { list?: string[]; active?: string };
-        if (parsed.active) return parsed.active;
-      }
-    } catch { /* ignore */ }
-    return coderWs;
-  });
-  const [workspaces, setWorkspaces] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem(WS_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as { list?: string[]; active?: string };
-        if (Array.isArray(parsed.list)) return parsed.list;
-      }
-    } catch { /* ignore */ }
-    return coderWs ? [coderWs] : [];
-  });
-
-  // Live state for the active workspace's conversation.
-  const [messages, setMessages] = useState<ChatMessage[]>(() => conversations[activeWs]?.messages ?? []);
+  const initialMeta = store.workspaces[activeWs]?.conversations[activeConv];
+  const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
-  const [ledger, setLedger] = useState<LogEntry[]>(() => conversations[activeWs]?.ledger ?? []);
-  const [todos, setTodos] = useState<TodoItem[]>(() => conversations[activeWs]?.todos ?? []);
+  const [ledger, setLedger] = useState<LogEntry[]>(initialMeta?.ledger ?? []);
+  const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
   const [wsBusy, setWsBusy] = useState(false);
+  const [showDir, setShowDir] = useState(false);
 
-  // Tracks the latest turn's prompt-token count for the active workspace so we
-  // can decide when to auto-compact (persisted alongside the conversation).
-  const lastPromptTokensRef = useRef<number>(conversations[activeWs]?.lastPromptTokens ?? 0);
+  const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
 
-  // Persist the active workspace's conversation whenever it (or the active
-  // workspace) changes.
+  /** Load a conversation's live state from the store (always reads the latest). */
+  const loadConv = (ws: string, convId: string) => {
+    const meta = storeRef.current.workspaces[ws]?.conversations[convId];
+    const m = meta ?? emptyConv(convId);
+    lastPromptTokensRef.current = m.lastPromptTokens ?? 0;
+    setMessages(m.messages ?? []);
+    setLedger(m.ledger ?? []);
+    setTodos(m.todos ?? []);
+  };
+
+  // Persist the active conversation's live state back into the store.
   useEffect(() => {
-    setConversations((c) => {
-      const next = { ...c, [activeWs]: { messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current } };
-      try { localStorage.setItem(CONV_KEY, JSON.stringify(next)); } catch { /* ignore */ }
-      return next;
+    if (!activeWs || !activeConv) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      if (!wsd) return prev;
+      const meta = wsd.conversations[activeConv];
+      const firstUser = messages.find((m) => m.role === 'user');
+      const title = firstUser
+        ? firstUser.content.replace(/\s+/g, ' ').trim().slice(0, 48) || (meta?.title ?? 'New conversation')
+        : (meta?.title ?? 'New conversation');
+      const updated: ConvMeta = { id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current };
+      const order = wsd.order.includes(activeConv) ? wsd.order : [...wsd.order, activeConv];
+      return {
+        ...prev,
+        workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: updated }, order } },
+      };
     });
-  }, [messages, ledger, todos, activeWs]);
+  }, [messages, ledger, todos, activeWs, activeConv]);
 
-  const loadConv = (ws: string) => {
-    const c = conversations[ws] ?? EMPTY_CONV;
-    lastPromptTokensRef.current = c.lastPromptTokens ?? 0;
-    setMessages(c.messages);
-    setLedger(c.ledger);
-    setTodos(c.todos);
-  };
-  const persistWs = (list: string[], active: string) => {
-    try { localStorage.setItem(WS_STORAGE_KEY, JSON.stringify({ list, active })); } catch { /* ignore */ }
-  };
-  const syncActiveWs = async (path: string) => {
+  // Keep the sidecar's coder workspace pointed at the active workspace.
+  useEffect(() => {
+    if (!activeWs) return;
+    let cancelled = false;
     setWsBusy(true);
-    try { await setCoderWorkspace(path); } catch (e) { console.warn('Failed to set coder workspace on sidecar:', e); }
-    finally { setWsBusy(false); }
-  };
-  const handleSelectWorkspace = (path: string) => {
-    if (path === activeWs) return;
-    setActiveWs(path);
-    loadConv(path);
-    persistWs(workspaces, path);
-    void syncActiveWs(path);
-  };
-  const handleAddWorkspace = (path: string) => {
-    const next = workspaces.includes(path) ? workspaces : [...workspaces, path];
-    setWorkspaces(next);
-    setActiveWs(path);
-    loadConv(path);
-    persistWs(next, path);
-    void syncActiveWs(path);
-  };
-  const handleRemoveWorkspace = (path: string) => {
-    const next = workspaces.filter((w) => w !== path);
-    setWorkspaces(next);
-    setConversations((c) => {
-      const copy = { ...c };
-      delete copy[path];
-      try { localStorage.setItem(CONV_KEY, JSON.stringify(copy)); } catch { /* ignore */ }
-      return copy;
+    setCoderWorkspace(activeWs)
+      .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
+      .finally(() => { if (!cancelled) setWsBusy(false); });
+    return () => { cancelled = true; };
+  }, [activeWs]);
+
+  // Seed the default workspace from the sidecar once its path is known.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!coderWs || seeded.current) return;
+    seeded.current = true;
+    setStore((prev) => {
+      if (prev.workspaces[coderWs]) return prev;
+      const id = newConvId();
+      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id };
+      return { ...prev, activeWs: coderWs, activeConv: id, workspaces: { ...prev.workspaces, [coderWs]: ws } };
     });
-    let nextActive = activeWs;
-    if (activeWs === path) {
-      nextActive = next[0] ?? '';
-      setActiveWs(nextActive);
-      loadConv(nextActive);
-      void syncActiveWs(nextActive);
-    }
-    persistWs(next, nextActive);
-  };
-  const newChat = () => {
+    setMessages([]);
+    setLedger([]);
+    setTodos([]);
+    lastPromptTokensRef.current = 0;
+  }, [coderWs]);
+
+  /** Create a fresh conversation inside a workspace and make it active. */
+  const newChat = (ws: string = activeWs) => {
+    if (!ws) return;
+    const id = newConvId();
+    setStore((prev) => {
+      const wsd = prev.workspaces[ws] ?? { expanded: true, conversations: {}, order: [], activeConv: undefined };
+      return {
+        ...prev,
+        activeWs: ws,
+        activeConv: id,
+        workspaces: { ...prev.workspaces, [ws]: { ...wsd, conversations: { ...wsd.conversations, [id]: emptyConv(id) }, order: [...wsd.order, id], activeConv: id } },
+      };
+    });
     setMessages([]);
     setLedger([]);
     setTodos([]);
     lastPromptTokensRef.current = 0;
   };
 
+  const handleSelectConv = (ws: string, convId: string) => {
+    if (ws === activeWs && convId === activeConv) return;
+    setStore((prev) => ({ ...prev, activeWs: ws, activeConv: convId }));
+    loadConv(ws, convId);
+  };
+  const handleSelectWorkspace = (ws: string) => {
+    const wsd = storeRef.current.workspaces[ws];
+    const cid = wsd?.activeConv ?? wsd?.order[0] ?? '';
+    handleSelectConv(ws, cid);
+  };
+  const handleToggleExpand = (ws: string) => {
+    setStore((prev) => {
+      const wsd = prev.workspaces[ws];
+      if (!wsd) return prev;
+      return { ...prev, workspaces: { ...prev.workspaces, [ws]: { ...wsd, expanded: !wsd.expanded } } };
+    });
+  };
+  const handleAddWorkspace = (path: string) => {
+    const existing = storeRef.current.workspaces[path];
+    setStore((prev) => {
+      if (existing) return { ...prev, activeWs: path, activeConv: existing.activeConv ?? existing.order[0] ?? '' };
+      const id = newConvId();
+      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id };
+      return { ...prev, activeWs: path, activeConv: id, workspaces: { ...prev.workspaces, [path]: ws } };
+    });
+    if (existing) {
+      const cid = existing.activeConv ?? existing.order[0] ?? '';
+      loadConv(path, cid);
+    } else {
+      setMessages([]);
+      setLedger([]);
+      setTodos([]);
+      lastPromptTokensRef.current = 0;
+    }
+  };
+  const handleRemoveWorkspace = (path: string) => {
+    const workspaces = { ...storeRef.current.workspaces };
+    delete workspaces[path];
+    const keys = Object.keys(workspaces);
+    let aWs = storeRef.current.activeWs;
+    let aConv = storeRef.current.activeConv;
+    if (storeRef.current.activeWs === path) {
+      aWs = keys[0] ?? '';
+      aConv = aWs ? (workspaces[aWs].activeConv ?? workspaces[aWs].order[0] ?? '') : '';
+    }
+    setStore((prev) => ({ ...prev, workspaces, activeWs: aWs, activeConv: aConv }));
+    if (aWs && aConv) loadConv(aWs, aConv);
+    else {
+      setMessages([]);
+      setLedger([]);
+      setTodos([]);
+      lastPromptTokensRef.current = 0;
+    }
+  };
+
   const abortRef = useRef<AbortController | null>(null);
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
-    setLedger(prev => [...prev.slice(-999), { ...entry, id: Math.random().toString(36).slice(2), time: Date.now() }]);
+    setLedger((prev) => [...prev.slice(-999), { ...entry, id: Math.random().toString(36).slice(2), time: Date.now() }]);
   };
 
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[]) => {
@@ -623,7 +761,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const onSubmit = () => {
-    if (!input.trim() || running) return;
+    if (!input.trim() || running || !activeWs) return;
     const msg: ChatMessage = { role: 'user', content: input.trim() };
     const next = [...messages, msg];
     setMessages(next);
@@ -659,87 +797,178 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return groups;
   }, [messages]);
 
+  const activeMeta = store.workspaces[activeWs]?.conversations[activeConv];
+
   return (
     <div className="flex h-full w-full">
-      <div className="flex w-64 flex-col border-r border-line bg-panel">
-        <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
-          <Terminal size={14} /> File Tree & Ledger
+      {/* Left: workspace folders + conversations + ledger */}
+      <div className="flex w-72 flex-col border-r border-line bg-panel">
+        <div className="flex items-center gap-2 border-b border-line p-2 text-sm font-semibold">
+          <Terminal size={14} /> Conversations
           <button
-            className="ml-auto rounded border border-line px-2 py-0.5 text-[11px] font-normal text-mute hover:bg-panel2 hover:text-ink"
-            title="Start a new chat in this workspace"
-            onClick={newChat}
+            className="ml-auto flex items-center gap-1 rounded border border-line px-2 py-0.5 text-[11px] font-normal text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            title="Add a workspace folder"
+            onClick={() => setShowDir(true)}
+            disabled={wsBusy}
+          >
+            <FolderPlus size={13} /> Add
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-auto">
+          {Object.keys(store.workspaces).length === 0 && (
+            <div className="p-3 text-[11px] italic text-faint">
+              No workspaces yet — click “Add” to point the coder at a folder.
+            </div>
+          )}
+          {Object.entries(store.workspaces).map(([ws, wsd]) => {
+            const isActiveWs = ws === activeWs;
+            return (
+              <div key={ws} className="border-b border-line/60">
+                <div className={cn('group flex items-center gap-1 px-1.5 py-1.5', isActiveWs ? 'bg-accent/10' : 'hover:bg-panel2')}>
+                  <button
+                    className="shrink-0 text-faint hover:text-ink"
+                    onClick={() => handleToggleExpand(ws)}
+                    title={wsd.expanded ? 'Collapse' : 'Expand'}
+                  >
+                    {wsd.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
+                  <button className="flex min-w-0 flex-1 items-center gap-1.5 text-left" onClick={() => handleSelectWorkspace(ws)} title={ws}>
+                    <Folder size={13} className={cn('shrink-0', isActiveWs ? 'text-accent' : 'text-mute')} />
+                    <span className={cn('truncate text-[12px] font-medium', isActiveWs ? 'text-ink' : 'text-mute')}>{baseName(ws)}</span>
+                    <span className="shrink-0 rounded-full bg-panel2 px-1.5 text-[9.5px] text-faint">{wsd.order.length}</span>
+                  </button>
+                  <button
+                    className="shrink-0 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                    title="New conversation in this workspace"
+                    onClick={() => newChat(ws)}
+                  >
+                    <Plus size={13} />
+                  </button>
+                  <button
+                    className="shrink-0 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
+                    title="Remove workspace"
+                    onClick={() => handleRemoveWorkspace(ws)}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+
+                {wsd.expanded && (
+                  <div className="space-y-0.5 pb-1.5 pl-6 pr-1.5">
+                    {wsd.order.map((cid) => {
+                      const c = wsd.conversations[cid];
+                      if (!c) return null;
+                      const isActive = ws === activeWs && cid === activeConv;
+                      return (
+                        <button
+                          key={cid}
+                          onClick={() => handleSelectConv(ws, cid)}
+                          className={cn('flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
+                          title={c.title}
+                        >
+                          <span className={cn('min-w-0 flex-1 truncate text-[11.5px]', isActive ? 'font-medium' : '')}>{c.title || 'New conversation'}</span>
+                          {c.updatedAt ? <span className="shrink-0 text-[9.5px] text-faint">{relTime(c.updatedAt)}</span> : null}
+                        </button>
+                      );
+                    })}
+                    <button onClick={() => newChat(ws)} className="flex w-full items-center gap-1 px-1.5 py-1 text-[11px] text-faint hover:text-accent">
+                      <Plus size={12} /> New conversation
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Session Ledger */}
+        <div className="max-h-44 shrink-0 overflow-auto border-t border-line p-2">
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Session Ledger</div>
+          <div className="space-y-1.5">
+            {ledger.map((l) => (
+              <div key={l.id} className="flex flex-col gap-0.5 border-l-2 border-line pl-2 ml-1 text-[10.5px]">
+                <div className="flex items-center gap-1.5">
+                  <span className="font-mono text-faint">{new Date(l.time).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                  <span className={cn(
+                    "font-semibold",
+                    l.type === 'error' ? 'text-danger' : 
+                    l.type === 'bash' ? 'text-[#e5c07b]' : 
+                    l.type === 'compact' ? 'text-accent' : 
+                    l.type === 'todo' ? 'text-ok' : 'text-accent'
+                  )}>{l.label}</span>
+                  {l.durationMs !== undefined && <span className="text-faint ml-auto">{l.durationMs}ms</span>}
+                </div>
+                {l.detail && <div className="text-mute truncate font-mono" title={l.detail}>{l.detail}</div>}
+              </div>
+            ))}
+            {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* Center: conversation messages */}
+      <div className="flex flex-1 flex-col">
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px]">
+          <Folder size={13} className="text-accent" />
+          <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
+          <span className="text-faint">/</span>
+          <span className="truncate text-mute">{activeMeta?.title || 'New conversation'}</span>
+          <button
+            className="ml-auto rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            onClick={() => newChat(activeWs)}
+            disabled={!activeWs}
+            title="New conversation in this workspace"
           >
             + chat
           </button>
         </div>
-        <div className="flex-1 flex flex-col min-h-0">
-          <Workspaces
-            workspaces={workspaces}
-            active={activeWs}
-            onSelect={handleSelectWorkspace}
-            onAdd={handleAddWorkspace}
-            onRemove={handleRemoveWorkspace}
-            busy={wsBusy}
-          />
-          <div className="flex-1 overflow-auto p-2">
-            <div className="text-[11px] font-semibold text-faint mb-2 uppercase tracking-wider">Session Ledger</div>
-            <div className="space-y-1.5">
-              {ledger.map((l) => (
-                <div key={l.id} className="flex flex-col gap-0.5 text-[10.5px] border-l-2 border-line pl-2 ml-1">
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-mono text-faint">{new Date(l.time).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                    <span className={cn(
-                      "font-semibold",
-                      l.type === 'error' ? 'text-danger' : 
-                      l.type === 'bash' ? 'text-[#e5c07b]' : 
-                      l.type === 'compact' ? 'text-accent' : 
-                      l.type === 'todo' ? 'text-ok' : 'text-accent'
-                    )}>{l.label}</span>
-                    {l.durationMs !== undefined && <span className="text-faint ml-auto">{l.durationMs}ms</span>}
-                  </div>
-                  {l.detail && <div className="text-mute truncate font-mono" title={l.detail}>{l.detail}</div>}
-                </div>
-              ))}
-              {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
+
+        <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
+          {!activeWs ? (
+            <div className="flex h-full items-center justify-center text-center text-[13px] text-faint">
+              <div>
+                <p>No workspace selected.</p>
+                <p className="mt-1 text-[12px]">Click “Add” to point the coder at a folder.</p>
+              </div>
             </div>
-          </div>
+          ) : (
+            messageGroups.map((g, i) => (
+              <React.Fragment key={i}>
+                {g.type === 'trajectory' ? (
+                  <TrajectoryBlock items={g.items} />
+                ) : (
+                  <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
+                    <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role}</div>
+                    {g.items[0].content && (
+                      g.items[0].role === 'assistant'
+                        ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
+                        : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
+                    )}
+                  </div>
+                )}
+              </React.Fragment>
+            ))
+          )}
         </div>
-      </div>
-      <div className="flex flex-1 flex-col">
-        <div className="flex-1 p-4 overflow-auto bg-panel2 space-y-4">
-          {messageGroups.map((g, i) => (
-            <React.Fragment key={i}>
-              {g.type === 'trajectory' ? (
-                <TrajectoryBlock items={g.items} />
-              ) : (
-                <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
-                  <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role}</div>
-                  {g.items[0].content && (
-                    g.items[0].role === 'assistant'
-                      ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
-                      : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
-                  )}
-                </div>
-              )}
-            </React.Fragment>
-          ))}
-        </div>
-        <div className="p-3 bg-panel border-t border-line flex gap-2">
+        <div className="flex gap-2 border-t border-line bg-panel p-3">
           <input 
             className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50" 
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && onSubmit()}
-            placeholder="Instruct the coder agent..."
-            disabled={running}
+            placeholder={activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
+            disabled={running || !activeWs}
           />
           {running ? (
              <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
           ) : (
-             <Button variant="primary" onClick={onSubmit}><Play size={14} /> Run</Button>
+             <Button variant="primary" onClick={onSubmit} disabled={!activeWs}><Play size={14} /> Run</Button>
           )}
         </div>
       </div>
+
+      {/* Right: todos */}
       <div className="flex w-64 flex-col border-l border-line bg-panel">
         <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
           <CheckSquare size={14} /> Todos
@@ -759,6 +988,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           )}
         </div>
       </div>
+
+      {showDir && (
+        <DirBrowser
+          initialPath={activeWs || '/'}
+          onPick={(p) => { handleAddWorkspace(p); setShowDir(false); }}
+          onClose={() => setShowDir(false)}
+        />
+      )}
     </div>
   );
 }
