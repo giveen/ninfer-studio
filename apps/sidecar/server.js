@@ -23,6 +23,13 @@ import { Readability } from '@mozilla/readability';
 import TurndownService from 'turndown';
 import { JSDOM } from 'jsdom';
 
+// Coder "safe mode": when ON, the sidecar refuses clearly destructive shell
+// commands (rm -rf /, git push --force, mkfs, dd to a device, piping a
+// download into a shell, etc.) so a local model — which can be jailbroken or
+// simply mistaken — cannot wipe the user's machine. Users can disable it for
+// trusted workflows via the Coder UI toggle (persisted only for the session).
+let coderSafeMode = true;
+
 // ---------------------------------------------------------------------------
 // Loopback HTTP helper. We deliberately avoid the global `fetch` (undici) for
 // engine calls: inside the sandbox undici fails to connect to 127.0.0.1 (it
@@ -1150,7 +1157,51 @@ async function globSearch(pattern, relRoot) {
   await walkFiles(root, relOf(base), files, MAX_GLOB_FILES);
   return files.filter((f) => re.test(f)).sort().slice(0, MAX_GLOB_FILES);
 }
+// Recognize shell commands that can cause irreversible data loss or system
+// damage. Returns a short human-readable reason, or null if the command looks
+// safe. Safe mode (coderSafeMode) blocks anything this flags.
+function detectDestructive(cmd) {
+  const tests = [
+    [/\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['"]?(\/|~|\.\.\/|\*|\/home|\/root|\/etc|\/usr|\/var|\/System|\/private)/i, 'recursive delete of a system/home directory or wildcard'],
+    [/\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['"]?\s*\.(?:\s|$)/i, 'recursive delete of the current directory'],
+    [/\bgit\s+push\b[^]*?(--force|-f\b)/i, 'force push (can overwrite remote history)'],
+    [/\bgit\s+reset\s+--hard\b/i, 'hard reset (discards uncommitted work)'],
+    [/\bgit\s+clean\s+-[a-z]*f/i, 'git clean (removes untracked files)'],
+    [/\bmkfs\b/i, 'filesystem format'],
+    [/\bdd\s+if=/i, 'dd disk image copy'],
+    [/\bshred\b/i, 'secure file shredding'],
+    [/\bwipefs\b/i, 'filesystem wipe'],
+    [/\b(shutdown|reboot|halt|poweroff)\b/i, 'system power command'],
+    [/:\(\)\s*\{\s*:\s*\|\s*:&\s*\}/, 'fork bomb'],
+    [/\b(curl|wget|fetch)\b[^]*?\|\s*(ba)?sh\b/i, 'piping a download straight into a shell'],
+    [/\bchmod\s+(-R\s+)?0+\b/i, 'removing all permissions'],
+    [/\bchown\s+-R\b/i, 'recursive ownership change'],
+    [/\bdd\b[^]*?\bof=\/dev\//i, 'writing directly to a device'],
+    [/>\s*\/dev\/sd/i, 'writing to a raw disk device'],
+  ];
+  for (const [re, why] of tests) {
+    if (re.test(cmd)) return why;
+  }
+  return null;
+}
+
 function execCommand(command, relCwd, timeoutMs) {
+  if (coderSafeMode) {
+    const reason = detectDestructive(command);
+    if (reason) {
+      const cwd = relOf(relCwd ? withinWs(relCwd) : coderRoot());
+      return Promise.resolve({
+        stdout: '',
+        stderr: `⛔ Blocked by safe mode: ${reason}. Use a scoped, non-destructive alternative or ask the user.`,
+        exitCode: 1,
+        timedOut: false,
+        truncated: false,
+        blocked: true,
+        cwd,
+        error: reason,
+      });
+    }
+  }
   const root = coderRoot();
   const cwd = relCwd ? withinWs(relCwd) : root;
   const timeout = Math.min(Math.max(timeoutMs || 120000, 1000), 600000);
@@ -1302,6 +1353,14 @@ async function handleCoder(req, res, p, url) {
         }
       }
       return sendJson(res, 200, { workspace: root || '', exists });
+    }
+    if (p === '/api/coder/safe-mode' && req.method === 'GET') {
+      return sendJson(res, 200, { enabled: coderSafeMode });
+    }
+    if (p === '/api/coder/safe-mode' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 10);
+      if (typeof body?.enabled === 'boolean') coderSafeMode = body.enabled;
+      return sendJson(res, 200, { enabled: coderSafeMode });
     }
     if (p === '/api/coder/workspace' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

@@ -367,6 +367,8 @@ export interface CoderExecResult {
   timedOut: boolean;
   /** True when stdout/stderr exceeded the sidecar's output cap and was truncated. */
   truncated?: boolean;
+  /** True when the command was refused by safe mode (see detectDestructive). */
+  blocked?: boolean;
   cwd: string;
   error?: string;
 }

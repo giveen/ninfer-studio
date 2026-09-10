@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, type CoderCommit } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
@@ -226,7 +226,10 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
         <div className="rounded-md bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[11px] overflow-hidden mt-1">
           <div className="bg-[#2d2d2d] px-2 py-1 flex justify-between items-center text-[#858585]">
             <span>Terminal {data.exitCode !== null ? `(exit ${data.exitCode})` : ''}</span>
-            {data.timedOut && <span className="text-warn">Timeout</span>}
+            <span className="flex items-center gap-2">
+              {data.blocked && <span className="text-danger font-semibold">Blocked by safe mode</span>}
+              {data.timedOut && <span className="text-warn">Timeout</span>}
+            </span>
           </div>
           <div className="p-2 overflow-auto max-h-64 whitespace-pre">
             {data.stdout && <div>{data.stdout}</div>}
@@ -499,6 +502,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
 
+  // Coder "safe mode": the sidecar refuses clearly destructive shell commands
+  // (release blocker #2). Surfaced as a toggle + warning banner.
+  const [coderSafeMode, setCoderSafeMode] = useState(true);
+  const toggleSafeMode = useCallback(async (next: boolean) => {
+    setCoderSafeMode(next);
+    try { await coderSafeModeSet(next); } catch { /* keep UI state as-is */ }
+  }, []);
+
   const loadCommits = useCallback(async () => {
     setCommitsLoading(true);
     try {
@@ -515,6 +526,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => {
     if (activeWs) loadCommits();
   }, [activeWs, loadCommits]);
+
+  // Sync the safe-mode toggle with the sidecar's current state on mount.
+  useEffect(() => {
+    coderSafeModeGet()
+      .then((r) => setCoderSafeMode(r.enabled))
+      .catch(() => { /* leave default true */ });
+  }, []);
 
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
   // The system prompt (CODER_SYSTEM + live repo map). Kept in a ref so it can be
@@ -915,6 +933,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     const COMPACT_AT = 0.8;
     const MAX_ATTEMPTS = 3;
+    // Hard ceiling on agent turns so a non-terminating plan (or a model that
+    // keeps emitting tool calls) can't loop forever — it stops with a clear
+    // message instead (release blocker #1).
+    const MAX_AGENT_STEPS = 60;
     // Derive the response budget from the engine's context window so a small
     // context still leaves room for the prompt (P3 #12). The Coder always thinks,
     // and a reasoning trace plus the answer can exceed a tiny budget, so floor
@@ -937,6 +959,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     };
     
     try {
+      let agentSteps = 0;
       while (true) {
         if (abortRef.current?.signal.aborted) break;
 
@@ -982,6 +1005,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         }
         
+        // Hard stop after MAX_AGENT_STEPS real turns (compactions above don't
+        // count) so a runaway plan can't loop indefinitely (release blocker #1).
+        if (agentSteps >= MAX_AGENT_STEPS) {
+          addLog({ type: 'error', label: 'limit', detail: `reached max agent steps (${MAX_AGENT_STEPS}) — stopping to avoid a runaway run` });
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `⚠ Reached the maximum number of agent steps (${MAX_AGENT_STEPS}). The run was stopped to avoid a runaway loop. Review the work so far, then continue in a new message or break the task into smaller steps.`,
+          }]);
+          break;
+        }
+        agentSteps++;
+
         let content = '';
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
@@ -1356,6 +1391,24 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
         </div>
 
+        {/* Safe mode — blocks destructive shell commands (release blocker #2) */}
+        <div className="shrink-0 border-t border-line p-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+              <Shield size={13} /> Safe Mode
+            </div>
+            <button
+              type="button"
+              onClick={() => toggleSafeMode(!coderSafeMode)}
+              className={cn("rounded px-2 py-0.5 text-[11px] font-medium", coderSafeMode ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              title={coderSafeMode ? 'Destructive commands are blocked' : 'Destructive commands are allowed'}
+            >
+              {coderSafeMode ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="mt-1 text-[10.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>
+        </div>
+
         {/* Commit History — git log of the active workspace */}
         <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
           <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
@@ -1427,6 +1480,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
 
         <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
+          {coderSafeMode && (
+            <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[11.5px] text-warn flex items-center gap-2">
+              <span>🛡</span>
+              <span>Safe mode is on — destructive commands (e.g. <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, piping a download into a shell) are blocked. Turn it off in the sidebar only for trusted workspaces.</span>
+            </div>
+          )}
           {!activeWs ? (
             <div className="flex h-full items-center justify-center text-center text-[13px] text-faint">
               <div>

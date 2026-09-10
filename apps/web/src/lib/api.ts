@@ -553,6 +553,12 @@ export function coderWebFetch(url: string): Promise<CoderWebFetch> {
 export function coderWebSearch(query: string): Promise<CoderWebSearch> {
   return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000);
 }
+export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
+}
+export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
+}
 
 export interface CoderCommit {
   hash: string;
