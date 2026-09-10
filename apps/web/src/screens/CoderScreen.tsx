@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -336,6 +336,7 @@ interface ConvMeta {
   ledger: LogEntry[];
   todos: TodoItem[];
   lastPromptTokens: number;
+  archived?: boolean;
 }
 interface WsData {
   expanded: boolean;
@@ -372,6 +373,10 @@ function relTime(ts: number): string {
   if (diff < 30 * DAY) return `${Math.floor(diff / DAY)}d`;
   if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
   return `${Math.floor(diff / (365 * DAY))}y`;
+}
+/** A compaction checkpoint message (the engine-side <compacted-summary> block). */
+function isCompactedMsg(m: ChatMessage): boolean {
+  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
 }
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
@@ -434,6 +439,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
   const [wsBusy, setWsBusy] = useState(false);
   const [showDir, setShowDir] = useState(false);
+  const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
+  const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
 
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
 
@@ -454,7 +461,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const wsd = prev.workspaces[activeWs];
       if (!wsd) return prev;
       const meta = wsd.conversations[activeConv];
-      const firstUser = messages.find((m) => m.role === 'user');
+      const firstUser = messages.find((m) => m.role === 'user' && !isCompactedMsg(m));
       const title = firstUser
         ? firstUser.content.replace(/\s+/g, ' ').trim().slice(0, 48) || (meta?.title ?? 'New conversation')
         : (meta?.title ?? 'New conversation');
@@ -566,6 +573,90 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       setLedger([]);
       setTodos([]);
       lastPromptTokensRef.current = 0;
+    }
+  };
+
+  const handleRenameConv = (ws: string, cid: string, title: string) => {
+    const t = title.trim();
+    setEditingConv(null);
+    if (!t) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[ws];
+      const c = wsd?.conversations[cid];
+      if (!wsd || !c) return prev;
+      return {
+        ...prev,
+        workspaces: { ...prev.workspaces, [ws]: { ...wsd, conversations: { ...wsd.conversations, [cid]: { ...c, title: t } } } },
+      };
+    });
+  };
+
+  const handleArchiveConv = (ws: string, cid: string, archived: boolean) => {
+    const wsd = storeRef.current.workspaces[ws];
+    const c = wsd?.conversations[cid];
+    if (!wsd || !c) return;
+    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
+    let aWs = storeRef.current.activeWs;
+    let aConv = storeRef.current.activeConv;
+    if (archived && isActive) {
+      const other = wsd.order.find((id) => id !== cid && !wsd.conversations[id]?.archived);
+      aConv = other ?? '';
+    }
+    setStore((prev) => {
+      const w = prev.workspaces[ws];
+      if (!w) return prev;
+      const conv = w.conversations[cid];
+      if (!conv) return prev;
+      return {
+        ...prev,
+        activeWs: aWs,
+        activeConv: aConv,
+        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: { ...w.conversations, [cid]: { ...conv, archived } } } },
+      };
+    });
+    if (archived && isActive) {
+      if (aConv) loadConv(aWs, aConv);
+      else {
+        setMessages([]);
+        setLedger([]);
+        setTodos([]);
+        lastPromptTokensRef.current = 0;
+      }
+    }
+  };
+
+  const handleDeleteConv = (ws: string, cid: string) => {
+    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
+    const wsd = storeRef.current.workspaces[ws];
+    if (!wsd) return;
+    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
+    let aWs = storeRef.current.activeWs;
+    let aConv = storeRef.current.activeConv;
+    if (isActive) {
+      const remaining = wsd.order.filter((id) => id !== cid);
+      aConv = remaining.find((id) => !wsd.conversations[id]?.archived) ?? remaining[0] ?? '';
+    }
+    setStore((prev) => {
+      const w = prev.workspaces[ws];
+      if (!w) return prev;
+      const convs = { ...w.conversations };
+      delete convs[cid];
+      const order = w.order.filter((id) => id !== cid);
+      return {
+        ...prev,
+        activeWs: aWs,
+        activeConv: aConv,
+        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: convs, order } },
+      };
+    });
+    if (isActive) {
+      if (aConv) loadConv(aWs, aConv);
+      else {
+        setMessages([]);
+        setLedger([]);
+        setTodos([]);
+        lastPromptTokensRef.current = 0;
+      }
     }
   };
 
@@ -774,26 +865,34 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const messageGroups = useMemo(() => {
-    const groups: { type: 'message' | 'trajectory', items: ChatMessage[] }[] = [];
+    const groups: { type: 'message' | 'trajectory' | 'compact', items: ChatMessage[] }[] = [];
     let currentTrajectory: ChatMessage[] = [];
-    
+
+    const flushTrajectory = () => {
+      if (currentTrajectory.length > 0) {
+        groups.push({ type: 'trajectory', items: currentTrajectory });
+        currentTrajectory = [];
+      }
+    };
+
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
+      // Compaction checkpoints are shown as a quiet divider, not a chat bubble.
+      if (isCompactedMsg(m)) {
+        flushTrajectory();
+        groups.push({ type: 'compact', items: [m] });
+        continue;
+      }
       const isBackground = m.role === 'tool' || (m.role === 'assistant' && !!m.tool_calls?.length);
-      
+
       if (isBackground) {
         currentTrajectory.push(m);
       } else {
-        if (currentTrajectory.length > 0) {
-          groups.push({ type: 'trajectory', items: currentTrajectory });
-          currentTrajectory = [];
-        }
+        flushTrajectory();
         groups.push({ type: 'message', items: [m] });
       }
     }
-    if (currentTrajectory.length > 0) {
-      groups.push({ type: 'trajectory', items: currentTrajectory });
-    }
+    flushTrajectory();
     return groups;
   }, [messages]);
 
@@ -856,25 +955,122 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
                 {wsd.expanded && (
                   <div className="space-y-0.5 pb-1.5 pl-6 pr-1.5">
-                    {wsd.order.map((cid) => {
-                      const c = wsd.conversations[cid];
-                      if (!c) return null;
-                      const isActive = ws === activeWs && cid === activeConv;
-                      return (
+                    {wsd.order
+                      .filter((cid) => {
+                        const c = wsd.conversations[cid];
+                        return c && !c.archived;
+                      })
+                      .map((cid) => {
+                        const c = wsd.conversations[cid];
+                        if (!c) return null;
+                        const isActive = ws === activeWs && cid === activeConv;
+                        const isEditing = editingConv?.ws === ws && editingConv?.cid === cid;
+                        return (
+                          <div
+                            key={cid}
+                            className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
+                          >
+                            {isEditing ? (
+                              <input
+                                autoFocus
+                                defaultValue={c.title}
+                                className="min-w-0 flex-1 rounded border border-line bg-inset px-1 py-0.5 text-[11.5px] outline-none focus:border-accent/50"
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') handleRenameConv(ws, cid, (e.target as HTMLInputElement).value);
+                                  if (e.key === 'Escape') setEditingConv(null);
+                                }}
+                                onBlur={(e) => handleRenameConv(ws, cid, e.target.value)}
+                              />
+                            ) : (
+                              <button
+                                onClick={() => handleSelectConv(ws, cid)}
+                                className={cn('min-w-0 flex-1 truncate text-left text-[11.5px]', isActive ? 'font-medium' : '')}
+                                title={c.title}
+                              >
+                                {c.title || 'New conversation'}
+                              </button>
+                            )}
+                            {c.updatedAt && !isEditing ? (
+                              <span className="shrink-0 text-[9.5px] text-faint">{relTime(c.updatedAt)}</span>
+                            ) : null}
+                            {!isEditing && (
+                              <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
+                                <button
+                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
+                                  title="Rename conversation"
+                                  onClick={() => setEditingConv({ ws, cid })}
+                                >
+                                  <Pencil size={14} />
+                                </button>
+                                <button
+                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
+                                  title="Archive conversation"
+                                  onClick={() => handleArchiveConv(ws, cid, true)}
+                                >
+                                  <Archive size={14} />
+                                </button>
+                                <button
+                                  className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
+                                  title="Delete conversation"
+                                  onClick={() => handleDeleteConv(ws, cid)}
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                    {wsd.order.some((cid) => wsd.conversations[cid]?.archived) && (
+                      <div className="pt-1">
                         <button
-                          key={cid}
-                          onClick={() => handleSelectConv(ws, cid)}
-                          className={cn('flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
-                          title={c.title}
+                          onClick={() => setArchivedOpen((o) => ({ ...o, [ws]: !o[ws] }))}
+                          className="flex w-full items-center gap-1 px-1.5 py-1 text-[10.5px] text-faint hover:text-ink"
                         >
-                          <span className={cn('min-w-0 flex-1 truncate text-[11.5px]', isActive ? 'font-medium' : '')}>{c.title || 'New conversation'}</span>
-                          {c.updatedAt ? <span className="shrink-0 text-[9.5px] text-faint">{relTime(c.updatedAt)}</span> : null}
+                          {archivedOpen[ws] ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                          Archived ({wsd.order.filter((cid) => wsd.conversations[cid]?.archived).length})
                         </button>
-                      );
-                    })}
-                    <button onClick={() => newChat(ws)} className="flex w-full items-center gap-1 px-1.5 py-1 text-[11px] text-faint hover:text-accent">
-                      <Plus size={12} /> New conversation
-                    </button>
+                        {archivedOpen[ws] &&
+                          wsd.order
+                            .filter((cid) => wsd.conversations[cid]?.archived)
+                            .map((cid) => {
+                              const c = wsd.conversations[cid];
+                              if (!c) return null;
+                              const isActive = ws === activeWs && cid === activeConv;
+                              return (
+                                <div
+                                  key={cid}
+                                  className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-faint hover:bg-panel2')}
+                                >
+                                  <button
+                                    onClick={() => handleSelectConv(ws, cid)}
+                                    className="min-w-0 flex-1 truncate text-left text-[11.5px] line-through"
+                                    title={c.title}
+                                  >
+                                    {c.title || 'New conversation'}
+                                  </button>
+                                  <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
+                                    <button
+                                      className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
+                                      title="Restore conversation"
+                                      onClick={() => handleArchiveConv(ws, cid, false)}
+                                    >
+                                      <RotateCcw size={14} />
+                                    </button>
+                                    <button
+                                      className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
+                                      title="Delete conversation"
+                                      onClick={() => handleDeleteConv(ws, cid)}
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -935,7 +1131,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           ) : (
             messageGroups.map((g, i) => (
               <React.Fragment key={i}>
-                {g.type === 'trajectory' ? (
+                {g.type === 'compact' ? (
+                  <div className="my-1 flex items-center gap-2 text-[10.5px] text-faint">
+                    <span className="h-px flex-1 bg-line" />
+                    <span className="flex items-center gap-1">✂ Context compacted</span>
+                    <span className="h-px flex-1 bg-line" />
+                  </div>
+                ) : g.type === 'trajectory' ? (
                   <TrajectoryBlock items={g.items} />
                 ) : (
                   <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
