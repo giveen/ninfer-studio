@@ -242,6 +242,29 @@ async function saveConfig(patch) {
 }
 
 // ---------------------------------------------------------------------------
+// Coder self-improving memory (per-workspace, stored OUTSIDE the user's repo so
+// it never gets committed). Mirrors Evo-Memory / Cline "memory bank": a curated
+// markdown bank + an append-only learnings log the agent reads each session.
+// ---------------------------------------------------------------------------
+function memDirFor(ws) {
+  const slug = String(ws).replace(/[^\w.-]/g, '_').slice(-160);
+  return path.join(DATA_DIR, 'coder-memory', slug);
+}
+async function readMemFile(ws, name, def = '') {
+  try { return await fs.readFile(path.join(memDirFor(ws), name), 'utf8'); } catch { return def; }
+}
+async function writeMemFile(ws, name, content) {
+  const dir = memDirFor(ws);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, name), content);
+}
+async function readLearnings(ws) {
+  const raw = await readMemFile(ws, 'learnings.jsonl', '');
+  return raw.split('\n').map((l) => l.trim()).filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
 // Per-user profile state — the live engine profile, the chosen artifact, and the
 // named saved profiles. Persisted to <DATA_DIR>/profile.json so they survive a
 // restart (previously kept in browser localStorage).
@@ -1662,6 +1685,40 @@ async function handleCoder(req, res, p, url) {
       } catch (e) {
         return sendJson(res, 200, { files: [], diff: '', error: String(e?.message || e) });
       }
+    }
+    if (p === '/api/coder/memory' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const bank = await readMemFile(root, 'bank.md', '');
+      const learnings = await readLearnings(root);
+      return sendJson(res, 200, { bank, learnings });
+    }
+    if (p === '/api/coder/memory' && req.method === 'POST') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const body = await readBody(req, 1 << 20);
+      if (typeof body?.bank === 'string') {
+        await writeMemFile(root, 'bank.md', body.bank);
+      }
+      if (body?.learning && typeof body.learning.text === 'string') {
+        const entry = {
+          id: `l_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          text: body.learning.text,
+          kind: body.learning.kind || 'tip',
+          provenance: body.learning.provenance || '',
+          task: body.learning.task || '',
+          ts: new Date().toISOString(),
+        };
+        await fs.mkdir(memDirFor(root), { recursive: true });
+        await fs.appendFile(path.join(memDirFor(root), 'learnings.jsonl'), JSON.stringify(entry) + '\n');
+      }
+      if (typeof body?.dropLearningId === 'string') {
+        const keep = (await readLearnings(root)).filter((l) => l.id !== body.dropLearningId);
+        await writeMemFile(root, 'learnings.jsonl', keep.map((l) => JSON.stringify(l)).join('\n') + (keep.length ? '\n' : ''));
+      }
+      const bank = await readMemFile(root, 'bank.md', '');
+      const learnings = await readLearnings(root);
+      return sendJson(res, 200, { bank, learnings });
     }
     if (p === '/api/coder/fs/read' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

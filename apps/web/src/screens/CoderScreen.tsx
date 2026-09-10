@@ -5,7 +5,8 @@ import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
 import { DiffReviewModal } from '../components/DiffReviewModal';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, type CoderCommit, type CoderDiffResult } from '../lib/api';
+import { MemoryModal } from '../components/MemoryModal';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind } from '../lib/api';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
@@ -30,6 +31,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
 5. **Completion**: Only emit a final conversational response when the ENTIRE task is fully complete, tested, and verified.
 6. **Context is managed for you**: this harness automatically compacts the conversation when it nears the model's context limit, replacing earlier turns with a concise summary checkpoint. You do NOT need to summarize manually — keep working normally and rely on the checkpoint to preserve prior context.
+ 7. **You have a memory that persists across sessions**. The system prompt above injects the repository's *Memory Bank* (a curated markdown file the user maintains) and *Learnings* extracted from prior runs. Consult them before acting — they encode hard-won conventions, gotchas, and working commands. When you discover something non-obvious mid-work (a working build/test command, a project convention, a fix that worked, or a mistake to avoid), record it with the \`memory_update\` tool so future runs start smarter. Pass kind='success' for a working approach, 'tip' for a convention/fact/command, and 'avoid' for a mistake or anti-pattern.
 `;
 
 // Worker subagent (implementation): a focused agent that shares the workspace and
@@ -49,7 +51,11 @@ or
 VERDICT: CHANGES_REQUESTED
 <issue 1 — file:line, suggested fix>
 <issue 2 — ...>
-Do not rewrite code. Be precise and concise, and prefer specific file:line references.`;
+Do not rewrite code. Be precise and concise, and prefer specific file:line references.
+
+After the verdict, you MAY append reusable learnings, one per line, to make future runs smarter. Only include learnings that are genuinely reusable and non-obvious; none is fine:
+LEARNING: <a working approach, command, or convention worth repeating — something to DO>
+AVOID: <a mistake or anti-pattern to steer future runs away from — something NOT to do>`;
 
 const TOOLS = [
   {
@@ -372,6 +378,21 @@ const TOOLS = [
           question: { type: "string", description: "The question or request to show the user." }
         },
         required: ["question"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_update",
+      description: "Record a durable learning to this repo's memory bank so future sessions start smarter. Use it proactively when you discover something non-obvious: a build/test command, a project convention, a gotcha to avoid, or a fix that worked. The harness also auto-captures learnings from the critic, so only record things that surfaced mid-work. Pass kind='avoid' for mistakes/anti-patterns to steer future runs away from them.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "One concise, self-contained learning (imperative, e.g. 'Run `pnpm test` (not npm) — this repo uses pnpm.')." },
+          kind: { type: "string", enum: ["success", "tip", "avoid"], description: "success = a working approach/fix; tip = a convention/fact/command; avoid = a mistake or anti-pattern." }
+        },
+        required: ["text", "kind"]
       }
     }
   }
@@ -875,6 +896,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
   const conventionsRef = useRef<string>('');
 
+  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the sidecar
+  // under its data dir, so it is never committed by accident. The agent sees it
+  // only via system-prompt injection (memoryRef) — it can't read it as a file.
+  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
+  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
+  // Memory modal open state.
+  const [memOpen, setMemOpen] = useState(false);
+  // Pull the bank + learnings for the active workspace; called on workspace change
+  // and after the critic / memory_update writes new learnings.
+  const loadMemory = useCallback(async () => {
+    try {
+      const m = await coderMemoryGet();
+      setMemory(m);
+      memoryRef.current = m;
+    } catch {
+      // memory is best-effort; keep the last good value rather than wiping UI.
+    }
+  }, []);
+
   const loadCommits = useCallback(async () => {
     setCommitsLoading(true);
     try {
@@ -907,6 +947,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => {
     if (activeWsDir) loadCommits();
   }, [activeWsDir, loadCommits]);
+
+  // Refresh the self-improving memory whenever the active workspace changes.
+  useEffect(() => {
+    if (activeWsDir) loadMemory();
+  }, [activeWsDir, loadMemory]);
 
   // Sync the safe-mode toggle with the sidecar's current state on mount.
   useEffect(() => {
@@ -1303,6 +1348,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (followed.length > 1) sys += followed.join('\n');
       }
     } catch { /* never break system-prompt assembly over follow-bindings */ }
+
+    // Self-improving memory (Hybrid A+B): inject the per-repo bank + the most
+    // recent learnings so the agent starts each run informed by past sessions.
+    // The bank is authored/edited by the user (Memory modal) and the learnings
+    // are extracted by the critic and the memory_update tool — the model never
+    // sees these as ordinary files, only as injected context here.
+    try {
+      const mem = memoryRef.current;
+      const blocks: string[] = [];
+      if (mem.bank && mem.bank.trim()) {
+        blocks.push(`# Repository Memory Bank\n${mem.bank.trim()}`);
+      }
+      const recent = (mem.learnings ?? []).slice(-15);
+      if (recent.length) {
+        const tagged = recent
+          .map((l) => `- [${l.kind}${l.task ? ` · ${l.task}` : ''}] ${l.text}`)
+          .join('\n');
+        blocks.push(`# Learnings from prior runs (most recent first)\n${tagged}`);
+      }
+      if (blocks.length) {
+        sys += `\n\n${blocks.join('\n\n')}\n`;
+      }
+    } catch { /* memory injection must never break system-prompt assembly */ }
 
     dynamicSystemRef.current = sys;
   }, []);
@@ -1783,6 +1851,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             res = await runWorker('subagent', p, wmodel, abortRef.current?.signal ?? new AbortController().signal, 12, workerTools);
             if (criticMode && res.diff.trim()) {
               const c = await runCritic(res.diff, task);
+              if (c.learnings.length) {
+                await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
+              }
               if (!c.approved) {
                 critique = c.issues;
                 addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
@@ -1803,6 +1874,28 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           mutated = true;
           result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
           addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
+        } else if (call.name === 'memory_update') {
+          // Agent-proactive learning capture (the critic also writes learnings).
+          // Persist outside the repo and refresh local state so the rest of this
+          // run (and future runs) see the updated memory.
+          logType = 'todo';
+          const text = String(args.text || '').trim();
+          const rawKind = String(args.kind || 'tip');
+          const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
+          logDetail = `memory: ${kind} — ${text.slice(0, 40)}`;
+          addLog({ type: 'todo', label: 'memory', detail: `recording ${kind} learning` });
+          if (!text) {
+            result = JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
+          } else {
+            try {
+              const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' });
+              setMemory(m);
+              memoryRef.current = m;
+              result = JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
+            } catch (e) {
+              result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+            }
+          }
         } else {
           result = JSON.stringify({ error: 'Unknown tool' });
         }
@@ -1983,7 +2076,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   // Critic: review a working-tree-vs-HEAD diff against the task. Bounded and
   // fail-open (a critic error never blocks the run).
-  const runCritic = async (diff: string, task: string): Promise<{ approved: boolean; issues: string }> => {
+  /**
+   * Review a diff and decide approve / reject. Also parses any `LEARNING:` /
+   * `AVOID:` lines the critic appended into structured learnings the caller can
+   * persist (the critic is the memory writer for the self-improving loop).
+   */
+  const runCritic = async (
+    diff: string,
+    task: string,
+  ): Promise<{ approved: boolean; issues: string; learnings: Array<{ text: string; kind: CoderLearningKind }> }> => {
     const criticModel = coderParams.criticModel?.trim() || modelRef.current;
     const prompt = `TASK:\n${task.slice(0, 2000)}\n\nDIFF (working tree vs HEAD):\n\`\`\`diff\n${diff.slice(0, 24000)}\n\`\`\`\n\nReview the diff against the task.`;
     let content = '';
@@ -1994,11 +2095,53 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         { onContentDelta: (t) => { content += t; } },
       );
     } catch {
-      return { approved: true, issues: '' };
+      return { approved: true, issues: '', learnings: [] };
     }
     const approved = /VERDICT:\s*APPROVED/i.test(content);
-    const issues = content.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '').trim();
-    return { approved, issues };
+    // Pull learnings out of the raw text first so they don't bleed into `issues`.
+    const learnings: Array<{ text: string; kind: CoderLearningKind }> = [];
+    const kept: string[] = [];
+    for (const raw of content.split('\n')) {
+      const line = raw.trim();
+      const learn = line.match(/^LEARNING:\s*(.+)$/i) || line.match(/^\*?\s*LEARNING:\s*(.+)$/i);
+      const avoid = line.match(/^AVOID:\s*(.+)$/i) || line.match(/^\*?\s*AVOID:\s*(.+)$/i);
+      if (learn) {
+        const t = learn[1].trim();
+        if (t) learnings.push({ text: t, kind: 'success' });
+      } else if (avoid) {
+        const t = avoid[1].trim();
+        if (t) learnings.push({ text: t, kind: 'avoid' });
+      } else {
+        kept.push(raw);
+      }
+    }
+    const issues = kept
+      .join('\n')
+      .replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '')
+      .trim();
+    return { approved, issues, learnings };
+  };
+
+  /**
+   * Persist critic / agent learnings to the per-repo memory store (outside the
+   * repo) and refresh local state so the rest of this run + future runs see them.
+   */
+  const persistLearnings = async (
+    items: Array<{ text: string; kind: CoderLearningKind }>,
+    provenance: string,
+    task?: string,
+  ) => {
+    if (!items.length) return;
+    let m = memoryRef.current;
+    for (const it of items) {
+      try {
+        m = await coderMemoryAddLearning({ text: it.text, kind: it.kind, provenance, task: task || undefined });
+      } catch {
+        // An individual persistence failure must not break the run loop.
+      }
+    }
+    setMemory(m);
+    memoryRef.current = m;
   };
 
   const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
@@ -2288,6 +2431,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             } catch { d = ''; }
             if (d.trim()) {
               const c = await runCritic(d, taskText);
+              if (c.learnings.length) {
+                await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
+              }
               if (!c.approved) {
                 criticBudget++;
                 addLog({ type: 'error', label: 'critic', detail: `review rejected (${criticBudget}/${MAX_CRITIC}) — sending back to fix` });
@@ -3014,6 +3160,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
           <button
             type="button"
+            onClick={() => setMemOpen(true)}
+            disabled={!activeWs}
+            title={`Repository memory bank + learnings (${memory.learnings.length} learning${memory.learnings.length === 1 ? '' : 's'})`}
+            className={cn('flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', memOpen ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            <BookmarkPlus size={13} /> Memory{memory.learnings.length ? ` (${memory.learnings.length})` : ''}
+          </button>
+          <button
+            type="button"
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={forkConversation}
             disabled={!activeWs || running}
@@ -3300,6 +3455,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         onClose={() => commitResolveRef.current?.(false)}
         onApprove={() => commitResolveRef.current?.(true)}
         fetchDiff={coderDiff}
+      />
+      {/* Self-improving memory: per-repo bank (markdown) + extracted learnings. */}
+      <MemoryModal
+        open={memOpen}
+        onClose={() => setMemOpen(false)}
+        memory={memory}
+        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { setMemory(m); memoryRef.current = m; })}
+        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { setMemory(m); memoryRef.current = m; })}
+        onChanged={() => loadMemory()}
       />
       {showDir && (
         <DirBrowser

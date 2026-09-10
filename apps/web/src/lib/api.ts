@@ -593,6 +593,61 @@ export function coderSandboxSet(enabled: boolean): Promise<{ enabled: boolean }>
   return postJSON<{ enabled: boolean }>('/api/coder/sandbox', { enabled }, 5000);
 }
 
+// ---------------------------------------------------------------------------
+// Self-improving memory (Hybrid A+B).
+//   A: a per-repo markdown *memory bank* (read at session start, the agent
+//      sees it only via system-prompt injection — never as a normal file).
+//   B: structured *learnings* extracted by the item-5 critic (success/tip/avoid)
+//      plus agent-proactive records via the `memory_update` tool.
+// Both are persisted OUTSIDE the repo under the control plane's data dir, so
+// they survive across sessions and are never committed by accident.
+// ---------------------------------------------------------------------------
+export type CoderLearningKind = 'success' | 'tip' | 'avoid';
+
+export interface CoderLearning {
+  /** Stable id (sha1 of text+ts) so the UI can drop individual entries. */
+  id: string;
+  text: string;
+  kind: CoderLearningKind;
+  /** Where the learning came from (e.g. "critic:approve", "critic:reject", "tool"). */
+  provenance?: string;
+  /** Short task description the learning was extracted from, if known. */
+  task?: string;
+  /** ISO timestamp. */
+  ts: string;
+}
+
+export interface CoderMemory {
+  /** Full markdown bank text. */
+  bank: string;
+  learnings: CoderLearning[];
+}
+
+/** Read the current bank + learnings for the active workspace. */
+export function coderMemoryGet(): Promise<CoderMemory> {
+  return getJSON<CoderMemory>('/api/coder/memory', 8000);
+}
+
+/** Replace the markdown bank wholesale (used by the Memory modal's save). */
+export function coderMemorySetBank(bank: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { bank }, 8000);
+}
+
+/** Append one structured learning (text + kind) and return the updated memory. */
+export function coderMemoryAddLearning(learning: {
+  text: string;
+  kind: CoderLearningKind;
+  provenance?: string;
+  task?: string;
+}): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { learning }, 8000);
+}
+
+/** Drop a single learning by id and return the updated memory. */
+export function coderMemoryDropLearning(id: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { dropLearningId: id }, 8000);
+}
+
 export interface CoderCommit {
   hash: string;
   author: string;
