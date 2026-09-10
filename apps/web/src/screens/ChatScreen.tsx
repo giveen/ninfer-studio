@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
@@ -16,12 +16,41 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+
+// A legacy compaction checkpoint message (raw <compacted-summary> block).
+function isCompactedMsg(m: ChatMessage): boolean {
+  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
+}
+
+// Build the model context for a conversation. When compacted, prepend the summary
+// as leading context and keep only the messages added after compaction; the full
+// visible history is preserved separately for browsing.
+function modelHistory(conv: Conversation): ChatMessage[] {
+  if (conv.compactedSummary) {
+    const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
+    return [prefix, ...conv.messages.slice(conv.compactedCount ?? 0)];
+  }
+  return conv.messages;
+}
+
+// Subtle divider shown in place of the verbose compaction summary.
+function CompactDivider() {
+  return (
+    <div className="my-3 flex items-center gap-2 text-[11px] text-faint">
+      <span className="h-px flex-1 bg-line" />
+      <span>✂ Context compacted</span>
+      <span className="h-px flex-1 bg-line" />
+    </div>
+  );
+}
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
 import { Markdown } from '../components/Markdown';
-import { Badge, Button, cn, NumberField, SelectField, Toggle } from '../components/ui';
+import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
+
 
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
@@ -29,6 +58,33 @@ const DEFAULT_PARAMS: ChatParams = {
   preserveThinking: true,
   maxTokens: null as unknown as number,
 };
+
+const CHAT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description: "Fetch web content (extracts Markdown).",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web for up-to-date information.",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"]
+      }
+    }
+  }
+];
 
 // Slash-command palette (type `/` in the composer to see suggestions).
 const SLASH_COMMANDS: Array<{ cmd: string; desc: string; needsArg?: boolean }> = [
@@ -242,8 +298,8 @@ const MessageRow = memo(function MessageRow({
                 <div className="mb-2 flex flex-wrap gap-1.5">
                   {m.attachments.map((a, i) => (
                     <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
-                      {a.kind === 'image' ? '🖼' : '🎞'} {a.name}
-                      <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>
+                      {a.kind === 'image' ? '🖼' : a.kind === 'video' ? '🎞' : '📄'} {a.name}
+                      {a.dataUrl && <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>}
                     </span>
                   ))}
                 </div>
@@ -255,6 +311,21 @@ const MessageRow = memo(function MessageRow({
       </div>
     );
   }
+  
+  if (m.role === 'tool') {
+    return (
+      <div className="group relative max-w-full my-2">
+        <div className="flex items-center gap-2 mb-1">
+           <span className="text-[10px] font-mono text-faint uppercase bg-inset px-1.5 py-0.5 rounded border border-line">Tool Result</span>
+           <span className="text-[11px] font-semibold text-accent">{m.name}</span>
+        </div>
+        <div className="text-[12px] font-mono whitespace-pre-wrap bg-panel2 border border-line rounded p-2 overflow-auto max-h-48 text-mute">
+           {m.content}
+        </div>
+      </div>
+    );
+  }
+  
   return (
     <div className="group relative max-w-full">
       {toolbar}
@@ -284,9 +355,20 @@ const MessageRow = memo(function MessageRow({
                 <Markdown>{m.content}</Markdown>
               </div>
             )
-          ) : !streaming && !m.reasoning ? (
+          ) : !streaming && !m.reasoning && !m.tool_calls ? (
             <span className="text-[13px] text-faint">—</span>
           ) : null}
+          {m.tool_calls && m.tool_calls.length > 0 && (
+            <div className="mt-3 space-y-1.5 border-t border-line pt-2">
+              <div className="text-[10px] font-semibold text-faint uppercase tracking-wider">Tool Calls</div>
+              {m.tool_calls.map((tc, j) => (
+                <div key={j} className="text-[11.5px] font-mono text-accent bg-accent/10 p-1.5 rounded-md flex items-start gap-1">
+                  <span className="mt-0.5">⚡</span>
+                  <span className="break-all">{tc.name}({tc.arguments})</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <MessageMeta m={m} />
       </div>
@@ -391,6 +473,19 @@ function ParamsPopover({
           <Toggle checked={!!params.greedy} onChange={(v) => set({ greedy: v, ...(v ? { temperature: 0 } : { temperature: undefined }) })} label="Greedy (exact argmax)" hint="temperature 0 with no sampling — deterministic output. Overrides the other sampling fields while on." />
         </div>
         <div className="h-px bg-line" />
+        <div className="flex items-center">
+          <Toggle checked={!!params.humanize} onChange={(v) => set({ humanize: v })} label="Humanize replies (Not-Ai)" hint="Rewrite replies to sound human — no em dashes, no buzzwords, no empty framing. Replies that trip the tell-gate are silently re-written." />
+        </div>
+        <div className={row}>
+          <span className={lab}>Voice / style</span>
+          <SelectField
+            value={(params.voiceProfile as VoiceProfile) || 'personal'}
+            onChange={(v) => set({ voiceProfile: v })}
+            disabled={!params.humanize}
+            options={VOICE_PROFILES.map((p) => ({ value: p.value, label: p.label }))}
+          />
+        </div>
+        <div className="h-px bg-line" />
         <div className={row}>
           <span className={lab}>System prompt</span>
           <textarea
@@ -471,7 +566,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [paramsOpen, setParamsOpen] = useState(false);
-  const [model, setModel] = useState<string>(status?.engine?.modelId || 'qwen3.8-27b');
+  const [model, setModel] = useState<string>(status?.engine?.modelId || '');
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -513,9 +608,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   }, []);
 
   useEffect(() => {
-    if (runningModel && !convs.length) setModel(runningModel);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runningModel]);
+    // Keep the selector pointed at the running engine's actual id. The engine
+    // only answers to the id it was started with (e.g. "qwen-coder"); never leave
+    // a stale catalog fallback (e.g. "qwen3.8-27b") selected, which 404s.
+    if (runningModel && !model) setModel(runningModel);
+  }, [runningModel, model]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -564,16 +661,23 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     const ac = new AbortController();
     abortRef.current = ac;
     try {
+      // On a re-compaction, prepend the prior checkpoint so the engine can merge
+      // it instead of discarding everything compacted earlier. This is what keeps
+      // the summary (and the context it carries) injected back into the model
+      // after the visible context is cleared.
+      const prior: ChatMessage[] = conv.compactedSummary
+        ? [{ role: 'user', content: frameCompactedSummary(conv.compactedSummary) }]
+        : [];
       const summary = await summarizeConversation({
         model: useModel,
         systemPrompt: params.systemPrompt,
-        history: conv.messages,
+        history: [...prior, ...conv.messages],
         signal: ac.signal,
       });
       if (!summary) throw new Error('compaction produced no summary');
-      const compacted: Conversation = { ...conv, messages: [{ role: 'user', content: frameCompactedSummary(summary) }] };
+      const compacted: Conversation = { ...conv, compactedSummary: summary, compactedCount: conv.messages.length };
       setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
-      setNotice({ tone: 'ok', text: 'Conversation compacted — context preserved as a checkpoint. Keep chatting from here.' });
+      setNotice({ tone: 'ok', text: 'Conversation compacted — prior messages stay on screen and the summary is injected as context. Keep chatting from here.' });
     } catch (e) {
       setNotice({ tone: 'danger', text: e instanceof Error ? e.message : 'compaction failed' });
     } finally {
@@ -586,7 +690,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
-    async (convId: string, history: ChatMessage[]) => {
+    async (convId: string, history: ChatMessage[], depth = 0, placeholderId?: string) => {
       if (!engineUp) {
         onNavigate('engine');
         return;
@@ -596,8 +700,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       setStreaming(true);
       const ac = new AbortController();
       abortRef.current = ac;
+
+      // Target the streaming placeholder by stable id when available; fall back to
+      // the last message only when no id was assigned (C2).
+      const isTarget = (m: ChatMessage, i: number, len: number): boolean =>
+        placeholderId ? m.id === placeholderId : i === len - 1;
+
+      let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
+
       await streamChat(
-        buildChatRequest(useModel, params.systemPrompt, history, params),
+        buildChatRequest(useModel, effectiveSystemPrompt(params), history, params, { tools: CHAT_TOOLS }),
         ac.signal,
         {
           onReasoningDelta: (d) => {
@@ -605,7 +717,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               cs.map((c) =>
                 c.id !== convId
                   ? c
-                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
+                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
               ),
             );
           },
@@ -614,22 +726,27 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               cs.map((c) =>
                 c.id !== convId
                   ? c
-                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, content: m.content + d } : m)) },
+                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, content: m.content + d } : m)) },
               ),
             );
           },
           onUsage: (_u, meta) => {
             setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
             );
             setLatestRequestMetrics(meta, useModel);
           },
+          onToolCalls: (calls) => {
+            capturedToolCalls = calls;
+            setConvs((cs) =>
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, tool_calls: calls } : m)) })),
+            );
+          },
           onDone: (meta) => {
             setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
             );
             setLatestRequestMetrics(meta, useModel);
-            setStreaming(false);
           },
           onError: (msg) => {
             setConvs((cs) =>
@@ -639,15 +756,81 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   : {
                       ...c,
                       messages: c.messages.map((m, i) =>
-                        i === c.messages.length - 1 ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
+                        isTarget(m, i, c.messages.length) ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
                       ),
                     },
               ),
             );
-            setStreaming(false);
           },
         },
       );
+
+      // Not-Ai auto-rewrite: when humanize is on and this was a plain content
+      // reply (no tool calls), run the deterministic tell-gate and silently
+      // re-write the reply if it trips a high-signal tell (em dashes, buzzwords,
+      // mechanical transitions, participial openers).
+      if (!ac.signal.aborted && params.humanize && capturedToolCalls.length === 0) {
+        const convNow = convsRef.current.find((c) => c.id === convId);
+        if (convNow) {
+          const msgs = convNow.messages;
+          const idx = placeholderId ? msgs.findIndex((m) => m.id === placeholderId) : msgs.length - 1;
+          const target = msgs[idx];
+          if (target && target.role === 'assistant' && target.content.trim()) {
+            const gateRes = evaluate(target.content, effectiveVoice(params), {});
+            if (needsHumanize(gateRes)) {
+              try {
+                const rewritten = await humanizeRewriteText({
+                  model: useModel,
+                  baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
+                  priorMessages: msgs.slice(0, idx),
+                  originalText: target.content,
+                  params: { ...params, maxTokens: undefined },
+                  signal: ac.signal,
+                });
+                if (rewritten && rewritten.trim() && rewritten.trim() !== target.content.trim()) {
+                  setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
+                    ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: rewritten } : m)),
+                  }));
+                }
+              } catch {
+                /* keep the original reply if the rewrite fails */
+              }
+            }
+          }
+        }
+      }
+
+      if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
+         if (depth >= 12) {
+           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
+           setStreaming(false);
+           return;
+         }
+         const toolResults: ChatMessage[] = [];
+         for (const call of capturedToolCalls) {
+             let result = '';
+             try {
+                const args = JSON.parse(call.arguments);
+                if (call.name === 'web_fetch') result = JSON.stringify(await coderWebFetch(args.url));
+                else if (call.name === 'web_search') result = JSON.stringify(await coderWebSearch(args.query));
+                else result = JSON.stringify({ error: `unknown tool: ${call.name}` });
+             } catch(e) {
+                result = JSON.stringify({error: String(e)});
+             }
+             toolResults.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: result });
+         }
+         
+         const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+         setConvs(cs => cs.map(c => c.id !== convId ? c : { ...c, messages: [...c.messages, ...toolResults, asstMsg] }));
+         const updatedConv = convsRef.current.find(c => c.id === convId);
+         if (updatedConv && !ac.signal.aborted) {
+             const newHistory = [...updatedConv.messages, ...toolResults];
+             await runStream(convId, modelHistory({ ...updatedConv, messages: newHistory }), depth + 1, asstMsg.id);
+         }
+         return;
+      }
+      
+      setStreaming(false);
       abortRef.current = null;
     },
     [engineUp, model, runningModel, params, onNavigate],
@@ -670,7 +853,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
     let conv = convs.find((c) => c.id === activeId);
     const userMsg: ChatMessage = { role: 'user', content, attachments: attachments.length ? attachments : undefined };
-    const asstMsg: ChatMessage = { role: 'assistant', content: '', model: useModel, meta: {} };
+    const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
     if (!conv) {
       conv = {
         id: uid(),
@@ -692,8 +875,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setAttachments([]);
     stick.current = true;
 
-    const history: ChatMessage[] = base.messages.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
-    await runStream(newId, history);
+    const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+    await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
 
@@ -731,7 +914,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = conv.messages.slice(0, msgIndex);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, prior);
+      runStream(convId, modelHistory({ ...conv, messages: prior }));
     },
     [model, runningModel, runStream],
   );
@@ -746,7 +929,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = msgs.slice(0, msgIndex + 1);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, prior);
+      runStream(convId, modelHistory({ ...conv, messages: prior }));
     },
     [model, runningModel, runStream],
   );
@@ -841,9 +1024,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
-    <div className="flex h-full">
-      {/* conversation rail */}
-      <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
+    <div className="flex h-full flex-col">
+      <div className="flex min-h-0 flex-1">
+          <>
+            {/* conversation rail */}
+            <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
         <div className="p-2.5">
           <Button variant="primary" size="sm" className="w-full" onClick={newChat}>
             <Plus size={14} /> new chat
@@ -973,16 +1158,22 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           ) : (
             <div className="mx-auto flex max-w-3xl flex-col gap-5">
-              {messages.map((m, i) => (
-                <MessageRow
-                  key={i}
-                  m={m}
-                  convId={activeId ?? ''}
-                  index={i}
-                  streaming={streaming && i === messages.length - 1}
-                  actions={msgActions}
-                />
-              ))}
+              {messages.map((m, i) => {
+                if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
+                return (
+                  <Fragment key={i}>
+                    {showDivider && <CompactDivider />}
+                    <MessageRow
+                      m={m}
+                      convId={activeId ?? ''}
+                      index={i}
+                      streaming={streaming && i === messages.length - 1}
+                      actions={msgActions}
+                    />
+                  </Fragment>
+                );
+              })}
             </div>
           )}
         </div>
@@ -1108,6 +1299,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </span>
           </div>
         </div>
+      </div>
+          </>
       </div>
     </div>
   );

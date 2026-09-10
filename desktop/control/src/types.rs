@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Event emitted by the control plane for desktop-shell concerns (tray state,
@@ -38,6 +39,12 @@ pub struct AppSettings {
     pub api_key: String,
     pub hf_cli: String,
     pub build_command: String,
+    /// Command run in the Coder workspace after agent edits (lint/typecheck).
+    /// Empty = unset. Falls back to `build_command` when empty.
+    pub lint_command: String,
+    /// Command run in the Coder workspace after the lint check passes (tests).
+    /// Empty = unset (no test step).
+    pub test_command: String,
     /// JSON object merged (as defaults) into every proxied /v1 request body, so
     /// external clients (e.g. other coding harnesses) inherit these params without
     /// configuring each tool. Client-supplied fields win over these defaults.
@@ -47,6 +54,10 @@ pub struct AppSettings {
     /// (client fields win). The dedicated UI control overrides the generic
     /// default for this single key. Empty = unset.
     pub reasoning_effort: String,
+    /// Coding harness: the directory the "Code" mode is allowed to read/write/execute
+    /// within. Every coder filesystem tool is confined to this root (path traversal
+    /// rejected). Empty => no workspace configured. Serializes as `coderWorkspace`.
+    pub coder_workspace: String,
 }
 
 impl Default for AppSettings {
@@ -62,8 +73,11 @@ impl Default for AppSettings {
             api_key: String::new(),
             hf_cli: "hf".into(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
+            lint_command: String::new(),
+            test_command: String::new(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),
+            coder_workspace: String::new(),
         }
     }
 }
@@ -473,6 +487,12 @@ pub struct State {
     pub log_file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     pub downloads: tokio::sync::Mutex<HashMap<String, DownloadRec>>,
     pub update_job: tokio::sync::Mutex<Option<UpdateJob>>,
+    /// Coder "safe mode" (mirrors the sidecar's `coderSafeMode`): when true,
+    /// clearly destructive shell commands are refused before they run.
+    pub coder_safe_mode: AtomicBool,
+    /// Per-session working directories so the agent's shell behaves like a
+    /// stateful terminal (cd persists across calls within a session id).
+    pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
     /// Optional bridge to the desktop shell. `None` when running headless.
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,
@@ -496,6 +516,8 @@ impl State {
             log_file: tokio::sync::Mutex::new(None),
             downloads: tokio::sync::Mutex::new(HashMap::new()),
             update_job: tokio::sync::Mutex::new(None),
+            coder_safe_mode: AtomicBool::new(true),
+            shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
             event_tx,
             data_dir,
             dist_dir,

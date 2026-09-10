@@ -1,11 +1,18 @@
 {
   "name": "@ninfier/sidecar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Zero-dependency Node 22 management server: engine process control, model directory, downloads, GPU stats, API proxy, and static hosting of the web app.",
   "scripts": {
     "dev": "node server.js",
     "start": "node server.js"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "crawlee": "^3.18.1",
+    "jsdom": "^30.0.1",
+    "playwright": "^1.63.0",
+    "turndown": "^7.2.4"
   }
 }

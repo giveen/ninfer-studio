@@ -12,12 +12,116 @@
 // In the production Tauri build the same responsibilities move into the Rust
 // core (tauri commands + state); this file is the reference implementation.
 
-import { createServer } from 'node:http';
-import { execFile, spawn } from 'node:child_process';
+import { createServer, request as httpRequest } from 'node:http';
+import { execFile, spawn, execFileSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { PlaywrightCrawler } from 'crawlee';
+import { Readability } from '@mozilla/readability';
+import TurndownService from 'turndown';
+import { JSDOM } from 'jsdom';
+
+// Coder "safe mode": when ON, the sidecar refuses clearly destructive shell
+// commands (rm -rf /, git push --force, mkfs, dd to a device, piping a
+// download into a shell, etc.) so a local model — which can be jailbroken or
+// simply mistaken — cannot wipe the user's machine. Users can disable it for
+// trusted workflows via the Coder UI toggle (persisted only for the session).
+let coderSafeMode = true;
+// Filesystem sandbox: when enabled, agent shell commands run inside bwrap with the
+// whole host mounted read-only and only the workspace bind-mounted read-write. This
+// is the real safety net behind "Safe mode OFF" — even a jailbroken model can only
+// scribble inside its workspace. Network stays up so builds can fetch.
+let coderSandbox = false;
+let bwrapAvailable = null;
+let sandboxWarned = false;
+function checkBwrap() {
+  try { execFileSync('bwrap', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+}
+
+// Per-session working directories so the agent's shell calls behave like a
+// stateful terminal (cd / navigation persists across calls). Keyed by an
+// arbitrary session id (the web passes the active workspace). We avoid a
+// long-lived shell process to keep the sidecar crash-safe (no orphan PTYs).
+const shellSessions = new Map();
+function sessionCwd(sessionId) {
+  return (sessionId && shellSessions.get(sessionId)) || coderRoot();
+}
+function setSessionCwd(sessionId, cwd) {
+  if (sessionId) shellSessions.set(sessionId, cwd);
+}
+const CWD_MARKER = '<ninfx_cwd>';
+// Background shell jobs: long builds/tests run detached so the agentic loop
+// isn't blocked on a response timeout. The client starts a job via
+// POST /api/coder/exec {background:true}, polls GET /api/coder/jobs/:id,
+// and may stop it via POST /api/coder/jobs/:id/kill. Output is tail-capped.
+// Jobs die with their timeout (execCommand kills on timeout) or via kill.
+const bgJobs = new Map();
+const MAX_JOBS = 32;
+function startBgJob(command, relCwd, timeoutMs, sessionId) {
+  if (bgJobs.size >= MAX_JOBS) {
+    const oldest = bgJobs.keys().next().value;
+    bgJobs.get(oldest)?.proc?.kill('SIGKILL');
+    bgJobs.delete(oldest);
+  }
+  const id = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const rec = { id, command, done: false, exitCode: null, timedOut: false, truncated: false, stdout: '', stderr: '', startedAt: Date.now(), proc: null };
+  bgJobs.set(id, rec);
+  execCommand(command, relCwd, timeoutMs, sessionId, { onSpawn: (proc) => { rec.proc = proc; } }).then((r) => {
+    Object.assign(rec, { done: true, proc: null, exitCode: r.exitCode, timedOut: !!r.timedOut, truncated: !!r.truncated, stdout: r.stdout || '', stderr: r.stderr || '' });
+  }).catch((e) => {
+    Object.assign(rec, { done: true, proc: null, stdout: '', stderr: String(e?.message || e) });
+  });
+  return id;
+}
+function bgJobView(rec) {
+  return { id: rec.id, command: rec.command, done: rec.done, exitCode: rec.exitCode, timedOut: rec.timedOut, truncated: rec.truncated, startedAt: rec.startedAt, stdout: capOut(rec.stdout), stderr: capOut(rec.stderr) };
+}
+
+// ---------------------------------------------------------------------------
+// Loopback HTTP helper. We deliberately avoid the global `fetch` (undici) for
+// engine calls: inside the sandbox undici fails to connect to 127.0.0.1 (it
+// returns ECONNREFUSED while `curl` on the same loopback works), so the sidecar
+// could never reach the local engine. Node's `http` module connects fine, so we
+// use it for every request to 127.0.0.1:<enginePort>.
+// ---------------------------------------------------------------------------
+function loopbackSimple(method, url, { body, headers, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = httpRequest(
+      {
+        method,
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        headers: headers || {},
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            text: async () => text,
+            json: async () => JSON.parse(text || 'null'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (signal) {
+      const onAbort = () => req.destroy(new Error('aborted'));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
 const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
@@ -111,7 +215,11 @@ const defaultConfig = {
   apiKey: '',
   hfCli: 'hf',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
+  lintCommand: '',
+  testCommand: '',
   reasoningEffort: '',
+  coderSandbox: false,
+  sandboxBinds: [],
 };
 
 let config = { ...defaultConfig };
@@ -120,6 +228,7 @@ async function loadConfig() {
   try {
     const raw = await fs.readFile(path.join(DATA_DIR, 'config.json'), 'utf8');
     config = { ...defaultConfig, ...JSON.parse(raw) };
+    coderSandbox = !!config.coderSandbox;
   } catch {
     /* first run: defaults */
   }
@@ -130,6 +239,29 @@ async function saveConfig(patch) {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(path.join(DATA_DIR, 'config.json'), JSON.stringify(config, null, 2));
   return config;
+}
+
+// ---------------------------------------------------------------------------
+// Coder self-improving memory (per-workspace, stored OUTSIDE the user's repo so
+// it never gets committed). Mirrors Evo-Memory / Cline "memory bank": a curated
+// markdown bank + an append-only learnings log the agent reads each session.
+// ---------------------------------------------------------------------------
+function memDirFor(ws) {
+  const slug = String(ws).replace(/[^\w.-]/g, '_').slice(-160);
+  return path.join(DATA_DIR, 'coder-memory', slug);
+}
+async function readMemFile(ws, name, def = '') {
+  try { return await fs.readFile(path.join(memDirFor(ws), name), 'utf8'); } catch { return def; }
+}
+async function writeMemFile(ws, name, content) {
+  const dir = memDirFor(ws);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, name), content);
+}
+async function readLearnings(ws) {
+  const raw = await readMemFile(ws, 'learnings.jsonl', '');
+  return raw.split('\n').map((l) => l.trim()).filter(Boolean)
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +340,7 @@ async function saveChats(patch) {
  *   adopted: boolean  (running but not spawned by us)
  * }
  */
-let engine = { state: 'stopped', pid: null, port: null, artifact: null, modelId: null, argv: null, startedAt: null, logPath: null, adopted: false, failReason: null, failHint: null };
+let engine = { state: 'stopped', pid: null, port: null, artifact: null, modelId: null, maxContext: null, argv: null, startedAt: null, logPath: null, adopted: false, failReason: null, failHint: null };
 let engineProc = null;
 let engineLogStream = null;
 const healthPollers = new Set();
@@ -280,7 +412,7 @@ export function buildServeArgs(profile) {
 
 async function engineHealth(port) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
+    const r = await loopbackSimple('GET', `http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return false;
     const body = await r.json().catch(() => null);
     return body?.status === 'ok';
@@ -289,28 +421,34 @@ async function engineHealth(port) {
   }
 }
 
-async function engineModelId(port) {
+async function engineModelInfo(port) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+    const r = await loopbackSimple('GET', `http://127.0.0.1:${port}/v1/models`, {
       signal: AbortSignal.timeout(1500),
       headers: config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {},
     });
     if (!r.ok) return null;
     const body = await r.json();
-    return body?.data?.[0]?.id || null;
+    const m = body?.data?.[0];
+    return m ? { modelId: m.id || null, maxContext: m.max_model_len ?? null } : null;
   } catch {
     return null;
   }
 }
+async function engineModelId(port) {
+  return (await engineModelInfo(port))?.modelId ?? null;
+}
 
 async function adoptExternal(port) {
   const d = (await discoverEngines()).find((x) => x.port === port);
+  const info = await engineModelInfo(port);
   engine.state = 'external';
   engine.adopted = true;
   engine.pid = d?.pid ?? (await findExternalServePids())[0] ?? null;
   engine.argv = d?.argv ?? null;
   engine.artifact = engine.artifact ?? d?.artifact ?? null;
-  engine.modelId = await engineModelId(port);
+  engine.modelId = info?.modelId ?? (await engineModelId(port));
+  engine.maxContext = info?.maxContext ?? null;
   engine.failReason = null;
   engine.failHint = null;
 }
@@ -334,7 +472,7 @@ async function refreshEngineStatus() {
   if (engine.state === 'starting' && engine.deadline && Date.now() > engine.deadline) {
     markFailed('engine did not become healthy within 3 minutes');
   }
-  if (engine.state === 'stopped' && engine.port) {
+  if ((engine.state === 'stopped' || engine.state === 'failed') && engine.port) {
     const healthy = await engineHealth(engine.port);
     if (healthy) {
       await adoptExternal(engine.port);
@@ -344,12 +482,15 @@ async function refreshEngineStatus() {
     if (healthy) {
       const d = (await discoverEngines()).find((x) => x.port === engine.port);
       if (d) engine.pid = d.pid;
-      engine.modelId = engine.modelId || (await engineModelId(engine.port));
+      const info = await engineModelInfo(engine.port);
+      engine.modelId = engine.modelId || info?.modelId || null;
+      engine.maxContext = info?.maxContext ?? engine.maxContext ?? null;
     } else {
       engine.state = 'stopped';
       engine.adopted = false;
       engine.pid = null;
       engine.argv = null;
+      engine.maxContext = null;
     }
   }
 }
@@ -360,12 +501,14 @@ async function startEngine(profile, artifactPath) {
 
   if (await engineHealth(port)) {
     // something already serves this port — adopt, do not double-spawn
+    const info = await engineModelInfo(port);
     engine = {
       state: 'external',
       pid: (await findExternalServePids())[0] ?? null,
       port,
       artifact,
-      modelId: await engineModelId(port),
+      modelId: info?.modelId ?? (await engineModelId(port)),
+      maxContext: info?.maxContext ?? null,
       argv: null,
       startedAt: null,
       logPath: logPathFor(port),
@@ -607,7 +750,11 @@ function publicEngine() {
     failHint: engine.failHint ?? null,
     // The --max-context the engine was started with (the chat uses this to show
     // a context-limit indicator). Unknown for externally-adopted engines.
-    maxContext: !engine.adopted && lastStart?.profile ? (lastStart.profile.maxContext ?? null) : null,
+    // Live context length: for an adopted/external engine we report what the
+    // engine actually advertises via /v1/models (so a manually-relaunched engine
+    // with a new --max-context shows the real value). For engines we spawned, we
+    // report the profile value we started them with.
+    maxContext: engine.adopted ? (engine.maxContext ?? null) : (lastStart?.profile ? (lastStart.profile.maxContext ?? null) : null),
   };
 }
 
@@ -927,6 +1074,1122 @@ async function tailLog(lines = 400) {
 }
 
 // ---------------------------------------------------------------------------
+// Coding harness — control-plane endpoints
+//
+// The chat "Code" mode drives an agentic loop: it sends the engine an OpenAI
+// tool-calling request, then executes the returned `tool_calls` here. Every
+// filesystem tool is sandboxed to `config.coderWorkspace` (path traversal is
+// rejected) so the model can only touch the chosen project directory. Mirrors
+// the Rust `ninfier-control` `/api/coder/*` routes 1:1.
+// ---------------------------------------------------------------------------
+const CODER_IGNORE = new Set(['node_modules', '.git', 'target', 'dist', 'build', '.next', '.turbo', '.cache', 'vendor', '__pycache__', '.venv', 'venv']);
+const MAX_READ_BYTES = 256 * 1024;
+const MAX_OUTPUT_BYTES = 256 * 1024;
+const MAX_GREP_MATCHES = 300;
+const MAX_GLOB_FILES = 4000;
+const RE_SPECIAL = new Set(['.', '+', '?', '^', '$', '{', '}', '(', ')', '|', '[', ']', '\\']);
+
+function coderRoot() {
+  const ws = (config.coderWorkspace || '').trim();
+  return ws ? path.resolve(ws) : null;
+}
+function withinWs(rel) {
+  const root = coderRoot();
+  if (!root) throw Object.assign(new Error('no workspace configured — set a coder workspace in Settings or Code mode'), { status: 400 });
+  const full = path.resolve(root, rel && rel !== '.' ? rel : '.');
+  const rel2 = path.relative(root, full);
+  if (rel2.startsWith('..') || (path.isAbsolute(rel2) && rel2 !== '')) {
+    throw Object.assign(new Error('path escapes the workspace'), { status: 400 });
+  }
+  return full;
+}
+function relOf(full) {
+  const root = coderRoot();
+  return root ? path.relative(root, full) || '.' : '.';
+}
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+// Apply one old→new replacement: exact match first (with the uniqueness guard),
+// then a whitespace-agnostic line-window fallback. Pure helper shared by the
+// single-edit route's sibling below (`/api/coder/fs/patch` applies N hunks
+// atomically: every hunk must match or nothing is written).
+function applyEditHunk(fileText, oldStr, newStr, replaceAll) {
+  const exactIdx = fileText.indexOf(oldStr);
+  if (exactIdx !== -1) {
+    if (!replaceAll && fileText.indexOf(oldStr, exactIdx + 1) !== -1) {
+      return { error: 'old_string is not unique — pass replaceAll:true to replace all' };
+    }
+    const replaced = replaceAll ? fileText.split(oldStr).join(newStr) : fileText.replace(oldStr, newStr);
+    const count = replaceAll ? (fileText.match(new RegExp(escapeRe(oldStr), 'g')) || []).length : 1;
+    return { text: replaced, count };
+  }
+  const oldLines = oldStr.split('\n');
+  while (oldLines.length > 0 && oldLines[0].trim() === '') oldLines.shift();
+  while (oldLines.length > 0 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
+  if (oldLines.length === 0) {
+    return { error: 'old_string is empty or only whitespace' };
+  }
+  const fileLines = fileText.split('\n');
+  const matches = [];
+  for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < oldLines.length; j++) {
+      if (fileLines[i + j].trim() !== oldLines[j].trim()) { ok = false; break; }
+    }
+    if (ok) matches.push(i);
+  }
+  if (matches.length === 0) {
+    return { error: 'old_string not found (even with fuzzy whitespace matching)' };
+  }
+  if (matches.length > 1 && !replaceAll) {
+    return { error: 'old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true' };
+  }
+  const targets = replaceAll ? matches : [matches[0]];
+  for (let i = targets.length - 1; i >= 0; i--) {
+    fileLines.splice(targets[i], oldLines.length, newStr);
+  }
+  return { text: fileLines.join('\n'), count: targets.length };
+}
+// Cap tool output so a runaway command can't flood the context window. When the
+// output is larger than MAX_OUTPUT_BYTES we keep the HEAD and TAIL (with an
+// explicit "omitted" marker) rather than only the tail — the start of a command's
+// output (the command echo, early errors) is usually what the agent needs, and
+// the end (final state) is equally useful. `truncated` + `total_bytes` let the
+// agent know the true size and paginate/refine instead of guessing.
+function capOut(s) {
+  if (s.length <= MAX_OUTPUT_BYTES) return s;
+  const head = Math.floor(MAX_OUTPUT_BYTES * 0.3);
+  const tail = MAX_OUTPUT_BYTES - head;
+  const omitted = s.length - MAX_OUTPUT_BYTES;
+  return s.slice(0, head) + `\n… [${omitted} bytes omitted — output truncated, use offset/limit or refine] …\n` + s.slice(-tail);
+}
+async function isBinary(buf) {
+  const len = Math.min(buf.length, 8000);
+  for (let i = 0; i < len; i++) if (buf[i] === 0) return true;
+  return false;
+}
+async function treeNodes(root, rel, depth, maxDepth) {
+  if (depth > maxDepth) return [];
+  let entries;
+  try {
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  entries.sort((a, b) =>
+    a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1,
+  );
+  const nodes = [];
+  for (const e of entries) {
+    if (e.isDirectory() && CODER_IGNORE.has(e.name)) continue;
+    const childRel = rel === '.' ? e.name : path.join(rel, e.name);
+    if (e.isDirectory()) {
+      nodes.push({
+        name: e.name,
+        path: childRel,
+        kind: 'dir',
+        children: depth === maxDepth ? undefined : await treeNodes(root, childRel, depth + 1, maxDepth),
+      });
+    } else {
+      let size;
+      try {
+        size = (await fs.stat(path.join(root, childRel))).size;
+      } catch {
+        /* ignore */
+      }
+      nodes.push({ name: e.name, path: childRel, kind: 'file', size });
+    }
+  }
+  return nodes;
+}
+async function walkFiles(root, rel, out, cap) {
+  if (out.length >= cap) return;
+  let entries;
+  try {
+    entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (out.length >= cap) return;
+    const childRel = rel === '.' ? e.name : path.join(rel, e.name);
+    if (e.isDirectory()) {
+      if (CODER_IGNORE.has(e.name)) continue;
+      await walkFiles(root, childRel, out, cap);
+    } else {
+      out.push(childRel);
+    }
+  }
+}
+function globToRegex(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        re += '.*';
+        i++;
+        if (glob[i + 1] === '/') i++;
+      } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else if (RE_SPECIAL.has(c)) re += '\\' + c;
+    else re += c;
+  }
+  return new RegExp('^' + re + '$');
+}
+async function grepSearch(pattern, relRoot, include, ignoreCase, hardCap, offset = 0, limit = 200) {
+  const root = coderRoot();
+  const base = relRoot ? withinWs(relRoot) : root;
+  let re;
+  try {
+    re = new RegExp(pattern, ignoreCase ? 'i' : '');
+  } catch (e) {
+    throw Object.assign(new Error('invalid regex: ' + e.message), { status: 400 });
+  }
+  const includeRe = include ? globToRegex(include) : null;
+  const files = [];
+  await walkFiles(root, relOf(base), files, 6000);
+  const all = [];
+  let truncated = false;
+  for (const f of files) {
+    if (all.length >= hardCap) {
+      truncated = true;
+      break;
+    }
+    if (includeRe && !includeRe.test(f)) continue;
+    const full = path.join(root, f);
+    let buf;
+    try {
+      buf = await fs.readFile(full);
+    } catch {
+      continue;
+    }
+    if (await isBinary(buf)) continue;
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (all.length >= hardCap) {
+        truncated = true;
+        break;
+      }
+      if (re.test(lines[i])) all.push({ file: f, line: i + 1, text: lines[i].slice(0, 400) });
+    }
+  }
+  // Pagination: return one page plus the true total so the agent can page or refine.
+  const total = all.length;
+  const start = Math.max(0, offset | 0);
+  const page = all.slice(start, start + Math.max(1, limit | 0));
+  const more = start + page.length < total;
+  return {
+    matches: page,
+    total,
+    truncated,
+    offset: start,
+    limit: Math.max(1, limit | 0),
+    more,
+    summary: truncated
+      ? `showing ${page.length} of ${total}+ matches — refine the pattern, add \`include\`, or pass \`offset\` to page`
+      : `showing ${page.length} of ${total} matches`,
+  };
+}
+async function globSearch(pattern, relRoot, offset = 0, limit = 200) {
+  const root = coderRoot();
+  const base = relRoot ? withinWs(relRoot) : root;
+  const re = globToRegex(pattern);
+  const files = [];
+  await walkFiles(root, relOf(base), files, MAX_GLOB_FILES);
+  const all = files.filter((f) => re.test(f)).sort();
+  const total = all.length;
+  const start = Math.max(0, offset | 0);
+  const page = all.slice(start, start + Math.max(1, limit | 0));
+  const more = start + page.length < total;
+  return {
+    files: page,
+    total,
+    truncated: total >= MAX_GLOB_FILES,
+    offset: start,
+    limit: Math.max(1, limit | 0),
+    more,
+    summary: `showing ${page.length} of ${total} files`,
+  };
+}
+
+// ---- Retrieval: ranked repo search (symbol index cached, refreshed periodically) ----
+let symbolIndexCache = null;
+let symbolIndexAt = 0;
+async function buildSymbolIndex() {
+  const root = coderRoot();
+  if (!root) return [];
+  try {
+    const r = await execCommand(
+      "rg '^(?:\\s*)(?:export\\s+|pub\\s+|async\\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait|def|func)\\s+([A-Za-z_][A-Za-z0-9_]*)' -g '*.{ts,tsx,js,jsx,mjs,cjs,rs,py,go,c,cpp,h,hpp,hh,java,rb,php,swift,kt,kts,scala,sc,cs,sh,bash,zsh,lua,r,ex,exs,erl,elm,hs,dart,sql}' --no-heading --line-number",
+      '.',
+      10000,
+    );
+    const out = [];
+    for (const l of r.stdout.split('\n')) {
+      if (!l) continue;
+      const m = l.match(/^(.+?):(\d+):.*?(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait|def|func)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      if (m) out.push({ file: m[1], line: parseInt(m[2], 10), name: m[3] });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+async function getSymbolIndex() {
+  if (!symbolIndexCache || Date.now() - symbolIndexAt > 15000) {
+    symbolIndexCache = await buildSymbolIndex();
+    symbolIndexAt = Date.now();
+  }
+  return symbolIndexCache;
+}
+// Ranked retrieval: symbol-name matches (high score) merged with content matches
+// (lower score), deduped by file:line and sorted by score. The symbol index is
+// cached in memory and refreshed at most every 15s, so repeated searches in a
+// short window are cheap (the "persistent" repo index).
+async function repoSearch(query, limit = 15) {
+  const q = (query || '').trim();
+  if (!q) return { results: [], truncated: false };
+  const terms = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+  const results = new Map();
+  const idx = await getSymbolIndex();
+  for (const s of idx) {
+    const fileLow = s.file.toLowerCase();
+    const nameLow = s.name.toLowerCase();
+    let score = 0;
+    for (const t of terms) {
+      if (nameLow === t) score += 100;
+      else if (nameLow.startsWith(t)) score += 60;
+      else if (nameLow.includes(t)) score += 30;
+      else if (fileLow.includes(t)) score += 10;
+    }
+    if (score > 0) {
+      const key = s.file + ':' + s.line;
+      const e = results.get(key) || { file: s.file, line: s.line, snippet: '', score: 0, kind: 'symbol' };
+      e.score += score;
+      results.set(key, e);
+    }
+  }
+  try {
+    const r = await execCommand(
+      `rg -F --no-heading --line-number -e ${JSON.stringify(q)} -g '!.git' -g '!node_modules' -g '!target' -g '!dist' -g '!build' -g '!vendor' -g '!__pycache__'`,
+      '.',
+      20000,
+    );
+    for (const l of r.stdout.split('\n')) {
+      if (!l) continue;
+      const m = l.match(/^(.+?):(\d+):(.*)$/);
+      if (!m) continue;
+      const file = m[1], ln = parseInt(m[2], 10), text = m[3];
+      const key = file + ':' + ln;
+      const e = results.get(key) || { file, line: ln, snippet: '', score: 0, kind: 'content' };
+      e.score += 8;
+      e.snippet = text.slice(0, 300);
+      results.set(key, e);
+    }
+  } catch {
+    /* no content matches */
+  }
+  const arr = [...results.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+  return { results: arr, truncated: results.size > limit };
+}
+// Recognize shell commands that can cause irreversible data loss or system
+// damage. Returns a short human-readable reason, or null if the command looks
+// safe. Safe mode (coderSafeMode) blocks anything this flags.
+function detectDestructive(cmd) {
+  const tests = [
+    [/\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['"]?(\/|~|\.\.\/|\*|\/home|\/root|\/etc|\/usr|\/var|\/System|\/private)/i, 'recursive delete of a system/home directory or wildcard'],
+    [/\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['"]?\s*\.(?:\s|$)/i, 'recursive delete of the current directory'],
+    [/\bgit\s+push\b[^]*?(--force|-f\b)/i, 'force push (can overwrite remote history)'],
+    [/\bgit\s+reset\s+--hard\b/i, 'hard reset (discards uncommitted work)'],
+    [/\bgit\s+clean\s+-[a-z]*f/i, 'git clean (removes untracked files)'],
+    [/\bmkfs\b/i, 'filesystem format'],
+    [/\bdd\s+if=/i, 'dd disk image copy'],
+    [/\bshred\b/i, 'secure file shredding'],
+    [/\bwipefs\b/i, 'filesystem wipe'],
+    [/\b(shutdown|reboot|halt|poweroff)\b/i, 'system power command'],
+    [/:\(\)\s*\{\s*:\s*\|\s*:&\s*\}/, 'fork bomb'],
+    [/\b(curl|wget|fetch)\b[^]*?\|\s*(ba)?sh\b/i, 'piping a download straight into a shell'],
+    [/\bchmod\s+(-R\s+)?0+\b/i, 'removing all permissions'],
+    [/\bchown\s+-R\b/i, 'recursive ownership change'],
+    [/\bdd\b[^]*?\bof=\/dev\//i, 'writing directly to a device'],
+    [/>\s*\/dev\/sd/i, 'writing to a raw disk device'],
+  ];
+  for (const [re, why] of tests) {
+    if (re.test(cmd)) return why;
+  }
+  return null;
+}
+
+// Pull the session cwd out of a command's stdout (the marker is appended last)
+// and update the session map. Returns the stdout with the marker stripped.
+function stripCwdMarker(sessionId, buf) {
+  if (!sessionId) return buf;
+  const mi = buf.indexOf(CWD_MARKER);
+  if (mi < 0) return buf;
+  const end = buf.indexOf(CWD_MARKER, mi + CWD_MARKER.length);
+  if (end <= mi) return buf;
+  const newCwd = buf.slice(mi + CWD_MARKER.length, end).trim();
+  if (newCwd) setSessionCwd(sessionId, newCwd);
+  return buf.slice(0, mi);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent per-session shell.
+//
+// The agent issues many short `bash` calls. A fresh `bash -lc` per call drops
+// both cwd AND environment, so `export`, `source venv/bin/activate`, and conda
+// activation never survive to the next command. We keep one long-lived bash per
+// shell-session id so that state persists, serializing commands through a queue.
+// Sessions are keyed by `sh:<id>` (the bash tool uses `sh:<workspace>`); other
+// exec calls (git utils, etc.) keep the stateless spawn + cwd-marker path.
+// ---------------------------------------------------------------------------
+const shells = new Map();
+// Random sentinel so a command's own output can never collide with our markers.
+const SHELL_TOKEN = `NINFXSH_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
+
+// Spawn args for a bwrap-sandboxed persistent shell (mirrors the stateless path).
+function shellSpawnArgs(cwd) {
+  const ws = coderRoot() || cwd;
+  const binds = (config.sandboxBinds || []).filter(Boolean).flatMap((p) => ['--bind', p, p]);
+  return {
+    args: ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '--norc', '--noprofile', ...binds],
+    cwd,
+  };
+}
+
+class PersistentShell {
+  constructor(cwd, sessionId) {
+    this.sessionId = sessionId;
+    this.cwd = cwd;
+    this.dead = false;
+    this.busy = false;
+    this.queue = [];
+    this.cur = null;
+    this.spawnErr = null;
+    try {
+      if (coderSandbox && bwrapAvailable !== false) {
+        if (bwrapAvailable === null) bwrapAvailable = checkBwrap();
+        if (bwrapAvailable) {
+          const { args, cwd: sc } = shellSpawnArgs(cwd);
+          this.proc = spawn('bwrap', args, { cwd: sc, env: { ...process.env } });
+        }
+      }
+      if (!this.proc) {
+        this.proc = spawn('bash', ['--norc', '--noprofile'], { cwd, env: { ...process.env } });
+      }
+    } catch (e) {
+      this.dead = true;
+      this.spawnErr = e;
+    }
+    if (this.proc) {
+      this.proc.stdin.on('error', () => {}); // ignore EPIPE after kill
+      this.proc.stdout.on('data', (d) => this._onData(d, 'out'));
+      this.proc.stderr.on('data', (d) => this._onData(d, 'err'));
+      this.proc.on('exit', () => { this.dead = true; this._failAll(new Error('shell process exited')); });
+      this.proc.on('error', () => { this.dead = true; this._failAll(new Error('shell process error')); });
+    }
+  }
+  _failAll(err) {
+    if (this.cur) { const c = this.cur; this.cur = null; clearTimeout(c.timer); c.reject(err); }
+    while (this.queue.length) this.queue.shift()(new Error('shell dead'));
+  }
+  _onData(d, which) {
+    const c = this.cur;
+    if (!c) return; // ignore stray output after finalize
+    const s = d.toString();
+    c[which] += s;
+    c.totalLen += s.length;
+    if (c[which].length > MAX_OUTPUT_BYTES * 2) c[which] = c[which].slice(-MAX_OUTPUT_BYTES * 2);
+    if (c.totalLen > MAX_OUTPUT_BYTES) c.truncated = true;
+    if (which === 'out' && s.indexOf(SHELL_TOKEN) >= 0) this._finalize();
+  }
+  _finalize() {
+    const c = this.cur;
+    if (!c) return;
+    this.cur = null;
+    clearTimeout(c.timer);
+    const out = c.out;
+    let exitCode = 0;
+    let body = out;
+    const i1 = out.indexOf(SHELL_TOKEN);
+    if (i1 >= 0) {
+      const i2 = out.indexOf(SHELL_TOKEN, i1 + SHELL_TOKEN.length);
+      if (i2 >= 0) {
+        exitCode = parseInt(out.slice(i1 + SHELL_TOKEN.length, i2).trim(), 10) || 0;
+        body = out.slice(0, i1); // drop the sentinel + trailing cwd marker region
+      }
+    }
+    body = stripCwdMarker(this.sessionId, body);
+    this.cwd = sessionCwd(this.sessionId) || this.cwd;
+    const result = {
+      stdout: capOut(body),
+      stderr: capOut(c.err),
+      exitCode,
+      timedOut: false,
+      truncated: c.truncated,
+      total_bytes: c.totalLen,
+      cwd: this.cwd,
+    };
+    this.busy = false;
+    c.resolve(result);
+    this._next();
+  }
+  _next() {
+    if (this.busy) return;
+    const job = this.queue.shift();
+    if (!job) return;
+    if (this.dead) { job.reject(new Error('shell dead')); return; }
+    this.busy = true;
+    this.cur = { resolve: job.resolve, reject: job.reject, out: '', err: '', truncated: false, totalLen: 0, timer: null };
+    // Re-`cd` to the tracked cwd first so a restarted shell resumes correctly.
+    const wrapped =
+      `cd ${JSON.stringify(this.cwd)} 2>/dev/null || true\n` +
+      `${job.command}\n` +
+      `printf '${CWD_MARKER}%s${CWD_MARKER}\n' "$PWD"\n` +
+      `printf '%s%s%s' '${SHELL_TOKEN}' "$?" '${SHELL_TOKEN}'\n`;
+    this.cur.timer = setTimeout(() => {
+      this.busy = false;
+      this.dead = true;
+      try { this.proc.kill('SIGKILL'); } catch { /* ignore */ }
+      const c = this.cur; this.cur = null;
+      if (c) c.resolve({
+        stdout: capOut(stripCwdMarker(this.sessionId, c.out)),
+        stderr: capOut(c.err), exitCode: null, timedOut: true, truncated: c.truncated, total_bytes: c.totalLen, cwd: this.cwd, error: 'timeout',
+      });
+      shells.delete(this.sessionId);
+      this._next();
+    }, Math.min(Math.max(job.timeoutMs || 120000, 1000), 600000));
+    try {
+      this.proc.stdin.write(wrapped);
+    } catch (e) {
+      this.busy = false;
+      job.reject(e);
+      this._next();
+    }
+  }
+  run(command, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (this.dead) return reject(new Error('shell dead'));
+      this.queue.push({ command, timeoutMs, resolve, reject });
+      this._next();
+    });
+  }
+}
+
+function getShell(sessionId, cwd) {
+  let sh = shells.get(sessionId);
+  if (!sh || sh.dead) {
+    sh = new PersistentShell(cwd, sessionId);
+    shells.set(sessionId, sh);
+  }
+  return sh;
+}
+
+async function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
+  if (coderSafeMode) {
+    const reason = detectDestructive(command);
+    if (reason) {
+      const cwd = relOf(relCwd ? withinWs(relCwd) : coderRoot());
+      return Promise.resolve({
+        stdout: '',
+        stderr: `⛔ Blocked by safe mode: ${reason}. Use a scoped, non-destructive alternative or ask the user.`,
+        exitCode: 1,
+        timedOut: false,
+        truncated: false,
+        blocked: true,
+        cwd,
+        error: reason,
+      });
+    }
+  }
+  const root = coderRoot();
+  let cwd = relCwd ? withinWs(relCwd) : root;
+  // Stateful shell: a persistent bash per `sh:<id>` session carries cwd + env
+  // across commands (export / venv / conda activation survive). Other exec calls
+  // (git utils, background jobs, stateless sessions) keep the spawn below.
+  if (sessionId && sessionId.startsWith('sh:')) {
+    const sh = getShell(sessionId, cwd);
+    if (!sh.dead) {
+      try {
+        return await sh.run(command, timeoutMs);
+      } catch {
+        // fall through to stateless on any shell failure
+      }
+    }
+  }
+  // Stateless spawn with a cwd marker so even non-shell sessions keep their cwd.
+  let runCmd = command;
+  if (sessionId) {
+    const base = sessionCwd(sessionId);
+    runCmd = `cd ${JSON.stringify(base)} 2>/dev/null || true\n${command}\nprintf '\\n${CWD_MARKER}%s${CWD_MARKER}\n' "$PWD"`;
+    cwd = root;
+  }
+  const resultCwd = sessionId ? sessionCwd(sessionId) : relOf(cwd);
+  // Optional filesystem sandbox: wrap the shell in bwrap so the agent can only
+  // write inside the workspace (the rest of the host is read-only). Network stays
+  // available so builds can fetch; this is the real safety net behind "Safe mode
+  // OFF", containing a jailbroken/mistaken model to its workspace.
+  let sandboxOk = false;
+  let sandboxBindArgs = [];
+  if (coderSandbox) {
+    const ws = coderRoot() || '';
+    sandboxBindArgs = (config.sandboxBinds || []).filter(Boolean).flatMap((p) => ['--bind', p, p]);
+    if (ws) {
+      if (bwrapAvailable === null) bwrapAvailable = checkBwrap();
+      sandboxOk = bwrapAvailable;
+      if (!sandboxOk && !sandboxWarned) {
+        console.warn('[coder] sandbox enabled but bwrap not found; running unsandboxed');
+        sandboxWarned = true;
+      }
+    }
+  }
+  const timeout = Math.min(Math.max(timeoutMs || 120000, 1000), 600000);
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      if (sandboxOk) {
+        proc = spawn('bwrap', ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '-lc', runCmd, ...sandboxBindArgs], { cwd, env: process.env });
+      } else {
+        proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
+      }
+      if (hooks?.onSpawn) hooks.onSpawn(proc);
+    } catch (err) {
+      return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: resultCwd, error: err.message });
+    }
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    let truncated = false;
+    let totalLen = 0;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, total_bytes: totalLen, cwd: resultCwd });
+    }, timeout);
+    proc.stdout.on('data', (d) => {
+      totalLen += d.length;
+      stdout += d;
+      if (stdout.length > MAX_OUTPUT_BYTES) truncated = true;
+      if (stdout.length > MAX_OUTPUT_BYTES * 2) stdout = stdout.slice(-MAX_OUTPUT_BYTES * 2);
+    });
+    proc.stderr.on('data', (d) => {
+      totalLen += d.length;
+      stderr += d;
+      if (stderr.length > MAX_OUTPUT_BYTES) truncated = true;
+      if (stderr.length > MAX_OUTPUT_BYTES * 2) stderr = stderr.slice(-MAX_OUTPUT_BYTES * 2);
+    });
+    proc.on('error', (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, total_bytes: totalLen, cwd: resultCwd, error: err.message });
+    });
+    proc.on('close', (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, total_bytes: totalLen, cwd: resultCwd });
+    });
+  });
+}
+async function webFetch(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw Object.assign(new Error('invalid url'), { status: 400 });
+  }
+
+  let extractedMarkdown = null;
+  let fetchStatus = 200;
+  
+  try {
+    const crawler = new PlaywrightCrawler({
+      requestHandlerTimeoutSecs: 15,
+      maxRequestsPerCrawl: 1,
+      headless: true,
+      requestHandler: async ({ page, request, response }) => {
+        fetchStatus = response?.status() || 200;
+        const html = await page.content();
+        const dom = new JSDOM(html, { url: request.loadedUrl });
+        const reader = new Readability(dom.window.document);
+        const article = reader.parse();
+        if (article && article.content) {
+          const turndownService = new TurndownService();
+          extractedMarkdown = turndownService.turndown(article.content);
+        } else {
+          const turndownService = new TurndownService();
+          extractedMarkdown = turndownService.turndown(html);
+        }
+      },
+    });
+    await crawler.run([u.toString()]);
+  } catch (err) {
+    const resp = await fetch(u, { redirect: 'follow', headers: { 'user-agent': 'ninfier-studio/0.1' } }).catch((e) => {
+      throw Object.assign(new Error('fetch failed: ' + e.message), { status: 502 });
+    });
+    fetchStatus = resp.status;
+    let htmlText = await resp.text().catch(() => '');
+    const dom = new JSDOM(htmlText, { url: u.toString() });
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
+    const turndownService = new TurndownService();
+    extractedMarkdown = turndownService.turndown(article ? article.content : htmlText);
+  }
+  
+  let finalContent = extractedMarkdown || '';
+  const truncated = finalContent.length > 200000;
+  finalContent = finalContent.slice(0, 200000);
+  
+  return { url: u.toString(), status: fetchStatus, contentType: 'text/markdown', content: finalContent, truncated };
+}
+async function webSearch(query) {
+  const url = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+  const resp = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64)' } }).catch((e) => {
+    throw Object.assign(new Error('search failed: ' + e.message), { status: 502 });
+  });
+  const html = await resp.text();
+  const results = [];
+  
+  try {
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    const resultNodes = doc.querySelectorAll('.result');
+    
+    for (const node of resultNodes) {
+      if (results.length >= 8) break;
+      
+      const a = node.querySelector('.result__a');
+      if (!a) continue;
+      
+      let href = a.getAttribute('href') || '';
+      const um = href.match(/uddg=([^&]+)/);
+      if (um) {
+        try {
+          href = decodeURIComponent(um[1]);
+        } catch { /* ignore */ }
+      }
+      
+      const snippetNode = node.querySelector('.result__snippet');
+      const snippet = snippetNode ? snippetNode.textContent.trim().slice(0, 300) : '';
+      
+      results.push({ title: a.textContent.trim(), url: href, snippet });
+    }
+  } catch (err) {
+    // Ignore JSDOM parse errors
+  }
+  
+  return { results, query };
+}
+
+async function handleCoder(req, res, p, url) {
+  try {
+    if (p === '/api/coder/workspace' && req.method === 'GET') {
+      const root = coderRoot();
+      let exists = false;
+      if (root) {
+        try {
+          exists = (await fs.stat(root)).isDirectory();
+        } catch {
+          /* not there */
+        }
+      }
+      return sendJson(res, 200, { workspace: root || '', exists });
+    }
+    if (p === '/api/coder/safe-mode' && req.method === 'GET') {
+      return sendJson(res, 200, { enabled: coderSafeMode });
+    }
+    if (p === '/api/coder/safe-mode' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 10);
+      if (typeof body?.enabled === 'boolean') coderSafeMode = body.enabled;
+      return sendJson(res, 200, { enabled: coderSafeMode });
+    }
+    if (p === '/api/coder/sandbox' && req.method === 'GET') {
+      return sendJson(res, 200, { enabled: coderSandbox });
+    }
+    if (p === '/api/coder/sandbox' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 10);
+      if (typeof body?.enabled === 'boolean') {
+        coderSandbox = body.enabled;
+        await saveConfig({ coderSandbox });
+      }
+      return sendJson(res, 200, { enabled: coderSandbox });
+    }
+    if (p === '/api/coder/workspace' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      const raw = (body?.path || '').trim();
+      if (raw) {
+        const ws = path.resolve(raw);
+        await fs.mkdir(ws, { recursive: true });
+        const exists = (await fs.stat(ws)).isDirectory();
+        config = { ...config, coderWorkspace: ws };
+        await saveConfig({ coderWorkspace: ws });
+        return sendJson(res, 200, { workspace: ws, exists });
+      }
+      config = { ...config, coderWorkspace: '' };
+      await saveConfig({ coderWorkspace: '' });
+      return sendJson(res, 200, { workspace: '', exists: false });
+    }
+    if (p === '/api/coder/tree' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const depth = Math.min(Math.max(Number(url.searchParams.get('depth') || 3), 1), 6);
+      const rel = url.searchParams.get('root') || '.';
+      let base;
+      try {
+        base = withinWs(rel);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      const nodes = await treeNodes(root, relOf(base), 1, depth);
+      return sendJson(res, 200, { root: relOf(base), nodes });
+    }
+    if (p === '/api/coder/repo_map' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      try {
+        const r = await execCommand(`rg '^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)' -g '*.{ts,tsx,js,jsx,mjs,cjs,rs,py,go,c,cpp,h,hpp,hh,java,rb,php,swift,kt,kts,scala,sc,cs,sh,bash,zsh,lua,r,ex,exs,erl,elm,hs,dart,sql}' --no-heading --line-number`, '.', 10000);
+        let map = r.stdout;
+        if (map.length > 15000) {
+            map = map.slice(0, 15000) + "\n... (repo map truncated)";
+        }
+        return sendJson(res, 200, { map });
+      } catch (err) {
+        return sendJson(res, 200, { map: "" });
+      }
+    }
+    if (p === '/api/coder/search' && req.method === 'GET') {
+      const q = url.searchParams.get('q') || '';
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 15), 1), 50);
+      const r = await repoSearch(q, limit);
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/diff' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      try {
+        const stat = await execCommand('git --no-pager diff HEAD --stat', '.', 15000);
+        const diff = await execCommand('git --no-pager diff HEAD', '.', 60000);
+        const files = (stat.stdout || '').split('\n')
+          .map((l) => l.match(/^(.+?)\s*\|\s*\d+\s*([+-]*)$/))
+          .filter((m) => m && !m[1].trim().startsWith(' '))
+          .map((m) => ({ path: m[1].trim(), bar: m[2] }));
+        return sendJson(res, 200, {
+          files,
+          diff: (diff.stdout || '').slice(0, 60000),
+          truncated: (diff.stdout || '').length > 60000,
+        });
+      } catch (e) {
+        return sendJson(res, 200, { files: [], diff: '', error: String(e?.message || e) });
+      }
+    }
+    if (p === '/api/coder/memory' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const bank = await readMemFile(root, 'bank.md', '');
+      const learnings = await readLearnings(root);
+      return sendJson(res, 200, { bank, learnings });
+    }
+    if (p === '/api/coder/memory' && req.method === 'POST') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const body = await readBody(req, 1 << 20);
+      if (typeof body?.bank === 'string') {
+        await writeMemFile(root, 'bank.md', body.bank);
+      }
+      if (body?.learning && typeof body.learning.text === 'string') {
+        const entry = {
+          id: `l_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          text: body.learning.text,
+          kind: body.learning.kind || 'tip',
+          provenance: body.learning.provenance || '',
+          task: body.learning.task || '',
+          ts: new Date().toISOString(),
+        };
+        await fs.mkdir(memDirFor(root), { recursive: true });
+        await fs.appendFile(path.join(memDirFor(root), 'learnings.jsonl'), JSON.stringify(entry) + '\n');
+      }
+      if (typeof body?.dropLearningId === 'string') {
+        const keep = (await readLearnings(root)).filter((l) => l.id !== body.dropLearningId);
+        await writeMemFile(root, 'learnings.jsonl', keep.map((l) => JSON.stringify(l)).join('\n') + (keep.length ? '\n' : ''));
+      }
+      const bank = await readMemFile(root, 'bank.md', '');
+      const learnings = await readLearnings(root);
+      return sendJson(res, 200, { bank, learnings });
+    }
+    if (p === '/api/coder/fs/read' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      let buf;
+      try {
+        buf = await fs.readFile(full);
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      if (await isBinary(buf)) return sendJson(res, 200, { path: body.path, binary: true, note: 'binary file — not shown' });
+      const text = buf.toString('utf8');
+      const totalLines = text.split('\n').length;
+      let content = text;
+      if (body?.offset != null || body?.limit != null) {
+        const lines = text.split('\n');
+        const off = Math.max(0, body.offset || 0);
+        const lim = body.limit != null ? body.limit : lines.length;
+        content = lines.slice(off, off + lim).join('\n');
+      }
+      const truncated = content.length > MAX_READ_BYTES;
+      if (truncated) content = content.slice(0, MAX_READ_BYTES);
+      return sendJson(res, 200, { path: body.path, content, totalLines, truncated, lineCount: content.split('\n').length });
+    }
+    if (p === '/api/coder/fs/b64' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      let buf;
+      try {
+        buf = await fs.readFile(full);
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      const MAX_ATTACH_BYTES = 5 * 1024 * 1024;
+      if (buf.length > MAX_ATTACH_BYTES) {
+        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 5 MB` });
+      }
+      const ext = (body?.path || full).split('.').pop()?.toLowerCase() || '';
+      const mime = (
+        { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon' }
+      )[ext] || 'application/octet-stream';
+      const dataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+      return sendJson(res, 200, { path: body.path, mime, dataUrl, size: buf.length });
+    }
+    if (p === '/api/coder/fs/write' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      if (typeof body?.content !== 'string') return sendJson(res, 400, { error: 'content must be a string' });
+      await fs.mkdir(path.dirname(full), { recursive: true });
+      const existed = await fs.stat(full).then((s) => s.isFile()).catch(() => false);
+      await fs.writeFile(full, body.content);
+      return sendJson(res, 200, { path: body.path, bytes: Buffer.byteLength(body.content), created: !existed });
+    }
+    if (p === '/api/coder/fs/edit' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      if (typeof body?.old !== 'string' || typeof body?.new !== 'string') {
+        return sendJson(res, 400, { error: 'old and new strings required' });
+      }
+      let fileText;
+      try {
+        fileText = await fs.readFile(full, 'utf8');
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      
+      let replaced = fileText;
+      let count = 0;
+      const exactIdx = fileText.indexOf(body.old);
+      
+      if (exactIdx !== -1) {
+        if (!body.replaceAll && fileText.indexOf(body.old, exactIdx + 1) !== -1) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string is not unique — pass replaceAll:true to replace all' });
+        }
+        replaced = body.replaceAll ? fileText.split(body.old).join(body.new) : fileText.replace(body.old, body.new);
+        count = body.replaceAll ? (fileText.match(new RegExp(escapeRe(body.old), 'g')) || []).length : 1;
+      } else {
+        const oldLines = body.old.split('\n');
+        while (oldLines.length > 0 && oldLines[0].trim() === '') oldLines.shift();
+        while (oldLines.length > 0 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
+        
+        if (oldLines.length === 0) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string is empty or only whitespace' });
+        }
+        
+        const fileLines = fileText.split('\n');
+        let matchIndex = -1;
+        let matchCount = 0;
+        
+        for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+          let matches = true;
+          for (let j = 0; j < oldLines.length; j++) {
+            if (fileLines[i + j].trim() !== oldLines[j].trim()) {
+              matches = false;
+              break;
+            }
+          }
+          if (matches) {
+            matchIndex = i;
+            matchCount++;
+          }
+        }
+        
+        if (matchCount === 0) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string not found (even with fuzzy whitespace matching)' });
+        }
+        if (matchCount > 1 && !body.replaceAll) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: 'old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true' });
+        }
+        
+        if (!body.replaceAll) {
+          fileLines.splice(matchIndex, oldLines.length, body.new);
+          replaced = fileLines.join('\n');
+          count = 1;
+        } else {
+          let matches = [];
+          for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+            let isMatch = true;
+            for (let j = 0; j < oldLines.length; j++) {
+              if (fileLines[i + j].trim() !== oldLines[j].trim()) {
+                isMatch = false; break;
+              }
+            }
+            if (isMatch) matches.push(i);
+          }
+          count = matches.length;
+          for (let i = matches.length - 1; i >= 0; i--) {
+            fileLines.splice(matches[i], oldLines.length, body.new);
+          }
+          replaced = fileLines.join('\n');
+        }
+      }
+      
+      await fs.writeFile(full, replaced);
+      return sendJson(res, 200, { path: body.path, replacements: count });
+    }
+    if (p === '/api/coder/fs/patch' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      const hunks = body?.edits;
+      if (!Array.isArray(hunks) || hunks.length === 0) {
+        return sendJson(res, 400, { error: 'edits must be a non-empty array of {old, new}' });
+      }
+      for (let i = 0; i < hunks.length; i++) {
+        const h = hunks[i] || {};
+        if (typeof h.old !== 'string' || typeof h.new !== 'string') {
+          return sendJson(res, 400, { error: `edits[${i}].old and edits[${i}].new strings required` });
+        }
+      }
+      let fileText;
+      try {
+        fileText = await fs.readFile(full, 'utf8');
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      // All-or-nothing: validate every hunk against the evolving text first.
+      let working = fileText;
+      let total = 0;
+      for (let i = 0; i < hunks.length; i++) {
+        const r = applyEditHunk(working, hunks[i].old, hunks[i].new, !!hunks[i].replaceAll);
+        if (r.error) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: `hunk ${i}: ${r.error}` });
+        }
+        working = r.text;
+        total += r.count;
+      }
+      await fs.writeFile(full, working);
+      return sendJson(res, 200, { path: body.path, replacements: total });
+    }
+    if (p === '/api/coder/exec' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.command || typeof body.command !== 'string') return sendJson(res, 400, { error: 'command required' });
+      if (body.background) {
+        const root = coderRoot();
+        if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+        const id = startBgJob(body.command, body.cwd, body.timeoutMs, body.sessionId);
+        return sendJson(res, 200, { jobId: id, started: true });
+      }
+      const r = await execCommand(body.command, body.cwd, body.timeoutMs, body.sessionId);
+      return sendJson(res, 200, r);
+    }
+    if (p.startsWith('/api/coder/jobs/') && (req.method === 'GET' || req.method === 'POST')) {
+      const rest = p.slice('/api/coder/jobs/'.length);
+      const kill = rest.endsWith('/kill');
+      const id = kill ? rest.slice(0, -'/kill'.length) : rest;
+      const rec = bgJobs.get(id);
+      if (!rec) return sendJson(res, 404, { error: 'unknown job' });
+      if (kill && req.method === 'POST') {
+        if (!rec.done) {
+          try { rec.proc?.kill('SIGKILL'); } catch { /* already exited */ }
+          rec.done = true;
+        }
+        return sendJson(res, 200, bgJobView(rec));
+      }
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+      return sendJson(res, 200, bgJobView(rec));
+    }
+    if (p === '/api/coder/grep' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const r = await grepSearch(
+        body.pattern,
+        body.path,
+        body.include,
+        !!body.ignoreCase,
+        Math.min(body.maxMatches || MAX_GREP_MATCHES, 2000),
+        Math.max(0, body.offset | 0),
+        Math.max(1, body.limit || 200),
+      );
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/glob' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      const r = await globSearch(body.pattern, body.path, Math.max(0, body.offset | 0), Math.max(1, body.limit || 200));
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/web/fetch' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.url) return sendJson(res, 400, { error: 'url required' });
+      const r = await webFetch(body.url);
+      return sendJson(res, 200, r);
+    }
+    if (p === '/api/coder/web/search' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (!body?.query) return sendJson(res, 400, { error: 'query required' });
+      const r = await webSearch(body.query);
+      return sendJson(res, 200, r);
+    }
+    return sendJson(res, 404, { error: 'unknown coder endpoint' });
+  } catch (err) {
+    const code = err.status || 500;
+    if (!res.headersSent) sendJson(res, code, { error: err.message });
+    else res.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP layer
 // ---------------------------------------------------------------------------
 function sendJson(res, code, obj) {
@@ -1087,40 +2350,44 @@ async function proxyToEngine(req, res, targetPath) {
     headers.authorization = `Bearer ${config.apiKey}`;
   }
 
-  const upstream = await fetch(`http://127.0.0.1:${port}${targetPath}`, {
-    method: req.method,
-    headers: { ...headers, 'content-type': req.headers['content-type'] || 'application/json' },
-    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-    duplex: 'half',
-    redirect: 'manual',
-  }).catch((err) => {
-    sendJson(res, 502, { error: 'engine unreachable', detail: err.message });
-    return null;
-  });
-  if (!upstream) return;
+  // Use Node's http module (not undici fetch) — fetch cannot connect to the
+  // loopback engine inside the sandbox, while http.request works like curl.
+  const target = new URL(req.url, 'http://127.0.0.1');
+  const fwdHeaders = { ...headers };
+  delete fwdHeaders['content-length'];
+  delete fwdHeaders['transfer-encoding'];
 
-  res.writeHead(upstream.status, {
-    'content-type': upstream.headers.get('content-type') || 'application/json',
-    'cache-control': 'no-cache',
-    'x-request-id': upstream.headers.get('x-request-id') || '',
-    'access-control-allow-origin': '*',
+  const upstreamReq = httpRequest(
+    {
+      method: req.method,
+      hostname: '127.0.0.1',
+      port,
+      path: target.pathname + target.search,
+      headers: { ...fwdHeaders, 'content-type': req.headers['content-type'] || 'application/json' },
+    },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode || 502, {
+        'content-type': upstreamRes.headers['content-type'] || 'application/json',
+        'cache-control': 'no-cache',
+        'x-request-id': upstreamRes.headers['x-request-id'] || '',
+        'access-control-allow-origin': '*',
+      });
+      if (req.method === 'HEAD') return res.end();
+      upstreamRes.on('data', (chunk) => {
+        res.write(chunk);
+        if (typeof res.flush === 'function') res.flush();
+      });
+      upstreamRes.on('end', () => res.end());
+      upstreamRes.on('error', () => { try { res.end(); } catch { /* already closed */ } });
+    },
+  );
+  upstreamReq.on('error', (err) => {
+    console.error('[proxyToEngine] upstream http failed:', err?.message, '| port=', port, '| path=', target.pathname);
+    if (!res.headersSent) sendJson(res, 502, { error: 'engine unreachable', detail: err.message });
+    else try { res.end(); } catch { /* already closed */ }
   });
-  if (req.method === 'HEAD') return res.end();
-
-  if (!upstream.body) return res.end();
-  // SSE-safe: pipe chunks as they arrive
-  try {
-    const reader = upstream.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-      if (typeof res.flush === 'function') res.flush();
-    }
-  } catch (err) {
-    // client aborted
-  }
-  res.end();
+  if (req.method !== 'GET' && req.method !== 'HEAD') upstreamReq.write(body);
+  upstreamReq.end();
 }
 
 const server = createServer(async (req, res) => {
@@ -1220,6 +2487,35 @@ const server = createServer(async (req, res) => {
 
     if (p === '/api/gpu' && req.method === 'GET') {
       return sendJson(res, 200, await gpuStats());
+    }
+
+    // List subdirectories of a host path so the web UI can browse and point a
+    // workspace at an existing directory. Unreadable/missing roots return
+    // exists:false rather than an error so the picker can still render.
+    if (p === '/api/coder/dirs' && req.method === 'GET') {
+      const root = (url.searchParams.get('root') || '/').trim() || '/';
+      try {
+        const st = await fs.stat(root);
+        if (!st.isDirectory()) {
+          return sendJson(res, 200, { root, exists: true, isDir: false, dirs: [] });
+        }
+        const entries = await fs.readdir(root, { withFileTypes: true });
+        const dirs = entries
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name)
+          .sort((a, b) => a.localeCompare(b));
+        return sendJson(res, 200, { root, exists: true, isDir: true, dirs });
+      } catch (e) {
+        return sendJson(res, 200, { root, exists: false, isDir: false, dirs: [], error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    // Delegate the remaining /api/coder/* routes to the sidecar's own coder
+    // implementation (filesystem tools, exec, grep/glob, web) so the web UI's
+    // coding agent can actually act on the selected workspace. (/api/coder/dirs
+    // above is handled explicitly before this fallback.)
+    if (p.startsWith('/api/coder')) {
+      return handleCoder(req, res, p, url);
     }
 
     // Engine API passthrough (OpenAI / Anthropic / health)

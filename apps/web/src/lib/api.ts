@@ -1,5 +1,28 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppSettings, ChatMessage, ChatParams, MessageMeta, ProfileState, SavedProfile, StatusPayload } from './types';
+import type {
+  AgentToolCall,
+  AppSettings,
+  ChatMessage,
+  ChatParams,
+  CoderEditResult,
+  CoderExecResult,
+  CoderGlobResult,
+  CoderGrepResult,
+  CoderJob,
+  CoderMessage,
+  CoderReadResult,
+  CoderTodo,
+  CoderTree,
+  CoderWebFetch,
+  CoderWebSearch,
+  CoderWorkspace,
+  CoderWriteResult,
+  FileNode,
+  MessageMeta,
+  ProfileState,
+  SavedProfile,
+  StatusPayload,
+} from './types';
 import type { ChatAttachment } from './types';
 
 // In dev (Vite) the web is served on :5173 and /api is proxied to the sidecar on
@@ -37,6 +60,20 @@ export function getStatus(): Promise<StatusPayload> {
 
 export function getConfig(): Promise<AppSettings> {
   return getJSON<AppSettings>('/api/config');
+}
+
+/** Read the engine's context window (max_model_len) for `model` from its
+ *  /v1/models advertisement. Falls back to null so callers can try the
+ *  sidecar-reported maxContext instead. */
+export async function getEngineContextSize(model = 'qwen-coder'): Promise<number | null> {
+  try {
+    const data = await getJSON<{ data?: Array<{ id: string; max_model_len?: number }> }>('/v1/models');
+    const models = data?.data ?? [];
+    const hit = models.find((m) => m.id === model) ?? models[0];
+    return hit?.max_model_len != null ? hit.max_model_len : null;
+  } catch {
+    return null;
+  }
 }
 
 export function saveConfig(patch: Partial<AppSettings>): Promise<AppSettings> {
@@ -144,6 +181,8 @@ export interface ChatStreamCallbacks {
   onUsage?: (usage: Record<string, unknown>, meta: MessageMeta) => void;
   onDone?: (meta: MessageMeta) => void;
   onError?: (message: string) => void;
+  /** Coding harness: tool calls assembled from streamed `delta.tool_calls`. Fires at finish. */
+  onToolCalls?: (calls: import('./types').AgentToolCall[]) => void;
 }
 
 export function buildChatRequest(
@@ -152,25 +191,42 @@ export function buildChatRequest(
   history: ChatMessage[],
   params: ChatParams,
   extra?: Record<string, unknown>,
+  /** When true, mark the system prompt with `cache_control` so the engine can
+   *  cache it across turns (Anthropic-style prefix caching). Opt-in: only enable
+   *  if your engine supports it; some OpenAI-compatible servers reject the field. */
+  cacheSystem = false,
 ): Record<string, unknown> {
   const messages: Array<Record<string, unknown>> = [];
-  if (systemPrompt?.trim()) messages.push({ role: 'system', content: systemPrompt.trim() });
+  if (systemPrompt?.trim()) {
+    const sys: Record<string, unknown> = { role: 'system', content: systemPrompt.trim() };
+    if (cacheSystem) sys.cache_control = { type: 'ephemeral' };
+    messages.push(sys);
+  }
   for (const m of history) {
     if (m.role === 'system') continue;
     if (m.attachments && m.attachments.length) {
       const content: Array<Record<string, unknown>> = [];
       if (m.content.trim()) content.push({ type: 'text', text: m.content });
       for (const a of m.attachments) {
-        if (a.kind === 'image') content.push({ type: 'image_url', image_url: { url: a.dataUrl } });
-        else content.push({ type: 'video_url', video_url: { url: a.dataUrl } });
+        if (a.kind === 'image') content.push({ type: 'image_url', image_url: { url: a.dataUrl! } });
+        else if (a.kind === 'video') content.push({ type: 'video_url', video_url: { url: a.dataUrl! } });
+        else if (a.kind === 'file') {
+          const p = a.path ?? a.name;
+          content.push({ type: 'text', text: `\n\n[Attached file: ${p}]\n\`\`\`\n${a.content ?? ''}\n\`\`\`\n` });
+        }
       }
       messages.push({ role: 'user', content });
     } else {
-      messages.push({
-        role: m.role,
-        content: m.content,
-        ...(m.role === 'assistant' && m.reasoning ? { reasoning_content: m.reasoning } : {}),
-      });
+      const msg: Record<string, unknown> = { role: m.role, content: m.content };
+      if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
+      if (m.tool_calls) msg.tool_calls = m.tool_calls.map(tc => ({
+        id: tc.id,
+        type: 'function',
+        function: { name: tc.name, arguments: tc.arguments }
+      }));
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+      if (m.name) msg.name = m.name;
+      messages.push(msg);
     }
   }
   // Thinking switch + effort: a contradictory enable_thinking/reasoning_effort
@@ -216,9 +272,15 @@ export async function streamChat(
   const meta: MessageMeta = {};
   let firstContentAt: number | null = null;
   let sawDone = false;
+  // Accumulate streamed tool calls (native OpenAI function calling).
+  const toolAcc: Array<{ id: string; type: string; name: string; arguments: string }> = [];
 
   const finish = () => {
     if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
+    const calls = toolAcc
+      .filter(Boolean)
+      .map((t, i) => ({ id: t.id || `call_${i}`, name: t.name, arguments: t.arguments }));
+    if (calls.length) cb.onToolCalls?.(calls);
     cb.onDone?.(meta);
   };
 
@@ -283,6 +345,18 @@ export async function streamChat(
         if (d.content) {
           if (firstContentAt === null) firstContentAt = performance.now();
           cb.onContentDelta?.(d.content);
+        }
+        // Native tool calling: accumulate streamed tool_call deltas by index.
+        const tcs = (choice.delta as { tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }> } | undefined)?.tool_calls;
+        if (Array.isArray(tcs)) {
+          for (const tc of tcs) {
+            const idx = tc.index ?? toolAcc.length;
+            if (!toolAcc[idx]) toolAcc[idx] = { id: '', type: 'function', name: '', arguments: '' };
+            if (tc.id) toolAcc[idx].id = tc.id;
+            if (tc.type) toolAcc[idx].type = tc.type;
+            if (tc.function?.name) toolAcc[idx].name = tc.function.name;
+            if (tc.function?.arguments) toolAcc[idx].arguments += tc.function.arguments;
+          }
         }
         if (choice.finish_reason) meta.finishReason = choice.finish_reason;
       }
@@ -428,6 +502,293 @@ export function summarizeConversation(opts: {
       onError: (m) => reject(new Error(m)),
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Tool-output summarization: condense a giant tool result (command output, a
+// large file read, a fetched page) into an actionable summary so the agent's
+// context stays small instead of ingesting a raw multi-hundred-KB dump.
+// ---------------------------------------------------------------------------
+const OUTPUT_SUMMARY_INSTRUCTION = [
+  'You are a tool-output summarizer for a coding agent. Condense the tool output below into a tight, actionable summary a software engineer can act on without seeing the raw dump.',
+  '',
+  'Preserve verbatim: exact error messages and stack traces, exit codes, key numeric values (IDs, counts, sizes, ports, addresses), file paths and line numbers, command output that indicates success/failure, and the final state.',
+  'Drop: boilerplate, banners, repeated lines, progress bars, ANSI/carriage-return noise, and irrelevant verbose dumps.',
+  'Use terse bullets. If the output is already short, say so. Output ONLY the summary — no preamble, no tools.',
+].join('\n');
+
+/** Stream an AI summary of a single tool output from the engine. */
+export function summarizeOutput(opts: {
+  model: string;
+  output: string;
+  signal?: AbortSignal;
+  maxTokens?: number;
+}): Promise<string> {
+  const instruction: ChatMessage = { role: 'user', content: OUTPUT_SUMMARY_INSTRUCTION };
+  const params: ChatParams = {
+    thinking: false,
+    reasoningEffort: '',
+    preserveThinking: false,
+    maxTokens: opts.maxTokens ?? 1024,
+  };
+  const body = buildChatRequest(opts.model, undefined, [{ role: 'user', content: opts.output }, instruction], params);
+  return new Promise<string>((resolve, reject) => {
+    let acc = '';
+    streamChat(body, opts.signal ?? AbortSignal.timeout(180_000), {
+      onContentDelta: (d) => {
+        acc += d;
+      },
+      onDone: () => resolve(acc.trim()),
+      onError: (m) => reject(new Error(m)),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Coding harness control-plane endpoints (sandboxed to the workspace)
+// ---------------------------------------------------------------------------
+export function getCoderWorkspace(): Promise<CoderWorkspace> {
+  return getJSON<CoderWorkspace>('/api/coder/workspace');
+}
+export function coderRepoMap(): Promise<{ map: string }> {
+  return getJSON<{ map: string }>('/api/coder/repo_map');
+}
+export function setCoderWorkspace(path: string): Promise<CoderWorkspace> {
+  return postJSON<CoderWorkspace>('/api/coder/workspace', { path }, 8000);
+}
+export interface CoderDirs {
+  root: string;
+  exists: boolean;
+  isDir: boolean;
+  dirs: string[];
+  error?: string;
+}
+export function coderDirs(root: string): Promise<CoderDirs> {
+  return getJSON<CoderDirs>(`/api/coder/dirs?root=${encodeURIComponent(root)}`);
+}
+export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
+  return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}`);
+}
+export function coderRead(path: string, offset?: number, limit?: number): Promise<CoderReadResult> {
+  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000);
+}
+export interface CoderBase64Result {
+  path: string;
+  mime: string;
+  dataUrl: string;
+  size: number;
+}
+export function coderReadBase64(path: string): Promise<CoderBase64Result> {
+  return postJSON<CoderBase64Result>('/api/coder/fs/b64', { path }, 15_000);
+}
+export function coderWrite(path: string, content: string): Promise<CoderWriteResult> {
+  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000);
+}
+export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000);
+}
+export interface CoderPatchEdit { old: string; new: string; replaceAll?: boolean; }
+export function coderPatch(path: string, edits: CoderPatchEdit[]): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000);
+}
+export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean): Promise<CoderExecResult> {
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background }, 15_000);
+}
+export function coderJob(jobId: string): Promise<CoderJob> {
+  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000);
+}
+export function coderJobKill(jobId: string): Promise<CoderJob> {
+  return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, {}, 15_000);
+}
+export function coderGrep(
+  pattern: string,
+  path?: string,
+  include?: string,
+  ignoreCase?: boolean,
+  offset = 0,
+  limit = 200,
+): Promise<CoderGrepResult> {
+  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit }, 15_000);
+}
+export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200): Promise<CoderGlobResult> {
+  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit }, 15_000);
+}
+export interface CoderSearchResult {
+  results: Array<{ file: string; line: number; snippet: string; score: number; kind: string }>;
+  truncated: boolean;
+}
+export function coderSearch(query: string, limit = 15): Promise<CoderSearchResult> {
+  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+}
+export interface CoderDiffResult {
+  files: Array<{ path: string; bar?: string }>;
+  diff: string;
+  truncated?: boolean;
+  error?: string;
+}
+export function coderDiff(): Promise<CoderDiffResult> {
+  return getJSON<CoderDiffResult>('/api/coder/diff', 60000);
+}
+export function coderWebFetch(url: string): Promise<CoderWebFetch> {
+  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000);
+}
+export function coderWebSearch(query: string): Promise<CoderWebSearch> {
+  return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000);
+}
+export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
+}
+export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
+}
+export function coderSandboxGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/coder/sandbox', 5000);
+}
+export function coderSandboxSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/coder/sandbox', { enabled }, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Self-improving memory (Hybrid A+B).
+//   A: a per-repo markdown *memory bank* (read at session start, the agent
+//      sees it only via system-prompt injection — never as a normal file).
+//   B: structured *learnings* extracted by the item-5 critic (success/tip/avoid)
+//      plus agent-proactive records via the `memory_update` tool.
+// Both are persisted OUTSIDE the repo under the control plane's data dir, so
+// they survive across sessions and are never committed by accident.
+// ---------------------------------------------------------------------------
+export type CoderLearningKind = 'success' | 'tip' | 'avoid';
+
+export interface CoderLearning {
+  /** Stable id (sha1 of text+ts) so the UI can drop individual entries. */
+  id: string;
+  text: string;
+  kind: CoderLearningKind;
+  /** Where the learning came from (e.g. "critic:approve", "critic:reject", "tool"). */
+  provenance?: string;
+  /** Short task description the learning was extracted from, if known. */
+  task?: string;
+  /** ISO timestamp. */
+  ts: string;
+}
+
+export interface CoderMemory {
+  /** Full markdown bank text. */
+  bank: string;
+  learnings: CoderLearning[];
+}
+
+/** Read the current bank + learnings for the active workspace. */
+export function coderMemoryGet(): Promise<CoderMemory> {
+  return getJSON<CoderMemory>('/api/coder/memory', 8000);
+}
+
+/** Replace the markdown bank wholesale (used by the Memory modal's save). */
+export function coderMemorySetBank(bank: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { bank }, 8000);
+}
+
+/** Append one structured learning (text + kind) and return the updated memory. */
+export function coderMemoryAddLearning(learning: {
+  text: string;
+  kind: CoderLearningKind;
+  provenance?: string;
+  task?: string;
+}): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { learning }, 8000);
+}
+
+/** Drop a single learning by id and return the updated memory. */
+export function coderMemoryDropLearning(id: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { dropLearningId: id }, 8000);
+}
+
+export interface CoderCommit {
+  hash: string;
+  author: string;
+  /** Human-friendly relative date, e.g. "3 hours ago" (git %ar). */
+  relDate: string;
+  /** ISO-ish commit date (git %ad). */
+  date: string;
+  /** First line of the commit message (git %s). */
+  subject: string;
+  /** Full commit message body (git %b), may be empty. */
+  body: string;
+}
+
+/**
+ * List recent commits in the active Coder workspace via `git log`. Runs through
+ * `coderExec` (which executes in the workspace root), so no sidecar change is
+ * needed. Returns [] when the workspace isn't a git repo or has no commits yet.
+ */
+export async function coderGitLog(limit = 100): Promise<CoderCommit[]> {
+  const fmt = '%H%x1f%an%x1f%ar%x1f%ad%x1f%s%x1f%b%x1e';
+  const r = await coderExec(`git log --pretty=format:${fmt} -n ${limit}`);
+  if (r.exitCode !== 0 || !r.stdout.trim()) return [];
+  const HASH_RE = /^[0-9a-f]{7,40}$/;
+  return r.stdout
+    .split('\x1e')
+    .map((rec) => rec.trim())
+    .filter(Boolean)
+    .map((rec): CoderCommit | null => {
+      const parts = rec.split('\x1f');
+      // A record whose body happened to contain a separator byte would yield the
+      // wrong arity; skip it rather than mis-mapping author/date/subject (M1).
+      if (parts.length !== 6 || !HASH_RE.test(parts[0] || '')) return null;
+      const [hash, author, relDate, date, subject, body] = parts;
+      return { hash, author, relDate, date, subject, body: (body || '').trim() };
+    })
+    .filter((c): c is CoderCommit => c !== null);
+}
+
+/**
+ * Build an OpenAI-style chat completion body for the coding agent. Converts the
+ * CoderMessage history (user / assistant-with-tool_calls / tool) into the wire
+ * format and attaches the tool schema + `tool_choice: auto`. The engine executes
+ * no tools itself — it returns `tool_calls`, which the agent loop runs locally.
+ */
+export function buildCoderRequest(
+  model: string,
+  systemPrompt: string | undefined,
+  history: CoderMessage[],
+  tools: unknown[],
+  params: ChatParams,
+): Record<string, unknown> {
+  const messages: Array<Record<string, unknown>> = [];
+  if (systemPrompt?.trim()) messages.push({ role: 'system', content: systemPrompt.trim() });
+  for (const m of history) {
+    if (m.role === 'user') {
+      messages.push({ role: 'user', content: m.content });
+    } else if (m.role === 'tool') {
+      messages.push({ role: 'tool', tool_call_id: m.toolCallId, name: m.name, content: m.content });
+    } else {
+      const a = m as Extract<CoderMessage, { role: 'assistant' }>;
+      const o: Record<string, unknown> = { role: 'assistant', content: a.content || '' };
+      if (a.toolCalls && a.toolCalls.length) {
+        o.tool_calls = a.toolCalls.map((t) => ({ id: t.id, type: 'function', function: { name: t.name, arguments: t.arguments } }));
+      }
+      messages.push(o);
+    }
+  }
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+    tools,
+    tool_choice: 'auto',
+    enable_thinking: params.thinking,
+  };
+  if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
+  if (params.greedy) body.temperature = 0;
+  if (params.temperature !== undefined) body.temperature = params.temperature;
+  if (params.topP !== undefined) body.top_p = params.topP;
+  if (params.topK !== undefined) body.top_k = params.topK;
+  if (params.minP !== undefined) body.min_p = params.minP;
+  if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
+  if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
+  if (params.seed !== undefined) body.seed = params.seed;
+  return body;
 }
 
 export type { ChatAttachment };

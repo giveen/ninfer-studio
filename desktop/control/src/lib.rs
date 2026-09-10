@@ -5,6 +5,7 @@
 //!   /health,/v1/* SSE-safe proxy to the engine port
 //!   /…            static hosting of the built web app (SPA fallback)
 
+pub mod coder;
 pub mod engine;
 pub mod gpu;
 pub mod models;
@@ -52,6 +53,23 @@ pub fn build_router(state: S) -> Router {
         .route("/api/models/download", post(models_download))
         .route("/api/engine/update", post(engine_update))
         .route("/api/gpu", get(gpu))
+        // Coding harness — control-plane endpoints (mirror apps/sidecar/server.js)
+        .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
+        .route("/api/coder/tree", get(coder::tree))
+        .route("/api/coder/repo_map", get(coder::repo_map))
+        .route("/api/coder/fs/read", post(coder::fs_read))
+        .route("/api/coder/fs/write", post(coder::fs_write))
+        .route("/api/coder/fs/edit", post(coder::fs_edit))
+        .route("/api/coder/exec", post(coder::exec))
+        .route("/api/coder/jobs/{id}", get(coder::job_get))
+        .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
+        .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
+        .route("/api/coder/fs/b64", post(coder::fs_b64))
+        .route("/api/coder/fs/patch", post(coder::fs_patch))
+        .route("/api/coder/grep", post(coder::grep))
+        .route("/api/coder/glob", post(coder::glob))
+        .route("/api/coder/web/fetch", post(coder::web_fetch))
+        .route("/api/coder/web/search", post(coder::web_search))
         .route("/health", get(proxy))
         .route("/v1/{*path}", axum::routing::any(proxy))
         .with_state(state)
@@ -103,7 +121,7 @@ pub async fn boot_adopt(state: &S) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, String)> {
+pub(crate) async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body too large".to_string()))?;
@@ -302,6 +320,9 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     }
     if let Some(v) = body.get("buildCommand").and_then(|v| v.as_str()) {
         merged.build_command = v.into();
+    }
+    if let Some(v) = body.get("coderWorkspace").and_then(|v| v.as_str()) {
+        merged.coder_workspace = v.into();
     }
     let path = state.data_dir.join("config.json");
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;

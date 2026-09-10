@@ -102,6 +102,24 @@ fn main() {
                         "quit" => app.exit(0),
                         _ => {}
                     })
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                if w.is_visible().unwrap_or(false) {
+                                    let _ = w.hide();
+                                } else {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        }
+                    })
                     .build(app)?;
                 app.manage(TrayState(std::sync::Mutex::new(Some(tray))));
             }
