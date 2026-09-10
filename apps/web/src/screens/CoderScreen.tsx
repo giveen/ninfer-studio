@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -261,6 +261,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "delegate",
+      description: "Spawn a subagent to investigate a focused sub-task and return a summary. Perfect for fanning out research or mapping distant files without bloating your context. The subagent runs in parallel and cannot write files (read-only tools only).",
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "Clear, standalone instructions for the subagent." },
+          tools: { type: "array", items: { type: "string" }, description: "List of read-only tools it may use (e.g. ['read', 'grep', 'glob']). Omit for all read-only tools." }
+        },
+        required: ["task"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "git_branch",
       description: "List, create, or switch git branches in the workspace. Creating switches to the new branch.",
       parameters: {
@@ -268,6 +283,22 @@ const TOOLS = [
         properties: {
           action: { type: "string", enum: ["list", "create", "switch"] },
           name: { type: "string", description: "Branch name for create/switch." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_worktree",
+      description: "List or create git worktrees to isolate parallel tasks. A worktree checks out a branch into a separate directory without affecting the main working tree.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "add"] },
+          path: { type: "string", description: "Relative path for the new worktree (e.g. '../task-foo')." },
+          branch: { type: "string", description: "Branch to create/checkout in the new worktree (e.g. 'task-foo')." }
         },
         required: ["action"]
       }
@@ -487,10 +518,14 @@ type PermTier = 'allow' | 'ask' | 'deny';
 interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; }
 const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
-const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch']);
+const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree']);
 /** Tool names the read-only scout and plan mode may use. */
-const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll']);
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate']);
 interface ConvMeta {
+  /** Linked worktree path for this conversation, relative to the main workspace. */
+  worktree?: string;
+  /** Files/folders pinned from the Tree panel so the system prompt "follows" them. */
+  boundPaths?: string[];
   id: string;
   title: string;
   updatedAt: number;
@@ -614,8 +649,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const activeWs = store.activeWs;
   const activeConv = store.activeConv;
+  const activeMeta = store.workspaces[activeWs]?.conversations[activeConv];
+  /** Effective workspace directory: worktree if set, otherwise the main workspace root. */
+  const activeWsDir = activeMeta?.worktree ? `${activeWs}/${activeMeta.worktree}` : activeWs;
 
-  const initialMeta = store.workspaces[activeWs]?.conversations[activeConv];
+  const initialMeta = activeMeta;
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
@@ -635,6 +673,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [pickerSelected, setPickerSelected] = useState<Record<string, boolean>>({});
   const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
   const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
+
+  // File Tree panel — browse the workspace and pin files/folders so the system
+  // prompt "follows" them (system-prompt follow binding).
+  const [treeOpen, setTreeOpen] = useState(true);
+  const [treeNodes, setTreeNodes] = useState<FileNode[]>([]);
+  const [treeLoading, setTreeLoading] = useState(false);
+  const [treeExpanded, setTreeExpanded] = useState<Record<string, boolean>>({});
+  const [treeChildren, setTreeChildren] = useState<Record<string, FileNode[]>>({});
+  const [previewFile, setPreviewFile] = useState<{ path: string; content: string; loading: boolean } | null>(null);
 
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
@@ -708,11 +755,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
   /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
   const revertCommit = useCallback(async (hash: string) => {
-    if (running || !activeWs) return;
+    if (running || !activeWsDir) return;
     if (!/^[0-9a-f]{7,40}$/i.test(hash)) return;
     addLog({ type: 'bash', label: 'revert', detail: hash.slice(0, 7) });
     try {
-      const r = await coderExec(`git revert --no-edit ${hash}`, undefined, 30000, activeWs);
+      const r = await coderExec(`git revert --no-edit ${hash}`, undefined, 30000, activeWsDir);
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'revert', detail: (r.stderr || r.stdout || 'revert failed').slice(0, 300) });
       }
@@ -725,8 +772,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   // Refresh the commit history whenever the active workspace changes.
   useEffect(() => {
-    if (activeWs) loadCommits();
-  }, [activeWs, loadCommits]);
+    if (activeWsDir) loadCommits();
+  }, [activeWsDir, loadCommits]);
 
   // Sync the safe-mode toggle with the sidecar's current state on mount.
   useEffect(() => {
@@ -774,7 +821,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const title = firstUser
         ? firstUser.content.replace(/\s+/g, ' ').trim().slice(0, 48) || (meta?.title ?? 'New conversation')
         : (meta?.title ?? 'New conversation');
-      const updated: ConvMeta = { id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current, checkpoints: meta?.checkpoints ?? [] };
+      const base = meta ?? { id: activeConv, title: 'New conversation', updatedAt: Date.now(), messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
+      const updated: ConvMeta = { ...base, id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current, checkpoints: meta?.checkpoints ?? [] };
       const order = wsd.order.includes(activeConv) ? wsd.order : [...wsd.order, activeConv];
       return {
         ...prev,
@@ -785,14 +833,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   // Keep the sidecar's coder workspace pointed at the active workspace.
   useEffect(() => {
-    if (!activeWs) return;
+    if (!activeWsDir) return;
     let cancelled = false;
     setWsBusy(true);
-    setCoderWorkspace(activeWs)
+    setCoderWorkspace(activeWsDir)
       .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
       .finally(() => { if (!cancelled) setWsBusy(false); });
     return () => { cancelled = true; };
-  }, [activeWs]);
+  }, [activeWsDir]);
 
   // Seed the default workspace from the sidecar once its path is known.
   const seeded = useRef(false);
@@ -1079,16 +1127,117 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         addLog({ type: 'read', label: 'skills', detail: `${lines.length} skill(s)` });
       }
     } catch { /* no skills dir */ }
+    // System-prompt "follow" bindings: files/folders pinned from the Tree panel.
+    // The system prompt follows the user's selection, re-read fresh each run so
+    // edits to followed files surface in the agent's context automatically.
+    try {
+      const ws = storeRef.current.activeWs;
+      const conv = storeRef.current.activeConv;
+      const bps = storeRef.current.workspaces[ws]?.conversations[conv]?.boundPaths ?? [];
+      if (bps.length) {
+        const followed: string[] = [
+          '\n\n# Followed files (system prompt follows these — pinned context for every turn)',
+        ];
+        const seen = new Set<string>();
+        let used = 0;
+        const CAP = 20000;
+        for (const p of bps) {
+          if (used > CAP || seen.has(p)) continue;
+          seen.add(p);
+          try {
+            const r = await coderRead(p, 0, 300);
+            if (!r.binary && r.content && r.content.length) {
+              const body = r.content.length > 4000 ? r.content.slice(0, 4000) + '\n…(truncated to 4000 chars)' : r.content;
+              followed.push(`## ${p}\n\`\`\`\n${body}\n\`\`\``);
+              used += body.length;
+            } else if (r.binary) {
+              followed.push(`- ${p} (binary — omitted)`);
+            } else {
+              // No readable file content → treat as a directory and list its files (bounded).
+              let files: string[] = [];
+              try { files = (await coderGlob(`${p}/**`)).files ?? []; } catch { /* ignore */ }
+              files = files.slice(0, 200);
+              followed.push(`## ${p}/ (directory — ${files.length} file(s) listed)\n${files.map((f) => `- ${f}`).join('\n')}`);
+              used += files.join('\n').length;
+            }
+          } catch {
+            followed.push(`- ${p} (unreadable)`);
+          }
+        }
+        if (followed.length > 1) sys += followed.join('\n');
+      }
+    } catch { /* never break system-prompt assembly over follow-bindings */ }
+
     dynamicSystemRef.current = sys;
   }, []);
+
+  // ---- File Tree panel: browse + system-prompt follow bindings ----
+  const loadTree = useCallback(async () => {
+    if (!activeWsDir) return;
+    setTreeLoading(true);
+    try {
+      const t = await coderTree(6, '.');
+      setTreeNodes(t.nodes ?? []);
+    } catch { setTreeNodes([]); }
+    finally { setTreeLoading(false); }
+  }, [activeWsDir]);
+
+  const onExpandDir = useCallback(async (node: FileNode) => {
+    const willOpen = !treeExpanded[node.path];
+    setTreeExpanded((e) => ({ ...e, [node.path]: willOpen }));
+    if (willOpen && !(treeChildren[node.path] ?? node.children)) {
+      try {
+        const t = await coderTree(6, node.path);
+        setTreeChildren((prev) => ({ ...prev, [node.path]: t.nodes ?? [] }));
+      } catch { /* ignore — leave unexpanded */ }
+    }
+  }, [treeExpanded, treeChildren]);
+
+  const toggleBind = useCallback((path: string) => {
+    if (!activeWs || !activeConv) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      const c = wsd?.conversations[activeConv];
+      if (!wsd || !c) return prev;
+      const cur = c.boundPaths ?? [];
+      const next = cur.includes(path) ? cur.filter((p) => p !== path) : [...cur, path];
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...c, boundPaths: next } } } } };
+    });
+    void refreshRepoMap();
+  }, [activeWs, activeConv, refreshRepoMap]);
+
+  const clearBinds = useCallback(() => {
+    if (!activeWs || !activeConv) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      const c = wsd?.conversations[activeConv];
+      if (!wsd || !c) return prev;
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...c, boundPaths: [] } } } } };
+    });
+    void refreshRepoMap();
+  }, [activeWs, activeConv, refreshRepoMap]);
+
+  const openPreview = useCallback(async (path: string) => {
+    setPreviewFile({ path, content: '', loading: true });
+    try {
+      const r = await coderRead(path, 0, 400);
+      setPreviewFile({ path, content: r.binary ? '(binary file — not shown)' : (r.content ?? '(empty)'), loading: false });
+    } catch (e) {
+      setPreviewFile({ path, content: `[error reading file: ${e instanceof Error ? e.message : String(e)}]`, loading: false });
+    }
+  }, []);
+
+  // Load/refresh the tree whenever the active (possibly worktree-bound) directory changes.
+  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, treeOpen, loadTree]);
+
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
-    if (running || !activeWs || commits.length === 0) return;
+    if (running || !activeWsDir || commits.length === 0) return;
     const top = commits[0];
     if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
     addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
     try {
-      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWs);
+      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWsDir);
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'undo', detail: (r.stderr || r.stdout || 'undo failed').slice(0, 300) });
       }
@@ -1098,8 +1247,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       loadCommits();
       refreshRepoMap();
     }
-  }, [running, activeWs, commits, loadCommits, refreshRepoMap]);
-  // ---- Checkpoints: transcript + workspace restore points ----
+  }, [running, activeWsDir, commits, loadCommits, refreshRepoMap]);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
   /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
@@ -1107,7 +1255,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!activeWs || !activeConv) return;
     let commit = '';
     try {
-      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWs);
+      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWsDir);
       if (r.exitCode === 0 && /^[0-9a-f]{5,40}$/i.test((r.stdout || '').trim())) commit = (r.stdout || '').trim();
     } catch { /* not a git repo — transcript-only checkpoint */ }
     const cp: Checkpoint = {
@@ -1134,10 +1282,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!window.confirm(`Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${cp.messages} messages.`)) return;
     if (cp.commit) {
       if (!/^[0-9a-f]{5,40}$/i.test(cp.commit)) return;
-      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWs);
+      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWsDir);
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
-        return;
       }
       loadCommits();
       refreshRepoMap();
@@ -1275,13 +1422,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (result === '' && (permVerdict === null || approvedAfterAsk)) {
           if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
-          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs, args.background === true);
+          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
           result = JSON.stringify(res);
           if (args.background === true) mutated = true;
           if (res.jobId) {
             const id = res.jobId;
             const cmd = String(args.command || '');
-            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWs }]));
+            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
           }
         } else if (call.name === 'bash_poll') {
           logType = 'bash'; logDetail = `poll ${args.jobId}`;
@@ -1343,6 +1490,39 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } else {
             result = JSON.stringify({ error: `unknown action: ${action} (use list, create, or switch)` });
           }
+        } else if (call.name === 'git_worktree') {
+          const action = String(args.action || 'list');
+          logType = 'bash'; logDetail = `git worktree ${action}${args.path ? ` ${args.path}` : ''}`;
+          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+          if (action === 'list') {
+            const r = await coderExec('git worktree list', undefined, 15000);
+            const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
+            result = JSON.stringify({ worktrees: lines, ...r });
+          } else if (action === 'add') {
+            const p = String(args.path || '').trim();
+            const b = String(args.branch || '').trim();
+            if (!p || !b) {
+              result = JSON.stringify({ error: "path and branch required for action 'add'" });
+            } else if (!/^[A-Za-z0-9._\/-]+$/.test(b) || !/^\.\.\/[A-Za-z0-9._\/-]+$/.test(p)) {
+              result = JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
+            } else {
+              const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
+              const r = await coderExec(cmd, undefined, 30000);
+              result = JSON.stringify(r);
+              if (r.exitCode === 0) {
+                // Link the conversation to this new worktree
+                setStore((prev) => {
+                  const wsd = prev.workspaces[activeWs];
+                  const meta = wsd?.conversations[activeConv];
+                  if (!wsd || !meta) return prev;
+                  return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, worktree: p } } } } };
+                });
+                mutated = true;
+              }
+            }
+          } else {
+            result = JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
+          }
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
           const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase);
@@ -1399,6 +1579,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'todo'; logDetail = 'Updated task list';
           setTodos(args.todos || []);
           result = JSON.stringify({ success: true });
+        } else if (call.name === 'delegate') {
+          logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
+          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, abortRef.current?.signal ?? new AbortController().signal, 6, Array.isArray(args.tools) ? args.tools : undefined);
+          result = JSON.stringify({ summary: res });
         } else {
           result = JSON.stringify({ error: 'Unknown tool' });
         }
@@ -1406,7 +1590,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         logDetail = msg;
-        result = JSON.stringify({ error: msg });
       }
       
       const durationMs = Math.round(performance.now() - t0);
@@ -1459,14 +1642,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
   };
-  const runScoutProbe = async (label: string, goal: string, task: string, model: string, signal: AbortSignal): Promise<string> => {
-    const tools = TOOLS.filter((t) => ['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search'].includes(t.function.name));
-    let msgs: ChatMessage[] = [{
-      role: 'user',
-      content: `Task: ${task}\n\nScout goal (${label}): ${goal}\n\nYou are read-only: investigate with tools and reply with a concise findings report (paths + facts). Do not write code.`,
-    }];
-    for (let step = 0; step < 6; step++) {
-      if (signal.aborted) return '(scout aborted)';
+  const runSubagent = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
+    if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
+    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'delegate']);
+    const tools = TOOLS.filter((t) => allowed.has(t.function.name));
+    let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
+    for (let step = 0; step < maxSteps; step++) {
+      if (signal.aborted) return `(subagent ${label} aborted)`;
       let content = '';
       let toolCalls: AgentToolCall[] = [];
       try {
@@ -1476,16 +1658,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
         );
       } catch (e) {
-        return `(scout ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
+        return `(subagent ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
       }
       msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
       if (toolCalls.length === 0) return content.trim() || '(no findings)';
       for (const call of toolCalls) {
-        const res = await runReadOnlyCall(call);
-        msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
+        if (call.name === 'delegate') {
+          const args = JSON.parse(call.arguments);
+          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools : undefined, depth + 1);
+          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
+        } else {
+          const res = await runReadOnlyCall(call);
+          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
+        }
       }
     }
-    return '(scout step budget reached)';
+    return '(subagent step budget reached)';
   };
   const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
     setRunning(true);
@@ -1504,6 +1692,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const s = await getStatus();
       if (s?.engine?.modelId) model = s.engine.modelId;
     } catch { /* ignore */ }
+    modelRef.current = model;
 
     // Read-only scout pre-pass. The probes fan out concurrently, so they run
     // ONLY when the engine was launched with max-concurrency > 1 (parallel
@@ -1516,7 +1705,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const signal = abortRef.current.signal;
         const summaries = await Promise.all(
           SCOUT_PROBES.map(async (p) => {
-            const s = await runScoutProbe(p.label, p.goal, task.slice(0, 2000), model, signal);
+            const s = await runSubagent(p.label, `Task: ${task.slice(0, 2000)}\n\nScout goal (${p.label}): ${p.goal}\n\nYou are read-only: investigate with tools and reply with a concise findings report (paths + facts). Do not write code.`, model, signal);
             addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
             return `## ${p.label}\n${s}`;
           }),
@@ -1830,7 +2019,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
-      // Compaction checkpoints are shown as a quiet divider, not a chat bubble.
       if (isCompactedMsg(m)) {
         flushTrajectory();
         groups.push({ type: 'compact', items: [m] });
@@ -1849,7 +2037,44 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return groups;
   }, [messages]);
 
-  const activeMeta = store.workspaces[activeWs]?.conversations[activeConv];
+  const boundPaths = activeMeta?.boundPaths ?? [];
+
+  const renderTree = (list: FileNode[], depth: number): React.ReactNode => (
+    <div>
+      {list.map((n) => {
+        const bound = boundPaths.includes(n.path);
+        const kids = treeChildren[n.path] ?? n.children;
+        return (
+          <div key={n.path}>
+            <div className={cn('group flex items-center gap-1 rounded px-1 py-0.5 hover:bg-panel2', bound && 'text-accent')} style={{ paddingLeft: depth * 10 + 4 }}>
+              {n.kind === 'dir' ? (
+                <button type="button" className="flex min-w-0 flex-1 items-center gap-1 text-left" onClick={() => void onExpandDir(n)}>
+                  {treeExpanded[n.path] ? <ChevronDown size={12} className="shrink-0" /> : <ChevronRight size={12} className="shrink-0" />}
+                  <Folder size={12} className="shrink-0 text-accent" />
+                  <span className="truncate">{n.name}</span>
+                </button>
+              ) : (
+                <button type="button" className="flex min-w-0 flex-1 items-center gap-1 text-left" onClick={() => void openPreview(n.path)} title={n.path}>
+                  <span className="w-3 shrink-0" />
+                  <File size={12} className="shrink-0 text-mute" />
+                  <span className="truncate">{n.name}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className={cn('shrink-0 rounded p-0.5 hover:bg-panel', bound ? 'text-accent' : 'text-faint opacity-0 group-hover:opacity-100')}
+                title={bound ? 'Unpin from system prompt (stop following)' : 'Pin to system prompt (follow this file/dir)'}
+                onClick={() => toggleBind(n.path)}
+              >
+                <BookmarkPlus size={12} />
+              </button>
+            </div>
+            {n.kind === 'dir' && treeExpanded[n.path] && kids && renderTree(kids, depth + 1)}
+          </div>
+        );
+      })}
+    </div>
+  );
 
   return (
     <div className="flex h-full w-full">
@@ -2269,6 +2494,45 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
       </div>
 
+      {/* Middle: file tree + system-prompt follow bindings */}
+      {treeOpen ? (
+        <div className="flex w-64 flex-col border-r border-line bg-panel">
+          <div className="flex items-center gap-2 border-b border-line p-2 text-sm font-semibold">
+            <Folder size={14} /> Files
+            <button type="button" className="ml-auto rounded p-0.5 text-faint hover:text-ink" title="Refresh tree" onClick={() => void loadTree()}>
+              <RefreshCw size={12} className={treeLoading ? 'animate-spin' : ''} />
+            </button>
+            <button type="button" className="rounded p-0.5 text-faint hover:text-ink" title="Collapse file tree" onClick={() => setTreeOpen(false)}>
+              <ChevronLeft size={14} />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-auto text-[11.5px]">
+            {treeLoading ? (
+              <div className="p-3 text-faint">Loading…</div>
+            ) : treeNodes.length === 0 ? (
+              <div className="p-3 text-faint">No files.</div>
+            ) : (
+              renderTree(treeNodes, 0)
+            )}
+          </div>
+          <div className="shrink-0 border-t border-line p-2 text-[10.5px] text-faint">
+            System prompt follows <span className="text-ink">{boundPaths.length}</span> item{boundPaths.length === 1 ? '' : 's'}.
+            {boundPaths.length > 0 && (
+              <button type="button" className="ml-1 underline hover:text-ink" onClick={clearBinds}>Clear</button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="flex w-8 shrink-0 flex-col items-center justify-center gap-1 border-r border-line bg-panel text-faint hover:text-ink"
+          title="Show file tree"
+          onClick={() => { setTreeOpen(true); void loadTree(); }}
+        >
+          <Folder size={15} />
+        </button>
+      )}
+
       {/* Center: conversation messages */}
       <div className="flex flex-1 flex-col">
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px]">
@@ -2586,9 +2850,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           maxBytes={ATTACH_MAX_BYTES}
         />
       )}
+
+      {previewFile && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setPreviewFile(null)}>
+          <div className="w-[640px] max-h-[80vh] flex flex-col rounded-xl border border-line bg-panel shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2 border-b border-line p-3">
+              <File size={14} />
+              <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{previewFile.path}</span>
+              <button type="button" className="text-faint hover:text-ink" onClick={() => setPreviewFile(null)}><X size={16} /></button>
+            </div>
+            <div className="flex-1 overflow-auto p-3 font-mono text-[11.5px] whitespace-pre-wrap">
+              {previewFile.loading ? 'Loading…' : previewFile.content}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // Workspace file picker — attach project files to a Coder message.
