@@ -207,6 +207,29 @@ async fn engine_update(AxumState(state): AxumState<S>, req: Request<Body>) -> Re
     Ok(Json(start_update(&state, &action).await))
 }
 
+/// Recursively replace empty-string values with null. The web form uses "" as
+/// "unset" for some fields; a typed Option<u64>/Option<bool> field cannot
+/// deserialize from "" and would fail the entire profile parse.
+fn sanitize_empty_strings(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for (_, val) in map.iter_mut() {
+                if val.as_str() == Some("") {
+                    *val = Value::Null;
+                } else {
+                    sanitize_empty_strings(val);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                sanitize_empty_strings(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
     // Parse `profile` and `artifact` independently. A whole-body deserialization
@@ -216,9 +239,32 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
     // separately; mirror that here so a malformed profile field can never
     // discard the chosen artifact.
     let profile_val = body.get("profile").cloned().unwrap_or(Value::Null);
-    let profile = serde_json::from_value::<EngineProfile>(profile_val).unwrap_or_default();
+    // Empty strings ("") are how the UI represents an unset field, but a ''
+    // against a typed Option<u64>/Option<f64> field fails the WHOLE profile
+    // parse. Coerce '' to null (unset) first; then parse strictly and — if it
+    // still fails — never fall back silently: report the error in the response
+    // so a dropped profile is visible instead of looking like "the GUI ignored
+    // my settings".
+    let mut sanitized = profile_val.clone();
+    sanitize_empty_strings(&mut sanitized);
+    let (profile, profile_parse_error) = match serde_json::from_value::<EngineProfile>(sanitized) {
+        Ok(p) => (p, None),
+        Err(e) => {
+            let msg = format!(
+                "engine profile could not be read ({e}); the engine will start with defaults — check the settings you changed"
+            );
+            eprintln!("[engine_start] {msg} | raw profile: {profile_val}");
+            (EngineProfile::default(), Some(msg))
+        }
+    };
     let artifact = body.get("artifact").and_then(|v| v.as_str()).map(|s| s.to_string());
-    Ok(Json(start_engine(&state, profile, artifact).await))
+    let mut result = start_engine(&state, profile, artifact).await;
+    if let Some(err) = profile_parse_error {
+        if let Value::Object(map) = &mut result {
+            map.insert("profileParseError".to_string(), Value::String(err));
+        }
+    }
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]

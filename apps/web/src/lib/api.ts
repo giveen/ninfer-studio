@@ -118,10 +118,19 @@ export interface EngineActionResult {
   code?: string;
   message?: string;
   engine?: StatusPayload['engine'];
+  /** set by the control plane when the profile failed to deserialize */
+  profileParseError?: string;
 }
 
 export function startEngine(profile: unknown, artifact: string | null): Promise<EngineActionResult> {
-  return postJSON<EngineActionResult>('/api/engine/start', { profile, artifact }, 15_000);
+  // Empty strings are how the form represents "unset" for some fields, but the
+  // Rust control plane deserializes typed Option<u64>/Option<f64> fields — a ''
+  // value fails the whole profile parse there and (with its fallback) silently
+  // drops EVERY setting. Strip '' values here so both the Node sidecar and the
+  // control plane receive a clean profile; `undefined` keys are dropped by
+  // JSON.stringify.
+  const clean = JSON.parse(JSON.stringify(profile, (_k, v) => (v === '' ? undefined : v)));
+  return postJSON<EngineActionResult>('/api/engine/start', { profile: clean, artifact }, 15_000);
 }
 
 export function stopEngine(externalPid?: number): Promise<EngineActionResult> {

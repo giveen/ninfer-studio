@@ -280,7 +280,8 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
       await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
       await new Promise((res) => setTimeout(res, 800));
       const r = await startEngine(profile, artifact || null);
-      if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} already serves an engine — adopted as external (see Engine status).` });
+      if (r.profileParseError) setNotice({ tone: 'warn', text: r.profileParseError });
+      else if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} already serves an engine — adopted as external (see Engine status).` });
       else if (!r.ok) setNotice({ tone: 'danger', text: r.message || 'start failed' });
       else setNotice({ tone: 'ok', text: 'engine starting — watch the log below; it takes a while to load weights.' });
     } catch (e) {
