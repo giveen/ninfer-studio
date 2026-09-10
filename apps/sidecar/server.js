@@ -1644,6 +1644,25 @@ async function handleCoder(req, res, p, url) {
       const r = await repoSearch(q, limit);
       return sendJson(res, 200, r);
     }
+    if (p === '/api/coder/diff' && req.method === 'GET') {
+      const root = coderRoot();
+      if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+      try {
+        const stat = await execCommand('git --no-pager diff HEAD --stat', '.', 15000);
+        const diff = await execCommand('git --no-pager diff HEAD', '.', 60000);
+        const files = (stat.stdout || '').split('\n')
+          .map((l) => l.match(/^(.+?)\s*\|\s*\d+\s*([+-]*)$/))
+          .filter((m) => m && !m[1].trim().startsWith(' '))
+          .map((m) => ({ path: m[1].trim(), bar: m[2] }));
+        return sendJson(res, 200, {
+          files,
+          diff: (diff.stdout || '').slice(0, 60000),
+          truncated: (diff.stdout || '').length > 60000,
+        });
+      } catch (e) {
+        return sendJson(res, 200, { files: [], diff: '', error: String(e?.message || e) });
+      }
+    }
     if (p === '/api/coder/fs/read' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
       let full;

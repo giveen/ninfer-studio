@@ -4,12 +4,18 @@ import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment,
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, type CoderCommit } from '../lib/api';
+import { DiffReviewModal } from '../components/DiffReviewModal';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, type CoderCommit, type CoderDiffResult } from '../lib/api';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
 const isImagePath = (p: string) => IMAGE_EXT.has((p.split('.').pop() || '').toLowerCase());
+/** Cheap guard used by the commit-approval gate: does this shell command commit? */
+const isGitCommitCommand = (cmd: string): boolean => {
+  const c = cmd.replace(/^\s*(sudo|env|time|setsid|nice)\s+/, '').trim();
+  return /^git\b/.test(c) && /\bcommit\b/.test(c);
+};
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
 
@@ -799,6 +805,26 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setCoderSandbox(next);
     try { await coderSandboxSet(next); } catch { /* keep UI state as-is */ }
   }, []);
+  // Commit approval gate: when ON, the agent may not commit without an explicit
+  // human sign-off on the working-tree-vs-HEAD diff. Auto-commits on write/edit
+  // are suppressed so the only commits are intentional, reviewed ones.
+  const [commitApproval, setCommitApproval] = useState(false);
+  // Diff-review viewer (opened from the toolbar "Diff" button).
+  const [diffViewOpen, setDiffViewOpen] = useState(false);
+  // Commit-approval pending dialog (the agent asked to commit while the gate is ON).
+  const [commitReviewOpen, setCommitReviewOpen] = useState(false);
+  const commitResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  /** Pause the agent loop and show the diff for human sign-off. Resolves true=approve. */
+  const requestCommitApproval = (): Promise<boolean> => {
+    setCommitReviewOpen(true);
+    return new Promise<boolean>((resolve) => {
+      commitResolveRef.current = (ok: boolean) => {
+        commitResolveRef.current = null;
+        setCommitReviewOpen(false);
+        resolve(ok);
+      };
+    });
+  };
   // Plan mode: read-only agent (no mutating tools), toggled per run.
   const [planMode, setPlanMode] = useState(false);
   // Read-only scout pre-pass (auto, concurrency-gated — see runAgent).
@@ -1495,13 +1521,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (result === '' && (permVerdict === null || approvedAfterAsk)) {
           if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
-          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
-          result = JSON.stringify(res);
-          if (args.background === true) mutated = true;
-          if (res.jobId) {
-            const id = res.jobId;
-            const cmd = String(args.command || '');
-            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+          // Commit-approval gate: a shell `git commit` must be signed off too.
+          let commitBlocked = false;
+          if (commitApproval && isGitCommitCommand(String(args.command || ''))) {
+            addLog({ type: 'ask', label: 'bash', detail: 'git commit — awaiting human review' });
+            const ok = await requestCommitApproval();
+            addLog({ type: ok ? 'bash' : 'error', label: 'bash', detail: ok ? 'approved' : 'denied by user' });
+            if (!ok) commitBlocked = true;
+          }
+          if (commitBlocked) {
+            result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
+          } else {
+            const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
+            result = JSON.stringify(res);
+            if (args.background === true) mutated = true;
+            if (res.jobId) {
+              const id = res.jobId;
+              const cmd = String(args.command || '');
+              setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+            }
           }
         } else if (call.name === 'bash_poll') {
           logType = 'bash'; logDetail = `poll ${args.jobId}`;
@@ -1520,16 +1558,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'write'; logDetail = args.path;
           const res = await coderWrite(args.path, args.content);
           mutated = true;
-          const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`);
-          result = JSON.stringify(await runPostEditChecks(res, preview));
+          if (commitApproval) {
+            // Gate ON: don't auto-commit; let the human review + approve a real commit.
+            result = JSON.stringify(await runPostEditChecks(res, ''));
+          } else {
+            const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`);
+            result = JSON.stringify(await runPostEditChecks(res, preview));
+          }
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
           const res = await coderEdit(args.path, args.old, args.new, args.replaceAll);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
-             const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`);
-             result = JSON.stringify(await runPostEditChecks(res, preview));
+            if (commitApproval) {
+              result = JSON.stringify(await runPostEditChecks(res, ''));
+            } else {
+              const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`);
+              result = JSON.stringify(await runPostEditChecks(res, preview));
+            }
           }
         } else if (call.name === 'apply_patch') {
           logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
@@ -1537,8 +1584,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
-             const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`);
-             result = JSON.stringify(await runPostEditChecks(res, preview));
+            if (commitApproval) {
+              result = JSON.stringify(await runPostEditChecks(res, ''));
+            } else {
+              const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`);
+              result = JSON.stringify(await runPostEditChecks(res, preview));
+            }
           }
         } else if (call.name === 'git_branch') {
           const action = String(args.action || 'list');
@@ -1622,6 +1673,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify(res);
         } else if (call.name === 'git_commit') {
           logType = 'bash'; logDetail = `git commit ${args.files}`;
+          // Commit-approval gate: when ON, the human must sign off on the
+          // working-tree-vs-HEAD diff before the commit actually runs.
+          let proceed = true;
+          if (commitApproval) {
+            addLog({ type: 'ask', label: 'git_commit', detail: 'awaiting human review' });
+            proceed = await requestCommitApproval();
+            addLog({ type: proceed ? 'bash' : 'error', label: 'git_commit', detail: proceed ? 'approved' : 'denied by user' });
+          }
+          if (!proceed) {
+            result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff (Diff button) and adjust your changes; the commit was not made.' });
+            continue;
+          }
           // Safely quote each workspace path / flag; only bare flags (e.g. -A)
           // are passed through unquoted so git globs/flags still work.
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -2049,6 +2112,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     abortRef.current?.abort();
     // Never leave the agent loop parked on an approval dialog after Stop.
     approvalResolveRef.current?.(false);
+    commitResolveRef.current?.(false);
   };
 
   // Persist conversations + per-workspace permissions across reloads.
@@ -2409,6 +2473,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
         </div>
+        {/* Commit approval — gate: the agent cannot commit without human sign-off */}
+        <div className="shrink-0 border-t border-line p-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+              <GitCommit size={13} /> Commit approval
+            </div>
+            <button
+              type="button"
+              onClick={() => setCommitApproval((v) => !v)}
+              className={cn('rounded px-2 py-0.5 text-[11px] font-medium', commitApproval ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              title={commitApproval ? 'Agent commits require your approval of the working-tree diff' : 'Agent may commit freely (auto-commits on every write)'}
+            >
+              {commitApproval ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <p className="mt-1 text-[10.5px] text-faint">When ON, the agent cannot commit until you review the working-tree-vs-HEAD diff and approve. Auto-commits on write/edit are paused so only intentional, reviewed commits land.</p>
+        </div>
         {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
         <div className="shrink-0 border-t border-line p-2">
           <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
@@ -2688,6 +2769,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
           <button
             type="button"
+            onClick={() => setDiffViewOpen(true)}
+            disabled={!activeWs}
+            title="Review the working-tree vs HEAD diff"
+            className={cn('flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', diffViewOpen ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            <GitCommit size={13} /> Diff
+          </button>
+          <button
+            type="button"
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={forkConversation}
             disabled={!activeWs || running}
@@ -2949,6 +3039,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
         </div>
       )}
+      {/* Diff-review viewer: working-tree vs HEAD, opened from the toolbar "Diff" button. */}
+      <DiffReviewModal
+        open={diffViewOpen}
+        mode="view"
+        title="Working tree vs HEAD"
+        onClose={() => setDiffViewOpen(false)}
+        fetchDiff={coderDiff}
+      />
+      {/* Commit-approval gate: the agent asked to commit while the gate is ON. */}
+      <DiffReviewModal
+        open={commitReviewOpen}
+        mode="approve"
+        title="Approve commit?"
+        onClose={() => commitResolveRef.current?.(false)}
+        onApprove={() => commitResolveRef.current?.(true)}
+        fetchDiff={coderDiff}
+      />
       {showDir && (
         <DirBrowser
           initialPath={activeWs || '/'}

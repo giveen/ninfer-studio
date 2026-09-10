@@ -565,6 +565,15 @@ export interface CoderSearchResult {
 export function coderSearch(query: string, limit = 15): Promise<CoderSearchResult> {
   return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`);
 }
+export interface CoderDiffResult {
+  files: Array<{ path: string; bar?: string }>;
+  diff: string;
+  truncated?: boolean;
+  error?: string;
+}
+export function coderDiff(): Promise<CoderDiffResult> {
+  return getJSON<CoderDiffResult>('/api/coder/diff', 60000);
+}
 export function coderWebFetch(url: string): Promise<CoderWebFetch> {
   return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000);
 }
