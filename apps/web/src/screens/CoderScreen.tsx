@@ -24,12 +24,32 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
    - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
    - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
+    - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
 2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
 3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself. For long-running commands (builds, test suites), pass \`background:true\` to \`bash\` and poll the returned job with \`bash_poll\` until \`done:true\` instead of blocking.
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
 5. **Completion**: Only emit a final conversational response when the ENTIRE task is fully complete, tested, and verified.
 6. **Context is managed for you**: this harness automatically compacts the conversation when it nears the model's context limit, replacing earlier turns with a concise summary checkpoint. You do NOT need to summarize manually — keep working normally and rely on the checkpoint to preserve prior context.
 `;
+
+// Worker subagent (implementation): a focused agent that shares the workspace and
+// writes real code but leaves version control + human interaction to the supervisor.
+const WORKER_SYSTEM = `You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
+- Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
+- Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
+- Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
+- When the task is complete, STOP calling tools and reply with a concise summary: what you changed, the files touched, and any build/test commands you ran.
+- Stay strictly scoped to the assigned task.`;
+
+// Critic: reviews a working-tree-vs-HEAD diff against the task and decides approve / reject.
+const CRITIC_SYSTEM = `You are a meticulous senior code reviewer. You are given a task and a unified diff (working tree vs HEAD). Decide whether the changes are acceptable.
+Respond with EXACTLY one verdict line, then (only when rejecting) a short prioritized list of issues:
+VERDICT: APPROVED
+or
+VERDICT: CHANGES_REQUESTED
+<issue 1 — file:line, suggested fix>
+<issue 2 — ...>
+Do not rewrite code. Be precise and concise, and prefer specific file:line references.`;
 
 const TOOLS = [
   {
@@ -274,6 +294,22 @@ const TOOLS = [
         properties: {
           task: { type: "string", description: "Clear, standalone instructions for the subagent." },
           tools: { type: "array", items: { type: "string" }, description: "List of read-only tools it may use (e.g. ['read', 'grep', 'glob']). Omit for all read-only tools." }
+        },
+        required: ["task"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "subagent",
+      description: "Spawn an IMPLEMENTATION subagent to complete a focused coding task in the shared workspace. It can read, search, edit, and run commands, but cannot commit, branch, or ask the user. Use it to fan out independent implementation work; the harness captures the subagent's diff and returns a summary. Each call runs sequentially to avoid clobbering the working tree.",
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "A clear, self-contained implementation task for the subagent." },
+          tools: { type: "array", items: { type: "string" }, description: "Optional allow-list of tools it may use (e.g. ['read','grep','write','edit','bash']). Omit for the default implementation set." },
+          model: { type: "string", description: "Optional model id for the subagent (defaults to the supervisor's model)." }
         },
         required: ["task"]
       }
@@ -539,7 +575,7 @@ type PermTier = 'allow' | 'ask' | 'deny';
 interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; }
 const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
-const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree']);
+const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
 /** Tool names the read-only scout and plan mode may use. */
 const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
 interface ConvMeta {
@@ -754,7 +790,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; }
+  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -830,6 +866,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Read-only scout pre-pass (auto, concurrency-gated — see runAgent).
   const [scoutOn, setScoutOn] = useState(true);
   const [verifyMode, setVerifyMode] = useState(true);
+  // Critic gate: after edits, a (possibly different) model reviews the working-tree
+  // diff and can bounce it back for fixes before the run is allowed to finish.
+  const [criticMode, setCriticMode] = useState(false);
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`).
   const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
   const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
@@ -1723,6 +1762,47 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
           const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, abortRef.current?.signal ?? new AbortController().signal, 6, Array.isArray(args.tools) ? args.tools : undefined);
           result = JSON.stringify({ summary: res });
+        } else if (call.name === 'subagent') {
+          // Implementation subagent (worker): spawn a focused agent, capture its
+          // diff, and optionally bounce it through the critic for a fix loop.
+          logType = 'bash';
+          const task = String(args.task || '');
+          logDetail = `subagent: ${task.slice(0, 40)}`;
+          addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
+          const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
+          const workerTools = Array.isArray(args.tools) ? args.tools : undefined;
+          let preTree = '';
+          try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
+          let res = { summary: '', diff: '', ok: false };
+          let critique = '';
+          const MAX_WORKER_CRIT = 2;
+          for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
+            const p = attempt === 0
+              ? `TASK (implement now):\n${task}`
+              : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
+            res = await runWorker('subagent', p, wmodel, abortRef.current?.signal ?? new AbortController().signal, 12, workerTools);
+            if (criticMode && res.diff.trim()) {
+              const c = await runCritic(res.diff, task);
+              if (!c.approved) {
+                critique = c.issues;
+                addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
+                continue;
+              }
+            }
+            break;
+          }
+          // Net diff across all worker attempts (git write-tree before/after).
+          let diff = res.diff;
+          try {
+            const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
+            if (preTree && postTree && preTree !== postTree) {
+              const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
+              diff = (d.stdout || '').slice(0, 60000);
+            }
+          } catch { /* keep res.diff */ }
+          mutated = true;
+          result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
+          addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
         } else {
           result = JSON.stringify({ error: 'Unknown tool' });
         }
@@ -1815,9 +1895,120 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     return '(subagent step budget reached)';
   };
+
+  // Dispatch a single tool call for an IMPLEMENTATION worker subagent. This is a
+  // self-contained, dependency-free executor (it does NOT go through the main
+  // handleToolCalls, so it never pollutes the supervisor transcript or trips the
+  // commit/ask gates). Read-only fan-out (`delegate`) recurses into runSubagent.
+  const runWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
+    try {
+      const args = JSON.parse(call.arguments);
+      switch (call.name) {
+        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern));
+        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
+        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
+        case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
+        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15));
+        case 'write': return JSON.stringify(await coderWrite(args.path, args.content));
+        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll));
+        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []));
+        case 'bash': return JSON.stringify(await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true));
+        case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || '')));
+        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000));
+        case 'delegate': {
+          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools : undefined, depth + 1);
+          return JSON.stringify({ summary: r });
+        }
+        default: return JSON.stringify({ error: `worker cannot use tool: ${call.name}` });
+      }
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  // Run an autonomous implementation worker: a focused agent loop that shares the
+  // workspace. Captures the net working-tree change (git write-tree before/after)
+  // so the supervisor gets a clean per-task diff regardless of commits/edits.
+  const runWorker = async (
+    label: string,
+    prompt: string,
+    model: string,
+    signal: AbortSignal,
+    maxSteps = 12,
+    allowedTools?: string[],
+    depth = 0,
+  ): Promise<{ summary: string; diff: string; ok: boolean }> => {
+    if (depth > 3) return { summary: '(worker depth limit reached)', diff: '', ok: false };
+    const allowed = allowedTools
+      ? new Set(allowedTools)
+      : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+    const tools = TOOLS.filter((t) => allowed.has(t.function.name));
+    let preTree = '';
+    try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
+    let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
+    let summary = '';
+    try {
+      for (let step = 0; step < maxSteps; step++) {
+        if (signal.aborted) break;
+        let content = '';
+        let toolCalls: AgentToolCall[] = [];
+        await streamChat(
+          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }),
+          signal,
+          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
+        );
+        summary = content.trim() || summary;
+        msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
+        if (toolCalls.length === 0) break;
+        for (const call of toolCalls) {
+          const res = await runWorkerCall(call, signal, model, depth);
+          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
+        }
+      }
+    } catch (e) {
+      summary = `(worker ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
+    }
+    let diff = '';
+    try {
+      const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
+      if (preTree && postTree && preTree !== postTree) {
+        const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
+        diff = (d.stdout || '').slice(0, 60000);
+      }
+    } catch { /* no diff */ }
+    return { summary: summary || '(no summary)', diff, ok: !summary.startsWith('(worker') };
+  };
+
+  // Critic: review a working-tree-vs-HEAD diff against the task. Bounded and
+  // fail-open (a critic error never blocks the run).
+  const runCritic = async (diff: string, task: string): Promise<{ approved: boolean; issues: string }> => {
+    const criticModel = coderParams.criticModel?.trim() || modelRef.current;
+    const prompt = `TASK:\n${task.slice(0, 2000)}\n\nDIFF (working tree vs HEAD):\n\`\`\`diff\n${diff.slice(0, 24000)}\n\`\`\`\n\nReview the diff against the task.`;
+    let content = '';
+    try {
+      await streamChat(
+        buildChatRequest(criticModel, CRITIC_SYSTEM, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
+        abortRef.current?.signal ?? new AbortController().signal,
+        { onContentDelta: (t) => { content += t; } },
+      );
+    } catch {
+      return { approved: true, issues: '' };
+    }
+    const approved = /VERDICT:\s*APPROVED/i.test(content);
+    const issues = content.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '').trim();
+    return { approved, issues };
+  };
+
   const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
     setRunning(true);
     let currentMessages = initialMessages;
+    // Capture the repo HEAD at run start so the critic can review the CUMULATIVE
+    // diff of everything the agent did this run (including auto-committed edits),
+    // not just the (often empty) working-tree-vs-HEAD diff.
+    let runStartHead = '';
+    try { runStartHead = (await coderExec('git rev-parse HEAD', undefined, 10000)).stdout.trim(); } catch { /* not a repo yet */ }
 
     // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
     // after file mutations during the run (P1 #6).
@@ -1893,6 +2084,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Bounded self-repair: when the agent tries to "finish" right after a tool
     // action failed, nudge it to fix the error instead of declaring success (#6).
     const MAX_REPAIR = 3;
+    // Bounded critic bounce-back: a reviewer can reject the final diff and send the
+    // run back to fix at most MAX_CRITIC times before we give up and finish (M6).
+    const MAX_CRITIC = 2;
+    let criticBudget = 0;
+    // The original user task — used as the critic's review context.
+    const taskText = [...initialMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
     // Derive the response budget from the engine's context window so a small
     // context still leaves room for the prompt (P3 #12). The Coder always thinks,
     // and a reasoning trace plus the answer can exceed a tiny budget, so floor
@@ -2062,6 +2259,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // Verification gate: before declaring done, confirm lint/test pass. If
           // they fail, send the run back to fix them (bounded by MAX_REPAIR) rather
           // than finishing with broken code.
+          let bounced = false;
           if (verifyMode && repairCount < MAX_REPAIR) {
             const v = await runPostEditChecks({}, '');
             if (v.linter_error || v.test_error) {
@@ -2073,9 +2271,38 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 content: `VERIFICATION GATE: the project's lint/test checks are still failing. You must fix them before the task is complete — do not declare success. Re-run the checks after fixing.\n\n${summary}`,
               }];
               setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
-              continue;
+              bounced = true;
             }
           }
+          // Critic gate: if there are working-tree changes, a (possibly different)
+          // model reviews the diff and can reject it, bouncing the run back to fix
+          // before it is allowed to finish (bounded by MAX_CRITIC).
+          if (!bounced && criticMode && criticBudget < MAX_CRITIC) {
+            // Review the cumulative run diff (everything since run start, including
+            // auto-committed edits). Falls back to working-tree-vs-HEAD if no base commit.
+            let d = '';
+            try {
+              d = runStartHead
+                ? (await coderExec(`git --no-pager diff ${runStartHead}`, undefined, 60000)).stdout || ''
+                : (await coderDiff()).diff || '';
+            } catch { d = ''; }
+            if (d.trim()) {
+              const c = await runCritic(d, taskText);
+              if (!c.approved) {
+                criticBudget++;
+                addLog({ type: 'error', label: 'critic', detail: `review rejected (${criticBudget}/${MAX_CRITIC}) — sending back to fix` });
+                currentMessages = [...currentMessages, {
+                  role: 'user',
+                  content: `CODE REVIEW REJECTED: a reviewer found issues with your changes. Address every point below, then continue — do not declare success until the review passes.\n\n${c.issues}`,
+                }];
+                setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
+                bounced = true;
+              } else {
+                addLog({ type: 'todo', label: 'critic', detail: 'review passed' });
+              }
+            }
+          }
+          if (bounced) continue;
           break; // Done!
         }
       }
@@ -2769,6 +2996,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
           <button
             type="button"
+            onClick={() => setCriticMode((v) => !v)}
+            disabled={running}
+            title={criticMode ? 'Critic ON: a model reviews the diff and can bounce it back for fixes before the run finishes' : 'Critic OFF'}
+            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', criticMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            Critic
+          </button>
+          <button
+            type="button"
             onClick={() => setDiffViewOpen(true)}
             disabled={!activeWs}
             title="Review the working-tree vs HEAD diff"
@@ -2949,6 +3185,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 </label>
                 <label className="flex items-center gap-1.5 text-[12px] text-mute">
                   seed <NumberField value={coderParams.seed ?? null} onChange={(v) => setCoderParams({ ...coderParams, seed: v })} onEmpty={() => setCoderParams({ ...coderParams, seed: undefined })} empty />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Optional model id for the critic (defaults to the supervisor's model). Empty = same model reviews the diff.">
+                  critic
+                  <input
+                    value={coderParams.criticModel ?? ''}
+                    onChange={(e) => setCoderParams({ ...coderParams, criticModel: e.target.value })}
+                    placeholder="same model"
+                    className="w-28 bg-inset border border-line rounded px-1.5 py-0.5 text-[11px] outline-none focus:border-accent/50"
+                  />
                 </label>
                 <button type="button" onClick={() => setCoderParams({ ...DEFAULT_CODER_PARAMS })} className="ml-auto text-[11px] text-faint hover:text-ink">reset</button>
               </div>
