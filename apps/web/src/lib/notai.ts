@@ -125,10 +125,13 @@ const TIER_TWO = new Set([
   'enhance', 'crucial', 'enduring', 'valuable',
 ]);
 const MECHANICAL_PATTERNS: Array<[string, RegExp]> = [
-  ['template-transition', /\b(?:furthermore|moreover|additionally|in conclusion|to summarize)\b/i],
-  ['empty-frame', /\b(?:it is (?:worth|important) to note that|in today's fast-paced world)\b/i],
-  ['copula-avoidance', /\b(?:serves as|stands as|functions as|operates as|marks a)\b/i],
-  ['negative-parallelism', /\bnot just\b[^.!?]{0,80}\bbut\b/i],
+  // All patterns MUST be global: evaluate() scans them with String.matchAll,
+  // which throws TypeError on a non-global regex — and that throw used to
+  // unwind runStream mid-flight, leaving the chat stuck "streaming" forever.
+  ['template-transition', /\b(?:furthermore|moreover|additionally|in conclusion|to summarize)\b/gi],
+  ['empty-frame', /\b(?:it is (?:worth|important) to note that|in today's fast-paced world)\b/gi],
+  ['copula-avoidance', /\b(?:serves as|stands as|functions as|operates as|marks a)\b/gi],
+  ['negative-parallelism', /\bnot just\b[^.!?]{0,80}\bbut\b/gi],
 ];
 
 const EM_DASH = '—';

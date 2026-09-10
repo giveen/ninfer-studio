@@ -769,8 +769,12 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       // Not-Ai auto-rewrite: when humanize is on and this was a plain content
       // reply (no tool calls), run the deterministic tell-gate and silently
       // re-write the reply if it trips a high-signal tell (em dashes, buzzwords,
-      // mechanical transitions, participial openers).
-      if (!ac.signal.aborted && params.humanize && capturedToolCalls.length === 0) {
+      // mechanical transitions, participial openers). The whole pass is
+      // best-effort: any failure must degrade to keeping the original reply,
+      // never skip the setStreaming(false) below (which is what froze the chat
+      // "streaming" with a dead STOP button when the gate once threw).
+      try {
+        if (!ac.signal.aborted && params.humanize && capturedToolCalls.length === 0) {
         const convNow = convsRef.current.find((c) => c.id === convId);
         if (convNow) {
           const msgs = convNow.messages;
@@ -799,6 +803,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             }
           }
         }
+      }
+      } catch (humanizeError) {
+        // The gate or rewrite must never take the whole run down — the reply
+        // is already complete and shown; keep it and release the UI.
+        console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
       }
 
       if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
@@ -915,7 +924,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = conv.messages.slice(0, msgIndex);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }));
+      runStream(convId, modelHistory({ ...conv, messages: prior })).catch((e) =>
+        console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
   );
@@ -930,7 +940,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const prior = msgs.slice(0, msgIndex + 1);
       const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }));
+      runStream(convId, modelHistory({ ...conv, messages: prior })).catch((e) =>
+        console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
   );

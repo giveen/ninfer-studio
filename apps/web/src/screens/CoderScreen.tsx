@@ -2719,9 +2719,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // deterministic tell-gate and silently re-write the message in place when
         // it trips a high-signal tell. Skipped for tool-call turns.
         if (coderParams.humanize && toolCalls.length === 0 && assistantMsg.content.trim()) {
-          const gateRes = evaluate(assistantMsg.content, effectiveVoice({ ...coderParams, humanize: true }, 'technical'), {});
-          if (needsHumanize(gateRes)) {
-            try {
+          // Best-effort pass: the gate runs outside the rewrite's own try, so
+          // wrap it too — a gate failure must keep the original reply, never
+          // strand the streaming state.
+          try {
+            const gateRes = evaluate(assistantMsg.content, effectiveVoice({ ...coderParams, humanize: true }, 'technical'), {});
+            if (needsHumanize(gateRes)) {
               const rewritten = await humanizeRewriteText({
                 model,
                 baseSystem: dynamicSystemRef.current,
@@ -2735,9 +2738,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
                 setMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
               }
-            } catch {
-              /* keep the original reply if the rewrite fails */
             }
+          } catch {
+            /* keep the original reply if the gate or rewrite fails */
           }
         }
 
