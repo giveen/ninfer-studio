@@ -14,7 +14,7 @@
 
 import { createServer, request as httpRequest } from 'node:http';
 import { execFile, spawn, execFileSync } from 'node:child_process';
-import { createReadStream } from 'node:fs';
+import { createReadStream, statSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -125,6 +125,12 @@ function loopbackSimple(method, url, { body, headers, signal } = {}) {
 
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
 const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
+const SELF_FILE = path.join(SELF_DIR, 'server.js');
+// When this process started. Node loads server.js once at startup, so any edit
+// to the file after this moment is invisible to the running process — the exact
+// failure mode that made engine flags appear to be dropped. Surfaced via
+// /api/status (sidecar.stale) so the UI can warn instead of failing silently.
+const SIDECAR_STARTED_AT = Date.now() - process.uptime() * 1000;
 const ROOT = path.resolve(SELF_DIR, '..', '..');
 
 // Persisted data lives in the user's profile dir, not next to the checkout, so
@@ -347,6 +353,22 @@ const healthPollers = new Set();
 
 function logPathFor(port) {
   return path.join(ENGINE_LOG_DIR, `engine-${port}.log`);
+}
+
+function sidecarPublic() {
+  let codeMtime = null;
+  try {
+    codeMtime = Math.round(statSync(SELF_FILE).mtimeMs);
+  } catch {
+    codeMtime = null;
+  }
+  return {
+    startedAt: SIDECAR_STARTED_AT,
+    codeMtime,
+    // server.js edited after this process started → the running process is
+    // executing older code than the file on disk. Restart the sidecar.
+    stale: codeMtime !== null && codeMtime > SIDECAR_STARTED_AT + 2000,
+  };
 }
 
 export function buildServeArgs(profile) {
@@ -2419,6 +2441,7 @@ const server = createServer(async (req, res) => {
         catalog: ARTIFACTS,
         downloads: downloadsPublic(),
         update: updatePublic(),
+        sidecar: sidecarPublic(),
       });
     }
 

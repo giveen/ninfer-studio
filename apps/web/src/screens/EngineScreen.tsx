@@ -441,6 +441,16 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </div>
       </nav>
       <div className="mx-auto max-w-5xl space-y-4 px-5 py-4" id="engine-top">
+        {status?.sidecar?.stale && (
+          <div className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
+            <span className="font-medium">Sidecar is running stale code.</span>{' '}
+            server.js was edited on disk after this sidecar process started
+            {status.sidecar.codeMtime ? ` (${new Date(status.sidecar.codeMtime).toLocaleTimeString()})` : ''}, so
+            engine settings from this GUI may be silently dropped at launch — this is exactly how "the GUI ignores my
+            parameters" happens. Restart the sidecar (re-run start-stack.sh or quit/relaunch the app), then Start the
+            engine again.
+          </div>
+        )}
         {/* status row */}
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Stat

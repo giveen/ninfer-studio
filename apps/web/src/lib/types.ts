@@ -94,6 +94,12 @@ export interface LastStart {
   at: number;
 }
 
+export interface SidecarStatus {
+  startedAt: number;
+  codeMtime: number | null;
+  stale: boolean;
+}
+
 export interface StatusPayload {
   engine: EngineStatus;
   engines?: EngineStatus[];
@@ -104,6 +110,7 @@ export interface StatusPayload {
   catalog: CatalogEntry[];
   downloads: DownloadRec[];
   update?: UpdateJob | null;
+  sidecar?: SidecarStatus;
 }
 
 export interface DownloadRec {
