@@ -763,6 +763,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 const args = JSON.parse(call.arguments);
                 if (call.name === 'web_fetch') result = JSON.stringify(await coderWebFetch(args.url));
                 else if (call.name === 'web_search') result = JSON.stringify(await coderWebSearch(args.query));
+                else result = JSON.stringify({ error: `unknown tool: ${call.name}` });
              } catch(e) {
                 result = JSON.stringify({error: String(e)});
              }

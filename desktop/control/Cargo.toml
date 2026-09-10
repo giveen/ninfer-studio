@@ -11,8 +11,11 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
 ignore = "0.4"
+globset = "0.4"
+scraper = "0.27"
 regex = "1.10"
 futures-util = "0.3"
 dirs = "6"

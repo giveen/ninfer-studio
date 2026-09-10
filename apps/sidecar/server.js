@@ -1046,6 +1046,47 @@ function relOf(full) {
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+// Apply one old→new replacement: exact match first (with the uniqueness guard),
+// then a whitespace-agnostic line-window fallback. Pure helper shared by the
+// single-edit route's sibling below (`/api/coder/fs/patch` applies N hunks
+// atomically: every hunk must match or nothing is written).
+function applyEditHunk(fileText, oldStr, newStr, replaceAll) {
+  const exactIdx = fileText.indexOf(oldStr);
+  if (exactIdx !== -1) {
+    if (!replaceAll && fileText.indexOf(oldStr, exactIdx + 1) !== -1) {
+      return { error: 'old_string is not unique — pass replaceAll:true to replace all' };
+    }
+    const replaced = replaceAll ? fileText.split(oldStr).join(newStr) : fileText.replace(oldStr, newStr);
+    const count = replaceAll ? (fileText.match(new RegExp(escapeRe(oldStr), 'g')) || []).length : 1;
+    return { text: replaced, count };
+  }
+  const oldLines = oldStr.split('\n');
+  while (oldLines.length > 0 && oldLines[0].trim() === '') oldLines.shift();
+  while (oldLines.length > 0 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
+  if (oldLines.length === 0) {
+    return { error: 'old_string is empty or only whitespace' };
+  }
+  const fileLines = fileText.split('\n');
+  const matches = [];
+  for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < oldLines.length; j++) {
+      if (fileLines[i + j].trim() !== oldLines[j].trim()) { ok = false; break; }
+    }
+    if (ok) matches.push(i);
+  }
+  if (matches.length === 0) {
+    return { error: 'old_string not found (even with fuzzy whitespace matching)' };
+  }
+  if (matches.length > 1 && !replaceAll) {
+    return { error: 'old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true' };
+  }
+  const targets = replaceAll ? matches : [matches[0]];
+  for (let i = targets.length - 1; i >= 0; i--) {
+    fileLines.splice(targets[i], oldLines.length, newStr);
+  }
+  return { text: fileLines.join('\n'), count: targets.length };
+}
 function capOut(s) {
   return s.length > MAX_OUTPUT_BYTES ? s.slice(-MAX_OUTPUT_BYTES) : s;
 }
@@ -1595,6 +1636,44 @@ async function handleCoder(req, res, p, url) {
       
       await fs.writeFile(full, replaced);
       return sendJson(res, 200, { path: body.path, replacements: count });
+    }
+    if (p === '/api/coder/fs/patch' && req.method === 'POST') {
+      const body = await readBody(req, 32 << 20);
+      let full;
+      try {
+        full = withinWs(body?.path);
+      } catch (e) {
+        return sendJson(res, e.status || 400, { error: e.message });
+      }
+      const hunks = body?.edits;
+      if (!Array.isArray(hunks) || hunks.length === 0) {
+        return sendJson(res, 400, { error: 'edits must be a non-empty array of {old, new}' });
+      }
+      for (let i = 0; i < hunks.length; i++) {
+        const h = hunks[i] || {};
+        if (typeof h.old !== 'string' || typeof h.new !== 'string') {
+          return sendJson(res, 400, { error: `edits[${i}].old and edits[${i}].new strings required` });
+        }
+      }
+      let fileText;
+      try {
+        fileText = await fs.readFile(full, 'utf8');
+      } catch {
+        return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
+      }
+      // All-or-nothing: validate every hunk against the evolving text first.
+      let working = fileText;
+      let total = 0;
+      for (let i = 0; i < hunks.length; i++) {
+        const r = applyEditHunk(working, hunks[i].old, hunks[i].new, !!hunks[i].replaceAll);
+        if (r.error) {
+          return sendJson(res, 200, { path: body.path, replacements: 0, error: `hunk ${i}: ${r.error}` });
+        }
+        working = r.text;
+        total += r.count;
+      }
+      await fs.writeFile(full, working);
+      return sendJson(res, 200, { path: body.path, replacements: total });
     }
     if (p === '/api/coder/exec' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

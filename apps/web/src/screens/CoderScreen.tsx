@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
-import { Button, CodeBlock, cn } from '../components/ui';
+import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
+import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
@@ -94,6 +95,33 @@ const TOOLS = [
           replaceAll: { type: "boolean" }
         },
         required: ["path", "old", "new"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description: "Apply multiple string replacements to one file in a single atomic operation — all edits must match or nothing is written. Prefer over several edit calls for multi-hunk changes.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: {
+            type: "array",
+            description: "Ordered replacements applied top-to-bottom against the evolving file.",
+            items: {
+              type: "object",
+              properties: {
+                old: { type: "string" },
+                new: { type: "string" },
+                replaceAll: { type: "boolean" }
+              },
+              required: ["old", "new"]
+            }
+          }
+        },
+        required: ["path", "edits"]
       }
     }
   },
@@ -218,6 +246,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "git_branch",
+      description: "List, create, or switch git branches in the workspace. Creating switches to the new branch.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "create", "switch"] },
+          name: { type: "string", description: "Branch name for create/switch." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "Pause and ask the user a clarifying question or request approval before proceeding (e.g. which approach to take, confirmation for an irreversible action). Use sparingly — only when you genuinely cannot continue without the user's input. The run will pause until they answer.",
       parameters: {
@@ -246,9 +289,10 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
             </span>
           </div>
           <div className="p-2 overflow-auto max-h-64 whitespace-pre">
-            {data.stdout && <div>{data.stdout}</div>}
-            {data.stderr && <div className="text-danger">{data.stderr}</div>}
+            {data.stdout && <div>{redactSecrets(data.stdout)}</div>}
+            {data.stderr && <div className="text-danger">{redactSecrets(data.stderr)}</div>}
             {!data.stdout && !data.stderr && <div className="text-faint italic">No output</div>}
+            {data.blocked && <div className="mt-1 border-t border-[#3a3a3a] pt-1 text-[#858585]">The model can ask for one-off approval via ask_user — approve only for trusted workspaces (Safe Mode toggle in the sidebar).</div>}
           </div>
         </div>
       );
@@ -256,7 +300,7 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
     if (name === 'read') {
       return (
         <div className="mt-1">
-           <CodeBlock code={data.content || ''} />
+           <CodeBlock code={redactSecrets(data.content || '')} />
         </div>
       );
     }
@@ -272,7 +316,6 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
             {data.results?.map((r: any, i: number) => (
               <div key={i} className="flex flex-col gap-0.5">
                 <a href={r.url} target="_blank" rel="noreferrer" className="text-[11px] text-accent hover:underline truncate">{r.url}</a>
-                <div className="text-[12px] font-medium text-ink">{r.title}</div>
                 <div className="text-[11px] text-mute line-clamp-2">{r.snippet}</div>
               </div>
             ))}
@@ -290,25 +333,35 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
             {data.status && <span className={cn("text-[10px] font-medium", data.status >= 400 ? 'text-danger' : 'text-ok')}>{data.status}</span>}
           </div>
           <div className="p-3 max-h-64 overflow-auto text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink bg-panel">
-            {data.content || <span className="italic text-faint">No content extracted.</span>}
+            {data.content ? redactSecrets(data.content) : <span className="italic text-faint">No content extracted.</span>}
             {data.truncated && <div className="mt-2 text-warn italic border-t border-line pt-1 text-[10px]">Content truncated due to length limits.</div>}
           </div>
         </div>
       );
     }
 
-    if (name === 'edit') {
+    if (name === 'write') {
       return (
         <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
-           Successfully applied edit.
+           Wrote {typeof data.bytes === 'number' ? `${data.bytes} bytes` : 'file'}{data.created ? ' (new file)' : ''}.
+           {data.preview_diff && <div className="mt-1.5"><CodeBlock code={data.preview_diff} /></div>}
+        </div>
+      );
+    }
+
+    if (name === 'edit' || name === 'apply_patch') {
+      return (
+        <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
+           Applied edit ({typeof data.replacements === 'number' ? `${data.replacements} replacement${data.replacements === 1 ? '' : 's'}` : 'done'}).
+           {data.preview_diff && <div className="mt-1.5"><CodeBlock code={redactSecrets(data.preview_diff)} /></div>}
         </div>
       );
     }
     
-    if (name === 'grep' || name === 'glob') {
+    if (name === 'grep' || name === 'glob' || name === 'git_branch') {
        return (
          <div className="mt-1 p-2 bg-inset border border-line rounded-md text-[11px] font-mono overflow-auto max-h-48 whitespace-pre">
-           {JSON.stringify(data, null, 2)}
+           {redactSecrets(JSON.stringify(data, null, 2))}
          </div>
        )
     }
@@ -373,7 +426,7 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
               )}
             </div>
           ))}
-        </div>
+      </div>
       )}
     </div>
   );
@@ -388,10 +441,36 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
  * row loads that conversation's messages, ledger, and todos, so you can
  * hop between threads and come back to them later.
  * ------------------------------------------------------------------ */
+/** High-precision secret shapes redacted from displayed tool output + ledger.
+ *  Display-layer only: model context is untouched so code still executes. */
+const SECRET_RES: RegExp[] = [
+  /AKIA[0-9A-Z]{16}/g,
+  /gh[pousr]_[A-Za-z0-9_]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /xox[bpas]-[A-Za-z0-9-]{10,}/g,
+  /sk-ant-[A-Za-z0-9-_]{10,}/g,
+  /sk-[A-Za-z0-9]{20,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /eyJ[A-Za-z0-9-_]{10,}\.[A-Za-z0-9-_]{10,}\.[A-Za-z0-9-_]{10,}/g,
+];
+const redactSecrets = (s: string): string => {
+  let o = s ?? '';
+  for (const re of SECRET_RES) {
+    re.lastIndex = 0;
+    o = o.replace(re, '[redacted]');
+  }
+  return o;
+};
 
 type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number };
 type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
-
+type PermTier = 'allow' | 'ask' | 'deny';
+interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; }
+const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
+/** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
+const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch']);
+/** Tool names the read-only scout and plan mode may use. */
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user']);
 interface ConvMeta {
   id: string;
   title: string;
@@ -407,6 +486,8 @@ interface WsData {
   conversations: Record<string, ConvMeta>;
   order: string[];
   activeConv?: string;
+  /** Per-workspace tool permission tiers + denied path prefixes. */
+  perms?: PermConfig;
 }
 interface CoderStore {
   activeWs: string;
@@ -527,6 +608,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
+  // Sampling params for the coder runs (persisted globally, not per workspace).
+  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; }
+  const CODER_PARAMS_KEY = 'ninfier.coder.params';
+  const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
+  const [coderParams, setCoderParams] = useState<CoderParams>(() => {
+    try {
+      const raw = localStorage.getItem(CODER_PARAMS_KEY);
+      if (raw) return { ...DEFAULT_CODER_PARAMS, ...JSON.parse(raw) };
+    } catch { /* ignore */ }
+    return { ...DEFAULT_CODER_PARAMS };
+  });
+  const [showCoderParams, setShowCoderParams] = useState(false);
   const [commitsOpen, setCommitsOpen] = useState(true);
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
@@ -538,6 +631,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setCoderSafeMode(next);
     try { await coderSafeModeSet(next); } catch { /* keep UI state as-is */ }
   }, []);
+  // Plan mode: read-only agent (no mutating tools), toggled per run.
+  const [planMode, setPlanMode] = useState(false);
+  // Read-only scout pre-pass (auto, concurrency-gated — see runAgent).
+  const [scoutOn, setScoutOn] = useState(true);
+  // A tool call awaiting the user's approve/deny decision (permission tier `ask`).
+  const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
+  const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
+  const conventionsRef = useRef<string>('');
 
   const loadCommits = useCallback(async () => {
     setCommitsLoading(true);
@@ -550,6 +652,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       setCommitsLoading(false);
     }
   }, []);
+  /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
+  const revertCommit = useCallback(async (hash: string) => {
+    if (running || !activeWs) return;
+    if (!/^[0-9a-f]{7,40}$/i.test(hash)) return;
+    addLog({ type: 'bash', label: 'revert', detail: hash.slice(0, 7) });
+    try {
+      const r = await coderExec(`git revert --no-edit ${hash}`, undefined, 30000, activeWs);
+      if (r.exitCode !== 0) {
+        addLog({ type: 'error', label: 'revert', detail: (r.stderr || r.stdout || 'revert failed').slice(0, 300) });
+      }
+    } catch (e) {
+      addLog({ type: 'error', label: 'revert', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      loadCommits();
+    }
+  }, [running, activeWs, loadCommits]);
 
   // Refresh the commit history whenever the active workspace changes.
   useEffect(() => {
@@ -564,6 +682,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
 
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
+  // Visible mirrors of the ref above + the engine context window + the agent
+  // step counter, so the header can show live context usage (release #3).
+  const [ctxTokens, setCtxTokens] = useState<number>(initialMeta?.lastPromptTokens ?? 0);
+  const [ctxLimit, setCtxLimit] = useState<number | null>(null);
+  const [agentSteps, setAgentSteps] = useState(0);
+  // The ref updates inside stream callbacks (no re-render); mirror it into
+  // state whenever the transcript changes so the meter stays live.
+  useEffect(() => { setCtxTokens(lastPromptTokensRef.current); }, [messages]);
   // The system prompt (CODER_SYSTEM + live repo map). Kept in a ref so it can be
   // refreshed mid-run after the agent writes/edits files (P1 #6).
   const dynamicSystemRef = useRef<string>(CODER_SYSTEM);
@@ -649,6 +775,57 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setLedger([]);
     setTodos([]);
     lastPromptTokensRef.current = 0;
+  };
+  /** Fork the active conversation: duplicate its transcript into a new thread. */
+  const forkConversation = () => {
+    if (running || !activeWs || !activeConv) return;
+    const src = storeRef.current.workspaces[activeWs]?.conversations[activeConv];
+    if (!src) return;
+    const id = newConvId();
+    const copy: ConvMeta = {
+      ...src,
+      id,
+      title: `${src.title || 'Conversation'} (fork)`,
+      updatedAt: Date.now(),
+      messages: src.messages.map((m) => ({ ...m })),
+      ledger: src.ledger.map((l) => ({ ...l })),
+      todos: src.todos.map((t) => ({ ...t })),
+    };
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      if (!wsd) return prev;
+      const at = wsd.order.indexOf(activeConv);
+      const order = [...wsd.order];
+      order.splice(at < 0 ? order.length : at + 1, 0, id);
+      return {
+        ...prev,
+        activeConv: id,
+        workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [id]: copy }, order, activeConv: id } },
+      };
+    });
+    loadConv(activeWs, id);
+  };
+  /** Export the active transcript as Markdown (download). Secrets stay redacted. */
+  const exportTranscript = () => {
+    const meta = storeRef.current.workspaces[activeWs]?.conversations[activeConv];
+    if (!meta || meta.messages.length === 0) return;
+    const parts: string[] = [`# ${meta.title || 'Conversation'}`, '', `_Workspace: ${activeWs}_`, ''];
+    for (const m of meta.messages) {
+      if (m.role === 'user' && !isCompactedMsg(m)) parts.push(`## user\n\n${m.content}`);
+      else if (m.role === 'assistant') {
+        parts.push(`## assistant${m.model ? ` (${m.model})` : ''}\n`);
+        if (m.reasoning) parts.push(`<details><summary>thinking</summary>\n\n${m.reasoning}\n\n</details>`);
+        if (m.content) parts.push(m.content);
+        for (const tc of m.tool_calls ?? []) parts.push(`- tool \`${tc.name}\` \`${tc.arguments.slice(0, 300)}\``);
+      } else if (m.role === 'tool') parts.push(`- result \`${m.name ?? ''}\`:\n\n\`\`\`\n${redactSecrets(m.content).slice(0, 4000)}\n\`\`\``);
+      parts.push('');
+    }
+    const blob = new Blob([parts.join('\n')], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(meta.title || 'conversation').replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'conversation'}.md`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
 
   const handleSelectConv = (ws: string, convId: string) => {
@@ -794,7 +971,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const abortRef = useRef<AbortController | null>(null);
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
-    setLedger((prev) => [...prev.slice(-999), { ...entry, id: Math.random().toString(36).slice(2), time: Date.now() }]);
+    const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
+    setLedger((prev) => [...prev.slice(-999), { ...safe, id: Math.random().toString(36).slice(2), time: Date.now() }]);
   };
 
   // Rebuild the system prompt, refreshing the codebase map so the agent sees files
@@ -807,9 +985,76 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${rMap.map}\n\`\`\`\n`;
       }
     } catch { /* ignore */ }
+    // Project conventions: AGENTS.md at the workspace root, refreshed each run
+    // so edits to it take effect. Capped to bound context usage.
+    try {
+      const conv = await coderRead('AGENTS.md');
+      const txt = (!conv.binary && conv.content ? conv.content : '').slice(0, 8000);
+      if (txt.trim() && txt !== conventionsRef.current) {
+        conventionsRef.current = txt;
+        addLog({ type: 'read', label: 'conventions', detail: `AGENTS.md (${txt.length} chars)` });
+      } else if (!txt.trim()) {
+        conventionsRef.current = '';
+      }
+    } catch {
+      conventionsRef.current = '';
+    }
+    if (conventionsRef.current.trim()) {
+      sys += `\n\n# Project Conventions (from AGENTS.md — follow these)\n${conventionsRef.current}\n`;
+    }
     dynamicSystemRef.current = sys;
   }, []);
+  // ---- Permissions (per-workspace tiers + denied path prefixes) ----
+  const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
+  const setPerms = (next: PermConfig) => {
+    if (!activeWs) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      if (!wsd) return prev;
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, perms: next } } };
+    });
+  };
+  const setToolPerm = (tool: string, tier: PermTier) =>
+    setPerms({ ...perms, tools: { ...perms.tools, [tool]: tier } });
+  /** Human-readable denial reason, or `'ask'` when the user must decide, or null. */
+  const checkPerm = (name: string, args: Record<string, unknown>): string | 'ask' | null => {
+    if (planMode && MUTATING_TOOLS.has(name)) {
+      return 'Plan mode is read-only — the run cannot write files or execute commands. Turn Plan off to apply changes.';
+    }
+    if ((perms.tools[name] ?? 'allow') === 'deny') {
+      return `Denied by workspace permissions (${name} is set to deny).`;
+    }
+    const target = typeof args.path === 'string' ? args.path : '';
+    if (target) {
+      const hit = perms.denyPaths.find((d) => {
+        const clean = d.trim().replace(/\/+$/, '');
+        return clean !== '' && (target === clean || target.startsWith(clean + '/'));
+      });
+      if (hit) return `Denied by workspace permissions (path is under denied prefix "${hit.trim()}").`;
+    }
+    if ((perms.tools[name] ?? 'allow') === 'ask') return 'ask';
+    return null;
+  };
+  /** Pause the agent loop until the user approves or denies this one call. */
+  const requestApproval = (name: string, detail: string): Promise<boolean> => {
+    setPendingApproval({ name, detail });
+    return new Promise<boolean>((resolve) => {
+      approvalResolveRef.current = (ok: boolean) => {
+        approvalResolveRef.current = null;
+        setPendingApproval(null);
+        resolve(ok);
+      };
+    });
+  };
 
+  /** Stage + auto-commit one file, returning a bounded unified-diff preview. */
+  const commitFile = async (path: string, message: string): Promise<{ ok: boolean; preview: string }> => {
+    const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000);
+    if (c.exitCode !== 0) return { ok: false, preview: '' };
+    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000);
+    return { ok: true, preview: (d.stdout || '').slice(0, 4000) };
+  };
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
     let mutated = false;
@@ -822,7 +1067,31 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       
       try {
         const args = JSON.parse(call.arguments);
-        if (call.name === 'bash') {
+        // Permission gate: plan-mode read-only, per-tool tiers, denied paths.
+        // `ask` pauses the loop on a user decision; denials return an error
+        // the model can react to instead of executing.
+        const permVerdict = checkPerm(call.name, args);
+        // Set when the user approves an `ask` call — the dispatch below runs.
+        let approvedAfterAsk = false;
+        if (permVerdict !== null) {
+          logType = 'error';
+          logDetail = `${call.name} blocked`;
+          if (permVerdict === 'ask') {
+            const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.files ?? args.pattern ?? args.query ?? args.url ?? '');
+            addLog({ type: 'ask', label: call.name, detail });
+            const ok = await requestApproval(call.name, detail);
+            addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+            if (!ok) {
+              result = JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+            } else {
+              approvedAfterAsk = true;
+            }
+          } else {
+            result = JSON.stringify({ error: permVerdict });
+          }
+        }
+        if (result === '' && (permVerdict === null || approvedAfterAsk)) {
+          if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.command;
           const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs);
           result = JSON.stringify(res);
@@ -833,13 +1102,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } else if (call.name === 'write') {
           logType = 'write'; logDetail = args.path;
           const res = await coderWrite(args.path, args.content);
-          result = JSON.stringify(res);
           mutated = true;
-          await coderExec(`git add "${args.path}" && git commit -m "Agent auto-commit: wrote ${args.path}"`, undefined, 10000);
+          const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`);
+          result = JSON.stringify({ ...res, preview_diff: preview || undefined });
           const cfg = await getConfig();
           if (cfg.buildCommand) {
             const check = await coderExec(cfg.buildCommand, undefined, 30000);
-            if (check.exitCode !== 0) result = JSON.stringify({ ...res, linter_error: check.stderr || check.stdout });
+            if (check.exitCode !== 0) result = JSON.stringify({ ...res, preview_diff: preview || undefined, linter_error: check.stderr || check.stdout });
           }
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
@@ -847,12 +1116,50 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
-             await coderExec(`git add "${args.path}" && git commit -m "Agent auto-commit: edited ${args.path}"`, undefined, 10000);
+             const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`);
+             if (preview) result = JSON.stringify({ ...res, preview_diff: preview });
              const cfg = await getConfig();
              if (cfg.buildCommand) {
                const check = await coderExec(cfg.buildCommand, undefined, 30000);
-               if (check.exitCode !== 0) result = JSON.stringify({ ...res, linter_error: check.stderr || check.stdout });
+               if (check.exitCode !== 0) result = JSON.stringify({ ...res, ...(preview ? { preview_diff: preview } : {}), linter_error: check.stderr || check.stdout });
              }
+          }
+        } else if (call.name === 'apply_patch') {
+          logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
+          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []);
+          result = JSON.stringify(res);
+          mutated = true;
+          if (res.replacements > 0) {
+             const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`);
+             if (preview) result = JSON.stringify({ ...res, preview_diff: preview });
+             const cfg = await getConfig();
+             if (cfg.buildCommand) {
+               const check = await coderExec(cfg.buildCommand, undefined, 30000);
+               if (check.exitCode !== 0) result = JSON.stringify({ ...res, ...(preview ? { preview_diff: preview } : {}), linter_error: check.stderr || check.stdout });
+             }
+          }
+        } else if (call.name === 'git_branch') {
+          const action = String(args.action || 'list');
+          logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
+          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+          if (action === 'list') {
+            const r = await coderExec(`git branch --show-current && git branch --format='%(refname:short)'`, undefined, 15000);
+            const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
+            result = JSON.stringify({ current: lines[0] || '', branches: lines.slice(1), ...r });
+          } else if (action === 'create' || action === 'switch') {
+            const name = String(args.name || '').trim();
+            if (!name) {
+              result = JSON.stringify({ error: `branch name required for action '${action}'` });
+            } else if (!/^[A-Za-z0-9._\/-]+$/.test(name)) {
+              result = JSON.stringify({ error: `invalid branch name: ${name}` });
+            } else {
+              const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
+              const r = await coderExec(cmd, undefined, 30000);
+              result = JSON.stringify(r);
+              if (r.exitCode === 0) mutated = true;
+            }
+          } else {
+            result = JSON.stringify({ error: `unknown action: ${action} (use list, create, or switch)` });
           }
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
@@ -913,8 +1220,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } else {
           result = JSON.stringify({ error: 'Unknown tool' });
         }
+        }
       } catch (err: unknown) {
-        logType = 'error';
         const msg = err instanceof Error ? err.message : String(err);
         logDetail = msg;
         result = JSON.stringify({ error: msg });
@@ -936,10 +1243,72 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     return nextMessages;
   };
-  const runAgent = async (initialMessages: ChatMessage[]) => {
+  // ---- Read-only scout pre-pass (subagents lite) ----
+  // Three parallel probes (structure / usages+tests / history+docs) with their
+  // own short context; only merged summaries reach the main run. Parallelism
+  // needs parallel engine slots, so this runs ONLY when the engine's
+  // max-concurrency (from the profile it was launched with) exceeds 1.
+  const SCOUT_PROBES = [
+    { label: 'structure', goal: 'Map the relevant code structure: key files, modules, entry points, and how they connect. Be concrete with paths.' },
+    { label: 'usages', goal: 'Find existing usages, tests, and examples related to the task. Quote exact paths.' },
+    { label: 'history', goal: 'Summarize recent related work or docs that bear on the task (from file layout, changelogs, notes, or git diffs of related areas).' },
+  ];
+  const engineMaxConcurrency = async (): Promise<number> => {
+    try {
+      const s = await getStatus();
+      const mc = s?.lastStart?.profile?.maxConcurrency;
+      if (typeof mc === 'number' && mc > 0) return mc;
+    } catch { /* unknown — fail closed below */ }
+    return 1;
+  };
+  const runReadOnlyCall = async (call: AgentToolCall): Promise<string> => {
+    try {
+      const args = JSON.parse(call.arguments);
+      switch (call.name) {
+        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern));
+        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
+        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
+        case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
+        default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
+      }
+    } catch (e) {
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+  };
+  const runScoutProbe = async (label: string, goal: string, task: string, model: string, signal: AbortSignal): Promise<string> => {
+    const tools = TOOLS.filter((t) => ['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search'].includes(t.function.name));
+    let msgs: ChatMessage[] = [{
+      role: 'user',
+      content: `Task: ${task}\n\nScout goal (${label}): ${goal}\n\nYou are read-only: investigate with tools and reply with a concise findings report (paths + facts). Do not write code.`,
+    }];
+    for (let step = 0; step < 6; step++) {
+      if (signal.aborted) return '(scout aborted)';
+      let content = '';
+      let toolCalls: AgentToolCall[] = [];
+      try {
+        await streamChat(
+          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }),
+          signal,
+          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
+        );
+      } catch (e) {
+        return `(scout ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
+      }
+      msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
+      if (toolCalls.length === 0) return content.trim() || '(no findings)';
+      for (const call of toolCalls) {
+        const res = await runReadOnlyCall(call);
+        msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
+      }
+    }
+    return '(scout step budget reached)';
+  };
+  const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
     setRunning(true);
     let currentMessages = initialMessages;
-    
+
     // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
     // after file mutations during the run (P1 #6).
     await refreshRepoMap();
@@ -954,6 +1323,40 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (s?.engine?.modelId) model = s.engine.modelId;
     } catch { /* ignore */ }
 
+    // Read-only scout pre-pass. The probes fan out concurrently, so they run
+    // ONLY when the engine was launched with max-concurrency > 1 (parallel
+    // slots must exist); otherwise the main loop works unaided.
+    if (opts?.scout && scoutOn) {
+      const mc = await engineMaxConcurrency();
+      if (mc > 1 && !abortRef.current.signal.aborted) {
+        const task = [...currentMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
+        addLog({ type: 'read', label: 'scout', detail: `3 parallel probes (engine concurrency ${mc})` });
+        const signal = abortRef.current.signal;
+        const summaries = await Promise.all(
+          SCOUT_PROBES.map(async (p) => {
+            const s = await runScoutProbe(p.label, p.goal, task.slice(0, 2000), model, signal);
+            addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
+            return `## ${p.label}\n${s}`;
+          }),
+        );
+        if (!signal.aborted) {
+          const scoutMsg: ChatMessage = {
+            role: 'user',
+            content: `# Scout Report (read-only pre-pass, ${SCOUT_PROBES.length} parallel probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
+          };
+          currentMessages = [...currentMessages, scoutMsg];
+          setMessages((prev) => [...prev, scoutMsg]);
+        }
+      } else if (!abortRef.current.signal.aborted) {
+        addLog({ type: 'read', label: 'scout', detail: `skipped: engine max-concurrency is ${mc} (needs > 1 for parallel probes)` });
+      }
+    }
+    if (abortRef.current.signal.aborted) {
+      setRunning(false);
+      abortRef.current = null;
+      return;
+    }
+
     // Read the engine's context window so we can auto-compact once usage crosses
     // 80% of max. Prefer the engine's own /v1/models advertisement, falling back
     // to the sidecar-reported maxContext.
@@ -967,12 +1370,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         maxContext = s?.engine?.maxContext ?? 0;
       } catch { /* ignore */ }
     }
+    setCtxLimit(maxContext > 0 ? maxContext : null);
     const COMPACT_AT = 0.8;
     const MAX_ATTEMPTS = 3;
     // Hard ceiling on agent turns so a non-terminating plan (or a model that
     // keeps emitting tool calls) can't loop forever — it stops with a clear
     // message instead (release blocker #1).
     const MAX_AGENT_STEPS = 60;
+    // Bounded self-repair: when the agent tries to "finish" right after a tool
+    // action failed, nudge it to fix the error instead of declaring success (#6).
+    const MAX_REPAIR = 3;
     // Derive the response budget from the engine's context window so a small
     // context still leaves room for the prompt (P3 #12). The Coder always thinks,
     // and a reasoning trace plus the answer can exceed a tiny budget, so floor
@@ -982,7 +1389,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       ? Math.min(Math.max(Math.floor(maxContext / 2), respFloor), 16384)
       : 8192;
 
-    // Rough token estimate (~4 chars/token) used as a safety net so a single turn
     // whose tool results push past the window is caught before we send it (P1 #4).
     const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / 4);
     const estimateTokens = (msgs: ChatMessage[]): number => {
@@ -996,6 +1402,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     
     try {
       let agentSteps = 0;
+      setAgentSteps(0);
+      let lastFailed = false;
+      let repairCount = 0;
       while (true) {
         if (abortRef.current?.signal.aborted) break;
 
@@ -1052,12 +1461,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           break;
         }
         agentSteps++;
+        setAgentSteps(agentSteps);
 
         let content = '';
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
         
-        const req = buildChatRequest(model, dynamicSystemRef.current, currentMessages, { thinking: true, maxTokens: respMax } as ChatParams, { tools: TOOLS });
+        // Plan mode advertises read-only tools only; the permission gate in
+        // handleToolCalls enforces it even if the model tries otherwise.
+        const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name)) : TOOLS;
+        const system = planMode
+          ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete plan. Do NOT call write, edit, apply_patch, bash, git_commit, or git_branch — they are disabled. End with a step-by-step plan and wait for the user.`
+          : dynamicSystemRef.current;
+        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools });
 
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
@@ -1148,8 +1564,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const onSubmit = () => {
     if ((!input.trim() && attachments.length === 0) || running || !activeWs) return;
     // Answering a pending ask_user question: clear the pause and continue. The
-    // answer is just a normal user message that resumes the run (#5).
-    if (pendingQuestion) setPendingQuestion(null);
+    // answer is just a normal user message that resumes the run (#5). Resumed
+    // runs skip the scout — its findings are already in context.
+    const resuming = pendingQuestion !== null;
+    if (resuming) setPendingQuestion(null);
     const msg: ChatMessage = { role: 'user', content: input.trim(), attachments: attachments.length ? attachments : undefined };
     const next = [...messages, msg];
     setMessages(next);
@@ -1158,12 +1576,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Seed the model context from the most recent compaction checkpoint onward.
     // The visible transcript keeps the full history; only the engine's context is
     // cleared to the summary and re-injected as leading context.
-    runAgent(compactedContext(messages).concat(msg));
+    runAgent(compactedContext(messages).concat(msg), { scout: !resuming });
   };
 
   const stop = () => {
     abortRef.current?.abort();
+    // Never leave the agent loop parked on an approval dialog after Stop.
+    approvalResolveRef.current?.(false);
   };
+
+  // Persist conversations + per-workspace permissions across reloads.
+  useEffect(() => {
+    try {
+      localStorage.setItem(CONV_KEY, JSON.stringify(store));
+    } catch { /* quota or privacy mode — session still works in memory */ }
+  }, [store]);
+  // Persist sampling params across reloads.
+  useEffect(() => {
+    try {
+      localStorage.setItem(CODER_PARAMS_KEY, JSON.stringify(coderParams));
+    } catch { /* ignore */ }
+  }, [coderParams]);
 
   // ---- Workspace file attachments -------------------------------------------
   const openPicker = async () => {
@@ -1457,6 +1890,53 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>
         </div>
+        {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
+        <div className="shrink-0 border-t border-line p-2">
+          <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+            <Shield size={13} /> Permissions
+          </div>
+          {!activeWs ? (
+            <div className="text-[10.5px] italic text-faint">Select a workspace.</div>
+          ) : (
+            <>
+              <div className="max-h-36 space-y-1 overflow-auto">
+                {TOOLS.map((t) => {
+                  const tier = perms.tools[t.function.name] ?? 'allow';
+                  return (
+                    <div key={t.function.name} className="flex items-center gap-1">
+                      <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.function.description}>{t.function.name}</span>
+                      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          onClick={() => setToolPerm(t.function.name, v)}
+                          title={`${v} ${t.function.name}`}
+                          className={cn(
+                            'rounded px-1.5 py-px text-[10px] font-medium',
+                            tier === v
+                              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                              : 'text-faint hover:bg-panel2 hover:text-mute',
+                          )}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+              <input
+                key={activeWs}
+                defaultValue={perms.denyPaths.join(' ')}
+                placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
+                title="Tool calls touching these workspace-relative paths are denied"
+                onBlur={(e) => setPerms({ ...perms, denyPaths: e.target.value.split(/\s+/).map((s) => s.trim()).filter(Boolean) })}
+                onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+                className="mt-1.5 w-full rounded border border-line bg-inset px-1.5 py-1 font-mono text-[10.5px] outline-none placeholder:text-faint focus:border-accent/50"
+              />
+            </>
+          )}
+        </div>
 
         {/* Commit History — git log of the active workspace */}
         <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
@@ -1488,15 +1968,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               ) : (
                 commits.map((c) => (
                   <div key={c.hash} className="rounded border border-line">
-                    <button
-                      type="button"
-                      onClick={() => setExpandedCommit(expandedCommit === c.hash ? null : c.hash)}
-                      className="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-panel2"
-                    >
-                      <span className="shrink-0 font-mono text-[10.5px] text-accent">{c.hash.slice(0, 7)}</span>
-                      <span className="min-w-0 flex-1 truncate text-[11px] text-ink">{c.subject}</span>
-                      <span className="shrink-0 text-[10px] text-faint">{c.relDate}</span>
-                    </button>
+                    <div className="flex w-full items-center gap-2 px-2 py-1 hover:bg-panel2">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedCommit(expandedCommit === c.hash ? null : c.hash)}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      >
+                        <span className="shrink-0 font-mono text-[10.5px] text-accent">{c.hash.slice(0, 7)}</span>
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-ink">{c.subject}</span>
+                        <span className="shrink-0 text-[10px] text-faint">{c.relDate}</span>
+                      </button>
+                      <button
+                        type="button"
+                        title={`Revert ${c.hash.slice(0, 7)} (creates an undo commit)`}
+                        onClick={() => revertCommit(c.hash)}
+                        className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-warn"
+                      >
+                        <Undo2 size={12} />
+                      </button>
+                    </div>
                     {expandedCommit === c.hash && (
                       <div className="whitespace-pre-wrap border-t border-line px-2 py-1.5 text-[10.5px] leading-relaxed text-mute">
                         <div className="mb-1 text-faint">{c.author} · {c.date}</div>
@@ -1518,8 +2008,51 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
           <span className="text-faint">/</span>
           <span className="truncate text-mute">{activeMeta?.title || 'New conversation'}</span>
+          <span
+            className="ml-auto hidden shrink-0 font-mono text-[10.5px] text-faint sm:inline"
+            title={ctxLimit != null ? `${formatTokens(ctxTokens)} of ${formatTokens(ctxLimit)} context tokens used (last request)` : 'Context usage appears after the first agent request'}
+          >
+            {ctxLimit != null ? `ctx ${formatTokens(ctxTokens)} / ${formatTokens(ctxLimit)}` : `ctx ${formatTokens(ctxTokens)}`}
+            {(running || agentSteps > 0) && <span className="text-mute"> · step {agentSteps}/60</span>}
+          </span>
           <button
-            className="ml-auto rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            type="button"
+            onClick={() => setPlanMode((v) => !v)}
+            disabled={running}
+            title={planMode ? 'Plan mode ON: read-only investigation, no writes or commands' : 'Turn on Plan mode: read-only investigation'}
+            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', planMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            Plan
+          </button>
+          <button
+            type="button"
+            onClick={() => setScoutOn((v) => !v)}
+            disabled={running}
+            title={scoutOn ? 'Scout pre-pass ON: 3 parallel read-only probes when the engine allows (max-concurrency > 1)' : 'Scout pre-pass OFF'}
+            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', scoutOn ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
+          >
+            Scout
+          </button>
+          <button
+            type="button"
+            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            onClick={forkConversation}
+            disabled={!activeWs || running}
+            title="Fork this conversation into a new thread"
+          >
+            <GitFork size={13} />
+          </button>
+          <button
+            type="button"
+            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            onClick={exportTranscript}
+            disabled={!activeWs || messages.length === 0}
+            title="Export transcript as Markdown"
+          >
+            <Download size={13} />
+          </button>
+          <button
+            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={() => newChat(activeWs)}
             disabled={!activeWs}
             title="New conversation in this workspace"
@@ -1529,6 +2062,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
 
         <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
+          {planMode && (
+            <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 text-[11.5px] text-accent flex items-center gap-2">
+              <BrainCircuit size={13} className="shrink-0" />
+              <span>Plan mode is on — the agent investigates read-only and cannot write files or run commands. Turn it off to apply changes.</span>
+            </div>
+          )}
           {coderSafeMode && (
             <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[11.5px] text-warn flex items-center gap-2">
               <span>🛡</span>
@@ -1587,6 +2126,28 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               ))}
             </div>
           )}
+          {showCoderParams && (
+            <div className="rounded-md border border-line bg-panel2 px-3 py-2 mb-2">
+              <div className="flex items-center gap-4 flex-wrap">
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  <Toggle checked={coderParams.thinking} onChange={(v) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  temp <NumberField value={coderParams.temperature ?? null} onChange={(v) => setCoderParams({ ...coderParams, temperature: v })} onEmpty={() => setCoderParams({ ...coderParams, temperature: undefined })} empty />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  top_p <NumberField value={coderParams.topP ?? null} onChange={(v) => setCoderParams({ ...coderParams, topP: v })} onEmpty={() => setCoderParams({ ...coderParams, topP: undefined })} empty />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  top_k <NumberField value={coderParams.topK ?? null} onChange={(v) => setCoderParams({ ...coderParams, topK: v })} onEmpty={() => setCoderParams({ ...coderParams, topK: undefined })} empty />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  seed <NumberField value={coderParams.seed ?? null} onChange={(v) => setCoderParams({ ...coderParams, seed: v })} onEmpty={() => setCoderParams({ ...coderParams, seed: undefined })} empty />
+                </label>
+                <button type="button" onClick={() => setCoderParams({ ...DEFAULT_CODER_PARAMS })} className="ml-auto text-[11px] text-faint hover:text-ink">reset</button>
+              </div>
+            </div>
+          )}
           {pendingQuestion && (
             <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 mb-2 text-[12px]">
               <div className="flex items-center gap-1.5 font-semibold text-accent mb-1">
@@ -1598,6 +2159,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           <div className="flex gap-2">
             <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files">
               <Paperclip size={14} />
+            </Button>
+            <Button variant="ghost" onClick={() => setShowCoderParams((v) => !v)} disabled={!activeWs} title="Sampling params (thinking, temperature, top_p, top_k, seed)">
+              <SlidersHorizontal size={14} />
             </Button>
             <input 
               className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50" 
@@ -1613,6 +2177,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0}><Play size={14} /> Run</Button>
             )}
           </div>
+          {activeWs && (
+            <div className={cn('mt-2 text-[10.5px]', coderSafeMode ? 'text-faint' : 'font-medium text-danger')}>
+              {coderSafeMode
+                ? `Agent runs shell commands locally in ${baseName(activeWs)} — destructive commands are blocked by Safe Mode.`
+                : `Agent runs shell commands locally in ${baseName(activeWs)} — Safe Mode is OFF, destructive commands are allowed.`}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1637,6 +2208,31 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
       </div>
 
+      {pendingApproval && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-[480px] rounded-xl border border-warn/40 bg-panel shadow-xl">
+            <div className="border-b border-line p-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-warn">
+                <Shield size={14} /> Agent requests approval
+              </div>
+              <div className="mt-0.5 text-[11.5px] text-faint">
+                <span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in this workspace.
+              </div>
+            </div>
+            <div className="max-h-48 overflow-auto p-3 font-mono text-[12px] whitespace-pre-wrap break-all text-ink">
+              {redactSecrets(pendingApproval.detail) || '(no details)'}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-line p-2.5">
+              <Button variant="ghost" size="sm" onClick={() => approvalResolveRef.current?.(false)}>
+                Deny
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => approvalResolveRef.current?.(true)}>
+                Approve once
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
       {showDir && (
         <DirBrowser
           initialPath={activeWs || '/'}

@@ -538,6 +538,10 @@ export function coderWrite(path: string, content: string): Promise<CoderWriteRes
 export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false): Promise<CoderEditResult> {
   return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000);
 }
+export interface CoderPatchEdit { old: string; new: string; replaceAll?: boolean; }
+export function coderPatch(path: string, edits: CoderPatchEdit[]): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000);
+}
 export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string): Promise<CoderExecResult> {
   return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId }, 15_000);
 }

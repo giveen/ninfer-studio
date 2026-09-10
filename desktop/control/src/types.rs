@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Event emitted by the control plane for desktop-shell concerns (tray state,
@@ -478,6 +479,12 @@ pub struct State {
     pub log_file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     pub downloads: tokio::sync::Mutex<HashMap<String, DownloadRec>>,
     pub update_job: tokio::sync::Mutex<Option<UpdateJob>>,
+    /// Coder "safe mode" (mirrors the sidecar's `coderSafeMode`): when true,
+    /// clearly destructive shell commands are refused before they run.
+    pub coder_safe_mode: AtomicBool,
+    /// Per-session working directories so the agent's shell behaves like a
+    /// stateful terminal (cd persists across calls within a session id).
+    pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
     /// Optional bridge to the desktop shell. `None` when running headless.
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,
@@ -501,6 +508,8 @@ impl State {
             log_file: tokio::sync::Mutex::new(None),
             downloads: tokio::sync::Mutex::new(HashMap::new()),
             update_job: tokio::sync::Mutex::new(None),
+            coder_safe_mode: AtomicBool::new(true),
+            shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
             event_tx,
             data_dir,
             dist_dir,
