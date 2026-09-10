@@ -4,7 +4,7 @@ import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/t
 import { Button, CodeBlock, cn } from '../components/ui';
 import { Workspaces } from '../components/Workspaces';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary } from '../lib/api';
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
 
@@ -316,13 +316,13 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
 }
 
 export function CoderScreen({ coderWs }: { coderWs: string }) {
-  type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error'; label: string; detail?: string; durationMs?: number };
+  type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact'; label: string; detail?: string; durationMs?: number };
   type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
-  type CoderConv = { messages: ChatMessage[]; ledger: LogEntry[]; todos: TodoItem[] };
+  type CoderConv = { messages: ChatMessage[]; ledger: LogEntry[]; todos: TodoItem[]; lastPromptTokens: number };
 
   const WS_STORAGE_KEY = 'ninfier.coder.workspaces.v1';
   const CONV_KEY = 'ninfier.coder.conversations.v1';
-  const EMPTY_CONV: CoderConv = { messages: [], ledger: [], todos: [] };
+  const EMPTY_CONV: CoderConv = { messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
 
   // Every workspace keeps its own conversation (mirrors deepseek-harness's
   // Sessions-per-Workspace model), keyed by absolute workspace path.
@@ -362,11 +362,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [todos, setTodos] = useState<TodoItem[]>(() => conversations[activeWs]?.todos ?? []);
   const [wsBusy, setWsBusy] = useState(false);
 
+  // Tracks the latest turn's prompt-token count for the active workspace so we
+  // can decide when to auto-compact (persisted alongside the conversation).
+  const lastPromptTokensRef = useRef<number>(conversations[activeWs]?.lastPromptTokens ?? 0);
+
   // Persist the active workspace's conversation whenever it (or the active
   // workspace) changes.
   useEffect(() => {
     setConversations((c) => {
-      const next = { ...c, [activeWs]: { messages, ledger, todos } };
+      const next = { ...c, [activeWs]: { messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current } };
       try { localStorage.setItem(CONV_KEY, JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
@@ -374,6 +378,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const loadConv = (ws: string) => {
     const c = conversations[ws] ?? EMPTY_CONV;
+    lastPromptTokensRef.current = c.lastPromptTokens ?? 0;
     setMessages(c.messages);
     setLedger(c.ledger);
     setTodos(c.todos);
@@ -423,6 +428,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setMessages([]);
     setLedger([]);
     setTodos([]);
+    lastPromptTokensRef.current = 0;
   };
 
   const abortRef = useRef<AbortController | null>(null);
@@ -533,10 +539,48 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch (e) {}
 
     abortRef.current = new AbortController();
+
+    // Read the engine's context window so we can auto-compact once usage crosses
+    // 80% of max. Prefer the engine's own /v1/models advertisement, falling back
+    // to the sidecar-reported maxContext.
+    let maxContext = 0;
+    try {
+      maxContext = (await getEngineContextSize('qwen-coder')) ?? 0;
+    } catch { /* ignore */ }
+    if (!maxContext) {
+      try {
+        const s = await getStatus();
+        maxContext = s?.engine?.maxContext ?? 0;
+      } catch { /* ignore */ }
+    }
+    const COMPACT_AT = 0.8;
     
     try {
       while (true) {
         if (abortRef.current?.signal.aborted) break;
+
+        // Auto-compact: if the last turn already consumed >= 80% of the engine
+        // context window, summarize the conversation into a checkpoint before
+        // continuing so we never silently truncate mid-task.
+        if (maxContext > 0 && lastPromptTokensRef.current >= COMPACT_AT * maxContext) {
+          addLog({ type: 'compact', label: 'compact', detail: `context ${lastPromptTokensRef.current}/${maxContext} ≥ 80% — summarizing` });
+          try {
+            const summary = await summarizeConversation({
+              model: 'qwen-coder',
+              systemPrompt: dynamicSystem,
+              history: currentMessages,
+              maxTokens: 2048,
+            });
+            if (summary) {
+              currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
+              setMessages(currentMessages);
+              lastPromptTokensRef.current = 0;
+              continue;
+            }
+          } catch (e) {
+            addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
+          }
+        }
         
         let content = '';
         let reasoning = '';
@@ -547,7 +591,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         await streamChat(req, abortRef.current.signal, {
           onContentDelta: (text) => { content += text; },
           onReasoningDelta: (text) => { reasoning += text; },
-          onToolCalls: (calls) => { toolCalls = calls; }
+          onToolCalls: (calls) => { toolCalls = calls; },
+          onDone: (meta) => { if (meta?.promptTokens) lastPromptTokensRef.current = meta.promptTokens; },
         });
         
         const assistantMsg: ChatMessage = {
@@ -647,6 +692,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                       "font-semibold",
                       l.type === 'error' ? 'text-danger' : 
                       l.type === 'bash' ? 'text-[#e5c07b]' : 
+                      l.type === 'compact' ? 'text-accent' : 
                       l.type === 'todo' ? 'text-ok' : 'text-accent'
                     )}>{l.label}</span>
                     {l.durationMs !== undefined && <span className="text-faint ml-auto">{l.durationMs}ms</span>}

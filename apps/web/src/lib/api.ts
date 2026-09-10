@@ -61,6 +61,20 @@ export function getConfig(): Promise<AppSettings> {
   return getJSON<AppSettings>('/api/config');
 }
 
+/** Read the engine's context window (max_model_len) for `model` from its
+ *  /v1/models advertisement. Falls back to null so callers can try the
+ *  sidecar-reported maxContext instead. */
+export async function getEngineContextSize(model = 'qwen-coder'): Promise<number | null> {
+  try {
+    const data = await getJSON<{ data?: Array<{ id: string; max_model_len?: number }> }>('/v1/models');
+    const models = data?.data ?? [];
+    const hit = models.find((m) => m.id === model) ?? models[0];
+    return hit?.max_model_len != null ? hit.max_model_len : null;
+  } catch {
+    return null;
+  }
+}
+
 export function saveConfig(patch: Partial<AppSettings>): Promise<AppSettings> {
   return postJSON<AppSettings>('/api/config', patch, 5000);
 }
