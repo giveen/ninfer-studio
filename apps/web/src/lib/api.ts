@@ -505,6 +505,46 @@ export function summarizeConversation(opts: {
 }
 
 // ---------------------------------------------------------------------------
+// Tool-output summarization: condense a giant tool result (command output, a
+// large file read, a fetched page) into an actionable summary so the agent's
+// context stays small instead of ingesting a raw multi-hundred-KB dump.
+// ---------------------------------------------------------------------------
+const OUTPUT_SUMMARY_INSTRUCTION = [
+  'You are a tool-output summarizer for a coding agent. Condense the tool output below into a tight, actionable summary a software engineer can act on without seeing the raw dump.',
+  '',
+  'Preserve verbatim: exact error messages and stack traces, exit codes, key numeric values (IDs, counts, sizes, ports, addresses), file paths and line numbers, command output that indicates success/failure, and the final state.',
+  'Drop: boilerplate, banners, repeated lines, progress bars, ANSI/carriage-return noise, and irrelevant verbose dumps.',
+  'Use terse bullets. If the output is already short, say so. Output ONLY the summary — no preamble, no tools.',
+].join('\n');
+
+/** Stream an AI summary of a single tool output from the engine. */
+export function summarizeOutput(opts: {
+  model: string;
+  output: string;
+  signal?: AbortSignal;
+  maxTokens?: number;
+}): Promise<string> {
+  const instruction: ChatMessage = { role: 'user', content: OUTPUT_SUMMARY_INSTRUCTION };
+  const params: ChatParams = {
+    thinking: false,
+    reasoningEffort: '',
+    preserveThinking: false,
+    maxTokens: opts.maxTokens ?? 1024,
+  };
+  const body = buildChatRequest(opts.model, undefined, [{ role: 'user', content: opts.output }, instruction], params);
+  return new Promise<string>((resolve, reject) => {
+    let acc = '';
+    streamChat(body, opts.signal ?? AbortSignal.timeout(180_000), {
+      onContentDelta: (d) => {
+        acc += d;
+      },
+      onDone: () => resolve(acc.trim()),
+      onError: (m) => reject(new Error(m)),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Coding harness control-plane endpoints (sandboxed to the workspace)
 // ---------------------------------------------------------------------------
 export function getCoderWorkspace(): Promise<CoderWorkspace> {

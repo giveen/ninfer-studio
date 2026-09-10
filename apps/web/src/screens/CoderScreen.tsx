@@ -1,12 +1,15 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
-import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
+import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { MemoryModal } from '../components/MemoryModal';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind } from '../lib/api';
+import { HitlDialog } from '../components/HitlDialog';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind } from '../lib/api';
+import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
@@ -831,7 +834,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; }
+  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -841,6 +844,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch { /* ignore */ }
     return { ...DEFAULT_CODER_PARAMS };
   });
+  // Mirror of coderParams for closures with empty deps (e.g. refreshRepoMap) so
+  // they read the latest humanize/voice setting without being recreated.
+  const coderParamsRef = useRef(coderParams);
+  coderParamsRef.current = coderParams;
   const [showCoderParams, setShowCoderParams] = useState(false);
   const [commitsOpen, setCommitsOpen] = useState(true);
   const [permsOpen, setPermsOpen] = useState(true);
@@ -913,6 +920,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`).
   const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
   const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  // Optional free-form note the human can attach to an ask_user decision.
+  const [askNote, setAskNote] = useState('');
   // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
   const conventionsRef = useRef<string>('');
 
@@ -1392,6 +1401,31 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
     } catch { /* memory injection must never break system-prompt assembly */ }
 
+    // Not-Ai humanize: when enabled, append the editorial contract (plus the
+    // chosen voice profile) so the agent's user-facing prose avoids em dashes,
+    // buzzwords, and empty framing. The deterministic gate is applied separately
+    // to content-only assistant replies.
+    if (coderParamsRef.current.humanize) {
+      const voice = voiceSnippet(coderParamsRef.current.voiceProfile || 'technical');
+      sys += `\n\n# Humanize replies (Not-Ai)\n${NOT_AI_CONTRACT}${voice ? `\n\n${voice}` : ''}\n`;
+    }
+
+    // Not-Ai humanize: when enabled, append the editorial contract (plus the
+    // chosen voice profile) so the agent's user-facing prose avoids em dashes,
+    // buzzwords, and empty framing. The deterministic gate is applied separately
+    // to content-only assistant replies.
+    if (coderParamsRef.current.humanize) {
+      const voice = voiceSnippet(coderParamsRef.current.voiceProfile || 'technical');
+      sys += `\n\n# Humanize replies (Not-Ai)\n${NOT_AI_CONTRACT}${voice ? `\n\n${voice}` : ''}\n`;
+    }
+
+    // Review lens: inject a distilled coding-review discipline (e.g. the Linus
+    // Torvalds method) into the system prompt. The full method is too large to
+    // inline every turn, so only the compact distillation is injected here; the
+    // complete catalog can live in the workspace `skills/` dir (auto-indexed).
+    const lensBlock = coderLensBlock(coderParamsRef.current.reviewLens);
+    if (lensBlock) sys += `\n\n# Review lens\n${lensBlock}\n`;
+
     dynamicSystemRef.current = sys;
   }, []);
 
@@ -1536,6 +1570,64 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, checkpoints: (meta.checkpoints ?? []).filter((c) => c.id !== id) } } } } };
     });
   };
+  /** File-grained undo: revert the active file to its state before the most recent
+   * commit that touched it (creating a recoverable undo commit). If the file has
+   * only uncommitted changes, they're discarded; if it was created in that
+   * commit, it's removed. */
+  const undoFileEdit = useCallback(async (path: string) => {
+    if (running || !activeWsDir) return;
+    const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
+    const p = q(path);
+    const refresh = async () => {
+      loadCommits();
+      refreshRepoMap();
+      try {
+        const r = await coderRead(path);
+        setPreviewFile((cur) => (cur && cur.path === path ? { ...cur, content: r.content ?? '', loading: false } : cur));
+      } catch {
+        // File was removed by the undo — close its preview.
+        setPreviewFile((cur) => (cur && cur.path === path ? null : cur));
+      }
+    };
+    if (!window.confirm(`Undo the last edit to ${path}?\n\nReverts this file to its previous committed state (a new undo commit is created).`)) return;
+    addLog({ type: 'bash', label: 'undo-file', detail: path });
+    // Find the most recent commit that touched this file.
+    const last = await coderExec(`git log -1 --format=%H -- ${p}`, undefined, 15000, activeWsDir);
+    const hash = (last.stdout || '').trim();
+    if (!hash) {
+      // No commit touched it — discard uncommitted working changes (if any).
+      const dis = await coderExec(`git checkout -- ${p}`, undefined, 15000, activeWsDir);
+      if (dis.exitCode !== 0) {
+        addLog({ type: 'error', label: 'undo-file', detail: `no commit and cannot discard changes for ${path}` });
+        return;
+      }
+      addLog({ type: 'bash', label: 'undo-file', detail: `discarded working changes to ${path}` });
+      await refresh();
+      return;
+    }
+    // Root commit has no parent → no prior version to revert to.
+    const parentOk = await coderExec(`git rev-parse ${hash}^`, undefined, 15000, activeWsDir);
+    if (parentOk.exitCode !== 0) {
+      addLog({ type: 'error', label: 'undo-file', detail: `cannot undo root-commit change to ${path} (no prior version)` });
+      return;
+    }
+    // Did the file exist before this commit? If not, it was created here → delete it.
+    const existed = await coderExec(`git cat-file -e ${hash}^:${p}`, undefined, 15000, activeWsDir);
+    const res = existed.exitCode === 0
+      ? await coderExec(`git checkout ${hash}^ -- ${p}`, undefined, 15000, activeWsDir)
+      : await coderExec(`git rm -f -- ${p}`, undefined, 15000, activeWsDir);
+    if (res.exitCode !== 0) {
+      addLog({ type: 'error', label: 'undo-file', detail: (res.stderr || res.stdout || 'undo failed').slice(0, 300) });
+      return;
+    }
+    const c = await coderExec(`git add -A -- ${p} && git commit -m ${q(`undo: revert ${path}`)}`, undefined, 30000, activeWsDir);
+    if (c.exitCode !== 0) {
+      addLog({ type: 'error', label: 'undo-file', detail: (c.stderr || c.stdout || 'commit failed').slice(0, 300) });
+    } else {
+      addLog({ type: 'bash', label: 'undo-file', detail: `reverted last edit to ${path}` });
+    }
+    await refresh();
+  }, [running, activeWsDir, loadCommits, refreshRepoMap]);
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
   const setPerms = (next: PermConfig) => {
@@ -1577,6 +1669,66 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         resolve(ok);
       };
     });
+  };
+  /** Resume the run after an ask_user pause, sending the human's decision (and
+   * optional note) back to the model as the tool answer. */
+  const resumeFromAsk = (answer: string) => {
+    if (pendingQuestion === null) return;
+    setPendingQuestion(null);
+    setAskNote('');
+    const msg: ChatMessage = { role: 'user', content: answer };
+    const next = [...messages, msg];
+    setMessages(next);
+    // Resumed runs skip the scout pre-pass (its findings are already in context).
+    runAgent(compactedContext(messages).concat(msg), { scout: false });
+  };
+
+  // ---------------------------------------------------------------------------
+  // AI summarization of giant tool outputs. When a tool result (command output,
+  // a large file read, a fetched page) exceeds SUMMARY_THRESHOLD, we ask the
+  // engine to condense it and return the summary plus a short raw tail to the
+  // agent — keeping its context small instead of ingesting a raw multi-KB dump.
+  // ---------------------------------------------------------------------------
+  const SUMMARY_THRESHOLD = 16 * 1024;
+  const SUMMARY_TAIL = 1500;
+  const maybeSummarizeTool = async (
+    name: string,
+    resultStr: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    // Structured results (grep/glob/repo_search) are already bounded — skip them.
+    if (name === 'grep' || name === 'glob' || name === 'repo_search') return resultStr;
+    let res: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(resultStr);
+      if (parsed && typeof parsed === 'object') res = parsed as Record<string, unknown>;
+    } catch {
+      return resultStr;
+    }
+    if (!res) return resultStr;
+    const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
+    const hasContent = typeof res.content === 'string';
+    if (!hasStd && !hasContent) return resultStr;
+    const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+    if (text.length <= SUMMARY_THRESHOLD) return resultStr;
+    try {
+      const summary = await summarizeOutput({ model, output: text, signal });
+      if (!summary) return resultStr;
+      const tail = text.slice(-SUMMARY_TAIL);
+      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity]\n${summary}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+      if (hasStd) {
+        res.stdout = wrapped;
+        res.stderr = '';
+      } else {
+        res.content = wrapped;
+      }
+      res._summarized = true;
+      return JSON.stringify(res);
+    } catch {
+      // On any summarizer failure, fall back to the raw (already-truncated) output.
+      return resultStr;
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -2068,10 +2220,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       
       const durationMs = Math.round(performance.now() - t0);
       addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
-      
+
+      // AI-summarize giant outputs so the agent gets a condensed summary + raw
+      // tail instead of a raw multi-KB dump (keeps its context small).
+      const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
+      if (maybeSummarized !== result) {
+        addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
+      }
+
       nextMessages.push({
         role: 'tool',
-        content: result,
+        content: maybeSummarized,
         tool_call_id: call.id,
         name: call.name
       });
@@ -2254,10 +2413,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   ): Promise<{ approved: boolean; issues: string; learnings: Array<{ text: string; kind: CoderLearningKind }> }> => {
     const criticModel = coderParams.criticModel?.trim() || modelRef.current;
     const prompt = `TASK:\n${task.slice(0, 2000)}\n\nDIFF (working tree vs HEAD):\n\`\`\`diff\n${diff.slice(0, 24000)}\n\`\`\`\n\nReview the diff against the task.`;
+    // When a review lens is active, extend the critic's rubric with it so the
+    // second-pass reviewer judges the diff by that discipline (e.g. Linus's
+    // "fatal invariants first" method) rather than generic taste. Concatenated
+    // (not a template literal) because LINUS_LENS contains backticks.
+    const criticSystem =
+      coderParams.reviewLens === 'linus'
+        ? CRITIC_SYSTEM + '\n\n# Review rubric — Linus Torvalds method (distilled)\n' + LINUS_LENS
+        : CRITIC_SYSTEM;
     let content = '';
     try {
       await streamChat(
-        buildChatRequest(criticModel, CRITIC_SYSTEM, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
+        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
         abortRef.current?.signal ?? new AbortController().signal,
         { onContentDelta: (t) => { content += t; } },
       );
@@ -2547,6 +2714,32 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
         currentMessages = [...currentMessages, assistantMsg];
         setMessages((prev) => [...prev, assistantMsg]);
+
+        // Not-Ai auto-rewrite: for content-only (user-facing) replies, run the
+        // deterministic tell-gate and silently re-write the message in place when
+        // it trips a high-signal tell. Skipped for tool-call turns.
+        if (coderParams.humanize && toolCalls.length === 0 && assistantMsg.content.trim()) {
+          const gateRes = evaluate(assistantMsg.content, effectiveVoice({ ...coderParams, humanize: true }, 'technical'), {});
+          if (needsHumanize(gateRes)) {
+            try {
+              const rewritten = await humanizeRewriteText({
+                model,
+                baseSystem: dynamicSystemRef.current,
+                priorMessages: currentMessages.slice(0, currentMessages.length - 1),
+                originalText: assistantMsg.content,
+                params: { thinking: coderParams.thinking, humanize: true, voiceProfile: coderParams.voiceProfile || 'technical' },
+                signal: abortRef.current?.signal,
+              });
+              if (rewritten && rewritten.trim() && rewritten.trim() !== assistantMsg.content.trim()) {
+                const updated: ChatMessage = { ...assistantMsg, content: rewritten };
+                currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
+                setMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
+              }
+            } catch {
+              /* keep the original reply if the rewrite fails */
+            }
+          }
+        }
 
         if (toolCalls.length > 0) {
           const before = currentMessages.length;
@@ -3547,16 +3740,28 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                     className="w-28 bg-inset border border-line rounded px-1.5 py-0.5 text-[11px] outline-none focus:border-accent/50"
                   />
                 </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Rewrite the agent's user-facing summaries to sound human — no em dashes, no buzzwords, no empty framing. Content-only replies that trip the tell-gate are silently re-written.">
+                  <Toggle checked={!!coderParams.humanize} onChange={(v) => setCoderParams({ ...coderParams, humanize: v })} /> humanize
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  voice
+                  <SelectField
+                    value={(coderParams.voiceProfile as VoiceProfile) || 'technical'}
+                    onChange={(v) => setCoderParams({ ...coderParams, voiceProfile: v })}
+                    disabled={!coderParams.humanize}
+                    options={VOICE_PROFILES.map((p) => ({ value: p.value, label: p.label }))}
+                  />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                  lens
+                  <SelectField
+                    value={coderParams.reviewLens || ''}
+                    onChange={(v) => setCoderParams({ ...coderParams, reviewLens: v })}
+                    options={CODING_LENSES.map((l) => ({ value: l.value, label: l.label }))}
+                  />
+                </label>
                 <button type="button" onClick={() => setCoderParams({ ...DEFAULT_CODER_PARAMS })} className="ml-auto text-[11px] text-faint hover:text-ink">reset</button>
               </div>
-            </div>
-          )}
-          {pendingQuestion && (
-            <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 mb-2 text-[12px]">
-              <div className="flex items-center gap-1.5 font-semibold text-accent mb-1">
-                <HelpCircle size={13} /> Agent is waiting for your answer
-              </div>
-              <div className="text-ink/90 whitespace-pre-wrap">{pendingQuestion}</div>
             </div>
           )}
           <div className="flex gap-2">
@@ -3571,13 +3776,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && onSubmit()}
-              placeholder={pendingQuestion ? "Type your answer and press Enter…" : activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
-              disabled={running || !activeWs}
+              placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
+              disabled={running || !activeWs || pendingQuestion !== null}
             />
             {running ? (
                <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
             ) : (
-               <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0}><Play size={14} /> Run</Button>
+               <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0 || pendingQuestion !== null}><Play size={14} /> Run</Button>
             )}
           </div>
           {activeWs && (
@@ -3611,46 +3816,62 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
       </div>
 
+      {pendingQuestion && (
+        <HitlDialog
+          tone="accent"
+          icon={<HelpCircle size={15} />}
+          title="Agent is waiting for your input"
+          subtitle="Review the request, then approve or disapprove to continue the run."
+          footer={
+            <>
+              <Button variant="ghost" size="sm" onClick={() => resumeFromAsk(askNote.trim() ? `Disapproved. ${askNote.trim()}` : 'Disapproved.')}>
+                Disapprove
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => resumeFromAsk(askNote.trim() ? `Approved. ${askNote.trim()}` : 'Approved.')}>
+                Approve
+              </Button>
+            </>
+          }
+        >
+          <div className="whitespace-pre-wrap text-ink/90">{pendingQuestion}</div>
+          <textarea
+            value={askNote}
+            onChange={(e) => setAskNote(e.target.value)}
+            placeholder="Optional note to send back with your decision…"
+            rows={2}
+            className="mt-2 w-full resize-y rounded-md border border-line bg-inset px-2 py-1.5 text-[12px] outline-none focus:border-accent/50"
+          />
+        </HitlDialog>
+      )}
       {pendingApproval && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-[480px] rounded-xl border border-warn/40 bg-panel shadow-xl">
-            <div className="border-b border-line p-3">
-              <div className="flex items-center gap-2 text-sm font-semibold text-warn">
-                <Shield size={14} /> Agent requests approval
-              </div>
-              <div className="mt-0.5 text-[11.5px] text-faint">
-                <span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in this workspace.
-              </div>
-            </div>
-            <div className="max-h-48 overflow-auto p-3 font-mono text-[12px] whitespace-pre-wrap break-all text-ink">
-              {redactSecrets(pendingApproval.detail) || '(no details)'}
-            </div>
-            <div className="flex items-center justify-end gap-2 border-t border-line p-2.5">
+        <HitlDialog
+          tone="warn"
+          width={480}
+          icon={<Shield size={15} />}
+          title="Agent requests approval"
+          subtitle={<span><span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in this workspace.</span>}
+          footer={
+            <>
               <Button variant="ghost" size="sm" onClick={() => approvalResolveRef.current?.(false)}>
                 Deny
               </Button>
               <Button variant="primary" size="sm" onClick={() => approvalResolveRef.current?.(true)}>
                 Approve once
               </Button>
-            </div>
-          </div>
-        </div>
+            </>
+          }
+        >
+          <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{redactSecrets(pendingApproval.detail) || '(no details)'}</pre>
+        </HitlDialog>
       )}
       {riskyApproval && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-[520px] rounded-xl border border-warn/40 bg-panel shadow-xl">
-            <div className="border-b border-line p-3">
-              <div className="flex items-center gap-2 text-sm font-semibold text-warn">
-                <Shield size={14} /> Risky command — approval required
-              </div>
-              <div className="mt-0.5 text-[11.5px] text-faint">
-                This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.
-              </div>
-            </div>
-            <div className="max-h-48 overflow-auto p-3 font-mono text-[12px] whitespace-pre-wrap break-all text-ink">
-              {redactSecrets(riskyApproval.command) || '(no command)'}
-            </div>
-            <div className="flex items-center justify-end gap-2 border-t border-line p-2.5">
+        <HitlDialog
+          tone="warn"
+          icon={<Shield size={15} />}
+          title="Risky command — approval required"
+          subtitle={<span>This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.</span>}
+          footer={
+            <>
               <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('deny')}>
                 Deny
               </Button>
@@ -3660,9 +3881,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               <Button variant="primary" size="sm" onClick={() => riskyResolveRef.current?.('remember')}>
                 Approve &amp; remember
               </Button>
-            </div>
-          </div>
-        </div>
+            </>
+          }
+        >
+          <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{redactSecrets(riskyApproval.command) || '(no command)'}</pre>
+        </HitlDialog>
       )}
 
       {/* Diff-review viewer: working-tree vs HEAD, opened from the toolbar "Diff" button. */}
@@ -3720,6 +3943,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             <div className="flex items-center gap-2 border-b border-line p-3">
               <File size={14} />
               <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{previewFile.path}</span>
+              <button
+                type="button"
+                title="Undo the last edit to this file (reverts it to its previous committed state)"
+                className="text-faint hover:text-warn disabled:opacity-40"
+                disabled={running}
+                onClick={() => undoFileEdit(previewFile.path)}
+              >
+                <Undo2 size={16} />
+              </button>
               <button type="button" className="text-faint hover:text-ink" onClick={() => setPreviewFile(null)}><X size={16} /></button>
             </div>
             <div className="flex-1 overflow-auto p-3 font-mono text-[11.5px] whitespace-pre-wrap">

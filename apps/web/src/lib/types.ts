@@ -267,6 +267,12 @@ export interface Conversation {
 
 export interface ChatParams {
   systemPrompt?: string;
+  /** When on, inject the Not-Ai editorial contract so replies read like a real
+   *  person wrote them, and auto-rewrite replies that trip the deterministic
+   *  tell-gate (em dashes, buzzwords, mechanical transitions). Off by default. */
+  humanize?: boolean;
+  /** Not-Ai voice/genre profile applied when `humanize` is on. */
+  voiceProfile?: string;
   thinking: boolean;
   reasoningEffort?: '' | 'none' | 'low' | 'medium' | 'xhigh';
   preserveThinking?: boolean;

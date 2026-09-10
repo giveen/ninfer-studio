@@ -17,6 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 
 // A legacy compaction checkpoint message (raw <compacted-summary> block).
 function isCompactedMsg(m: ChatMessage): boolean {
@@ -472,6 +473,19 @@ function ParamsPopover({
           <Toggle checked={!!params.greedy} onChange={(v) => set({ greedy: v, ...(v ? { temperature: 0 } : { temperature: undefined }) })} label="Greedy (exact argmax)" hint="temperature 0 with no sampling — deterministic output. Overrides the other sampling fields while on." />
         </div>
         <div className="h-px bg-line" />
+        <div className="flex items-center">
+          <Toggle checked={!!params.humanize} onChange={(v) => set({ humanize: v })} label="Humanize replies (Not-Ai)" hint="Rewrite replies to sound human — no em dashes, no buzzwords, no empty framing. Replies that trip the tell-gate are silently re-written." />
+        </div>
+        <div className={row}>
+          <span className={lab}>Voice / style</span>
+          <SelectField
+            value={(params.voiceProfile as VoiceProfile) || 'personal'}
+            onChange={(v) => set({ voiceProfile: v })}
+            disabled={!params.humanize}
+            options={VOICE_PROFILES.map((p) => ({ value: p.value, label: p.label }))}
+          />
+        </div>
+        <div className="h-px bg-line" />
         <div className={row}>
           <span className={lab}>System prompt</span>
           <textarea
@@ -695,7 +709,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
 
       await streamChat(
-        buildChatRequest(useModel, params.systemPrompt, history, params, { tools: CHAT_TOOLS }),
+        buildChatRequest(useModel, effectiveSystemPrompt(params), history, params, { tools: CHAT_TOOLS }),
         ac.signal,
         {
           onReasoningDelta: (d) => {
@@ -750,6 +764,42 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           },
         },
       );
+
+      // Not-Ai auto-rewrite: when humanize is on and this was a plain content
+      // reply (no tool calls), run the deterministic tell-gate and silently
+      // re-write the reply if it trips a high-signal tell (em dashes, buzzwords,
+      // mechanical transitions, participial openers).
+      if (!ac.signal.aborted && params.humanize && capturedToolCalls.length === 0) {
+        const convNow = convsRef.current.find((c) => c.id === convId);
+        if (convNow) {
+          const msgs = convNow.messages;
+          const idx = placeholderId ? msgs.findIndex((m) => m.id === placeholderId) : msgs.length - 1;
+          const target = msgs[idx];
+          if (target && target.role === 'assistant' && target.content.trim()) {
+            const gateRes = evaluate(target.content, effectiveVoice(params), {});
+            if (needsHumanize(gateRes)) {
+              try {
+                const rewritten = await humanizeRewriteText({
+                  model: useModel,
+                  baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
+                  priorMessages: msgs.slice(0, idx),
+                  originalText: target.content,
+                  params: { ...params, maxTokens: undefined },
+                  signal: ac.signal,
+                });
+                if (rewritten && rewritten.trim() && rewritten.trim() !== target.content.trim()) {
+                  setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
+                    ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: rewritten } : m)),
+                  }));
+                }
+              } catch {
+                /* keep the original reply if the rewrite fails */
+              }
+            }
+          }
+        }
+      }
+
       if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
          if (depth >= 12) {
            setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
