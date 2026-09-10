@@ -2551,21 +2551,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         maxContext = s?.engine?.maxContext ?? 0;
       } catch { /* ignore */ }
     }
-
-    // ninfer-serve's vision/multimodal profile enforces a much smaller *effective*
-    // context window than the advertised max_context: the model card documents the
-    // multimodal limit at 81,920 tokens, whereas the text-only profile advertises
-    // 240k+. If we trust the advertised 256k and only compact at 80% of it, the
-    // server rejects Coder requests with HTTP 400 "context length exceeded" (which
-    // the client then masks as an empty response). Clamp the working limit so
-    // proactive compaction fires before the server's real ceiling (P1 fix).
-    const VISION_CONTEXT_CAP = 81920;
-    try {
-      const st = await getStatus();
-      if (st?.lastStart?.profile?.vision && maxContext > VISION_CONTEXT_CAP) {
-        maxContext = VISION_CONTEXT_CAP;
-      }
-    } catch { /* ignore */ }
     setCtxLimit(maxContext > 0 ? maxContext : null);
     const COMPACT_AT = 0.8;
     const MAX_ATTEMPTS = 3;
@@ -2601,28 +2586,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
       return Math.ceil(n / 4);
     };
-
-    // Summarize the conversation down to a single compaction checkpoint. Shared by
-    // the proactive compaction path and the context-length self-heal below. Returns
-    // true when the history was successfully compacted.
-    const compactOnce = async (): Promise<boolean> => {
-      try {
-        const summary = await summarizeConversation({
-          model,
-          systemPrompt: dynamicSystemRef.current,
-          history: currentMessages,
-          maxTokens: 2048,
-        });
-        if (!summary) return false;
-        currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
-        setMessages((prev) => [...prev, ...currentMessages]);
-        lastPromptTokensRef.current = 0;
-        return true;
-      } catch {
-        return false;
-      }
-    };
-
+    
     try {
       let agentSteps = 0;
       setAgentSteps(0);
@@ -2688,38 +2652,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let content = '';
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
-
+        
         // Plan mode advertises read-only tools only; the permission gate in
         // handleToolCalls enforces it even if the model tries otherwise.
         const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name)) : TOOLS;
+        const system = planMode
+          ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete plan. Do NOT call write, edit, apply_patch, bash, git_commit, or git_branch — they are disabled. End with a step-by-step plan and wait for the user.`
+          : dynamicSystemRef.current;
+        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
 
-        // Bounded retry on transient stream failures so a single dropped connection
-        // doesn't kill a long agent run (P2 #9). A context-length rejection (HTTP
-        // 400) is NOT transient: compact the history and retry rather than resend
-        // the same oversized request (P1 fix).
+        // Bounded retry on transient stream failures so a single dropped
+        // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
         let streamOk = false;
-        let compactionBudget = 2;
         while (!streamOk && attempt < MAX_ATTEMPTS) {
           attempt++;
           content = '';
           reasoning = '';
           toolCalls = [];
-          const system = planMode
-            ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete plan. Do NOT call write, edit, apply_patch, bash, git_commit, or git_branch — they are disabled. End with a step-by-step plan and wait for the user.`
-            : dynamicSystemRef.current;
-          const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
-          let streamErr: string | null = null;
           try {
             await streamChat(req, abortRef.current.signal, {
               onContentDelta: (text) => { content += text; },
               onReasoningDelta: (text) => { reasoning += text; },
               onToolCalls: (calls) => { toolCalls = calls; },
-              // streamChat reports transport/HTTP failures (e.g. HTTP 400 context
-              // length exceeded) via onError WITHOUT throwing, so a failed request
-              // would otherwise be mistaken for a successful empty reply. Capture it
-              // and re-throw so the real cause surfaces — and can be self-healed.
-              onError: (m) => { streamErr = m; },
               onDone: (meta) => {
                 // Record the engine's real prompt-token count when present;
                 // otherwise keep the local estimate so accounting stays accurate
@@ -2727,19 +2682,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 lastPromptTokensRef.current = meta?.promptTokens ?? est;
               },
             });
-            if (streamErr) throw new Error(streamErr);
             streamOk = true;
           } catch (e) {
             if (abortRef.current?.signal.aborted) throw e;
             const msg = e instanceof Error ? e.message : String(e);
-            const isContextErr = /context length|context_length_exceeded|exceeds Engine max_context|exceeds.*max_context/i.test(msg);
-            if (isContextErr && compactionBudget > 0) {
-              compactionBudget--;
-              if (await compactOnce()) {
-                addLog({ type: 'compact', label: 'compact', detail: `context length exceeded — summarized history and retrying (${compactionBudget} attempt(s) left)` });
-                continue;
-              }
-            }
             if (attempt >= MAX_ATTEMPTS) {
               addLog({ type: 'error', label: 'retry', detail: `stream failed after ${MAX_ATTEMPTS} attempts: ${msg}` });
               throw e;
