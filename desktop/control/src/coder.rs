@@ -594,6 +594,27 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
+    // Background mode: hand the child to a detached drain task and return a
+    // job id immediately. The client polls `job_get`; output is tail-capped.
+    if req.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let id = format!("job_{now_ms}_{}", BG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let job = std::sync::Arc::new(BgJob::new(id.clone(), command.clone(), result_cwd.clone()));
+        {
+            let mut jobs = BG_JOBS.lock().await;
+            if jobs.len() >= 32 {
+                if let Some(victim) = jobs.iter().find_map(|(k, j)| j.try_done().then(|| k.clone())) {
+                    jobs.remove(&victim);
+                } else {
+                    return Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "too many background jobs"}))));
+                }
+            }
+            jobs.insert(id.clone(), job.clone());
+        }
+        let sid = session.clone();
+        tokio::spawn(drain_bg_job(job, child, sid, state.clone(), timeout_ms));
+        return Ok(Json(json!({"jobId": id, "started": true})));
+    }
 
     // Take the pipes up front and drain both streams concurrently so a large
     // stderr can't deadlock a large stdout (and vice versa). The future only
@@ -672,7 +693,143 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         }
     }
 }
-
+/// Background shell jobs (mirrors the sidecar's `bgJobs`): long builds/tests
+/// run detached; the client polls `job_get` and stops via `job_kill` (which
+/// sets a flag — the drain task sends SIGKILL via `start_kill`, so no child
+/// handle is ever held across an await).
+struct BgState {
+    command: String,
+    cwd: String,
+    done: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    killed: bool,
+    truncated: bool,
+    stdout: String,
+    stderr: String,
+    started_at: u64,
+}
+struct BgJob {
+    id: String,
+    state: tokio::sync::Mutex<BgState>,
+}
+impl BgJob {
+    fn new(id: String, command: String, cwd: String) -> Self {
+        Self {
+            id,
+            state: tokio::sync::Mutex::new(BgState {
+                command, cwd, done: false, exit_code: None, timed_out: false,
+                killed: false, truncated: false, stdout: String::new(),
+                stderr: String::new(),
+                started_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            }),
+        }
+    }
+    /// Non-blocking done check for eviction (contention ⇒ treat as busy).
+    fn try_done(&self) -> bool {
+        self.state.try_lock().map(|s| s.done).unwrap_or(false)
+    }
+    fn kill_requested(&self) -> bool {
+        self.state.try_lock().map(|s| !s.done && s.killed).unwrap_or(false)
+    }
+}
+static BG_JOBS: LazyLock<tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<BgJob>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static BG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Drain a background child: stream pipes to EOF in the background while a
+/// 1s wait-poll honors kill requests and the deadline, then record capped
+/// output (+ session cwd bookkeeping, like the foreground path).
+async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Child, session: Option<String>, state: S, timeout_ms: u64) {
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_h = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(o) = &mut out_pipe {
+            use tokio::io::AsyncReadExt as _;
+            let _ = o.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let err_h = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(e) = &mut err_pipe {
+            use tokio::io::AsyncReadExt as _;
+            let _ = e.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let code: Option<i32> = loop {
+        if job.kill_requested() {
+            let _ = child.start_kill();
+        }
+        if !timed_out && std::time::Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.start_kill();
+        }
+        match timeout(Duration::from_secs(1), child.wait()).await {
+            Ok(Ok(status)) => break status.code(),
+            Ok(Err(_)) => break None,
+            Err(_) => continue,
+        }
+    };
+    let so = out_h.await.unwrap_or_default();
+    let se = err_h.await.unwrap_or_default();
+    let mut st = job.state.lock().await;
+    st.done = true;
+    st.timed_out = timed_out;
+    let killed = st.killed;
+    let mut stdout = String::from_utf8_lossy(&so).into_owned();
+    if let Some(sid) = &session {
+        if let Some(first) = stdout.find(CWD_MARKER) {
+            let rest = &stdout[first + CWD_MARKER.len()..];
+            if let Some(end) = rest.find(CWD_MARKER) {
+                let new_cwd = rest[..end].trim().to_string();
+                if !new_cwd.is_empty() {
+                    state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
+                }
+            }
+            stdout = stdout[..first].to_string();
+        }
+    }
+    let (o, t1) = cap_out(&stdout);
+    let (e, t2) = cap_out(&String::from_utf8_lossy(&se));
+    st.stdout = o;
+    st.stderr = if killed && e.is_empty() { "killed".to_string() } else { e };
+    st.truncated = t1 || t2;
+    st.exit_code = code;
+}
+fn bg_view(id: &str, s: &BgState) -> Value {
+    serde_json::json!({
+        "jobId": id, "command": s.command, "done": s.done, "exitCode": s.exit_code,
+        "timedOut": s.timed_out, "killed": s.killed, "truncated": s.truncated,
+        "startedAt": s.started_at, "cwd": s.cwd, "stdout": s.stdout, "stderr": s.stderr,
+    })
+}
+pub async fn job_get(AxumState(_state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let jobs = BG_JOBS.lock().await;
+    match jobs.get(&id) {
+        Some(job) => {
+            let st = job.state.lock().await;
+            Ok(Json(bg_view(&job.id, &st)))
+        }
+        None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown job"})))),
+    }
+}
+pub async fn job_kill(AxumState(_state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let jobs = BG_JOBS.lock().await;
+    match jobs.get(&id) {
+        Some(job) => {
+            let mut st = job.state.lock().await;
+            if !st.done {
+                st.killed = true;
+            }
+            Ok(Json(bg_view(&job.id, &st)))
+        }
+        None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown job"})))),
+    }
+}
 pub async fn repo_map(AxumState(state): AxumState<S>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws = state.config.read().await.coder_workspace.clone();
     if ws.is_empty() {
@@ -1272,6 +1429,49 @@ mod tests {
             .collect();
         assert!(dirs.contains(&"sub"));
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    /// Background jobs: start → poll to completion → kill a sleeper.
+    #[tokio::test]
+    async fn bg_job_round_trip() {
+        use axum::extract::Path;
+        let tmp = std::env::temp_dir().join(format!("ninfier-bg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
+        let ws = || AxumState(state.clone());
+        let r = exec(ws(), Json(json!({"command": "echo bg-hi", "background": true}))).await.unwrap().0;
+        let id = r.get("jobId").and_then(|v| v.as_str()).unwrap().to_string();
+        let mut done = false;
+        for _ in 0..100 {
+            let v = job_get(ws(), Path(id.clone())).await.unwrap().0;
+            if v.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                assert_eq!(v.get("exitCode").and_then(|v| v.as_i64()), Some(0));
+                assert!(v.get("stdout").and_then(|v| v.as_str()).unwrap().contains("bg-hi"));
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(done, "bg job did not finish");
+        // unknown job 404s
+        assert!(job_get(ws(), Path("job_nope".to_string())).await.is_err());
+        // kill stops a sleeper
+        let r2 = exec(ws(), Json(json!({"command": "sleep 30", "background": true}))).await.unwrap().0;
+        let id2 = r2.get("jobId").and_then(|v| v.as_str()).unwrap().to_string();
+        let k = job_kill(ws(), Path(id2.clone())).await.unwrap().0;
+        assert_eq!(k.get("killed").and_then(|v| v.as_bool()), Some(true));
+        let mut dead = false;
+        for _ in 0..100 {
+            let v = job_get(ws(), Path(id2.clone())).await.unwrap().0;
+            if v.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(dead, "killed job did not stop");
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]

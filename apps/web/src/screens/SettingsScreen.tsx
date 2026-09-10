@@ -48,6 +48,8 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
         apiKey: form.apiKey,
         hfCli: form.hfCli,
         buildCommand: form.buildCommand ?? '',
+        lintCommand: form.lintCommand ?? '',
+        testCommand: form.testCommand ?? '',
         defaultRequestParams: form.defaultRequestParams ?? '',
       });
       setForm(c);
@@ -74,6 +76,12 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
             </Field>
             <Field label="Build command" hint="Run inside the Ninfer path. NInfer default: Ninja configure + Release build, parallelized over all cores (-j$(nproc)).">
               <TextField value={form.buildCommand ?? ''} onChange={(v) => set('buildCommand', v)} placeholder="cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)" className="font-mono text-[12px]" />
+            </Field>
+            <Field label="Coder lint command" hint="Run in the Coder workspace after the agent edits files. Empty = fall back to the build command above. Example: npx tsc --noEmit, cargo clippy, ruff check.">
+              <TextField value={form.lintCommand ?? ''} onChange={(v) => set('lintCommand', v)} placeholder="npx tsc --noEmit" className="font-mono text-[12px]" />
+            </Field>
+            <Field label="Coder test command" hint="Run in the Coder workspace after the lint step passes. Empty = no test step. Example: npm test, cargo test, pytest.">
+              <TextField value={form.testCommand ?? ''} onChange={(v) => set('testCommand', v)} placeholder="npm test" className="font-mono text-[12px]" />
             </Field>
           </div>
         </SectionCard>

@@ -4,7 +4,7 @@ import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment,
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
@@ -19,7 +19,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
    - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
 2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
-3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself.
+3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself. For long-running commands (builds, test suites), pass \`background:true\` to \`bash\` and poll the returned job with \`bash_poll\` until \`done:true\` instead of blocking.
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
 5. **Completion**: Only emit a final conversational response when the ENTIRE task is fully complete, tested, and verified.
 6. **Context is managed for you**: this harness automatically compacts the conversation when it nears the model's context limit, replacing earlier turns with a concise summary checkpoint. You do NOT need to summarize manually — keep working normally and rely on the checkpoint to preserve prior context.
@@ -129,14 +129,29 @@ const TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run a shell command in the workspace.",
+      description: "Run a shell command in the workspace. Pass background:true for long builds/tests — returns a jobId immediately; poll it with bash_poll until done.",
       parameters: {
         type: "object",
         properties: {
           command: { type: "string" },
-          timeoutMs: { type: "number" }
+          timeoutMs: { type: "number" },
+          background: { type: "boolean", description: "Run detached; returns {jobId} instead of blocking." }
         },
         required: ["command"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "bash_poll",
+      description: "Poll a background bash job started with background:true. Returns done, exitCode, and tail-capped output. Keep polling until done:true.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string" }
+        },
+        required: ["jobId"]
       }
     }
   },
@@ -282,7 +297,7 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
       return (
         <div className="rounded-md bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[11px] overflow-hidden mt-1">
           <div className="bg-[#2d2d2d] px-2 py-1 flex justify-between items-center text-[#858585]">
-            <span>Terminal {data.exitCode !== null ? `(exit ${data.exitCode})` : ''}</span>
+            <span>Terminal {data.jobId ? `(background job ${data.jobId} — poll with bash_poll)` : data.exitCode !== null && data.exitCode !== undefined ? `(exit ${data.exitCode})` : ''}</span>
             <span className="flex items-center gap-2">
               {data.blocked && <span className="text-danger font-semibold">Blocked by safe mode</span>}
               {data.timedOut && <span className="text-warn">Timeout</span>}
@@ -342,23 +357,27 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
 
     if (name === 'write') {
       return (
-        <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
-           Wrote {typeof data.bytes === 'number' ? `${data.bytes} bytes` : 'file'}{data.created ? ' (new file)' : ''}.
-           {data.preview_diff && <div className="mt-1.5"><CodeBlock code={data.preview_diff} /></div>}
-        </div>
+      <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
+         Wrote {typeof data.bytes === 'number' ? `${data.bytes} bytes` : 'file'}{data.created ? ' (new file)' : ''}.
+         {data.preview_diff && <div className="mt-1.5"><CodeBlock code={data.preview_diff} /></div>}
+         {data.linter_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Lint failed:{'\n'}{redactSecrets(String(data.linter_error)).slice(0, 2000)}</div>}
+         {data.test_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Tests failed:{'\n'}{redactSecrets(String(data.test_error)).slice(0, 2000)}</div>}
+      </div>
       );
     }
 
     if (name === 'edit' || name === 'apply_patch') {
       return (
-        <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
-           Applied edit ({typeof data.replacements === 'number' ? `${data.replacements} replacement${data.replacements === 1 ? '' : 's'}` : 'done'}).
-           {data.preview_diff && <div className="mt-1.5"><CodeBlock code={redactSecrets(data.preview_diff)} /></div>}
-        </div>
+      <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
+         Applied edit ({typeof data.replacements === 'number' ? `${data.replacements} replacement${data.replacements === 1 ? '' : 's'}` : 'done'}).
+         {data.preview_diff && <div className="mt-1.5"><CodeBlock code={redactSecrets(data.preview_diff)} /></div>}
+         {data.linter_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Lint failed:{'\n'}{redactSecrets(String(data.linter_error)).slice(0, 2000)}</div>}
+         {data.test_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Tests failed:{'\n'}{redactSecrets(String(data.test_error)).slice(0, 2000)}</div>}
+      </div>
       );
     }
     
-    if (name === 'grep' || name === 'glob' || name === 'git_branch') {
+    if (name === 'grep' || name === 'glob' || name === 'git_branch' || name === 'bash_poll') {
        return (
          <div className="mt-1 p-2 bg-inset border border-line rounded-md text-[11px] font-mono overflow-auto max-h-48 whitespace-pre">
            {redactSecrets(JSON.stringify(data, null, 2))}
@@ -470,7 +489,7 @@ const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
 const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch']);
 /** Tool names the read-only scout and plan mode may use. */
-const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user']);
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll']);
 interface ConvMeta {
   id: string;
   title: string;
@@ -621,6 +640,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   });
   const [showCoderParams, setShowCoderParams] = useState(false);
   const [commitsOpen, setCommitsOpen] = useState(true);
+  const [permsOpen, setPermsOpen] = useState(true);
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
 
@@ -967,14 +987,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
     }
   };
-
   const abortRef = useRef<AbortController | null>(null);
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
     setLedger((prev) => [...prev.slice(-999), { ...safe, id: Math.random().toString(36).slice(2), time: Date.now() }]);
   };
-
   // Rebuild the system prompt, refreshing the codebase map so the agent sees files
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
   const refreshRepoMap = useCallback(async () => {
@@ -985,25 +1003,68 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${rMap.map}\n\`\`\`\n`;
       }
     } catch { /* ignore */ }
-    // Project conventions: AGENTS.md at the workspace root, refreshed each run
-    // so edits to it take effect. Capped to bound context usage.
+    // Project conventions: AGENTS.md preferred, CLAUDE.md fallback — refreshed
+    let convName = '';
     try {
-      const conv = await coderRead('AGENTS.md');
+      let name = 'AGENTS.md';
+      let conv = await coderRead(name);
+      if (conv.binary || !conv.content?.trim()) { name = 'CLAUDE.md'; conv = await coderRead(name); }
       const txt = (!conv.binary && conv.content ? conv.content : '').slice(0, 8000);
       if (txt.trim() && txt !== conventionsRef.current) {
         conventionsRef.current = txt;
-        addLog({ type: 'read', label: 'conventions', detail: `AGENTS.md (${txt.length} chars)` });
+        addLog({ type: 'read', label: 'conventions', detail: `${name} (${txt.length} chars)` });
       } else if (!txt.trim()) {
         conventionsRef.current = '';
       }
+      if (conventionsRef.current.trim()) convName = name;
     } catch {
       conventionsRef.current = '';
     }
     if (conventionsRef.current.trim()) {
-      sys += `\n\n# Project Conventions (from AGENTS.md — follow these)\n${conventionsRef.current}\n`;
+      sys += `\n\n# Project Conventions (from ${convName || 'workspace memory file'} — follow these)\n${conventionsRef.current}\n`;
     }
+    // Skills-lite: workspace `skills/*/SKILL.md` index. Only names + first-line
+    // descriptions are injected; the model reads a skill file via `read` when
+    // relevant. Refreshed each run, capped to bound context usage.
+    try {
+      const g = await coderGlob('skills/*/SKILL.md');
+      const files = (g.files ?? []).slice(0, 20);
+      const lines: string[] = [];
+      for (const f of files) {
+        try {
+          const s = await coderRead(f, 0, 30);
+          if (s.binary || !s.content) continue;
+          const ls = s.content.split('\n').map((x) => x.trim()).filter(Boolean);
+          const title = (ls[0] ?? f).replace(/^#\s*/, '').slice(0, 80);
+          const desc = (ls[1] ?? '').slice(0, 160);
+          lines.push(`- ${f}: ${title}${desc ? ` — ${desc}` : ''}`);
+        } catch { /* skip unreadable skill */ }
+      }
+      if (lines.length > 0) {
+        sys += `\n\n# Skills (read the SKILL.md with the read tool when its trigger matches)\n${lines.join('\n').slice(0, 4000)}\n`;
+        addLog({ type: 'read', label: 'skills', detail: `${lines.length} skill(s)` });
+      }
+    } catch { /* no skills dir */ }
     dynamicSystemRef.current = sys;
   }, []);
+  /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
+  const undoLastCommit = useCallback(async () => {
+    if (running || !activeWs || commits.length === 0) return;
+    const top = commits[0];
+    if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
+    addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
+    try {
+      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWs);
+      if (r.exitCode !== 0) {
+        addLog({ type: 'error', label: 'undo', detail: (r.stderr || r.stdout || 'undo failed').slice(0, 300) });
+      }
+    } catch (e) {
+      addLog({ type: 'error', label: 'undo', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      loadCommits();
+      refreshRepoMap();
+    }
+  }, [running, activeWs, commits, loadCommits, refreshRepoMap]);
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
   const setPerms = (next: PermConfig) => {
@@ -1055,6 +1116,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000);
     return { ok: true, preview: (d.stdout || '').slice(0, 4000) };
   };
+  /** Post-edit verification: lint (falls back to build) then test, each bounded.
+   * Returns extra result fields; the first failure stops the chain so the
+   * model sees one error to fix at a time. */
+  const runPostEditChecks = async (res: unknown, preview: string): Promise<Record<string, unknown>> => {
+    const out: Record<string, unknown> = { ...(res as Record<string, unknown>), ...(preview ? { preview_diff: preview } : {}) };
+    const cfg = await getConfig();
+    const lintCmd = cfg.lintCommand || cfg.buildCommand;
+    if (lintCmd) {
+      const check = await coderExec(lintCmd, undefined, 60000);
+      if (check.exitCode !== 0) {
+        return { ...out, linter_error: check.stderr || check.stdout };
+      }
+    }
+    if (cfg.testCommand) {
+      const t = await coderExec(cfg.testCommand, undefined, 120000);
+      if (t.exitCode !== 0) {
+        return { ...out, test_error: t.stderr || t.stdout };
+      }
+    }
+    return out;
+  };
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
     let mutated = false;
@@ -1092,9 +1174,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         }
         if (result === '' && (permVerdict === null || approvedAfterAsk)) {
           if (call.name === 'bash') {
-          logType = 'bash'; logDetail = args.command;
-          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs);
+          logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
+          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs, args.background === true);
           result = JSON.stringify(res);
+          if (args.background === true) mutated = true;
+        } else if (call.name === 'bash_poll') {
+          logType = 'bash'; logDetail = `poll ${args.jobId}`;
+          try {
+            const res = await coderJob(String(args.jobId || ''));
+            result = JSON.stringify(res);
+          } catch (e) {
+            result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+          }
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;
           const res = await coderRead(args.path, args.offset, args.limit);
@@ -1104,12 +1195,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const res = await coderWrite(args.path, args.content);
           mutated = true;
           const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`);
-          result = JSON.stringify({ ...res, preview_diff: preview || undefined });
-          const cfg = await getConfig();
-          if (cfg.buildCommand) {
-            const check = await coderExec(cfg.buildCommand, undefined, 30000);
-            if (check.exitCode !== 0) result = JSON.stringify({ ...res, preview_diff: preview || undefined, linter_error: check.stderr || check.stdout });
-          }
+          result = JSON.stringify(await runPostEditChecks(res, preview));
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
           const res = await coderEdit(args.path, args.old, args.new, args.replaceAll);
@@ -1117,12 +1203,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           mutated = true;
           if (res.replacements > 0) {
              const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`);
-             if (preview) result = JSON.stringify({ ...res, preview_diff: preview });
-             const cfg = await getConfig();
-             if (cfg.buildCommand) {
-               const check = await coderExec(cfg.buildCommand, undefined, 30000);
-               if (check.exitCode !== 0) result = JSON.stringify({ ...res, ...(preview ? { preview_diff: preview } : {}), linter_error: check.stderr || check.stdout });
-             }
+             result = JSON.stringify(await runPostEditChecks(res, preview));
           }
         } else if (call.name === 'apply_patch') {
           logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
@@ -1131,12 +1212,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           mutated = true;
           if (res.replacements > 0) {
              const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`);
-             if (preview) result = JSON.stringify({ ...res, preview_diff: preview });
-             const cfg = await getConfig();
-             if (cfg.buildCommand) {
-               const check = await coderExec(cfg.buildCommand, undefined, 30000);
-               if (check.exitCode !== 0) result = JSON.stringify({ ...res, ...(preview ? { preview_diff: preview } : {}), linter_error: check.stderr || check.stdout });
-             }
+             result = JSON.stringify(await runPostEditChecks(res, preview));
           }
         } else if (call.name === 'git_branch') {
           const action = String(args.action || 'list');
@@ -1894,7 +1970,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         <div className="shrink-0 border-t border-line p-2">
           <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
             <Shield size={13} /> Permissions
+            <button
+              type="button"
+              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
+              title={permsOpen ? 'Collapse' : 'Expand'}
+              onClick={() => setPermsOpen((o) => !o)}
+            >
+              {permsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            </button>
           </div>
+          {permsOpen && (
+          <>
           {!activeWs ? (
             <div className="text-[10.5px] italic text-faint">Select a workspace.</div>
           ) : (
@@ -1935,6 +2021,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 className="mt-1.5 w-full rounded border border-line bg-inset px-1.5 py-1 font-mono text-[10.5px] outline-none placeholder:text-faint focus:border-accent/50"
               />
             </>
+          )}
+          </>
           )}
         </div>
 
@@ -2050,6 +2138,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             title="Export transcript as Markdown"
           >
             <Download size={13} />
+          </button>
+          <button
+            type="button"
+            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            onClick={undoLastCommit}
+            disabled={!activeWs || running || commits.length === 0}
+            title="Undo last commit (changes stay in the worktree)"
+          >
+            <Undo2 size={13} />
           </button>
           <button
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"

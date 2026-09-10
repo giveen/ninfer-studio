@@ -39,6 +39,12 @@ pub struct AppSettings {
     pub api_key: String,
     pub hf_cli: String,
     pub build_command: String,
+    /// Command run in the Coder workspace after agent edits (lint/typecheck).
+    /// Empty = unset. Falls back to `build_command` when empty.
+    pub lint_command: String,
+    /// Command run in the Coder workspace after the lint check passes (tests).
+    /// Empty = unset (no test step).
+    pub test_command: String,
     /// JSON object merged (as defaults) into every proxied /v1 request body, so
     /// external clients (e.g. other coding harnesses) inherit these params without
     /// configuring each tool. Client-supplied fields win over these defaults.
@@ -67,6 +73,8 @@ impl Default for AppSettings {
             api_key: String::new(),
             hf_cli: "hf".into(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
+            lint_command: String::new(),
+            test_command: String::new(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),
             coder_workspace: String::new(),

@@ -42,6 +42,32 @@ function setSessionCwd(sessionId, cwd) {
   if (sessionId) shellSessions.set(sessionId, cwd);
 }
 const CWD_MARKER = '<ninfx_cwd>';
+// Background shell jobs: long builds/tests run detached so the agentic loop
+// isn't blocked on a response timeout. The client starts a job via
+// POST /api/coder/exec {background:true}, polls GET /api/coder/jobs/:id,
+// and may stop it via POST /api/coder/jobs/:id/kill. Output is tail-capped.
+// Jobs die with their timeout (execCommand kills on timeout) or via kill.
+const bgJobs = new Map();
+const MAX_JOBS = 32;
+function startBgJob(command, relCwd, timeoutMs, sessionId) {
+  if (bgJobs.size >= MAX_JOBS) {
+    const oldest = bgJobs.keys().next().value;
+    bgJobs.get(oldest)?.proc?.kill('SIGKILL');
+    bgJobs.delete(oldest);
+  }
+  const id = `job_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const rec = { id, command, done: false, exitCode: null, timedOut: false, truncated: false, stdout: '', stderr: '', startedAt: Date.now(), proc: null };
+  bgJobs.set(id, rec);
+  execCommand(command, relCwd, timeoutMs, sessionId, { onSpawn: (proc) => { rec.proc = proc; } }).then((r) => {
+    Object.assign(rec, { done: true, proc: null, exitCode: r.exitCode, timedOut: !!r.timedOut, truncated: !!r.truncated, stdout: r.stdout || '', stderr: r.stderr || '' });
+  }).catch((e) => {
+    Object.assign(rec, { done: true, proc: null, stdout: '', stderr: String(e?.message || e) });
+  });
+  return id;
+}
+function bgJobView(rec) {
+  return { id: rec.id, command: rec.command, done: rec.done, exitCode: rec.exitCode, timedOut: rec.timedOut, truncated: rec.truncated, startedAt: rec.startedAt, stdout: capOut(rec.stdout), stderr: capOut(rec.stderr) };
+}
 
 // ---------------------------------------------------------------------------
 // Loopback HTTP helper. We deliberately avoid the global `fetch` (undici) for
@@ -179,6 +205,8 @@ const defaultConfig = {
   apiKey: '',
   hfCli: 'hf',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
+  lintCommand: '',
+  testCommand: '',
   reasoningEffort: '',
 };
 
@@ -1252,7 +1280,7 @@ function stripCwdMarker(sessionId, buf) {
   return buf.slice(0, mi);
 }
 
-function execCommand(command, relCwd, timeoutMs, sessionId) {
+function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
   if (coderSafeMode) {
     const reason = detectDestructive(command);
     if (reason) {
@@ -1286,6 +1314,7 @@ function execCommand(command, relCwd, timeoutMs, sessionId) {
     let proc;
     try {
       proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
+      if (hooks?.onSpawn) hooks.onSpawn(proc);
     } catch (err) {
       return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: resultCwd, error: err.message });
     }
@@ -1678,8 +1707,30 @@ async function handleCoder(req, res, p, url) {
     if (p === '/api/coder/exec' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
       if (!body?.command || typeof body.command !== 'string') return sendJson(res, 400, { error: 'command required' });
+      if (body.background) {
+        const root = coderRoot();
+        if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
+        const id = startBgJob(body.command, body.cwd, body.timeoutMs, body.sessionId);
+        return sendJson(res, 200, { jobId: id, started: true });
+      }
       const r = await execCommand(body.command, body.cwd, body.timeoutMs, body.sessionId);
       return sendJson(res, 200, r);
+    }
+    if (p.startsWith('/api/coder/jobs/') && (req.method === 'GET' || req.method === 'POST')) {
+      const rest = p.slice('/api/coder/jobs/'.length);
+      const kill = rest.endsWith('/kill');
+      const id = kill ? rest.slice(0, -'/kill'.length) : rest;
+      const rec = bgJobs.get(id);
+      if (!rec) return sendJson(res, 404, { error: 'unknown job' });
+      if (kill && req.method === 'POST') {
+        if (!rec.done) {
+          try { rec.proc?.kill('SIGKILL'); } catch { /* already exited */ }
+          rec.done = true;
+        }
+        return sendJson(res, 200, bgJobView(rec));
+      }
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+      return sendJson(res, 200, bgJobView(rec));
     }
     if (p === '/api/coder/grep' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

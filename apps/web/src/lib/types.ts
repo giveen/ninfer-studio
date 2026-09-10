@@ -65,6 +65,8 @@ export interface AppSettings {
   apiKey: string;
   hfCli: string;
   buildCommand: string;
+  lintCommand: string;
+  testCommand: string;
   /** JSON object merged (as defaults) into every proxied /v1 request body. */
   defaultRequestParams: string;
   /** Global default reasoning effort injected into chat_template_kwargs.reasoning_effort for every proxied request (client fields win). '' = unset. */
@@ -370,6 +372,22 @@ export interface CoderExecResult {
   /** True when the command was refused by safe mode (see detectDestructive). */
   blocked?: boolean;
   cwd: string;
+  error?: string;
+  /** Present when started with background:true — poll with coderJob(). */
+  jobId?: string;
+  started?: boolean;
+}
+export interface CoderJob {
+  jobId: string;
+  command: string;
+  done: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  killed?: boolean;
+  truncated?: boolean;
+  stdout: string;
+  stderr: string;
+  cwd?: string;
   error?: string;
 }
 export interface GrepMatch {

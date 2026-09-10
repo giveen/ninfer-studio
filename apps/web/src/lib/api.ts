@@ -8,6 +8,7 @@ import type {
   CoderExecResult,
   CoderGlobResult,
   CoderGrepResult,
+  CoderJob,
   CoderMessage,
   CoderReadResult,
   CoderTodo,
@@ -542,8 +543,14 @@ export interface CoderPatchEdit { old: string; new: string; replaceAll?: boolean
 export function coderPatch(path: string, edits: CoderPatchEdit[]): Promise<CoderEditResult> {
   return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000);
 }
-export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string): Promise<CoderExecResult> {
-  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId }, 15_000);
+export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean): Promise<CoderExecResult> {
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background }, 15_000);
+}
+export function coderJob(jobId: string): Promise<CoderJob> {
+  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000);
+}
+export function coderJobKill(jobId: string): Promise<CoderJob> {
+  return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, {}, 15_000);
 }
 export function coderGrep(pattern: string, path?: string, include?: string, ignoreCase?: boolean): Promise<CoderGrepResult> {
   return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase }, 15_000);
