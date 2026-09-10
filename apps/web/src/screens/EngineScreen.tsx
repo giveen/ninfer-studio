@@ -272,6 +272,13 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     setBusy('start');
     setNotice(null);
     try {
+      // Stop any existing engine first so the launched process always reflects
+      // the current form. Without this, an adopted/orphaned engine (e.g. one
+      // discovered on the default port at boot) keeps serving while a second
+      // engine is spawned elsewhere — which looks exactly like "the settings
+      // were ignored" because the stale process is the one actually answering.
+      await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
+      await new Promise((res) => setTimeout(res, 800));
       const r = await startEngine(profile, artifact || null);
       if (r.code === 'already_serving') setNotice({ tone: 'warn', text: `Port ${profile.port} already serves an engine — adopted as external (see Engine status).` });
       else if (!r.ok) setNotice({ tone: 'danger', text: r.message || 'start failed' });
