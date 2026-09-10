@@ -795,7 +795,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const args = JSON.parse(call.arguments);
         if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.command;
-          const res = await coderExec(args.command, undefined, args.timeoutMs);
+          const res = await coderExec(args.command, undefined, args.timeoutMs, activeWs);
           result = JSON.stringify(res);
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;

@@ -30,6 +30,19 @@ import { JSDOM } from 'jsdom';
 // trusted workflows via the Coder UI toggle (persisted only for the session).
 let coderSafeMode = true;
 
+// Per-session working directories so the agent's shell calls behave like a
+// stateful terminal (cd / navigation persists across calls). Keyed by an
+// arbitrary session id (the web passes the active workspace). We avoid a
+// long-lived shell process to keep the sidecar crash-safe (no orphan PTYs).
+const shellSessions = new Map();
+function sessionCwd(sessionId) {
+  return (sessionId && shellSessions.get(sessionId)) || coderRoot();
+}
+function setSessionCwd(sessionId, cwd) {
+  if (sessionId) shellSessions.set(sessionId, cwd);
+}
+const CWD_MARKER = '<ninfx_cwd>';
+
 // ---------------------------------------------------------------------------
 // Loopback HTTP helper. We deliberately avoid the global `fetch` (undici) for
 // engine calls: inside the sandbox undici fails to connect to 127.0.0.1 (it
@@ -1185,7 +1198,20 @@ function detectDestructive(cmd) {
   return null;
 }
 
-function execCommand(command, relCwd, timeoutMs) {
+// Pull the session cwd out of a command's stdout (the marker is appended last)
+// and update the session map. Returns the stdout with the marker stripped.
+function stripCwdMarker(sessionId, buf) {
+  if (!sessionId) return buf;
+  const mi = buf.indexOf(CWD_MARKER);
+  if (mi < 0) return buf;
+  const end = buf.indexOf(CWD_MARKER, mi + CWD_MARKER.length);
+  if (end <= mi) return buf;
+  const newCwd = buf.slice(mi + CWD_MARKER.length, end).trim();
+  if (newCwd) setSessionCwd(sessionId, newCwd);
+  return buf.slice(0, mi);
+}
+
+function execCommand(command, relCwd, timeoutMs, sessionId) {
   if (coderSafeMode) {
     const reason = detectDestructive(command);
     if (reason) {
@@ -1203,14 +1229,24 @@ function execCommand(command, relCwd, timeoutMs) {
     }
   }
   const root = coderRoot();
-  const cwd = relCwd ? withinWs(relCwd) : root;
+  let cwd = relCwd ? withinWs(relCwd) : root;
+  // Stateful-shell support: persist cwd across calls within a session. We wrap the
+  // command to cd into the session dir and echo the resulting PWD via a marker
+  // (stripped before returning). No long-lived process, so no orphan shells.
+  let runCmd = command;
+  if (sessionId) {
+    const base = sessionCwd(sessionId);
+    runCmd = `cd ${JSON.stringify(base)} 2>/dev/null || true\n${command}\nprintf '\\n${CWD_MARKER}%s${CWD_MARKER}\n' "$PWD"`;
+    cwd = root;
+  }
+  const resultCwd = sessionId ? sessionCwd(sessionId) : relOf(cwd);
   const timeout = Math.min(Math.max(timeoutMs || 120000, 1000), 600000);
   return new Promise((resolve) => {
     let proc;
     try {
-      proc = spawn('bash', ['-lc', command], { cwd, env: process.env });
+      proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
     } catch (err) {
-      return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: relOf(cwd), error: err.message });
+      return resolve({ stdout: '', stderr: String(err.message), exitCode: null, timedOut: false, cwd: resultCwd, error: err.message });
     }
     let stdout = '';
     let stderr = '';
@@ -1224,7 +1260,7 @@ function execCommand(command, relCwd, timeoutMs) {
       } catch {
         /* ignore */
       }
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, cwd: relOf(cwd) });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, cwd: resultCwd });
     }, timeout);
     proc.stdout.on('data', (d) => {
       stdout += d;
@@ -1240,13 +1276,13 @@ function execCommand(command, relCwd, timeoutMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, cwd: relOf(cwd), error: err.message });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, cwd: resultCwd, error: err.message });
     });
     proc.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: capOut(stdout), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, cwd: relOf(cwd) });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, cwd: resultCwd });
     });
   });
 }
@@ -1563,7 +1599,7 @@ async function handleCoder(req, res, p, url) {
     if (p === '/api/coder/exec' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
       if (!body?.command || typeof body.command !== 'string') return sendJson(res, 400, { error: 'command required' });
-      const r = await execCommand(body.command, body.cwd, body.timeoutMs);
+      const r = await execCommand(body.command, body.cwd, body.timeoutMs, body.sessionId);
       return sendJson(res, 200, r);
     }
     if (p === '/api/coder/grep' && req.method === 'POST') {

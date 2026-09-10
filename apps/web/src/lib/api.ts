@@ -538,8 +538,8 @@ export function coderWrite(path: string, content: string): Promise<CoderWriteRes
 export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false): Promise<CoderEditResult> {
   return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000);
 }
-export function coderExec(command: string, cwd?: string, timeoutMs?: number): Promise<CoderExecResult> {
-  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs }, 15_000);
+export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string): Promise<CoderExecResult> {
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId }, 15_000);
 }
 export function coderGrep(pattern: string, path?: string, include?: string, ignoreCase?: boolean): Promise<CoderGrepResult> {
   return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase }, 15_000);
