@@ -613,7 +613,7 @@ const redactSecrets = (s: string): string => {
 type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number };
 type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
 type PermTier = 'allow' | 'ask' | 'deny';
-interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; }
+interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; approvedCommands?: string[]; }
 const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
 const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
@@ -1579,6 +1579,76 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   };
 
+  // ---------------------------------------------------------------------------
+  // Per-workspace risky-command approval memory.
+  //
+  // Some bash commands have external / hard-to-reverse side effects (pushing to a
+  // remote, publishing a package, SSH to a host, mutating cloud/infra, running as
+  // root). When the agent issues one, we pause for human-in-the-loop review. If the
+  // human approves *and* asks to remember, the (normalized) command is added to
+  // this workspace's `approvedCommands` so future matching commands run without
+  // re-prompting. `detectDestructive` (server-side safe mode) still hard-blocks the
+  // truly catastrophic ones; this layer is for "risky but allowed with a yay/nay".
+  // ---------------------------------------------------------------------------
+  const RISKY_PATTERNS: Array<[RegExp, string]> = [
+    [/\bgit\s+push\b[^]*?(--force|-f\b|--delete)\b/i, 'force-pushes or deletes remote refs'],
+    [/\bgit\s+push\b/i, 'pushes commits to a remote'],
+    [/\b(npm|pnpm|yarn)\s+publish\b/i, 'publishes a package to a registry'],
+    [/\bcargo\s+publish\b/i, 'publishes a crate'],
+    [/\btwine\s+upload\b/i, 'uploads a release to PyPI'],
+    [/\bgh\s+(pr|release|api)\b/i, 'creates a GitHub release/PR via gh'],
+    [/\b(sudo|su|doas)\b/i, 'runs a command as another user (root)'],
+    [/\bssh\b(?!-)/i, 'opens an SSH connection to a remote host'],
+    [/\b(scp|rsync|sftp)\b/i, 'transfers files to/from a remote host'],
+    [/\b(docker|podman)\b/i, 'runs containers'],
+    [/\b(kubectl|helm|terraform\s+apply|ansible)\b/i, 'applies infrastructure changes'],
+    [/\b(aws|gcloud|az)\b[^]*?\b(ec2|s3|deploy|apply|create|delete|update|push)\b/i, 'mutates cloud resources'],
+    [/\b(apt|apt-get|yum|dnf|apk)\b\s+(install|remove|upgrade|update)\b/i, 'changes system packages'],
+    [/\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b/i, 'installs a global package'],
+  ];
+  const detectRisky = (cmd: string): string | null => {
+    for (const [re, why] of RISKY_PATTERNS) if (re.test(cmd)) return why;
+    return null;
+  };
+  const normalizeCommand = (cmd: string): string => cmd.replace(/\s+/g, ' ').trim();
+  const isApprovedCommand = (cmd: string, approved: string[] = []): boolean => {
+    const c = normalizeCommand(cmd);
+    return approved.some((a) => {
+      const na = normalizeCommand(a);
+      return c === na || c.startsWith(na + ' ');
+    });
+  };
+  const addApprovedCommand = (cmd: string) => {
+    const norm = normalizeCommand(cmd);
+    setStore((prev) => {
+      const wsd = prev.workspaces[activeWs];
+      if (!wsd) return prev;
+      const cur = wsd.perms?.approvedCommands || [];
+      if (cur.includes(norm)) return prev;
+      return {
+        ...prev,
+        workspaces: {
+          ...prev.workspaces,
+          [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: [...cur, norm] } },
+        },
+      };
+    });
+  };
+
+  // Risky-command HITL dialog: Deny / Approve once / Approve & remember.
+  const [riskyApproval, setRiskyApproval] = useState<{ command: string; reason: string } | null>(null);
+  const riskyResolveRef = useRef<((v: 'deny' | 'once' | 'remember') => void) | null>(null);
+  const requestRiskyApproval = (command: string, reason: string): Promise<'deny' | 'once' | 'remember'> => {
+    setRiskyApproval({ command, reason });
+    return new Promise((resolve) => {
+      riskyResolveRef.current = (v) => {
+        riskyResolveRef.current = null;
+        setRiskyApproval(null);
+        resolve(v);
+      };
+    });
+  };
+
   /** Stage + auto-commit one file, returning a bounded unified-diff preview. */
   const commitFile = async (path: string, message: string): Promise<{ ok: boolean; preview: string }> => {
     const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -1648,24 +1718,42 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (result === '' && (permVerdict === null || approvedAfterAsk)) {
           if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
-          // Commit-approval gate: a shell `git commit` must be signed off too.
-          let commitBlocked = false;
-          if (commitApproval && isGitCommitCommand(String(args.command || ''))) {
-            addLog({ type: 'ask', label: 'bash', detail: 'git commit — awaiting human review' });
-            const ok = await requestCommitApproval();
-            addLog({ type: ok ? 'bash' : 'error', label: 'bash', detail: ok ? 'approved' : 'denied by user' });
-            if (!ok) commitBlocked = true;
+          // Risky-command HITL gate + per-workspace approval memory. Truly
+          // catastrophic commands are already hard-blocked by server-side safe mode;
+          // this pauses on *risky but allowed* operations and learns approvals so the
+          // user isn't prompted again for the same command in this workspace.
+          const command0 = String(args.command || '');
+          const riskyReason = detectRisky(command0);
+          if (riskyReason && !isApprovedCommand(command0, perms.approvedCommands || [])) {
+            addLog({ type: 'ask', label: 'bash', detail: `risky: ${command0}` });
+            const v = await requestRiskyApproval(command0, riskyReason);
+            addLog({ type: v === 'deny' ? 'error' : 'bash', label: 'bash', detail: v === 'deny' ? `denied: ${command0}` : `approved (${v}): ${command0}` });
+            if (v === 'deny') {
+              result = JSON.stringify({ error: `Risky command denied by the user: ${riskyReason}. Use a safer alternative or ask.` });
+            } else if (v === 'remember') {
+              addApprovedCommand(command0);
+            }
           }
-          if (commitBlocked) {
-            result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
-          } else {
-            const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
-            result = JSON.stringify(res);
-            if (args.background === true) mutated = true;
-            if (res.jobId) {
-              const id = res.jobId;
-              const cmd = String(args.command || '');
-              setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+          if (result === '') {
+            // Commit-approval gate: a shell `git commit` must be signed off too.
+            let commitBlocked = false;
+            if (commitApproval && isGitCommitCommand(String(args.command || ''))) {
+              addLog({ type: 'ask', label: 'bash', detail: 'git commit — awaiting human review' });
+              const ok = await requestCommitApproval();
+              addLog({ type: ok ? 'bash' : 'error', label: 'bash', detail: ok ? 'approved' : 'denied by user' });
+              if (!ok) commitBlocked = true;
+            }
+            if (commitBlocked) {
+              result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
+            } else {
+              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
+              result = JSON.stringify(res);
+              if (args.background === true) mutated = true;
+              if (res.jobId) {
+                const id = res.jobId;
+                const cmd = String(args.command || '');
+                setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+              }
             }
           }
         } else if (call.name === 'bash_poll') {
@@ -2996,6 +3084,33 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                 className="mt-1.5 w-full rounded border border-line bg-inset px-1.5 py-1 font-mono text-[10.5px] outline-none placeholder:text-faint focus:border-accent/50"
               />
+              <div className="mt-2">
+                <div className="mb-1 text-[10.5px] font-semibold text-mute">Approved risky commands</div>
+                {(perms.approvedCommands || []).length === 0 ? (
+                  <div className="text-[10px] italic text-faint">None yet. Risky commands (push, publish, ssh, sudo, docker, cloud/infra mutations…) prompt for approval; choose &quot;Approve &amp; remember&quot; to whitelist them here for this workspace.</div>
+                ) : (
+                  <div className="max-h-28 space-y-1 overflow-auto">
+                    {(perms.approvedCommands || []).map((c) => (
+                      <div key={c} className="flex items-center gap-1 rounded border border-line bg-inset px-1.5 py-0.5">
+                        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-mute" title={c}>{c}</span>
+                        <button
+                          type="button"
+                          onClick={() => setStore((prev) => {
+                            const wsd = prev.workspaces[activeWs];
+                            if (!wsd) return prev;
+                            const cur = wsd.perms?.approvedCommands || [];
+                            return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: cur.filter((x) => x !== c) } } } };
+                          })}
+                          className="shrink-0 rounded p-0.5 text-faint hover:bg-danger/10 hover:text-danger"
+                          title="Remove from approved list"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </>
           )}
           </>
@@ -3521,6 +3636,35 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
         </div>
       )}
+      {riskyApproval && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-[520px] rounded-xl border border-warn/40 bg-panel shadow-xl">
+            <div className="border-b border-line p-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-warn">
+                <Shield size={14} /> Risky command — approval required
+              </div>
+              <div className="mt-0.5 text-[11.5px] text-faint">
+                This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.
+              </div>
+            </div>
+            <div className="max-h-48 overflow-auto p-3 font-mono text-[12px] whitespace-pre-wrap break-all text-ink">
+              {redactSecrets(riskyApproval.command) || '(no command)'}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-line p-2.5">
+              <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('deny')}>
+                Deny
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('once')}>
+                Approve once
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => riskyResolveRef.current?.('remember')}>
+                Approve &amp; remember
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Diff-review viewer: working-tree vs HEAD, opened from the toolbar "Diff" button. */}
       <DiffReviewModal
         open={diffViewOpen}
