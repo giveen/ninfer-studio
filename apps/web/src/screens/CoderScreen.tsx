@@ -484,6 +484,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWs, loadCommits]);
 
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
+  // The system prompt (CODER_SYSTEM + live repo map). Kept in a ref so it can be
+  // refreshed mid-run after the agent writes/edits files (P1 #6).
+  const dynamicSystemRef = useRef<string>(CODER_SYSTEM);
 
   /** Load a conversation's live state from the store (always reads the latest). */
   const loadConv = (ws: string, convId: string) => {
@@ -710,8 +713,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setLedger((prev) => [...prev.slice(-999), { ...entry, id: Math.random().toString(36).slice(2), time: Date.now() }]);
   };
 
-  const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[]) => {
+  // Rebuild the system prompt, refreshing the codebase map so the agent sees files
+  // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
+  const refreshRepoMap = useCallback(async () => {
+    let sys = CODER_SYSTEM;
+    try {
+      const rMap = await coderRepoMap();
+      if (rMap && rMap.map) {
+        sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${rMap.map}\n\`\`\`\n`;
+      }
+    } catch { /* ignore */ }
+    dynamicSystemRef.current = sys;
+  }, []);
+
+  const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
+    let mutated = false;
     
     for (const call of calls) {
       let result = '';
@@ -733,6 +750,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'write'; logDetail = args.path;
           const res = await coderWrite(args.path, args.content);
           result = JSON.stringify(res);
+          mutated = true;
           await coderExec(`git add "${args.path}" && git commit -m "Agent auto-commit: wrote ${args.path}"`, undefined, 10000);
           const cfg = await getConfig();
           if (cfg.buildCommand) {
@@ -743,6 +761,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'edit'; logDetail = args.path;
           const res = await coderEdit(args.path, args.old, args.new, args.replaceAll);
           result = JSON.stringify(res);
+          mutated = true;
           if (res.replacements > 0) {
              await coderExec(`git add "${args.path}" && git commit -m "Agent auto-commit: edited ${args.path}"`, undefined, 10000);
              const cfg = await getConfig();
@@ -795,20 +814,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         name: call.name
       });
     }
-    
+
+    if (mutated) {
+      try { await onMutated?.(); } catch { /* ignore */ }
+    }
     return nextMessages;
   };
   const runAgent = async (initialMessages: ChatMessage[]) => {
     setRunning(true);
     let currentMessages = initialMessages;
     
-    let dynamicSystem = CODER_SYSTEM;
-    try {
-      const rMap = await coderRepoMap();
-      if (rMap && rMap.map) {
-         dynamicSystem += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${rMap.map}\n\`\`\`\n`;
-      }
-    } catch (e) {}
+    // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
+    // after file mutations during the run (P1 #6).
+    await refreshRepoMap();
 
     abortRef.current = new AbortController();
 
@@ -837,7 +855,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
     // Rough token estimate (~4 chars/token) used as a safety net so a single turn
     // whose tool results push past the window is caught before we send it (P1 #4).
-    const sysTokenEstimate = Math.ceil(dynamicSystem.length / 4);
+    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / 4);
     const estimateTokens = (msgs: ChatMessage[]): number => {
       let n = sysTokenEstimate;
       for (const m of msgs) {
@@ -862,7 +880,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             const summary = await summarizeConversation({
               model,
-              systemPrompt: dynamicSystem,
+              systemPrompt: dynamicSystemRef.current,
               history: currentMessages,
               maxTokens: 2048,
             });
@@ -894,7 +912,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
         
-        const req = buildChatRequest(model, dynamicSystem, currentMessages, { thinking: true, maxTokens: 8192 } as ChatParams, { tools: TOOLS });
+        const req = buildChatRequest(model, dynamicSystemRef.current, currentMessages, { thinking: true, maxTokens: 8192 } as ChatParams, { tools: TOOLS });
         
         await streamChat(req, abortRef.current.signal, {
           onContentDelta: (text) => { content += text; },
@@ -915,7 +933,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         
         if (toolCalls.length > 0) {
           const before = currentMessages.length;
-          currentMessages = await handleToolCalls(toolCalls, currentMessages);
+          currentMessages = await handleToolCalls(toolCalls, currentMessages, refreshRepoMap);
           // Append only the new tool results to the visible transcript.
           setMessages((prev) => [...prev, ...currentMessages.slice(before)]);
         } else {
