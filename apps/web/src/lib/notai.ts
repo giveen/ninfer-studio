@@ -371,14 +371,32 @@ export async function humanizeRewriteText(opts: {
   const res = evaluate(opts.originalText, effectiveVoice(opts.params), {});
   const instruction: ChatMessage = { role: 'user', content: humanizeInstruction(opts.originalText, res) };
   const messages = [...opts.priorMessages, instruction];
-  const body = buildChatRequest(opts.model, opts.baseSystem, messages, { ...opts.params, maxTokens: undefined as unknown as number }, {});
+  const body = buildChatRequest(
+    opts.model,
+    opts.baseSystem,
+    messages,
+    // The rewrite can never need more tokens than the reply it is rewriting
+    // (that reply was itself generated under this cap). Leaving it uncapped
+    // lets the engine's own --default-max-tokens govern — e.g. 32000 tokens —
+    // and the rewrite "streams" for many minutes, looking like a reply that
+    // never finishes and blocking STOP/persistence the whole time.
+    { ...opts.params, maxTokens: opts.params.maxTokens ?? HUMANIZE_REWRITE_MAX_TOKENS },
+    {},
+  );
   let acc = '';
   await streamChat(body, opts.signal ?? AbortSignal.timeout(120_000), {
     onContentDelta: (d) => { acc += d; },
     onError: (m) => { throw new Error(m); },
   });
+  // streamChat resolves (rather than rejects) on abort, so a partial rewrite
+  // would otherwise replace the finished reply. Bail out when aborted — the
+  // caller keeps the original text.
+  if (opts.signal?.aborted) return '';
   return acc.trim();
 }
 
 // Match the upstream hard cap on retries so a stubborn reply can't loop forever.
 export const HUMANIZE_MAX_DEPTH = 2;
+
+// Hard cap for the Not-Ai rewrite pass (see humanizeRewriteText above).
+export const HUMANIZE_REWRITE_MAX_TOKENS = 2048;

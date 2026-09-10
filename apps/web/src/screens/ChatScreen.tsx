@@ -616,16 +616,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   useEffect(() => {
     if (!loaded) return;
-    // Don't persist on every streamed token — that would POST the whole
-    // conversation to the control plane per delta (thrashing the main thread and
-    // the control plane mid-generation). Persist on turn completion (streaming
-    // flips false) and on structural changes like new/delete/rename, debounced.
-    if (streaming) return;
+    // Persist on a quiet-period debounce: token deltas keep resetting the timer
+    // during active generation (no per-delta POST thrashing), and the moment
+    // generation pauses or ends — including the silent Not-Ai rewrite pass —
+    // the turn is saved. Gating on `streaming` instead skipped the save
+    // entirely when the user navigated away mid-rewrite, so the whole turn was
+    // lost on return (hydration restored the pre-turn snapshot).
     const t = setTimeout(() => {
       saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
-    }, 400);
+    }, 1500);
     return () => clearTimeout(t);
-  }, [convs, params, loaded, streaming]);
+  }, [convs, params, loaded]);
   const setParams = useCallback((p: ChatParams) => setParamsState(p), []);
 
   const active = convs.find((c) => c.id === activeId) || null;
@@ -784,10 +785,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
                   priorMessages: msgs.slice(0, idx),
                   originalText: target.content,
-                  params: { ...params, maxTokens: undefined },
+                  params,
                   signal: ac.signal,
                 });
-                if (rewritten && rewritten.trim() && rewritten.trim() !== target.content.trim()) {
+                if (!ac.signal.aborted && rewritten && rewritten.trim() && rewritten.trim() !== target.content.trim()) {
                   setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
                     ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: rewritten } : m)),
                   }));

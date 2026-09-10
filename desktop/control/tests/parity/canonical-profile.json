@@ -1,0 +1,79 @@
+{
+  "comment": "Shared contract for the two build_serve_args implementations (apps/sidecar/serve-args.js and desktop/control/src/types.rs). Cases are camelCase EngineProfile JSON exactly as the web UI posts them; expected-args.json is the argv both implementations must produce. Any drift between the two builders fails scripts/args-parity.mjs (Node) or the parity test in types.rs (cargo test -p ninfier-control).",
+  "cases": [
+    {
+      "name": "full profile — every mapped flag",
+      "port": 8095,
+      "profile": {
+        "host": "127.0.0.1",
+        "port": 8095,
+        "apiKey": "sk-test-key",
+        "modelId": "qwen-coder",
+        "maxContext": 240000,
+        "kvCapacity": 240000,
+        "maxConcurrency": 2,
+        "maxPendingRequests": 7,
+        "pendingTimeoutMs": 5000,
+        "prefillChunk": 1024,
+        "logStatsIntervalMs": 2000,
+        "logLevel": "info",
+        "device": 0,
+        "contextCostPresets": "presets.json",
+        "maxRequestMib": 64,
+        "mediaCacheMib": 256,
+        "mediaLiveMib": 128,
+        "mediaPreprocessThreads": 3,
+        "requestLogJsonl": "requests.jsonl",
+        "responseStoreMaxRecords": 1000,
+        "responseStoreMaxMib": 512,
+        "kvDtype": "fp8",
+        "spec": "mtp",
+        "draftTokens": 3,
+        "lmHeadDraft": true,
+        "defaultMaxTokens": 32000,
+        "defaultThinkingBudget": 512,
+        "vision": true,
+        "noCudaGraph": true,
+        "noPrefixReuse": true,
+        "deviceStateSlots": 2,
+        "hostStateSlots": 8,
+        "hostKvMib": 8192,
+        "maxPrivateContinuations": 4,
+        "maxSharedPrefixes": 6,
+        "maxLongAnchorsPerContinuation": 2,
+        "noThinking": true,
+        "preserveThinking": true,
+        "temperature": 0.7,
+        "topP": 0.95,
+        "topK": 20,
+        "minP": 0.05,
+        "presencePenalty": 0.1,
+        "frequencyPenalty": 0.2,
+        "seed": 42,
+        "greedy": false,
+        "cors": true
+      }
+    },
+    {
+      "name": "auto KV capacity — number-or-auto union",
+      "port": 8081,
+      "profile": {
+        "host": "0.0.0.0",
+        "port": 8081,
+        "maxContext": 32768,
+        "kvCapacity": "auto",
+        "spec": "dflash2",
+        "draftTokens": 4,
+        "vision": false
+      }
+    },
+    {
+      "name": "minimal — unset fields emit no flags",
+      "port": 8080,
+      "profile": {
+        "port": 8080,
+        "host": "127.0.0.1"
+      }
+    }
+  ]
+}

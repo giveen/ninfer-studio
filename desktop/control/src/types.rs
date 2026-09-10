@@ -538,3 +538,46 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod parity {
+    use super::*;
+    use std::path::Path;
+
+    /// The Node sidecar's builder (apps/sidecar/serve-args.js) must produce
+    /// byte-identical argv to build_serve_args — dev launches and packaged
+    /// AppImage launches must behave the same. scripts/args-parity.mjs checks
+    /// the TS side against the same fixture; if either test fails, one of the
+    /// two builders drifted. Update the fixture with
+    /// `node scripts/args-parity.mjs --update` only for intentional changes,
+    /// then make the other implementation match.
+    #[test]
+    fn serve_args_match_typescript_fixture() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/parity");
+        let cases: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("canonical-profile.json"))
+                .expect("read canonical-profile.json"),
+        )
+        .expect("parse canonical-profile.json");
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("expected-args.json")).expect("read expected-args.json"),
+        )
+        .expect("parse expected-args.json");
+
+        let cases = cases["cases"].as_array().expect("cases array");
+        let expected = expected.as_array().expect("expected array");
+        assert_eq!(cases.len(), expected.len(), "parity case count drift");
+
+        for (case, want) in cases.iter().zip(expected.iter()) {
+            // Deserializing through the real EngineProfile also exercises the
+            // camelCase serde mapping the web UI depends on.
+            let profile: EngineProfile = serde_json::from_value(case["profile"].clone())
+                .unwrap_or_else(|e| panic!("profile {:?} failed to deserialize: {e}", case["name"]));
+            let port = case["port"].as_u64().expect("case port") as u16;
+            let got = build_serve_args(&profile, port);
+            let want: Vec<String> =
+                serde_json::from_value(want["args"].clone()).expect("expected args array");
+            assert_eq!(got, want, "argv drift for parity case {:?}", case["name"]);
+        }
+    }
+}
