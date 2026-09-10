@@ -364,7 +364,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.artifact = Some(artifact.clone());
         eng.model_id = None;
         let mut argv = vec![artifact.clone()];
-        argv.extend(args);
+        argv.extend(args.iter().cloned());
         eng.argv = Some(argv);
         eng.started_at = Some(now_ms());
         eng.log_path = Some(log_file_path);
@@ -374,7 +374,13 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     }
 
     let mut cmd = tokio::process::Command::new(&engine_binary);
+    // Attach the FULL built command line. `args` carries every flag from the
+    // user's profile (--port, --max-context, --kv-dtype, …); it was previously
+    // only recorded into state.argv for display while the spawned process got
+    // the artifact alone — so packaged apps launched engines at pure defaults
+    // no matter what the GUI said.
     cmd.arg(&artifact)
+        .args(&args)
         .current_dir(
             engine_binary
                 .parent()
