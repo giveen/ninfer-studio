@@ -3,6 +3,7 @@ import { Play, Square, X, BrainCircuit, Terminal, CheckSquare } from 'lucide-rea
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams } from '../lib/types';
 import { Button, CodeBlock, cn } from '../components/ui';
 import { Workspaces } from '../components/Workspaces';
+import { Markdown } from '../components/Markdown';
 import { coderTree, coderRepoMap, coderRead, coderWrite, coderEdit, coderExec, coderGrep, coderGlob, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace } from '../lib/api';
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
@@ -289,7 +290,9 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
                 <div className="text-[11px] text-mute border-l-2 border-accent/50 pl-2 mb-2 italic whitespace-pre-wrap">{m.reasoning}</div>
               )}
               {m.content && m.role !== 'tool' && (
-                <div className="text-[12px] whitespace-pre-wrap">{m.content}</div>
+                m.role === 'assistant'
+                  ? <div className="markdown text-[12px] leading-relaxed"><Markdown>{m.content}</Markdown></div>
+                  : <div className="text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (
                  <ToolResultBlock name={m.name!} content={m.content} />
@@ -666,7 +669,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
                   <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role}</div>
                   {g.items[0].content && (
-                    <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
+                    g.items[0].role === 'assistant'
+                      ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
+                      : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
                   )}
                 </div>
               )}
