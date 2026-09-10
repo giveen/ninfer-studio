@@ -20,6 +20,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
 3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself.
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
 5. **Completion**: Only emit a final conversational response when the ENTIRE task is fully complete, tested, and verified.
+6. **Context is managed for you**: this harness automatically compacts the conversation when it nears the model's context limit, replacing earlier turns with a concise summary checkpoint. You do NOT need to summarize manually — keep working normally and rely on the checkpoint to preserve prior context.
 `;
 
 const TOOLS = [
@@ -934,6 +935,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (toolCalls.length > 0) {
           const before = currentMessages.length;
           currentMessages = await handleToolCalls(toolCalls, currentMessages, refreshRepoMap);
+          // Keep the Commit History panel live as the agent commits changes.
+          loadCommits();
           // Append only the new tool results to the visible transcript.
           setMessages((prev) => [...prev, ...currentMessages.slice(before)]);
         } else {

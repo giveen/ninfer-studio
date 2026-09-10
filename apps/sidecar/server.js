@@ -1336,7 +1336,7 @@ async function handleCoder(req, res, p, url) {
       const root = coderRoot();
       if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
       try {
-        const r = await execCommand(`rg '^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)' -g '*.{ts,tsx,js,jsx,rs,py,go,c,cpp,h,java}' --no-heading --line-number`, '.', 10000);
+        const r = await execCommand(`rg '^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)' -g '*.{ts,tsx,js,jsx,mjs,cjs,rs,py,go,c,cpp,h,hpp,hh,java,rb,php,swift,kt,kts,scala,sc,cs,sh,bash,zsh,lua,r,ex,exs,erl,elm,hs,dart,sql}' --no-heading --line-number`, '.', 10000);
         let map = r.stdout;
         if (map.length > 15000) {
             map = map.slice(0, 15000) + "\n... (repo map truncated)";
