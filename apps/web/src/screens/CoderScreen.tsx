@@ -209,7 +209,7 @@ const TOOLS = [
         type: "object",
         properties: {
           ref: { type: "string", description: "Revision(s): empty for working tree, a single ref, or 'a..b'." },
-          path: { type: "string", description: "Optional path filter (e.g. 'src/')." }
+          path: { type: "string", description: "Optional path filter(s): a single path or several space-separated paths (e.g. 'src/ lib/')." }
         },
         required: []
       }
@@ -504,7 +504,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     try {
       setCommits(await coderGitLog(100));
     } catch {
-      setCommits([]);
+      // Keep the last good list rather than wiping it on a transient sidecar
+      // blip (M2). An empty workspace simply shows no commits.
     } finally {
       setCommitsLoading(false);
     }
@@ -534,6 +535,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Persist the active conversation's live state back into the store.
   useEffect(() => {
     if (!activeWs || !activeConv) return;
+    // Don't clobber a loaded conversation with a transient empty transcript
+    // (e.g. the initial [] before loadConv populates messages) — L1.
+    const existing = storeRef.current.workspaces[activeWs]?.conversations[activeConv];
+    if (messages.length === 0 && existing && (existing.messages?.length ?? 0) > 0) return;
     setStore((prev) => {
       const wsd = prev.workspaces[activeWs];
       if (!wsd) return prev;
@@ -834,14 +839,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const message = args.message || 'Agent commit';
           const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000);
           result = JSON.stringify(commitRes);
-          mutated = true;
+          // Note: a commit doesn't change the file tree, so we deliberately do
+          // NOT set mutated=true (which would trigger a repo-map rescan, M5).
         } else if (call.name === 'git_diff') {
           logType = 'bash'; logDetail = `git diff ${args.ref || ''}`.trim();
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           const ref = (args.ref || '').trim();
-          const path = (args.path || '').trim();
+          // `path` may be a single path or several space-separated ones (L3).
+          const pathTokens = (args.path || '').trim().split(/\s+/).filter(Boolean);
           const refArg = ref ? q(ref) : '';
-          const pathArg = path ? q(path) : '';
+          const pathArg = pathTokens.map(q).join(' ');
           const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
           const diffRes = await coderExec(cmd, undefined, 30000);
           result = JSON.stringify(diffRes);
@@ -909,9 +916,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const COMPACT_AT = 0.8;
     const MAX_ATTEMPTS = 3;
     // Derive the response budget from the engine's context window so a small
-    // context still leaves room for the prompt (P3 #12). Falls back to 8192.
+    // context still leaves room for the prompt (P3 #12). The Coder always thinks,
+    // and a reasoning trace plus the answer can exceed a tiny budget, so floor
+    // thinking runs higher (M4). Falls back to 8192.
+    const respFloor = 4096;
     const respMax = maxContext > 0
-      ? Math.min(Math.max(Math.floor(maxContext / 2), 1024), 8192)
+      ? Math.min(Math.max(Math.floor(maxContext / 2), respFloor), 16384)
       : 8192;
 
     // Rough token estimate (~4 chars/token) used as a safety net so a single turn
@@ -932,10 +942,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
         // Auto-compact when the model context is near (>=80%) or past (estimate
         // >=100%) the window limit, so we never silently truncate mid-task.
+        // Use the recorded prompt-token count when the engine reports it; otherwise
+        // fall back to the local estimate (M3) so the 80% trigger still fires.
+        const est = estimateTokens(currentMessages);
+        const recordedOrEst = Math.max(lastPromptTokensRef.current, est);
         const overBudget =
           maxContext > 0 &&
-          (lastPromptTokensRef.current >= COMPACT_AT * maxContext ||
-            estimateTokens(currentMessages) >= maxContext);
+          (recordedOrEst >= COMPACT_AT * maxContext || est >= maxContext);
         if (overBudget) {
           addLog({ type: 'compact', label: 'compact', detail: `context ${lastPromptTokensRef.current}/${maxContext} — summarizing` });
           try {
@@ -989,7 +1002,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               onContentDelta: (text) => { content += text; },
               onReasoningDelta: (text) => { reasoning += text; },
               onToolCalls: (calls) => { toolCalls = calls; },
-              onDone: (meta) => { if (meta?.promptTokens) lastPromptTokensRef.current = meta.promptTokens; },
+              onDone: (meta) => {
+                // Record the engine's real prompt-token count when present;
+                // otherwise keep the local estimate so accounting stays accurate
+                // across turns even when usage is omitted (M3).
+                lastPromptTokensRef.current = meta?.promptTokens ?? est;
+              },
             });
             streamOk = true;
           } catch (e) {
@@ -1004,16 +1022,26 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         }
         
+        // A response with neither content nor tool calls is a no-op (the engine
+        // produced nothing actionable). Don't push a blank bubble into the
+        // transcript or the model context, and don't treat it as "done" — just
+        // stop the turn cleanly so the user can retry (H1).
+        const isEmptyResponse = !content.trim() && toolCalls.length === 0;
+        if (isEmptyResponse) {
+          addLog({ type: 'error', label: 'empty', detail: 'Model returned an empty response (no content or tool calls) — stopping the turn.' });
+          break;
+        }
+
         const assistantMsg: ChatMessage = {
           role: 'assistant',
           content,
           reasoning: reasoning || undefined,
           tool_calls: toolCalls.length > 0 ? toolCalls : undefined
         };
-        
+
         currentMessages = [...currentMessages, assistantMsg];
         setMessages((prev) => [...prev, assistantMsg]);
-        
+
         if (toolCalls.length > 0) {
           const before = currentMessages.length;
           currentMessages = await handleToolCalls(toolCalls, currentMessages, refreshRepoMap);

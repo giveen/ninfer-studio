@@ -676,7 +676,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
-    async (convId: string, history: ChatMessage[], depth = 0) => {
+    async (convId: string, history: ChatMessage[], depth = 0, placeholderId?: string) => {
       if (!engineUp) {
         onNavigate('engine');
         return;
@@ -686,7 +686,12 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       setStreaming(true);
       const ac = new AbortController();
       abortRef.current = ac;
-      
+
+      // Target the streaming placeholder by stable id when available; fall back to
+      // the last message only when no id was assigned (C2).
+      const isTarget = (m: ChatMessage, i: number, len: number): boolean =>
+        placeholderId ? m.id === placeholderId : i === len - 1;
+
       let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
 
       await streamChat(
@@ -698,7 +703,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               cs.map((c) =>
                 c.id !== convId
                   ? c
-                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
+                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
               ),
             );
           },
@@ -707,25 +712,25 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               cs.map((c) =>
                 c.id !== convId
                   ? c
-                  : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, content: m.content + d } : m)) },
+                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, content: m.content + d } : m)) },
               ),
             );
           },
           onUsage: (_u, meta) => {
             setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
             );
             setLatestRequestMetrics(meta, useModel);
           },
           onToolCalls: (calls) => {
             capturedToolCalls = calls;
             setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, tool_calls: calls } : m)) })),
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, tool_calls: calls } : m)) })),
             );
           },
           onDone: (meta) => {
             setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === c.messages.length - 1 ? { ...m, meta } : m)) })),
+              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
             );
             setLatestRequestMetrics(meta, useModel);
           },
@@ -737,7 +742,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   : {
                       ...c,
                       messages: c.messages.map((m, i) =>
-                        i === c.messages.length - 1 ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
+                        isTarget(m, i, c.messages.length) ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
                       ),
                     },
               ),
@@ -747,7 +752,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       );
       if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
          if (depth >= 12) {
-           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => i === c.messages.length - 1 ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
+           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
            setStreaming(false);
            return;
          }
@@ -764,12 +769,12 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
              toolResults.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: result });
          }
          
-         const asstMsg: ChatMessage = { role: 'assistant', content: '', model: useModel, meta: {} };
+         const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
          setConvs(cs => cs.map(c => c.id !== convId ? c : { ...c, messages: [...c.messages, ...toolResults, asstMsg] }));
          const updatedConv = convsRef.current.find(c => c.id === convId);
          if (updatedConv && !ac.signal.aborted) {
              const newHistory = [...updatedConv.messages, ...toolResults];
-             await runStream(convId, modelHistory({ ...updatedConv, messages: newHistory }), depth + 1);
+             await runStream(convId, modelHistory({ ...updatedConv, messages: newHistory }), depth + 1, asstMsg.id);
          }
          return;
       }
@@ -797,7 +802,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
     let conv = convs.find((c) => c.id === activeId);
     const userMsg: ChatMessage = { role: 'user', content, attachments: attachments.length ? attachments : undefined };
-    const asstMsg: ChatMessage = { role: 'assistant', content: '', model: useModel, meta: {} };
+    const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
     if (!conv) {
       conv = {
         id: uid(),
@@ -820,7 +825,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     stick.current = true;
 
     const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
-    await runStream(newId, history);
+    await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
 

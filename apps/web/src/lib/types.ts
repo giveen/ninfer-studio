@@ -233,6 +233,9 @@ export interface MessageMeta {
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  /** Stable id; assigned to streaming placeholders so delta updates can target
+   *  a specific message instead of guessing by array index (C2). */
+  id?: string;
   reasoning?: string;
   attachments?: ChatAttachment[];
   meta?: MessageMeta;

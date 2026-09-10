@@ -576,14 +576,20 @@ export async function coderGitLog(limit = 100): Promise<CoderCommit[]> {
   const fmt = '%H%x1f%an%x1f%ar%x1f%ad%x1f%s%x1f%b%x1e';
   const r = await coderExec(`git log --pretty=format:${fmt} -n ${limit}`);
   if (r.exitCode !== 0 || !r.stdout.trim()) return [];
+  const HASH_RE = /^[0-9a-f]{7,40}$/;
   return r.stdout
     .split('\x1e')
     .map((rec) => rec.trim())
     .filter(Boolean)
-    .map((rec) => {
-      const [hash, author, relDate, date, subject, body] = rec.split('\x1f');
+    .map((rec): CoderCommit | null => {
+      const parts = rec.split('\x1f');
+      // A record whose body happened to contain a separator byte would yield the
+      // wrong arity; skip it rather than mis-mapping author/date/subject (M1).
+      if (parts.length !== 6 || !HASH_RE.test(parts[0] || '')) return null;
+      const [hash, author, relDate, date, subject, body] = parts;
       return { hash, author, relDate, date, subject, body: (body || '').trim() };
-    });
+    })
+    .filter((c): c is CoderCommit => c !== null);
 }
 
 /**
