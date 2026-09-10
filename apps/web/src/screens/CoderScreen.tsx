@@ -16,6 +16,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
 1. **Research First**: ALWAYS investigate before writing code. 
    - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
+   - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
 2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
 3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself.
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
@@ -181,6 +182,36 @@ const TOOLS = [
           query: { type: "string" }
         },
         required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_commit",
+      description: "Stage files and create a git commit in the workspace. Commit only the files you intend to save. Use '-A' to stage all changes, or list specific paths.",
+      parameters: {
+        type: "object",
+        properties: {
+          files: { type: "string", description: "Files to stage. Use '-A' for all changes, or a space-separated list of paths." },
+          message: { type: "string", description: "Commit message." }
+        },
+        required: ["files", "message"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Show a git diff. Use with no ref for unstaged+staged changes, a single revision for changes vs it, or two revisions. Add a path filter to limit scope.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Revision(s): empty for working tree, a single ref, or 'a..b'." },
+          path: { type: "string", description: "Optional path filter (e.g. 'src/')." }
+        },
+        required: []
       }
     }
   }
@@ -791,6 +822,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'web'; logDetail = args.query;
           const res = await coderWebSearch(args.query);
           result = JSON.stringify(res);
+        } else if (call.name === 'git_commit') {
+          logType = 'bash'; logDetail = `git commit ${args.files}`;
+          const files = (args.files || '-A').trim() || '-A';
+          const commitRes = await coderExec(`git add ${files} && git commit -m "${String(args.message || 'Agent commit').replace(/"/g, '\\"')}" && git rev-parse HEAD`, undefined, 30000);
+          result = JSON.stringify(commitRes);
+          mutated = true;
+        } else if (call.name === 'git_diff') {
+          logType = 'bash'; logDetail = `git diff ${args.ref || ''}`.trim();
+          const ref = (args.ref || '').trim();
+          const path = (args.path || '').trim();
+          const cmd = `git --no-pager diff ${ref} ${path}`.replace(/\s+/g, ' ').trim();
+          const diffRes = await coderExec(cmd, undefined, 30000);
+          result = JSON.stringify(diffRes);
         } else if (call.name === 'todo_write') {
           logType = 'todo'; logDetail = 'Updated task list';
           setTodos(args.todos || []);
@@ -853,6 +897,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } catch { /* ignore */ }
     }
     const COMPACT_AT = 0.8;
+    const MAX_ATTEMPTS = 3;
+    // Derive the response budget from the engine's context window so a small
+    // context still leaves room for the prompt (P3 #12). Falls back to 8192.
+    const respMax = maxContext > 0
+      ? Math.min(Math.max(Math.floor(maxContext / 2), 1024), 8192)
+      : 8192;
 
     // Rough token estimate (~4 chars/token) used as a safety net so a single turn
     // whose tool results push past the window is caught before we send it (P1 #4).
@@ -913,14 +963,36 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
         
-        const req = buildChatRequest(model, dynamicSystemRef.current, currentMessages, { thinking: true, maxTokens: 8192 } as ChatParams, { tools: TOOLS });
-        
-        await streamChat(req, abortRef.current.signal, {
-          onContentDelta: (text) => { content += text; },
-          onReasoningDelta: (text) => { reasoning += text; },
-          onToolCalls: (calls) => { toolCalls = calls; },
-          onDone: (meta) => { if (meta?.promptTokens) lastPromptTokensRef.current = meta.promptTokens; },
-        });
+        const req = buildChatRequest(model, dynamicSystemRef.current, currentMessages, { thinking: true, maxTokens: respMax } as ChatParams, { tools: TOOLS });
+
+        // Bounded retry on transient stream failures so a single dropped
+        // connection doesn't kill a long agent run (P2 #9).
+        let attempt = 0;
+        let streamOk = false;
+        while (!streamOk && attempt < MAX_ATTEMPTS) {
+          attempt++;
+          content = '';
+          reasoning = '';
+          toolCalls = [];
+          try {
+            await streamChat(req, abortRef.current.signal, {
+              onContentDelta: (text) => { content += text; },
+              onReasoningDelta: (text) => { reasoning += text; },
+              onToolCalls: (calls) => { toolCalls = calls; },
+              onDone: (meta) => { if (meta?.promptTokens) lastPromptTokensRef.current = meta.promptTokens; },
+            });
+            streamOk = true;
+          } catch (e) {
+            if (abortRef.current?.signal.aborted) throw e;
+            const msg = e instanceof Error ? e.message : String(e);
+            if (attempt >= MAX_ATTEMPTS) {
+              addLog({ type: 'error', label: 'retry', detail: `stream failed after ${MAX_ATTEMPTS} attempts: ${msg}` });
+              throw e;
+            }
+            addLog({ type: 'error', label: 'retry', detail: `stream failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying: ${msg}` });
+            await new Promise((r) => setTimeout(r, 800 * attempt));
+          }
+        }
         
         const assistantMsg: ChatMessage = {
           role: 'assistant',
