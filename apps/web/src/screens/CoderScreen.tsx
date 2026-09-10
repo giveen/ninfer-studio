@@ -191,13 +191,15 @@ const TOOLS = [
     type: "function",
     function: {
       name: "grep",
-      description: "Search for a regex pattern in files.",
+      description: "Search for a regex pattern in files. Results are paginated — if the result's `more` is true, pass `offset` to fetch the next page (the `total` field shows the true count).",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
           include: { type: "string", description: "Glob pattern to include (e.g. *.ts)" },
-          ignoreCase: { type: "boolean" }
+          ignoreCase: { type: "boolean" },
+          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
+          limit: { type: "number", description: "Max matches to return per page (default 200, max 2000)." }
         },
         required: ["pattern"]
       }
@@ -207,11 +209,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "glob",
-      description: "Find files matching a glob pattern.",
+      description: "Find files matching a glob pattern. Paginated — if `more` is true, pass `offset` for the next page.",
       parameters: {
         type: "object",
         properties: {
-          pattern: { type: "string" }
+          pattern: { type: "string" },
+          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
+          limit: { type: "number", description: "Max files to return per page (default 200)." }
         },
         required: ["pattern"]
       }
@@ -333,6 +337,22 @@ const TOOLS = [
           name: { type: "string", description: "Branch name for create/switch." }
         },
         required: ["action"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_pr",
+      description: "Open a pull request for the CURRENT branch. Requires a clean, committed working tree. Uses the `gh` CLI when available (and a remote is configured); otherwise it pushes the branch and returns a compare URL so you can open the PR manually. Never force-pushes.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "PR title." },
+          body: { type: "string", description: "PR description / summary (markdown ok)." },
+          base: { type: "string", description: "Base branch to target (default: the repo's default branch)." }
+        },
+        required: ["title"]
       }
     }
   },
@@ -811,7 +831,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; }
+  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -1754,17 +1774,70 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } else {
             result = JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
           }
+        } else if (call.name === 'git_pr') {
+          // Open a PR for the current branch. Pushes to the remote, then uses `gh`
+          // when present; otherwise returns a compare URL to open manually. Never
+          // force-pushes. Requires a clean, committed working tree on a real branch.
+          logType = 'bash'; logDetail = `git pr: ${String(args.title || '').slice(0, 40)}`;
+          const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
+          const gitRemoteToWeb = (url: string, base: string, head: string): string => {
+            if (!url) return '';
+            let host: string | undefined; let repo: string | undefined;
+            const ssh = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+            if (ssh) { host = ssh[1]; repo = ssh[2]; }
+            else {
+              try { const u = new URL(url); host = u.host; repo = u.pathname.replace(/^\//, '').replace(/\.git$/, ''); } catch { return ''; }
+            }
+            return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
+          };
+          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000);
+          const branch = (br.stdout || '').trim();
+          if (!branch || branch === 'HEAD') {
+            result = JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
+          } else {
+            const st = await coderExec('git status --porcelain', undefined, 10000);
+            if ((st.stdout || '').trim()) {
+              result = JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
+            } else {
+              const rm = await coderExec('git remote', undefined, 10000);
+              const remote = (rm.stdout || '').trim().split('\n')[0];
+              if (!remote) {
+                result = JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
+              } else {
+                const base = String(args.base || '').trim()
+                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000)).stdout.trim()
+                  || 'main';
+                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000);
+                if (push.exitCode !== 0) {
+                  result = JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
+                } else {
+                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000);
+                  if ((gh.stdout || '').trim() === 'yes') {
+                    let cmd = `gh pr create --title ${q(args.title)} --body ${q(args.body || '')}`;
+                    if (base) cmd += ` --base ${q(base)}`;
+                    const pr = await coderExec(cmd, undefined, 60000);
+                    const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
+                    result = JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
+                  } else {
+                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000);
+                    const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
+                    result = JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
+                  }
+                }
+              }
+            }
+          }
         } else if (call.name === 'repo_search') {
           logType = 'read'; logDetail = `search: ${String(args.query ?? '').slice(0, 30)}`;
           const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15);
           result = JSON.stringify(sr);
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
-          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase);
+          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200);
           result = JSON.stringify(res);
         } else if (call.name === 'glob') {
           logType = 'glob'; logDetail = args.pattern;
-          const res = await coderGlob(args.pattern);
+          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200);
           result = JSON.stringify(res);
         } else if (call.name === 'ast_grep') {
           logType = 'grep'; logDetail = `[AST] ${args.pattern}`;
@@ -1944,8 +2017,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const args = JSON.parse(call.arguments);
       switch (call.name) {
         case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200));
         case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
         case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
         case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
@@ -1966,7 +2039,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       let toolCalls: AgentToolCall[] = [];
       try {
         await streamChat(
-          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }),
+          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
         );
@@ -1998,8 +2071,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const args = JSON.parse(call.arguments);
       switch (call.name) {
         case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200));
         case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
         case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
         case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
@@ -2007,7 +2080,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'write': return JSON.stringify(await coderWrite(args.path, args.content));
         case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll));
         case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []));
-        case 'bash': return JSON.stringify(await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true));
+        case 'bash': {
+          // Foreground bash runs in a persistent per-workspace shell so cwd AND
+          // environment (export / venv / conda activation) survive across calls;
+          // background jobs get their own process and stay stateless.
+          const sid = !args.background && activeWsDir ? 'sh:' + activeWsDir : (args.background ? activeWsDir : undefined);
+          return JSON.stringify(await coderExec(args.command, undefined, args.timeoutMs, sid, args.background === true));
+        }
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || '')));
         case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000));
         case 'delegate': {
@@ -2048,7 +2127,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let content = '';
         let toolCalls: AgentToolCall[] = [];
         await streamChat(
-          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }),
+          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
         );
@@ -2325,7 +2404,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const system = planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete plan. Do NOT call write, edit, apply_patch, bash, git_commit, or git_branch — they are disabled. End with a step-by-step plan and wait for the user.`
           : dynamicSystemRef.current;
-        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools });
+        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
 
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
@@ -3328,6 +3407,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               <div className="flex items-center gap-4 flex-wrap">
                 <label className="flex items-center gap-1.5 text-[12px] text-mute">
                   <Toggle checked={coderParams.thinking} onChange={(v) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
+                  <Toggle checked={!!coderParams.promptCache} onChange={(v) => setCoderParams({ ...coderParams, promptCache: v })} /> prompt cache
                 </label>
                 <label className="flex items-center gap-1.5 text-[12px] text-mute">
                   temp <NumberField value={coderParams.temperature ?? null} onChange={(v) => setCoderParams({ ...coderParams, temperature: v })} onEmpty={() => setCoderParams({ ...coderParams, temperature: undefined })} empty />

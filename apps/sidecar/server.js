@@ -1151,8 +1151,18 @@ function applyEditHunk(fileText, oldStr, newStr, replaceAll) {
   }
   return { text: fileLines.join('\n'), count: targets.length };
 }
+// Cap tool output so a runaway command can't flood the context window. When the
+// output is larger than MAX_OUTPUT_BYTES we keep the HEAD and TAIL (with an
+// explicit "omitted" marker) rather than only the tail — the start of a command's
+// output (the command echo, early errors) is usually what the agent needs, and
+// the end (final state) is equally useful. `truncated` + `total_bytes` let the
+// agent know the true size and paginate/refine instead of guessing.
 function capOut(s) {
-  return s.length > MAX_OUTPUT_BYTES ? s.slice(-MAX_OUTPUT_BYTES) : s;
+  if (s.length <= MAX_OUTPUT_BYTES) return s;
+  const head = Math.floor(MAX_OUTPUT_BYTES * 0.3);
+  const tail = MAX_OUTPUT_BYTES - head;
+  const omitted = s.length - MAX_OUTPUT_BYTES;
+  return s.slice(0, head) + `\n… [${omitted} bytes omitted — output truncated, use offset/limit or refine] …\n` + s.slice(-tail);
 }
 async function isBinary(buf) {
   const len = Math.min(buf.length, 8000);
@@ -1228,7 +1238,7 @@ function globToRegex(glob) {
   }
   return new RegExp('^' + re + '$');
 }
-async function grepSearch(pattern, relRoot, include, ignoreCase, maxMatches) {
+async function grepSearch(pattern, relRoot, include, ignoreCase, hardCap, offset = 0, limit = 200) {
   const root = coderRoot();
   const base = relRoot ? withinWs(relRoot) : root;
   let re;
@@ -1240,10 +1250,10 @@ async function grepSearch(pattern, relRoot, include, ignoreCase, maxMatches) {
   const includeRe = include ? globToRegex(include) : null;
   const files = [];
   await walkFiles(root, relOf(base), files, 6000);
-  const matches = [];
+  const all = [];
   let truncated = false;
   for (const f of files) {
-    if (matches.length >= maxMatches) {
+    if (all.length >= hardCap) {
       truncated = true;
       break;
     }
@@ -1258,22 +1268,50 @@ async function grepSearch(pattern, relRoot, include, ignoreCase, maxMatches) {
     if (await isBinary(buf)) continue;
     const lines = buf.toString('utf8').split('\n');
     for (let i = 0; i < lines.length; i++) {
-      if (matches.length >= maxMatches) {
+      if (all.length >= hardCap) {
         truncated = true;
         break;
       }
-      if (re.test(lines[i])) matches.push({ file: f, line: i + 1, text: lines[i].slice(0, 400) });
+      if (re.test(lines[i])) all.push({ file: f, line: i + 1, text: lines[i].slice(0, 400) });
     }
   }
-  return { matches, truncated, count: matches.length };
+  // Pagination: return one page plus the true total so the agent can page or refine.
+  const total = all.length;
+  const start = Math.max(0, offset | 0);
+  const page = all.slice(start, start + Math.max(1, limit | 0));
+  const more = start + page.length < total;
+  return {
+    matches: page,
+    total,
+    truncated,
+    offset: start,
+    limit: Math.max(1, limit | 0),
+    more,
+    summary: truncated
+      ? `showing ${page.length} of ${total}+ matches — refine the pattern, add \`include\`, or pass \`offset\` to page`
+      : `showing ${page.length} of ${total} matches`,
+  };
 }
-async function globSearch(pattern, relRoot) {
+async function globSearch(pattern, relRoot, offset = 0, limit = 200) {
   const root = coderRoot();
   const base = relRoot ? withinWs(relRoot) : root;
   const re = globToRegex(pattern);
   const files = [];
   await walkFiles(root, relOf(base), files, MAX_GLOB_FILES);
-  return files.filter((f) => re.test(f)).sort().slice(0, MAX_GLOB_FILES);
+  const all = files.filter((f) => re.test(f)).sort();
+  const total = all.length;
+  const start = Math.max(0, offset | 0);
+  const page = all.slice(start, start + Math.max(1, limit | 0));
+  const more = start + page.length < total;
+  return {
+    files: page,
+    total,
+    truncated: total >= MAX_GLOB_FILES,
+    offset: start,
+    limit: Math.max(1, limit | 0),
+    more,
+    summary: `showing ${page.length} of ${total} files`,
+  };
 }
 
 // ---- Retrieval: ranked repo search (symbol index cached, refreshed periodically) ----
@@ -1397,7 +1435,159 @@ function stripCwdMarker(sessionId, buf) {
   return buf.slice(0, mi);
 }
 
-function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
+// ---------------------------------------------------------------------------
+// Persistent per-session shell.
+//
+// The agent issues many short `bash` calls. A fresh `bash -lc` per call drops
+// both cwd AND environment, so `export`, `source venv/bin/activate`, and conda
+// activation never survive to the next command. We keep one long-lived bash per
+// shell-session id so that state persists, serializing commands through a queue.
+// Sessions are keyed by `sh:<id>` (the bash tool uses `sh:<workspace>`); other
+// exec calls (git utils, etc.) keep the stateless spawn + cwd-marker path.
+// ---------------------------------------------------------------------------
+const shells = new Map();
+// Random sentinel so a command's own output can never collide with our markers.
+const SHELL_TOKEN = `NINFXSH_${Math.random().toString(36).slice(2)}_${Date.now().toString(36)}`;
+
+// Spawn args for a bwrap-sandboxed persistent shell (mirrors the stateless path).
+function shellSpawnArgs(cwd) {
+  const ws = coderRoot() || cwd;
+  const binds = (config.sandboxBinds || []).filter(Boolean).flatMap((p) => ['--bind', p, p]);
+  return {
+    args: ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '--norc', '--noprofile', ...binds],
+    cwd,
+  };
+}
+
+class PersistentShell {
+  constructor(cwd, sessionId) {
+    this.sessionId = sessionId;
+    this.cwd = cwd;
+    this.dead = false;
+    this.busy = false;
+    this.queue = [];
+    this.cur = null;
+    this.spawnErr = null;
+    try {
+      if (coderSandbox && bwrapAvailable !== false) {
+        if (bwrapAvailable === null) bwrapAvailable = checkBwrap();
+        if (bwrapAvailable) {
+          const { args, cwd: sc } = shellSpawnArgs(cwd);
+          this.proc = spawn('bwrap', args, { cwd: sc, env: { ...process.env } });
+        }
+      }
+      if (!this.proc) {
+        this.proc = spawn('bash', ['--norc', '--noprofile'], { cwd, env: { ...process.env } });
+      }
+    } catch (e) {
+      this.dead = true;
+      this.spawnErr = e;
+    }
+    if (this.proc) {
+      this.proc.stdin.on('error', () => {}); // ignore EPIPE after kill
+      this.proc.stdout.on('data', (d) => this._onData(d, 'out'));
+      this.proc.stderr.on('data', (d) => this._onData(d, 'err'));
+      this.proc.on('exit', () => { this.dead = true; this._failAll(new Error('shell process exited')); });
+      this.proc.on('error', () => { this.dead = true; this._failAll(new Error('shell process error')); });
+    }
+  }
+  _failAll(err) {
+    if (this.cur) { const c = this.cur; this.cur = null; clearTimeout(c.timer); c.reject(err); }
+    while (this.queue.length) this.queue.shift()(new Error('shell dead'));
+  }
+  _onData(d, which) {
+    const c = this.cur;
+    if (!c) return; // ignore stray output after finalize
+    const s = d.toString();
+    c[which] += s;
+    c.totalLen += s.length;
+    if (c[which].length > MAX_OUTPUT_BYTES * 2) c[which] = c[which].slice(-MAX_OUTPUT_BYTES * 2);
+    if (c.totalLen > MAX_OUTPUT_BYTES) c.truncated = true;
+    if (which === 'out' && s.indexOf(SHELL_TOKEN) >= 0) this._finalize();
+  }
+  _finalize() {
+    const c = this.cur;
+    if (!c) return;
+    this.cur = null;
+    clearTimeout(c.timer);
+    const out = c.out;
+    let exitCode = 0;
+    let body = out;
+    const i1 = out.indexOf(SHELL_TOKEN);
+    if (i1 >= 0) {
+      const i2 = out.indexOf(SHELL_TOKEN, i1 + SHELL_TOKEN.length);
+      if (i2 >= 0) {
+        exitCode = parseInt(out.slice(i1 + SHELL_TOKEN.length, i2).trim(), 10) || 0;
+        body = out.slice(0, i1); // drop the sentinel + trailing cwd marker region
+      }
+    }
+    body = stripCwdMarker(this.sessionId, body);
+    this.cwd = sessionCwd(this.sessionId) || this.cwd;
+    const result = {
+      stdout: capOut(body),
+      stderr: capOut(c.err),
+      exitCode,
+      timedOut: false,
+      truncated: c.truncated,
+      total_bytes: c.totalLen,
+      cwd: this.cwd,
+    };
+    this.busy = false;
+    c.resolve(result);
+    this._next();
+  }
+  _next() {
+    if (this.busy) return;
+    const job = this.queue.shift();
+    if (!job) return;
+    if (this.dead) { job.reject(new Error('shell dead')); return; }
+    this.busy = true;
+    this.cur = { resolve: job.resolve, reject: job.reject, out: '', err: '', truncated: false, totalLen: 0, timer: null };
+    // Re-`cd` to the tracked cwd first so a restarted shell resumes correctly.
+    const wrapped =
+      `cd ${JSON.stringify(this.cwd)} 2>/dev/null || true\n` +
+      `${job.command}\n` +
+      `printf '${CWD_MARKER}%s${CWD_MARKER}\n' "$PWD"\n` +
+      `printf '%s%s%s' '${SHELL_TOKEN}' "$?" '${SHELL_TOKEN}'\n`;
+    this.cur.timer = setTimeout(() => {
+      this.busy = false;
+      this.dead = true;
+      try { this.proc.kill('SIGKILL'); } catch { /* ignore */ }
+      const c = this.cur; this.cur = null;
+      if (c) c.resolve({
+        stdout: capOut(stripCwdMarker(this.sessionId, c.out)),
+        stderr: capOut(c.err), exitCode: null, timedOut: true, truncated: c.truncated, total_bytes: c.totalLen, cwd: this.cwd, error: 'timeout',
+      });
+      shells.delete(this.sessionId);
+      this._next();
+    }, Math.min(Math.max(job.timeoutMs || 120000, 1000), 600000));
+    try {
+      this.proc.stdin.write(wrapped);
+    } catch (e) {
+      this.busy = false;
+      job.reject(e);
+      this._next();
+    }
+  }
+  run(command, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (this.dead) return reject(new Error('shell dead'));
+      this.queue.push({ command, timeoutMs, resolve, reject });
+      this._next();
+    });
+  }
+}
+
+function getShell(sessionId, cwd) {
+  let sh = shells.get(sessionId);
+  if (!sh || sh.dead) {
+    sh = new PersistentShell(cwd, sessionId);
+    shells.set(sessionId, sh);
+  }
+  return sh;
+}
+
+async function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
   if (coderSafeMode) {
     const reason = detectDestructive(command);
     if (reason) {
@@ -1416,9 +1606,20 @@ function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
   }
   const root = coderRoot();
   let cwd = relCwd ? withinWs(relCwd) : root;
-  // Stateful-shell support: persist cwd across calls within a session. We wrap the
-  // command to cd into the session dir and echo the resulting PWD via a marker
-  // (stripped before returning). No long-lived process, so no orphan shells.
+  // Stateful shell: a persistent bash per `sh:<id>` session carries cwd + env
+  // across commands (export / venv / conda activation survive). Other exec calls
+  // (git utils, background jobs, stateless sessions) keep the spawn below.
+  if (sessionId && sessionId.startsWith('sh:')) {
+    const sh = getShell(sessionId, cwd);
+    if (!sh.dead) {
+      try {
+        return await sh.run(command, timeoutMs);
+      } catch {
+        // fall through to stateless on any shell failure
+      }
+    }
+  }
+  // Stateless spawn with a cwd marker so even non-shell sessions keep their cwd.
   let runCmd = command;
   if (sessionId) {
     const base = sessionCwd(sessionId);
@@ -1461,6 +1662,7 @@ function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
     let stderr = '';
     let done = false;
     let truncated = false;
+    let totalLen = 0;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
@@ -1469,14 +1671,16 @@ function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
       } catch {
         /* ignore */
       }
-      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, cwd: resultCwd });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: null, timedOut: true, truncated, total_bytes: totalLen, cwd: resultCwd });
     }, timeout);
     proc.stdout.on('data', (d) => {
+      totalLen += d.length;
       stdout += d;
       if (stdout.length > MAX_OUTPUT_BYTES) truncated = true;
       if (stdout.length > MAX_OUTPUT_BYTES * 2) stdout = stdout.slice(-MAX_OUTPUT_BYTES * 2);
     });
     proc.stderr.on('data', (d) => {
+      totalLen += d.length;
       stderr += d;
       if (stderr.length > MAX_OUTPUT_BYTES) truncated = true;
       if (stderr.length > MAX_OUTPUT_BYTES * 2) stderr = stderr.slice(-MAX_OUTPUT_BYTES * 2);
@@ -1485,13 +1689,13 @@ function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, cwd: resultCwd, error: err.message });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr) + '\n' + err.message, exitCode: null, timedOut: false, truncated, total_bytes: totalLen, cwd: resultCwd, error: err.message });
     });
     proc.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, cwd: resultCwd });
+      resolve({ stdout: stripCwdMarker(sessionId, capOut(stdout)), stderr: capOut(stderr), exitCode: code, timedOut: false, truncated, total_bytes: totalLen, cwd: resultCwd });
     });
   });
 }
@@ -1946,7 +2150,15 @@ async function handleCoder(req, res, p, url) {
       if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
       const root = coderRoot();
       if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
-      const r = await grepSearch(body.pattern, body.path, body.include, !!body.ignoreCase, Math.min(body.maxMatches || MAX_GREP_MATCHES, 2000));
+      const r = await grepSearch(
+        body.pattern,
+        body.path,
+        body.include,
+        !!body.ignoreCase,
+        Math.min(body.maxMatches || MAX_GREP_MATCHES, 2000),
+        Math.max(0, body.offset | 0),
+        Math.max(1, body.limit || 200),
+      );
       return sendJson(res, 200, r);
     }
     if (p === '/api/coder/glob' && req.method === 'POST') {
@@ -1954,8 +2166,8 @@ async function handleCoder(req, res, p, url) {
       if (!body?.pattern) return sendJson(res, 400, { error: 'pattern required' });
       const root = coderRoot();
       if (!root) return sendJson(res, 400, { error: 'no workspace configured' });
-      const files = await globSearch(body.pattern, body.path);
-      return sendJson(res, 200, { files });
+      const r = await globSearch(body.pattern, body.path, Math.max(0, body.offset | 0), Math.max(1, body.limit || 200));
+      return sendJson(res, 200, r);
     }
     if (p === '/api/coder/web/fetch' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

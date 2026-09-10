@@ -191,9 +191,17 @@ export function buildChatRequest(
   history: ChatMessage[],
   params: ChatParams,
   extra?: Record<string, unknown>,
+  /** When true, mark the system prompt with `cache_control` so the engine can
+   *  cache it across turns (Anthropic-style prefix caching). Opt-in: only enable
+   *  if your engine supports it; some OpenAI-compatible servers reject the field. */
+  cacheSystem = false,
 ): Record<string, unknown> {
   const messages: Array<Record<string, unknown>> = [];
-  if (systemPrompt?.trim()) messages.push({ role: 'system', content: systemPrompt.trim() });
+  if (systemPrompt?.trim()) {
+    const sys: Record<string, unknown> = { role: 'system', content: systemPrompt.trim() };
+    if (cacheSystem) sys.cache_control = { type: 'ephemeral' };
+    messages.push(sys);
+  }
   for (const m of history) {
     if (m.role === 'system') continue;
     if (m.attachments && m.attachments.length) {
@@ -552,11 +560,18 @@ export function coderJob(jobId: string): Promise<CoderJob> {
 export function coderJobKill(jobId: string): Promise<CoderJob> {
   return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, {}, 15_000);
 }
-export function coderGrep(pattern: string, path?: string, include?: string, ignoreCase?: boolean): Promise<CoderGrepResult> {
-  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase }, 15_000);
+export function coderGrep(
+  pattern: string,
+  path?: string,
+  include?: string,
+  ignoreCase?: boolean,
+  offset = 0,
+  limit = 200,
+): Promise<CoderGrepResult> {
+  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit }, 15_000);
 }
-export function coderGlob(pattern: string, path?: string): Promise<CoderGlobResult> {
-  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path }, 15_000);
+export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200): Promise<CoderGlobResult> {
+  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit }, 15_000);
 }
 export interface CoderSearchResult {
   results: Array<{ file: string; line: number; snippet: string; score: number; kind: string }>;

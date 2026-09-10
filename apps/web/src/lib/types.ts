@@ -373,6 +373,8 @@ export interface CoderExecResult {
   blocked?: boolean;
   cwd: string;
   error?: string;
+  /** True total bytes produced before truncation (helps the agent decide to page/refine). */
+  total_bytes?: number;
   /** Present when started with background:true — poll with coderJob(). */
   jobId?: string;
   started?: boolean;
@@ -397,11 +399,26 @@ export interface GrepMatch {
 }
 export interface CoderGrepResult {
   matches: GrepMatch[];
+  /** True total matches (may exceed the returned page). */
+  total: number;
   truncated: boolean;
-  count: number;
+  /** Page offset that was requested. */
+  offset: number;
+  /** Page size that was requested. */
+  limit: number;
+  /** True when more matches exist beyond the returned page. */
+  more: boolean;
+  /** Human-readable one-liner the agent can show/log. */
+  summary: string;
 }
 export interface CoderGlobResult {
   files: string[];
+  total: number;
+  truncated: boolean;
+  offset: number;
+  limit: number;
+  more: boolean;
+  summary: string;
 }
 export interface CoderWebFetch {
   url: string;
