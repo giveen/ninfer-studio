@@ -558,6 +558,13 @@ export function coderGrep(pattern: string, path?: string, include?: string, igno
 export function coderGlob(pattern: string, path?: string): Promise<CoderGlobResult> {
   return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path }, 15_000);
 }
+export interface CoderSearchResult {
+  results: Array<{ file: string; line: number; snippet: string; score: number; kind: string }>;
+  truncated: boolean;
+}
+export function coderSearch(query: string, limit = 15): Promise<CoderSearchResult> {
+  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+}
 export function coderWebFetch(url: string): Promise<CoderWebFetch> {
   return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000);
 }

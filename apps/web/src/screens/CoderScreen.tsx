@@ -4,7 +4,7 @@ import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment,
 import { Button, CodeBlock, NumberField, Toggle, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 import { Markdown } from '../components/Markdown';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, type CoderCommit } from '../lib/api';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
@@ -307,6 +307,21 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "repo_search",
+      description: "Ranked retrieval over the workspace: returns the most relevant files/symbols for a query, ranked by symbol and content match. Prefer this over blind grep when hunting for 'where X is implemented', 'the auth handler', or similar — it surfaces the right places to read first.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Natural-language or keyword query, e.g. 'parse config' or 'AuthProvider'." },
+          limit: { type: "number", description: "Max results to return (default 15, max 50)." }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "ask_user",
       description: "Pause and ask the user a clarifying question or request approval before proceeding (e.g. which approach to take, confirmation for an irreversible action). Use sparingly — only when you genuinely cannot continue without the user's input. The run will pause until they answer.",
       parameters: {
@@ -520,7 +535,7 @@ const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
 const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree']);
 /** Tool names the read-only scout and plan mode may use. */
-const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate']);
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
 interface ConvMeta {
   /** Linked worktree path for this conversation, relative to the main workspace. */
   worktree?: string;
@@ -1576,6 +1591,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } else {
             result = JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
           }
+        } else if (call.name === 'repo_search') {
+          logType = 'read'; logDetail = `search: ${String(args.query ?? '').slice(0, 30)}`;
+          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15);
+          result = JSON.stringify(sr);
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
           const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase);

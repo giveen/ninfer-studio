@@ -1239,6 +1239,87 @@ async function globSearch(pattern, relRoot) {
   await walkFiles(root, relOf(base), files, MAX_GLOB_FILES);
   return files.filter((f) => re.test(f)).sort().slice(0, MAX_GLOB_FILES);
 }
+
+// ---- Retrieval: ranked repo search (symbol index cached, refreshed periodically) ----
+let symbolIndexCache = null;
+let symbolIndexAt = 0;
+async function buildSymbolIndex() {
+  const root = coderRoot();
+  if (!root) return [];
+  try {
+    const r = await execCommand(
+      "rg '^(?:\\s*)(?:export\\s+|pub\\s+|async\\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait|def|func)\\s+([A-Za-z_][A-Za-z0-9_]*)' -g '*.{ts,tsx,js,jsx,mjs,cjs,rs,py,go,c,cpp,h,hpp,hh,java,rb,php,swift,kt,kts,scala,sc,cs,sh,bash,zsh,lua,r,ex,exs,erl,elm,hs,dart,sql}' --no-heading --line-number",
+      '.',
+      10000,
+    );
+    const out = [];
+    for (const l of r.stdout.split('\n')) {
+      if (!l) continue;
+      const m = l.match(/^(.+?):(\d+):.*?(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait|def|func)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+      if (m) out.push({ file: m[1], line: parseInt(m[2], 10), name: m[3] });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+async function getSymbolIndex() {
+  if (!symbolIndexCache || Date.now() - symbolIndexAt > 15000) {
+    symbolIndexCache = await buildSymbolIndex();
+    symbolIndexAt = Date.now();
+  }
+  return symbolIndexCache;
+}
+// Ranked retrieval: symbol-name matches (high score) merged with content matches
+// (lower score), deduped by file:line and sorted by score. The symbol index is
+// cached in memory and refreshed at most every 15s, so repeated searches in a
+// short window are cheap (the "persistent" repo index).
+async function repoSearch(query, limit = 15) {
+  const q = (query || '').trim();
+  if (!q) return { results: [], truncated: false };
+  const terms = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+  const results = new Map();
+  const idx = await getSymbolIndex();
+  for (const s of idx) {
+    const fileLow = s.file.toLowerCase();
+    const nameLow = s.name.toLowerCase();
+    let score = 0;
+    for (const t of terms) {
+      if (nameLow === t) score += 100;
+      else if (nameLow.startsWith(t)) score += 60;
+      else if (nameLow.includes(t)) score += 30;
+      else if (fileLow.includes(t)) score += 10;
+    }
+    if (score > 0) {
+      const key = s.file + ':' + s.line;
+      const e = results.get(key) || { file: s.file, line: s.line, snippet: '', score: 0, kind: 'symbol' };
+      e.score += score;
+      results.set(key, e);
+    }
+  }
+  try {
+    const r = await execCommand(
+      `rg -F --no-heading --line-number -e ${JSON.stringify(q)} -g '!.git' -g '!node_modules' -g '!target' -g '!dist' -g '!build' -g '!vendor' -g '!__pycache__'`,
+      '.',
+      20000,
+    );
+    for (const l of r.stdout.split('\n')) {
+      if (!l) continue;
+      const m = l.match(/^(.+?):(\d+):(.*)$/);
+      if (!m) continue;
+      const file = m[1], ln = parseInt(m[2], 10), text = m[3];
+      const key = file + ':' + ln;
+      const e = results.get(key) || { file, line: ln, snippet: '', score: 0, kind: 'content' };
+      e.score += 8;
+      e.snippet = text.slice(0, 300);
+      results.set(key, e);
+    }
+  } catch {
+    /* no content matches */
+  }
+  const arr = [...results.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+  return { results: arr, truncated: results.size > limit };
+}
 // Recognize shell commands that can cause irreversible data loss or system
 // damage. Returns a short human-readable reason, or null if the command looks
 // safe. Safe mode (coderSafeMode) blocks anything this flags.
@@ -1510,6 +1591,12 @@ async function handleCoder(req, res, p, url) {
       } catch (err) {
         return sendJson(res, 200, { map: "" });
       }
+    }
+    if (p === '/api/coder/search' && req.method === 'GET') {
+      const q = url.searchParams.get('q') || '';
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 15), 1), 50);
+      const r = await repoSearch(q, limit);
+      return sendJson(res, 200, r);
     }
     if (p === '/api/coder/fs/read' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);
