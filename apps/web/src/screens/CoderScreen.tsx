@@ -982,6 +982,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
+  // Re-pointed sidecar workspace + flush counter (see the workspace effect below);
+  // declared early because the panel-reload effects depend on wsFlushed.
+  const wsAppliedDirRef = useRef<string | null>(null);
+  const [wsFlushed, setWsFlushed] = useState(0);
+  // Serialized re-point queue (see the workspace effect below): a run awaits
+  // this before its first sidecar tool call.
+  const wsApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [showPicker, setShowPicker] = useState(false);
@@ -1149,13 +1156,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // which setCoderWorkspace() re-points asynchronously. A response that lands
   // before the switch is confirmed belongs to the PREVIOUS workspace — so each
   // panel applies a response only if (a) it is the newest fetch (seq refs) and
-  // (b) the control was confirmed at that workspace by then (wsAppliedRef,
+  // (b) the control was confirmed at that workspace by then (wsAppliedDirRef.current,
   // set in the setCoderWorkspace success handler below, which also bumps
-  // wsSynced to trigger the confirmed reload).
-  const wsAppliedRef = useRef(activeWsDir);
+  // wsFlushed to trigger the confirmed reload).
   const treeSeqRef = useRef(0);
   const memSeqRef = useRef(0);
-  const [wsSynced, setWsSynced] = useState(0);
 
   // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the sidecar
   // under its data dir, so it is never committed by accident. The agent sees it
@@ -1164,6 +1169,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
   // Memory modal open state.
   const [memOpen, setMemOpen] = useState(false);
+  // Generation counters for the sidecar-relative panel fetches (commits panel —
+  // the tree/memory seq refs live in the shared block above).
+  const commitsSeqRef = useRef(0);
   // Pull the bank + learnings for the active workspace; called on workspace change
   // and after the critic / memory_update writes new learnings.
   const loadMemory = useCallback(async () => {
@@ -1175,7 +1183,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // only once the control is confirmed at this workspace — otherwise a
       // pre-switch response would land in memoryRef and leak the OTHER
       // workspace's bank into this workspace's system prompt.
-      if (seq === memSeqRef.current && wsAppliedRef.current === activeWsDir) {
+      if (seq === memSeqRef.current && wsAppliedDirRef.current === activeWsDir) {
         setMemory(m);
         memoryRef.current = m;
       }
@@ -1185,14 +1193,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWsDir]);
 
   const loadCommits = useCallback(async () => {
+    const seq = ++commitsSeqRef.current;
     setCommitsLoading(true);
     try {
-      setCommits(await coderGitLog(100));
+      const commits = await coderGitLog(100);
+      if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
+      setCommits(commits);
     } catch {
       // Keep the last good list rather than wiping it on a transient sidecar
       // blip (M2). An empty workspace simply shows no commits.
     } finally {
-      setCommitsLoading(false);
+      if (seq === commitsSeqRef.current) setCommitsLoading(false);
     }
   }, []);
   /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
@@ -1212,17 +1223,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
   }, [running, activeWs, loadCommits]);
 
-  // Refresh the commit history whenever the active workspace changes.
+  // Refresh the commit history whenever the active workspace changes (or the
+  // sidecar re-point is flushed after a held mid-run switch — wsFlushed).
   useEffect(() => {
     if (activeWsDir) loadCommits();
-  }, [activeWsDir, loadCommits]);
+  }, [activeWsDir, wsFlushed, loadCommits]);
 
   // Refresh the self-improving memory whenever the active workspace changes —
-  // and again once the control is confirmed at it (wsSynced), the only point
+  // and again once the control is confirmed at it (wsFlushed), the only point
   // at which the relative fetch is guaranteed to hit this workspace's store.
   useEffect(() => {
     if (activeWsDir) void loadMemory();
-  }, [wsSynced, activeWsDir, loadMemory]);
+  }, [activeWsDir, wsFlushed, loadMemory]);
 
   // Sync the safe-mode toggle with the sidecar's current state on mount.
   useEffect(() => {
@@ -1231,7 +1243,39 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       .catch(() => { /* leave default true */ });
   }, []);
 
+  // The conversation an in-flight run is pinned to. Set at run start so that
+  // switching conversations/workspaces mid-run is a pure VIEW change: the run
+  // keeps appending to ITS conversation (in the store), and the visible
+  // transcript only mirrors the update while that conversation is on screen.
+  // Without this, a mid-run switch would write the live transcript into the
+  // conversation the user switched to — the corruption P0 #2 guarded against.
+  const runConvRef = useRef<{ ws: string; convId: string } | null>(null);
+  // State mirror of the ref for the UI (drives the "running" marker below).
+  const [runConv, setRunConvState] = useState<{ ws: string; convId: string } | null>(null);
+  /** Pin/unpin the in-flight run's transcript target. */
+  const setRunConv = (pin: { ws: string; convId: string } | null) => {
+    runConvRef.current = pin;
+    setRunConvState(pin);
+  };
+  // Where a paused run (ask_user) was pinned, so the answer resumes the right
+  // conversation even if the user has since switched elsewhere.
+  const askConvRef = useRef<{ ws: string; convId: string } | null>(null);
+
   const lastPromptTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
+  // The IN-FLIGHT RUN's token accounting, pinned separately from the visible
+  // meter (lastPromptTokensRef): switching to another conversation mid-run
+  // overwrites the meter with that conversation's count, which must not feed
+  // the run's compaction threshold. The meter only mirrors the run's count
+  // while the run's conversation is on screen.
+  const runTokensRef = useRef<number>(initialMeta?.lastPromptTokens ?? 0);
+  /** Record the run's prompt-token count; mirrors to the visible meter only while the run's conversation is on screen. */
+  const noteRunTokens = (t: number) => {
+    runTokensRef.current = t;
+    const pin = runConvRef.current;
+    if (pin && pin.ws === storeRef.current.activeWs && pin.convId === storeRef.current.activeConv) {
+      lastPromptTokensRef.current = t;
+    }
+  };
   // Visible mirrors of the ref above + the engine context window + the agent
   // step counter, so the header can show live context usage (release #3).
   const [ctxTokens, setCtxTokens] = useState<number>(initialMeta?.lastPromptTokens ?? 0);
@@ -1253,6 +1297,43 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setMessages(msgs);
     setLedger(m.ledger ?? []);
     applyTodos(m.todos ?? [], m.todosUpdatedAt ?? null);
+  };
+
+  /** Apply a transcript update to the conversation the in-flight run is pinned
+   *  to. Persists to the store even when that conversation is NOT on screen
+   *  (so switching back shows the live transcript); mirrors to the visible
+   *  transcript only while it is on screen. */
+  const updateRunMessages = (fn: (prev: ChatMessage[]) => ChatMessage[]) => {
+    const pin = runConvRef.current;
+    if (!pin) return;
+    setStore((prev) => {
+      const wsd = prev.workspaces[pin.ws];
+      const meta = wsd?.conversations[pin.convId];
+      if (!wsd || !meta) return prev;
+      return {
+        ...prev,
+        workspaces: { ...prev.workspaces, [pin.ws]: { ...wsd, conversations: { ...wsd.conversations, [pin.convId]: { ...meta, messages: fn(meta.messages ?? []), lastPromptTokens: runTokensRef.current, updatedAt: Date.now() } } } },
+      };
+    });
+    if (pin.ws === storeRef.current.activeWs && pin.convId === storeRef.current.activeConv) setMessages(fn);
+  };
+  /** Same pinning for todo_write: the run's todos stay in the run's conversation. */
+  /** `ts` (from #5's todosUpdatedAt): persisted into the run conversation's
+   *  meta (so switching back shows the right "last updated"), mirrored to the
+   *  header only while that conversation is on screen. */
+  const updateRunTodos = (next: TodoItem[], ts?: number) => {
+    const pin = runConvRef.current;
+    if (!pin) { setTodos(next); if (ts != null) setTodosUpdatedAt(ts); return; }
+    setStore((prev) => {
+      const wsd = prev.workspaces[pin.ws];
+      const meta = wsd?.conversations[pin.convId];
+      if (!wsd || !meta) return prev;
+      return {
+        ...prev,
+        workspaces: { ...prev.workspaces, [pin.ws]: { ...wsd, conversations: { ...wsd.conversations, [pin.convId]: { ...meta, todos: next, todosUpdatedAt: ts, updatedAt: Date.now() } } } },
+      };
+    });
+    if (pin.ws === storeRef.current.activeWs && pin.convId === storeRef.current.activeConv) { setTodos(next); if (ts != null) setTodosUpdatedAt(ts); }
   };
 
   // Persist the active conversation's live state back into the store.
@@ -1280,39 +1361,57 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   }, [messages, ledger, todos, todosUpdatedAt, activeWs, activeConv]);
 
-  // Keep the sidecar's coder workspace pointed at the active workspace.
-  // Each set is chained after the previous one's completion: the `cancelled`
-  // flag only suppresses THIS effect's callback — an already-sent POST still
-  // reaches the server. Without serialization, rapid A→B→A switching could
-  // let B's POST complete after A's, leaving the control on B while the UI
-  // believes it is on A (and concurrent POSTs could interleave their config
-  // writes server-side). Chaining guarantees switch order == request order,
-  // so the server always ends on the latest workspace.
-  const wsSetQueueRef = useRef<Promise<void>>(Promise.resolve());
+  // Keep the sidecar's coder workspace pointed at the active workspace — but
+  // HOLD the re-point while a run is in flight: every agent tool call resolves
+  // against the sidecar's configured workspace, so re-pointing mid-run would
+  // send the running agent's edits/commits to the repo the user just switched
+  // to. When the run ends the re-point fires (running flips in the deps) and
+  // the panel reloads below pick it up via wsFlushed.
+  //
+  // Re-points are SERIALIZED (each chained after the previous) so rapid
+  // A→B→A switches can't interleave, and only the LATEST request commits
+  // wsAppliedDirRef/wsFlushed — a stale response from an older switch can't
+  // clobber the applied workspace. runAgent awaits this queue before its
+  // first sidecar tool call, so an in-flight re-point settles before the run
+  // starts rather than landing mid-run.
+  const wsApplySeqRef = useRef(0);
+  const wsApplyPendingRef = useRef(false);
+  /** Enqueue a sidecar re-point (serialized; only the latest request commits
+   *  wsAppliedDirRef/wsFlushed). Called by the effect below AND directly by
+   *  the ask-resume paths — their setStore-driven effect would otherwise
+   *  enqueue the re-point only after runAgent already passed its queue await,
+   *  i.e. mid-run. */
+  const queueWorkspaceApply = (dir: string) => {
+    if (wsAppliedDirRef.current === dir && !wsApplyPendingRef.current) return;
+    const seq = ++wsApplySeqRef.current;
+    wsApplyPendingRef.current = true;
+    setWsBusy(true);
+    const task = wsApplyQueueRef.current
+      .catch(() => undefined) // a previous failure must not clog the queue
+      .then(() => setCoderWorkspace(dir))
+      .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
+      .then(() => {
+        // Only the LATEST request may commit — a stale response from an older
+        // workspace switch would otherwise leave wsAppliedDirRef pointing at
+        // a workspace the sidecar is no longer on.
+        if (seq === wsApplySeqRef.current) {
+          wsAppliedDirRef.current = dir;
+          setWsFlushed((n) => n + 1);
+        }
+      })
+      .finally(() => { wsApplyPendingRef.current = false; setWsBusy(false); });
+    wsApplyQueueRef.current = task;
+  };
   useEffect(() => {
     if (!activeWsDir) return;
-    let cancelled = false;
-    setWsBusy(true);
-    wsSetQueueRef.current = wsSetQueueRef.current
-      .catch(() => undefined) // a previous failure must not clog the queue
-      .then(() => setCoderWorkspace(activeWsDir))
-      .then(
-        () => {
-          if (cancelled) return;
-          // Control confirmed at this workspace — from here on a relative
-          // tree fetch is valid, so (re)load the panel against the right root.
-          wsAppliedRef.current = activeWsDir;
-          setWsSynced((n) => n + 1);
-        },
-        (e) => {
-          if (!cancelled) console.warn('Failed to set coder workspace on sidecar:', e);
-        },
-      )
-      .finally(() => {
-        if (!cancelled) setWsBusy(false);
-      });
-    return () => { cancelled = true; };
-  }, [activeWsDir]);
+    // Held until the run finishes — wsBusy stays false so the user can still
+    // switch/add workspaces (those re-points just queue behind the run).
+    if (running) { setWsBusy(false); return; }
+    queueWorkspaceApply(activeWsDir);
+  }, [activeWsDir, running]);
+  // True while the view is on a different workspace than the one the sidecar
+  // is still pointed at (a re-point held by an in-flight run).
+  const wsHeld = running && wsAppliedDirRef.current !== null && wsAppliedDirRef.current !== activeWsDir;
 
   // Seed the default workspace from the sidecar once its path is known.
   const seeded = useRef(false);
@@ -1420,7 +1519,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const handleSelectConv = (ws: string, convId: string) => {
-    if (running) return; // don't switch conversations mid-run (P0 #2: avoids corrupting the in-flight transcript)
+    // Switching is a pure view change even mid-run: the in-flight run is pinned
+    // to its own conversation (runConvRef) and keeps persisting there, so the
+    // visible transcript can follow the user without corruption (P0 #2).
     if (ws === activeWs && convId === activeConv) return;
     setStore((prev) => ({ ...prev, activeWs: ws, activeConv: convId }));
     loadConv(ws, convId);
@@ -1456,6 +1557,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
   };
   const handleRemoveWorkspace = (path: string) => {
+    // A workspace hosting the in-flight (or paused, ask_user) run's
+    // conversation can't go away while its transcript is being written into it.
+    if ((runConvRef.current ?? askConvRef.current)?.ws === path) return;
     const workspaces = { ...storeRef.current.workspaces };
     delete workspaces[path];
     const keys = Object.keys(workspaces);
@@ -1491,6 +1595,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const handleArchiveConv = (ws: string, cid: string, archived: boolean) => {
+    // Hiding the conversation an in-flight (or paused, ask_user) run is pinned
+    // to would strand its live transcript; restoring it is always fine.
+    if (archived && (runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return;
     const wsd = storeRef.current.workspaces[ws];
     const c = wsd?.conversations[cid];
     if (!wsd || !c) return;
@@ -1525,6 +1632,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   const handleDeleteConv = (ws: string, cid: string) => {
+    if ((runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return; // pinned by the in-flight / paused run
     if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
     const wsd = storeRef.current.workspaces[ws];
     if (!wsd) return;
@@ -1568,7 +1676,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
-    setLedger((prev) => [...prev.slice(-999), { ...safe, id: crypto.randomUUID(), time: Date.now() }]);
+    // Run logs belong to the conversation the run is pinned to, not whatever
+    // the user is currently viewing; the ledger only mirrors the view. The
+    // fallback reads storeRef (not the captured activeWs/activeConv) because
+    // long-lived closures (e.g. refreshRepoMap) hold an old render's values.
+    const target = runConvRef.current ?? { ws: storeRef.current.activeWs, convId: storeRef.current.activeConv };
+    const rec: LogEntry = { ...safe, id: crypto.randomUUID(), time: Date.now() };
+    setStore((prev) => {
+      const wsd = prev.workspaces[target.ws];
+      const meta = wsd?.conversations[target.convId];
+      if (!wsd || !meta) return prev;
+      return {
+        ...prev,
+        workspaces: { ...prev.workspaces, [target.ws]: { ...wsd, conversations: { ...wsd.conversations, [target.convId]: { ...meta, ledger: [...(meta.ledger ?? []).slice(-999), rec], updatedAt: Date.now() } } } },
+      };
+    });
+    if (target.ws === storeRef.current.activeWs && target.convId === storeRef.current.activeConv) setLedger((prev) => [...prev.slice(-999), rec]);
   };
 
   // ---- Todos: user actions (the panel is no longer read-only). Edits take
@@ -1645,9 +1768,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // The system prompt follows the user's selection, re-read fresh each run so
     // edits to followed files surface in the agent's context automatically.
     try {
-      const ws = storeRef.current.activeWs;
-      const conv = storeRef.current.activeConv;
-      const bps = storeRef.current.workspaces[ws]?.conversations[conv]?.boundPaths ?? [];
+      // Followed paths belong to the conversation the run is pinned to, not
+      // the one on screen (a mid-run switch is a view change only) — otherwise
+      // a mutation in the still-running conversation could inject ANOTHER
+      // conversation's bound paths into its next prompt.
+      const pin = runConvRef.current;
+      const tWs = pin?.ws ?? storeRef.current.activeWs;
+      const tConv = pin?.convId ?? storeRef.current.activeConv;
+      const bps = storeRef.current.workspaces[tWs]?.conversations[tConv]?.boundPaths ?? [];
       if (bps.length) {
         const followed: string[] = [
           '\n\n# Followed files (system prompt follows these — pinned context for every turn)',
@@ -1734,7 +1862,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
 
   // ---- File Tree panel: browse + system-prompt follow bindings ----
-  // See the wsAppliedRef/treeSeqRef note above — a tree response only applies
+  // See the wsAppliedDirRef/treeSeqRef note above — a tree response only applies
   // if it is the newest fetch and the control is confirmed at this workspace.
   const loadTree = useCallback(async () => {
     if (!activeWsDir) return;
@@ -1742,7 +1870,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setTreeLoading(true);
     try {
       const t = await coderTree(6, '.');
-      if (seq === treeSeqRef.current && wsAppliedRef.current === activeWsDir) {
+      if (seq === treeSeqRef.current && wsAppliedDirRef.current === activeWsDir) {
         setTreeNodes(t.nodes ?? []);
       }
     } catch { if (seq === treeSeqRef.current) setTreeNodes([]); }
@@ -1785,8 +1913,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWs, activeConv, refreshRepoMap]);
 
   // Load/refresh the tree whenever the active (possibly worktree-bound) directory
-  // changes, or the sidecar re-point is flushed after a held mid-run switch.
-  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsSynced, treeOpen, loadTree]);
+  // changes, or the sidecar re-point is flushed after a held mid-run switch
+  // (#11's wsFlushed — the merged successor of #8's wsSynced counter).
+  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
     if (running || !activeWsDir || commits.length === 0) return;
@@ -1933,7 +2062,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     running,
     // Mid-run sidecar-hold gate: while a run pins the sidecar to another
     // workspace, every sidecar-touching tab op no-ops (the wsHeld chip explains).
-    sidecarReady: () => wsAppliedRef.current === activeWsDir,
+    sidecarReady: () => wsAppliedDirRef.current === activeWsDir,
     getLintCommand: () => {
       const c = activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined;
       return c?.lint || c?.build || null;
@@ -1944,21 +2073,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Refresh git badges once a new workspace's sidecar re-point is flushed.
   useEffect(() => {
     void tabs.refreshGitStatus();
-  }, [tabs.refreshGitStatus, wsSynced, activeWsDir]);
-  // Content refresh only when the flush actually lands (wsSynced bumped):
+  }, [tabs.refreshGitStatus, wsFlushed, activeWsDir]);
+  // Content refresh only when the flush actually lands (wsFlushed bumped):
   // a held mid-run switch — and even a plain switch's in-flight POST — skips
   // the restore re-reads (sidecarReady is false until the confirmed
   // workspace), so this is the point at which rereading open tabs (code AND
   // image — the snapshot drops image payloads) is guaranteed to hit the
   // right workspace. Gated on the delta so a plain activeWsDir change (no
   // flush) doesn't double-read the tabs the flush will cover anyway.
-  const wsSyncedPrevRef = useRef(wsSynced);
+  const wsFlushedPrevRef = useRef(wsFlushed);
   useEffect(() => {
-    const flushed = wsSynced !== wsSyncedPrevRef.current;
-    wsSyncedPrevRef.current = wsSynced;
+    const flushed = wsFlushed !== wsFlushedPrevRef.current;
+    wsFlushedPrevRef.current = wsFlushed;
     if (!flushed) return;
     void tabs.refreshOpenTabs();
-  }, [tabs.refreshOpenTabs, wsSynced]);
+  }, [tabs.refreshOpenTabs, wsFlushed]);
 
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
@@ -2017,10 +2146,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setPendingQuestion(null);
     setAskNote('');
     const msg: ChatMessage = { role: 'user', content: answer };
+    // Resume into the PAUSED conversation (askConvRef) even if the user has
+    // since switched — the answer must not resume from the transcript now on
+    // screen.
+    const pin = askConvRef.current;
+    askConvRef.current = null;
+    if (pin && (pin.ws !== activeWs || pin.convId !== activeConv)) {
+      setStore((prev) => ({ ...prev, activeWs: pin.ws, activeConv: pin.convId }));
+      const pMeta = storeRef.current.workspaces[pin.ws]?.conversations[pin.convId];
+      const pDir = pMeta?.worktree ? `${pin.ws}/${pMeta.worktree}` : pin.ws;
+      queueWorkspaceApply(pDir); // must settle before the resumed run's first tool call
+      const base = storeRef.current.workspaces[pin.ws]?.conversations[pin.convId]?.messages ?? [];
+      loadConv(pin.ws, pin.convId);
+      runAgent(compactedContext(base).concat(msg), { scout: false, pin });
+      return;
+    }
     const next = [...messages, msg];
     setMessages(next);
     // Resumed runs skip the scout pre-pass (its findings are already in context).
-    runAgent(compactedContext(messages).concat(msg), { scout: false });
+    runAgent(compactedContext(messages).concat(msg), { scout: false, pin: pin ?? undefined });
   };
 
   // ---------------------------------------------------------------------------
@@ -2504,7 +2648,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             addLog({ type: 'todo', label: 'todo_write', detail: 'discarded: list edited by the user mid-run' });
             result = JSON.stringify({ success: false, reason: 'the task list was edited by the user while this response was being generated, so this update was not applied. The current list is in your system prompt — re-emit todo_write with the full intended list if your plan is still correct.' });
           } else {
-            applyTodos(cleaned, Date.now());
+            // Composite of #5 (validation + stale-guard above) and #11 (run
+            // pinning): sync the run-loop ref FIRST so the next LLM call's
+            // system-prompt injection sees this list even before effects run,
+            // then write through the pinned path (store lands in the run's
+            // conversation even mid-switch; visible transcript mirrors it).
+            todosRef.current = cleaned;
+            updateRunTodos(cleaned, Date.now());
             result = JSON.stringify({ success: true, count: cleaned.length });
           }
         } else if (call.name === 'memory_update') {
@@ -2580,7 +2730,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               // The write landed in the store the control points at *now*;
               // adopt it into the active workspace's state only if that is
               // still the confirmed workspace.
-              if (wsAppliedRef.current === activeWsDir) {
+              if (wsAppliedDirRef.current === activeWsDir) {
                 setMemory(m);
                 memoryRef.current = m;
               }
@@ -2873,14 +3023,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     // Adopt the final write response only if the control is still confirmed
     // at the active workspace (it re-points async on workspace switches).
-    if (wsAppliedRef.current === activeWsDir) {
+    if (wsAppliedDirRef.current === activeWsDir) {
       setMemory(m);
       memoryRef.current = m;
     }
   };
 
-  const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
+  const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean; pin?: { ws: string; convId: string } }) => {
+    // Pin the run to its conversation BEFORE anything can switch the view, so
+    // every transcript/log/todo write below lands in this conversation's store
+    // entry even if the user moves to a different conversation mid-run.
+    setRunConv(opts?.pin ?? { ws: activeWs, convId: activeConv });
     setRunning(true);
+    // Pin the run's token accounting; the visible meter may follow the view.
+    runTokensRef.current = lastPromptTokensRef.current;
+    // Settle any in-flight sidecar re-point BEFORE the first tool call: a
+    // switch POST only ever targets the view the run starts in, so awaiting
+    // it makes the early calls hit the right repo instead of the previous
+    // workspace, and nothing re-points mid-run (switches now queue behind it).
+    await wsApplyQueueRef.current.catch(() => undefined);
     let currentMessages = initialMessages;
     // Capture the repo HEAD at run start so the critic can review the CUMULATIVE
     // diff of everything the agent did this run (including auto-committed edits),
@@ -2934,7 +3095,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             content: `# Scout Report (read-only pre-pass, ${SCOUT_PROBES.length} parallel probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
           };
           currentMessages = [...currentMessages, scoutMsg];
-          setMessages((prev) => [...prev, scoutMsg]);
+          updateRunMessages((prev) => [...prev, scoutMsg]);
         }
       } else if (!abortRef.current.signal.aborted) {
         addLog({ type: 'read', label: 'scout', detail: `skipped: engine max-concurrency is ${mc} (needs > 1 for parallel probes)` });
@@ -2943,6 +3104,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (abortRef.current.signal.aborted) {
       setRunning(false);
       abortRef.current = null;
+      setRunConv(null);
       return;
     }
 
@@ -3007,12 +3169,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // Use the recorded prompt-token count when the engine reports it; otherwise
         // fall back to the local estimate (M3) so the 80% trigger still fires.
         const est = estimateTokens(currentMessages);
-        const recordedOrEst = Math.max(lastPromptTokensRef.current, est);
+        const recordedOrEst = Math.max(runTokensRef.current, est);
         const overBudget =
           maxContext > 0 &&
           (recordedOrEst >= COMPACT_AT * maxContext || est >= maxContext);
         if (overBudget) {
-          addLog({ type: 'compact', label: 'compact', detail: `context ${lastPromptTokensRef.current}/${maxContext} — summarizing` });
+          addLog({ type: 'compact', label: 'compact', detail: `context ${runTokensRef.current}/${maxContext} — summarizing` });
           try {
             const summary = await summarizeConversation({
               model,
@@ -3025,14 +3187,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // Keep the full transcript on screen; only the model context is
             // cleared down to the summary checkpoint (re-injected as leading
             // context on the next turn).
-            setMessages((prev) => [...prev, ...currentMessages]);
-            lastPromptTokensRef.current = 0;
+            updateRunMessages((prev) => [...prev, ...currentMessages]);
+            noteRunTokens(0);
             continue;
           } catch (e) {
             // Compaction is our only guard against context overflow — if it fails
             // we must stop rather than send an oversized payload (P1 #3).
             addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
-            setMessages((prev) => [
+            updateRunMessages((prev) => [
               ...prev,
               {
                 role: 'system',
@@ -3048,7 +3210,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // count) so a runaway plan can't loop indefinitely (release blocker #1).
         if (agentSteps >= MAX_AGENT_STEPS) {
           addLog({ type: 'error', label: 'limit', detail: `reached max agent steps (${MAX_AGENT_STEPS}) — stopping to avoid a runaway run` });
-          setMessages((prev) => [...prev, {
+          updateRunMessages((prev) => [...prev, {
             role: 'system',
             content: `⚠ Reached the maximum number of agent steps (${MAX_AGENT_STEPS}). The run was stopped to avoid a runaway loop. Review the work so far, then continue in a new message or break the task into smaller steps.`,
           }]);
@@ -3092,8 +3254,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               onDone: (meta) => {
                 // Record the engine's real prompt-token count when present;
                 // otherwise keep the local estimate so accounting stays accurate
-                // across turns even when usage is omitted (M3).
-                lastPromptTokensRef.current = meta?.promptTokens ?? est;
+                // across turns even when usage is omitted (M3). Pinned to the
+                // run — the visible meter may follow a different conversation.
+                noteRunTokens(meta?.promptTokens ?? est);
               },
             });
             streamOk = true;
@@ -3146,7 +3309,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         };
 
         currentMessages = [...currentMessages, assistantMsg];
-        setMessages((prev) => [...prev, assistantMsg]);
+        updateRunMessages((prev) => [...prev, assistantMsg]);
 
         // Not-Ai auto-rewrite: for content-only (user-facing) replies, run the
         // deterministic tell-gate and silently re-write the message in place when
@@ -3169,7 +3332,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               if (rewritten && rewritten.trim() && rewritten.trim() !== assistantMsg.content.trim()) {
                 const updated: ChatMessage = { ...assistantMsg, content: rewritten };
                 currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
-                setMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
+                updateRunMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
               }
             }
           } catch {
@@ -3189,13 +3352,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // Keep the Commit History panel live as the agent commits changes.
           loadCommits();
           // Append only the new tool results to the visible transcript.
-          setMessages((prev) => [...prev, ...currentMessages.slice(before)]);
+          updateRunMessages((prev) => [...prev, ...currentMessages.slice(before)]);
           // Human-in-the-loop pause: if the agent asked the user a question, stop
           // the run and surface it. The (already-visible) transcript includes the
           // question; the user's answer resumes the run (#5).
           if (askRef.current) {
             const q = askRef.current;
             askRef.current = null;
+            askConvRef.current = runConvRef.current; // resume into THIS conversation
             setPendingQuestion(q);
             addLog({ type: 'ask', label: 'ask_user', detail: q });
             return;
@@ -3217,7 +3381,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 collapsed: true,
                 content: `VERIFICATION GATE: the project's lint/test checks are still failing. You must fix them before the task is complete — do not declare success. Re-run the checks after fixing.\n\n${summary}`,
               }];
-              setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
+              updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
               bounced = true;
             }
           }
@@ -3247,7 +3411,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                   collapsed: true,
                   content: `CODE REVIEW REJECTED: a reviewer found issues with your changes. Address every point below, then continue — do not declare success until the review passes.\n\n${c.issues}`,
                 }];
-                setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
+                updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
                 bounced = true;
               } else {
                 addLog({ type: 'todo', label: 'critic', detail: 'review passed' });
@@ -3271,6 +3435,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } finally {
       setRunning(false);
       abortRef.current = null;
+      setRunConv(null);
     }
   };
 
@@ -3282,6 +3447,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const resuming = pendingQuestion !== null;
     if (resuming) setPendingQuestion(null);
     const msg: ChatMessage = { role: 'user', content: input.trim(), attachments: attachments.length ? attachments : undefined };
+    // Answering a question that was asked while the user has since switched
+    // conversations: the answer belongs to the PAUSED conversation — go back
+    // there and resume from its transcript (not the one now on screen).
+    const resumePin = resuming ? askConvRef.current : null;
+    askConvRef.current = null;
+    if (resumePin && (resumePin.ws !== activeWs || resumePin.convId !== activeConv)) {
+      setStore((prev) => ({ ...prev, activeWs: resumePin.ws, activeConv: resumePin.convId }));
+      const pMeta = storeRef.current.workspaces[resumePin.ws]?.conversations[resumePin.convId];
+      const pDir = pMeta?.worktree ? `${resumePin.ws}/${pMeta.worktree}` : resumePin.ws;
+      queueWorkspaceApply(pDir); // must settle before the resumed run's first tool call
+      const base = storeRef.current.workspaces[resumePin.ws]?.conversations[resumePin.convId]?.messages ?? [];
+      loadConv(resumePin.ws, resumePin.convId);
+      setInput('');
+      setAttachments([]);
+      runAgent(compactedContext(base).concat(msg), { scout: false, pin: resumePin });
+      return;
+    }
     const next = [...messages, msg];
     setMessages(next);
     setInput('');
@@ -3289,8 +3471,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Seed the model context from the most recent compaction checkpoint onward.
     // The visible transcript keeps the full history; only the engine's context is
     // cleared to the summary and re-injected as leading context.
-    runAgent(compactedContext(messages).concat(msg), { scout: !resuming });
+    runAgent(compactedContext(messages).concat(msg), { scout: !resuming, pin: resumePin ?? undefined });
   };
+
+  // True while a run is in flight in a DIFFERENT conversation than the one on
+  // screen. The Stop button is disabled there so the user can't stop (or try to
+  // track) a run they can't see — switch to the running conversation (marked
+  // with the pulsing dot / header chip) to stop it.
+  const runElsewhere = running && !!runConv && (runConv.ws !== activeWs || runConv.convId !== activeConv);
 
   const stop = () => {
     abortRef.current?.abort();
@@ -3515,11 +3703,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                         if (!c) return null;
                         const isActive = ws === activeWs && cid === activeConv;
                         const isEditing = editingConv?.ws === ws && editingConv?.cid === cid;
+                        const isRunning = runConv?.ws === ws && runConv?.convId === cid;
                         return (
                           <div
                             key={cid}
                             className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
                           >
+                            {isRunning && (
+                              <span role="status" aria-label="Run in progress" className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="Run in progress — this conversation keeps updating in the background" />
+                            )}
                             {isEditing ? (
                               <input
                                 autoFocus
@@ -4024,6 +4216,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
           <span className="text-faint">/</span>
           <span className="truncate text-mute">{activeMeta?.title || 'New conversation'}</span>
+          {runConv && !(runConv.ws === activeWs && runConv.convId === activeConv) && (
+            <span
+              role="status"
+              className="shrink-0 rounded-full border border-accent/40 bg-accent/10 px-1.5 text-[10px] text-accent"
+              title="A run is in progress in another conversation — it keeps running in the background; switch back to watch it."
+            >
+              ● running in {baseName(runConv.ws)} / {store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'}
+            </span>
+          )}
+          {wsHeld && (
+            <span
+              className="shrink-0 text-[10px] text-faint"
+              title="All agent tools run against the sidecar's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
+            >
+              sidecar on {baseName(wsAppliedDirRef.current!)} until run ends
+            </span>
+          )}
           <span
             className="ml-auto hidden shrink-0 font-mono text-[10.5px] text-faint sm:inline"
             title={ctxLimit != null ? `${formatTokens(ctxTokens)} of ${formatTokens(ctxLimit)} context tokens used (last request)` : 'Context usage appears after the first agent request'}
@@ -4349,7 +4558,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               disabled={running || !activeWs || pendingQuestion !== null}
             />
             {running ? (
-               <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
+               <Button variant="danger" onClick={stop} disabled={runElsewhere}
+                 title={runElsewhere && runConv
+                   ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
+                   : 'Stop the running agent'}><Square size={14} /> Stop</Button>
             ) : (
                <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0 || pendingQuestion !== null}><Play size={14} /> Run</Button>
             )}
@@ -4541,8 +4753,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         open={memOpen}
         onClose={() => setMemOpen(false)}
         memory={memory}
-        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { if (wsAppliedRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
-        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { if (wsAppliedRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
+        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
+        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
         onChanged={() => loadMemory()}
       />
       {showDir && (
