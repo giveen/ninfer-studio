@@ -143,6 +143,69 @@ pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value
     Json(json!({"enabled": state.coder_safe_mode.load(Ordering::SeqCst)}))
 }
 
+/// Per-tool permission tier — mirrors the web UI's `PermTier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermTier {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// The active workspace's tool permissions, pushed here by the web UI
+/// (`perms_set`) whenever the user edits them or switches workspaces.
+///
+/// The UI is normally what decides whether to call a coder endpoint at all
+/// — but that's a client-side dispatcher the agent can route around (e.g.
+/// its allowed `bash` tool can `curl` straight at an endpoint whose own
+/// tool tier is `deny`). `enforce_perm` re-checks `deny` and `denyPaths`
+/// at the endpoint itself so that bypass doesn't work. `ask` has no
+/// server-side meaning — it means "pause and prompt a human", which only
+/// the client can do — so it stays a client-only tier here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CoderPerms {
+    pub tools: std::collections::HashMap<String, PermTier>,
+    pub deny_paths: Vec<String>,
+}
+
+/// Reject when `tool` is tiered `deny`, or when `rel` (a workspace-relative
+/// path, for tools that take one) sits under a denied prefix. Mirrors the
+/// frontend's `checkPerm`: exact match or `rel` starting with `"<prefix>/"`.
+async fn enforce_perm(state: &S, tool: &str, rel: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+    let perms = state.coder_perms.read().await;
+    if perms.tools.get(tool) == Some(&PermTier::Deny) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": format!("'{tool}' is set to deny by workspace permissions")})),
+        ));
+    }
+    if let Some(rel) = rel {
+        let hit = perms.deny_paths.iter().find(|d| {
+            let clean = d.trim().trim_end_matches('/');
+            !clean.is_empty() && (rel == clean || rel.starts_with(&format!("{clean}/")))
+        });
+        if let Some(hit) = hit {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn perms_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+}
+
+pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
+    if let Ok(parsed) = serde_json::from_value::<CoderPerms>(req) {
+        *state.coder_perms.write().await = parsed;
+    }
+    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+}
+
 #[derive(Serialize)]
 pub struct WorkspaceResp {
     pub workspace: String,
@@ -279,6 +342,7 @@ pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "read", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let buf = tokio::fs::read(&full)
         .await
@@ -317,6 +381,7 @@ pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "write", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let content = match req.get("content").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
@@ -341,6 +406,7 @@ pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "edit", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let (old, new) = match (req.get("old").and_then(|v| v.as_str()), req.get("new").and_then(|v| v.as_str())) {
         (Some(o), Some(n)) => (o.to_string(), n.to_string()),
@@ -464,6 +530,7 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "apply_patch", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let hunks = match req.get("edits").and_then(|v| v.as_array()) {
         Some(h) if !h.is_empty() => h.clone(),
@@ -544,6 +611,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if command.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "command required"}))));
     }
+    enforce_perm(&state, "bash", None).await?;
     let ws = state.config.read().await.coder_workspace.clone();
     let root = coder_root(&ws)?;
     let rel_cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -907,7 +975,8 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if pattern.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"}))));
     }
-    
+    enforce_perm(&state, "grep", None).await?;
+
     let ignore_case = req.get("ignoreCase").and_then(|v| v.as_bool()).unwrap_or(false);
     
     let regex_pattern = if ignore_case {
@@ -979,6 +1048,7 @@ pub async fn glob(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         Some(p) if !p.is_empty() => p.to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"})))),
     };
+    enforce_perm(&state, "glob", req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty())).await?;
     let ws = state.config.read().await.coder_workspace.clone();
     let ws_root = coder_root(&ws)?;
     let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1157,12 +1227,13 @@ async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, J
     Ok(())
 }
 
-pub async fn web_fetch(AxumState(_state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const MAX_REDIRECTS: u8 = 5;
     let raw = match req.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "url required"})))),
     };
+    enforce_perm(&state, "web_fetch", None).await?;
     let mut url = reqwest::Url::parse(&raw)
         .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid url"}))))?;
     let client = reqwest::Client::builder()
@@ -1302,11 +1373,12 @@ fn parse_ddg(html: &str) -> Vec<Value> {
     out
 }
 
-pub async fn web_search(AxumState(_state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn web_search(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let query = match req.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "query required"})))),
     };
+    enforce_perm(&state, "web_search", None).await?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
         .timeout(Duration::from_secs(20))
@@ -2188,6 +2260,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// A `deny`-tiered tool or denied path is rejected at the endpoint
+    /// itself — not only by the client dispatcher that normally decides
+    /// whether to call it (e.g. an agent routing `bash` around a denied
+    /// `write` tool must not be able to reach `fs_write` either).
+    #[tokio::test]
+    async fn perms_are_enforced_server_side() {
+        use axum::extract::State as AxumState;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-perms-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
+        let ws = || AxumState(state.clone());
+
+        // Defaults: nothing denied.
+        let got = perms_get(ws()).await.0;
+        assert_eq!(got.get("tools").and_then(|v| v.as_object()).map(|m| m.len()), Some(0));
+
+        // Push a policy: bash denied outright, anything under "secret" denied by path.
+        perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
+        let got = perms_get(ws()).await.0;
+        assert_eq!(got.get("tools").and_then(|v| v.get("bash")).and_then(|v| v.as_str()), Some("deny"));
+
+        // bash is denied even though safe mode alone would have allowed "echo hi".
+        assert!(exec(ws(), Json(json!({"command": "echo hi"}))).await.is_err());
+
+        // write under the denied prefix is rejected; a sibling path still works.
+        assert!(fs_write(ws(), Json(json!({"path": "secret/x.txt", "content": "no"}))).await.is_err());
+        assert!(fs_write(ws(), Json(json!({"path": "ok/x.txt", "content": "yes"}))).await.is_ok());
+        // exact-match on the denied prefix itself (no trailing content) is also rejected.
+        assert!(fs_read(ws(), Json(json!({"path": "secret"}))).await.is_err());
+        // unrelated read-only tools are unaffected.
+        assert!(grep(ws(), Json(json!({"pattern": "yes"}))).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Background jobs: start → poll to completion → kill a sleeper.
     #[tokio::test]
     async fn bg_job_round_trip() {

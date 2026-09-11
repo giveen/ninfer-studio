@@ -650,6 +650,15 @@ export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
 export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
   return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
 }
+/** Mirrors the active workspace's tool permission tiers + denied paths to the
+ *  control plane, so a `deny` tier or denied prefix is enforced at the
+ *  endpoint itself — not only by this client's own dispatcher, which an
+ *  agent could otherwise route around (e.g. `bash` curling straight at an
+ *  endpoint whose tool is denied). `ask` isn't sent — the server has no way
+ *  to pause and prompt a human, so that tier stays client-only. */
+export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }): Promise<unknown> {
+  return postJSON<unknown>('/api/coder/perms', perms, 5000);
+}
 export function coderSandboxGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/sandbox', 5000);
 }

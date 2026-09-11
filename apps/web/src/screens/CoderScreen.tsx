@@ -11,7 +11,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
@@ -425,113 +425,130 @@ const TOOLS = [
   }
 ];
 
+function BashResultView({ data }: { data: any }) {
+  return (
+    <div className="rounded-md bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[11px] overflow-hidden mt-1">
+      <div className="bg-[#2d2d2d] px-2 py-1 flex justify-between items-center text-[#858585]">
+        <span>Terminal {data.jobId ? `(background job ${data.jobId} — poll with bash_poll)` : data.exitCode !== null && data.exitCode !== undefined ? `(exit ${data.exitCode})` : ''}</span>
+        <span className="flex items-center gap-2">
+          {data.blocked && <span className="text-danger font-semibold">Blocked by safe mode</span>}
+          {data.timedOut && <span className="text-warn">Timeout</span>}
+        </span>
+      </div>
+      <div className="p-2 overflow-auto max-h-64 whitespace-pre">
+        {data.stdout && <div>{redactSecrets(data.stdout)}</div>}
+        {data.stderr && <div className="text-danger">{redactSecrets(data.stderr)}</div>}
+        {!data.stdout && !data.stderr && <div className="text-faint italic">No output</div>}
+        {data.blocked && <div className="mt-1 border-t border-[#3a3a3a] pt-1 text-[#858585]">The model can ask for one-off approval via ask_user — approve only for trusted workspaces (Safe Mode toggle in the sidebar).</div>}
+      </div>
+    </div>
+  );
+}
+
+function ReadResultView({ data }: { data: any }) {
+  return (
+    <div className="mt-1">
+       <CodeBlock code={redactSecrets(data.content || '')} />
+    </div>
+  );
+}
+
+function WebSearchResultView({ data }: { data: any }) {
+  return (
+    <div className="mt-1 p-3 bg-panel border border-line rounded-lg flex flex-col gap-2">
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-mute border-b border-line pb-1.5">
+        <span>🔍</span> <span>Search Results for "{data.query}"</span>
+      </div>
+      <div className="space-y-3 max-h-64 overflow-auto pt-1">
+        {data.results?.length === 0 && <div className="text-faint text-xs italic">No results found.</div>}
+        {data.results?.map((r: any, i: number) => (
+          <div key={i} className="flex flex-col gap-0.5">
+            <a href={r.url} target="_blank" rel="noreferrer" className="text-[11px] text-accent hover:underline truncate">{r.url}</a>
+            <div className="text-[11px] text-mute line-clamp-2">{r.snippet}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WebFetchResultView({ data }: { data: any }) {
+  return (
+    <div className="mt-1 rounded-lg border border-line bg-panel overflow-hidden">
+      <div className="bg-panel2 px-3 py-1.5 border-b border-line flex items-center gap-2">
+        <span className="text-[10px] bg-inset border border-line rounded px-1.5 py-0.5 text-faint">GET</span>
+        <span className="text-[11px] font-mono text-mute truncate flex-1">{data.url}</span>
+        {data.status && <span className={cn("text-[10px] font-medium", data.status >= 400 ? 'text-danger' : 'text-ok')}>{data.status}</span>}
+      </div>
+      <div className="p-3 max-h-64 overflow-auto text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink bg-panel">
+        {data.content ? redactSecrets(data.content) : <span className="italic text-faint">No content extracted.</span>}
+        {data.truncated && <div className="mt-2 text-warn italic border-t border-line pt-1 text-[10px]">Content truncated due to length limits.</div>}
+      </div>
+    </div>
+  );
+}
+
+/** Shared by `write`/`edit`/`apply_patch`: a status line, an optional diff
+ *  preview, and optional lint/test failure output. */
+function FileMutationResultView({ data, label }: { data: any, label: string }) {
+  return (
+    <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
+      {label}
+      {data.preview_diff && <div className="mt-1.5"><CodeBlock code={redactSecrets(data.preview_diff)} /></div>}
+      {data.linter_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Lint failed:{'\n'}{redactSecrets(String(data.linter_error)).slice(0, 2000)}</div>}
+      {data.test_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Tests failed:{'\n'}{redactSecrets(String(data.test_error)).slice(0, 2000)}</div>}
+    </div>
+  );
+}
+
+function RawJsonResultView({ data }: { data: any }) {
+  return (
+    <div className="mt-1 p-2 bg-inset border border-line rounded-md text-[11px] font-mono overflow-auto max-h-48 whitespace-pre">
+      {redactSecrets(JSON.stringify(data, null, 2))}
+    </div>
+  );
+}
+
+function AskUserResultView({ data, content }: { data: any, content: string }) {
+  return (
+    <div className="mt-1 p-2 bg-accent/10 border border-accent/30 rounded-md text-[11px] text-ink">
+      <div className="font-semibold text-accent mb-0.5 flex items-center gap-1">
+        <HelpCircle size={12} /> Agent asked:
+      </div>
+      <div className="whitespace-pre-wrap">{data?.question || content}</div>
+    </div>
+  );
+}
+
+/** Renders one tool's result by name; each shape has its own small view
+ *  component above so this stays a plain lookup. */
 function ToolResultBlock({ name, content }: { name: string, content: string }) {
   try {
     const data = JSON.parse(content);
-    
-    if (name === 'bash') {
-      return (
-        <div className="rounded-md bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[11px] overflow-hidden mt-1">
-          <div className="bg-[#2d2d2d] px-2 py-1 flex justify-between items-center text-[#858585]">
-            <span>Terminal {data.jobId ? `(background job ${data.jobId} — poll with bash_poll)` : data.exitCode !== null && data.exitCode !== undefined ? `(exit ${data.exitCode})` : ''}</span>
-            <span className="flex items-center gap-2">
-              {data.blocked && <span className="text-danger font-semibold">Blocked by safe mode</span>}
-              {data.timedOut && <span className="text-warn">Timeout</span>}
-            </span>
-          </div>
-          <div className="p-2 overflow-auto max-h-64 whitespace-pre">
-            {data.stdout && <div>{redactSecrets(data.stdout)}</div>}
-            {data.stderr && <div className="text-danger">{redactSecrets(data.stderr)}</div>}
-            {!data.stdout && !data.stderr && <div className="text-faint italic">No output</div>}
-            {data.blocked && <div className="mt-1 border-t border-[#3a3a3a] pt-1 text-[#858585]">The model can ask for one-off approval via ask_user — approve only for trusted workspaces (Safe Mode toggle in the sidebar).</div>}
-          </div>
-        </div>
-      );
+    switch (name) {
+      case 'bash': return <BashResultView data={data} />;
+      case 'read': return <ReadResultView data={data} />;
+      case 'web_search': return <WebSearchResultView data={data} />;
+      case 'web_fetch': return <WebFetchResultView data={data} />;
+      case 'write': {
+        const label = `Wrote ${typeof data.bytes === 'number' ? `${data.bytes} bytes` : 'file'}${data.created ? ' (new file)' : ''}.`;
+        return <FileMutationResultView data={data} label={label} />;
+      }
+      case 'edit':
+      case 'apply_patch': {
+        const label = `Applied edit (${typeof data.replacements === 'number' ? `${data.replacements} replacement${data.replacements === 1 ? '' : 's'}` : 'done'}).`;
+        return <FileMutationResultView data={data} label={label} />;
+      }
+      case 'grep':
+      case 'glob':
+      case 'git_branch':
+      case 'bash_poll':
+        return <RawJsonResultView data={data} />;
+      case 'ask_user':
+        return <AskUserResultView data={data} content={content} />;
+      default:
+        break;
     }
-    if (name === 'read') {
-      return (
-        <div className="mt-1">
-           <CodeBlock code={redactSecrets(data.content || '')} />
-        </div>
-      );
-    }
-
-    if (name === 'web_search') {
-      return (
-        <div className="mt-1 p-3 bg-panel border border-line rounded-lg flex flex-col gap-2">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-mute border-b border-line pb-1.5">
-            <span>🔍</span> <span>Search Results for "{data.query}"</span>
-          </div>
-          <div className="space-y-3 max-h-64 overflow-auto pt-1">
-            {data.results?.length === 0 && <div className="text-faint text-xs italic">No results found.</div>}
-            {data.results?.map((r: any, i: number) => (
-              <div key={i} className="flex flex-col gap-0.5">
-                <a href={r.url} target="_blank" rel="noreferrer" className="text-[11px] text-accent hover:underline truncate">{r.url}</a>
-                <div className="text-[11px] text-mute line-clamp-2">{r.snippet}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      );
-    }
-
-    if (name === 'web_fetch') {
-      return (
-        <div className="mt-1 rounded-lg border border-line bg-panel overflow-hidden">
-          <div className="bg-panel2 px-3 py-1.5 border-b border-line flex items-center gap-2">
-            <span className="text-[10px] bg-inset border border-line rounded px-1.5 py-0.5 text-faint">GET</span>
-            <span className="text-[11px] font-mono text-mute truncate flex-1">{data.url}</span>
-            {data.status && <span className={cn("text-[10px] font-medium", data.status >= 400 ? 'text-danger' : 'text-ok')}>{data.status}</span>}
-          </div>
-          <div className="p-3 max-h-64 overflow-auto text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink bg-panel">
-            {data.content ? redactSecrets(data.content) : <span className="italic text-faint">No content extracted.</span>}
-            {data.truncated && <div className="mt-2 text-warn italic border-t border-line pt-1 text-[10px]">Content truncated due to length limits.</div>}
-          </div>
-        </div>
-      );
-    }
-
-    if (name === 'write') {
-      return (
-      <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
-         Wrote {typeof data.bytes === 'number' ? `${data.bytes} bytes` : 'file'}{data.created ? ' (new file)' : ''}.
-         {data.preview_diff && <div className="mt-1.5"><CodeBlock code={data.preview_diff} /></div>}
-         {data.linter_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Lint failed:{'\n'}{redactSecrets(String(data.linter_error)).slice(0, 2000)}</div>}
-         {data.test_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Tests failed:{'\n'}{redactSecrets(String(data.test_error)).slice(0, 2000)}</div>}
-      </div>
-      );
-    }
-
-    if (name === 'edit' || name === 'apply_patch') {
-      return (
-      <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
-         Applied edit ({typeof data.replacements === 'number' ? `${data.replacements} replacement${data.replacements === 1 ? '' : 's'}` : 'done'}).
-         {data.preview_diff && <div className="mt-1.5"><CodeBlock code={redactSecrets(data.preview_diff)} /></div>}
-         {data.linter_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Lint failed:{'\n'}{redactSecrets(String(data.linter_error)).slice(0, 2000)}</div>}
-         {data.test_error && <div className="mt-1.5 whitespace-pre-wrap text-danger">Tests failed:{'\n'}{redactSecrets(String(data.test_error)).slice(0, 2000)}</div>}
-      </div>
-      );
-    }
-    
-    if (name === 'grep' || name === 'glob' || name === 'git_branch' || name === 'bash_poll') {
-       return (
-         <div className="mt-1 p-2 bg-inset border border-line rounded-md text-[11px] font-mono overflow-auto max-h-48 whitespace-pre">
-           {redactSecrets(JSON.stringify(data, null, 2))}
-         </div>
-       )
-    }
-
-    if (name === 'ask_user') {
-      return (
-        <div className="mt-1 p-2 bg-accent/10 border border-accent/30 rounded-md text-[11px] text-ink">
-          <div className="font-semibold text-accent mb-0.5 flex items-center gap-1">
-            <HelpCircle size={12} /> Agent asked:
-          </div>
-          <div className="whitespace-pre-wrap">{data?.question || content}</div>
-        </div>
-      );
-    }
-
   } catch {
     // fallback
   }
@@ -2100,6 +2117,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const setToolPerm = (tool: string, tier: PermTier) =>
     setPerms({ ...perms, tools: { ...perms.tools, [tool]: tier } });
+  // Mirror tiers + denyPaths to the control plane so `deny` is enforced
+  // server-side too (see coderPermsSet) — re-synced on every edit and on
+  // workspace switch, since `perms` is derived from `activeWs`.
+  useEffect(() => {
+    if (!activeWs) return;
+    coderPermsSet({ tools: perms.tools, denyPaths: perms.denyPaths }).catch(() => { /* best-effort mirror */ });
+  }, [activeWs, perms]);
   /** Human-readable denial reason, or `'ask'` when the user must decide, or null. */
   const checkPerm = (name: string, args: Record<string, unknown>): string | 'ask' | null => {
     if (planMode && MUTATING_TOOLS.has(name)) {
