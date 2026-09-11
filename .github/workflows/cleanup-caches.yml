@@ -1,0 +1,63 @@
+name: Cleanup Actions Cache
+
+# GitHub Actions caches are capped at 10GB per repo; once full, GitHub starts
+# silently evicting the oldest ones, which can cold-cache a build at an
+# inconvenient time instead of on a predictable schedule. This runs daily and
+# proactively trims to one cache per ref (branch/PR/tag) — keeping every
+# active branch's own most-recent cache so none of them go cold, while
+# clearing out the older generations that pile up as new commits land.
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 03:17 UTC daily — off the hour to dodge the cron stampede
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: Trim to newest cache per ref
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Delete stale caches, keeping the newest per ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "::group::Caches before cleanup"
+          gh cache list --repo "$REPO" --limit 1000 --order desc --sort created_at
+          echo "::endgroup::"
+
+          stale_ids=$(
+            gh cache list --repo "$REPO" --json id,ref,createdAt --limit 1000 \
+              --order desc --sort created_at \
+            | jq -r '
+                sort_by(.createdAt) | reverse
+                | reduce .[] as $c ({seen: {}, del: []};
+                    if .seen[$c.ref] then .del += [$c.id]
+                    else .seen[$c.ref] = true end
+                  )
+                | .del[]
+              '
+          )
+
+          if [ -z "$stale_ids" ]; then
+            echo "Nothing to delete — at most one cache per ref already."
+            exit 0
+          fi
+
+          count=0
+          for id in $stale_ids; do
+            echo "Deleting cache id=$id"
+            gh cache delete "$id" --repo "$REPO" || echo "  (already gone, skipping)"
+            count=$((count + 1))
+          done
+          echo "Deleted $count stale cache(s)."
+
+          echo "::group::Caches after cleanup"
+          gh cache list --repo "$REPO" --limit 1000 --order desc --sort created_at
+          echo "::endgroup::"
