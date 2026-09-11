@@ -256,6 +256,11 @@ export interface ChatMessage {
   tool_call_id?: string;
   /** Tool name (tool role). */
   name?: string;
+  /** Human-facing label for harness-injected messages (Scout report,
+   *  Verification gate, Critic review) so they don't show as plain "user". */
+  displayName?: string;
+  /** Harness-injected reports start collapsed; the user can expand them. */
+  collapsed?: boolean;
 }
 
 export interface Conversation {

@@ -535,6 +535,30 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
   return <div className="text-sm whitespace-pre-wrap">{content}</div>;
 }
 
+/** Collapsed-by-default harness report (Scout / Verify / Critic). These are
+ *  model-written markdown documents injected into the transcript — they get a
+ *  proper source label and render as markdown when expanded, instead of
+ *  showing up as a plain "user" wall of text. */
+function ReportBlock({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(!message.collapsed);
+  const preview = (message.content.replace(/^#+\s*/, '').split('\n')[0] || '').slice(0, 90);
+  return (
+    <div className="mb-4 overflow-hidden rounded-lg border border-line bg-panel">
+      <button type="button" className="flex w-full items-center gap-2 px-3 py-2 text-left" onClick={() => setOpen((o) => !o)}>
+        <ChevronDown size={13} className={`shrink-0 text-faint transition-transform ${open ? '' : '-rotate-90'}`} />
+        <span className="font-semibold text-xs text-faint">{message.displayName}</span>
+        {!open && preview && <span className="truncate text-[11.5px] text-faint">{preview}</span>}
+        <span className="ml-auto shrink-0 text-[11px] text-faint">{open ? 'Hide' : 'Show'}</span>
+      </button>
+      {open && message.content && (
+        <div className="markdown border-t border-line px-3 py-2 text-[13.5px] leading-relaxed">
+          <Markdown>{message.content}</Markdown>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
   const [open, setOpen] = useState(false);
   
@@ -934,9 +958,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   // Plan mode: read-only agent (no mutating tools), toggled per run.
   const [planMode, setPlanMode] = useState(false);
-  // Read-only scout pre-pass (auto, concurrency-gated — see runAgent).
-  const [scoutOn, setScoutOn] = useState(true);
-  const [verifyMode, setVerifyMode] = useState(true);
+  // Read-only scout pre-pass (auto, concurrency-gated — see runAgent). Opt-in:
+  // no harness mode runs unless the user turns it on.
+  const [scoutOn, setScoutOn] = useState(false);
+  const [verifyMode, setVerifyMode] = useState(false);
   // Critic gate: after edits, a (possibly different) model reviews the working-tree
   // diff and can bounce it back for fixes before the run is allowed to finish.
   const [criticMode, setCriticMode] = useState(false);
@@ -2563,6 +2588,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (!signal.aborted) {
           const scoutMsg: ChatMessage = {
             role: 'user',
+            displayName: 'Scout',
+            collapsed: true,
             content: `# Scout Report (read-only pre-pass, ${SCOUT_PROBES.length} parallel probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
           };
           currentMessages = [...currentMessages, scoutMsg];
@@ -2814,6 +2841,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               addLog({ type: 'error', label: 'verify', detail: `checks failing — sending back to fix (${repairCount}/${MAX_REPAIR})` });
               currentMessages = [...currentMessages, {
                 role: 'user',
+                displayName: 'Verify',
+                collapsed: true,
                 content: `VERIFICATION GATE: the project's lint/test checks are still failing. You must fix them before the task is complete — do not declare success. Re-run the checks after fixing.\n\n${summary}`,
               }];
               setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
@@ -2842,6 +2871,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 addLog({ type: 'error', label: 'critic', detail: `review rejected (${criticBudget}/${MAX_CRITIC}) — sending back to fix` });
                 currentMessages = [...currentMessages, {
                   role: 'user',
+                  displayName: 'Critic',
+                  collapsed: true,
                   content: `CODE REVIEW REJECTED: a reviewer found issues with your changes. Address every point below, then continue — do not declare success until the review passes.\n\n${c.issues}`,
                 }];
                 setMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
@@ -3721,9 +3752,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                   </div>
                 ) : g.type === 'trajectory' ? (
                   <TrajectoryBlock items={g.items} />
+                ) : g.items[0].displayName && g.items[0].collapsed ? (
+                  <ReportBlock message={g.items[0]} />
                 ) : (
                   <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
-                    <div className="font-semibold text-xs text-faint mb-1">{g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role}</div>
+                    <div className="font-semibold text-xs text-faint mb-1">{g.items[0].displayName ?? (g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role)}</div>
                     {g.items[0].attachments?.length ? (
                       <div className="flex flex-wrap gap-1.5 mb-1.5">
                         {g.items[0].attachments.map((a, i) => (
@@ -3732,7 +3765,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                       </div>
                     ) : null}
                     {g.items[0].content && (
-                      g.items[0].role === 'assistant'
+                      g.items[0].role === 'assistant' || g.items[0].displayName
                         ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
                         : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
                     )}
