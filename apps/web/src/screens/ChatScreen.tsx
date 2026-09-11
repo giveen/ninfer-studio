@@ -17,7 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
-import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 
 // A legacy compaction checkpoint message (raw <compacted-summary> block).
 function isCompactedMsg(m: ChatMessage): boolean {
@@ -210,16 +210,17 @@ type MsgActions = {
   onBranch: (convId: string, i: number) => void;
 };
 
-function ActionBtn({ title, onClick, children }: { title: string; onClick: () => void; children: ReactNode }) {
+function ActionBtn({ title, onClick, disabled, children }: { title: string; onClick: () => void; disabled?: boolean; children: ReactNode }) {
   return (
     <button
       type="button"
       title={title}
+      disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
       }}
-      className="rounded p-1 text-faint transition-colors hover:bg-panel2 hover:text-ink"
+      className="rounded p-1 text-faint transition-colors hover:bg-panel2 hover:text-ink disabled:pointer-events-none disabled:opacity-40"
     >
       {children}
     </button>
@@ -229,12 +230,17 @@ function ActionBtn({ title, onClick, children }: { title: string; onClick: () =>
 const MessageRow = memo(function MessageRow({
   m,
   streaming,
+  locked,
   convId,
   index,
   actions,
 }: {
   m: ChatMessage;
   streaming?: boolean;
+  /** A stream is in flight somewhere in this conversation — Regenerate/Edit
+   *  are disabled so a second runStream can't race the first over the
+   *  shared abortRef/streaming state (see runStream's placeholderId). */
+  locked?: boolean;
   convId: string;
   index: number;
   actions: MsgActions;
@@ -257,12 +263,12 @@ const MessageRow = memo(function MessageRow({
         <Copy size={13} />
       </ActionBtn>
       {m.role === 'assistant' && (
-        <ActionBtn title="Regenerate" onClick={() => actions.onRegenerate(convId, index)}>
+        <ActionBtn title="Regenerate" onClick={() => actions.onRegenerate(convId, index)} disabled={locked}>
           <RefreshCw size={13} />
         </ActionBtn>
       )}
       {m.role === 'user' && (
-        <ActionBtn title="Edit" onClick={startEdit}>
+        <ActionBtn title="Edit" onClick={startEdit} disabled={locked}>
           <Pencil size={13} />
         </ActionBtn>
       )}
@@ -371,7 +377,7 @@ const MessageRow = memo(function MessageRow({
           {m.error ? (
             <div>
               <div className="text-[13px] text-danger">{m.content}</div>
-              <Button size="sm" variant="subtle" className="mt-2" onClick={() => actions.onRegenerate(convId, index)}>
+              <Button size="sm" variant="subtle" className="mt-2" onClick={() => actions.onRegenerate(convId, index)} disabled={locked}>
                 <RefreshCw size={12} /> retry
               </Button>
             </div>
@@ -518,6 +524,13 @@ function ParamsPopover({
         </div>
         <div className="h-px bg-line" />
         <div className={row}>
+          <span className={lab} title="Once a reply's usage crosses this share of the model's context window, the conversation is silently folded into a summary checkpoint so the next message doesn't risk truncation.">Auto-compact at %</span>
+          <div className={num}>
+            <NumberField value={params.compactAt ?? null} onChange={(v) => set({ compactAt: v })} onEmpty={() => set({ compactAt: undefined })} min={20} max={95} placeholder="80" />
+          </div>
+        </div>
+        <div className="h-px bg-line" />
+        <div className={row}>
           <span className={lab}>System prompt</span>
           <textarea
             value={params.systemPrompt || ''}
@@ -547,8 +560,8 @@ function ParamsPopover({
 function ContextMeter({ used, limit }: { used: number | null; limit: number | null }) {
   if (limit == null) {
     return (
-      <div className="flex h-7 shrink-0 items-center gap-1.5 border-b border-line bg-panel/40 px-4 text-[11px] text-faint">
-        <Gauge size={12} /> context limit not reported — set --max-context to track usage
+      <div className="flex items-center gap-1.5 text-[10.5px] text-faint">
+        <Gauge size={11} /> context limit not reported — set --max-context to track usage
       </div>
     );
   }
@@ -566,14 +579,14 @@ function ContextMeter({ used, limit }: { used: number | null; limit: number | nu
   return (
     <div
       className={cn(
-        'flex h-7 shrink-0 items-center gap-2 border-b border-line bg-panel/40 px-4 text-[11px]',
+        'flex items-center gap-1.5 text-[10.5px]',
         pct > 90 ? 'text-danger' : pct > 75 ? 'text-warn' : 'text-faint',
       )}
       title={used != null ? `${formatTokens(used)} / ${formatTokens(limit)} tokens` : 'no requests yet'}
     >
-      <Gauge size={12} className={pct > 75 ? '' : 'text-faint'} />
+      <Gauge size={11} className={pct > 75 ? '' : 'text-faint'} />
       <span className="text-faint">ctx</span>
-      <span className="relative h-1.5 w-28 overflow-hidden rounded-full bg-line">
+      <span className="relative h-1 w-20 overflow-hidden rounded-full bg-line">
         <span className={cn('absolute inset-y-0 left-0 rounded-full transition-[width] duration-300', bar)} style={{ width: `${pct}%` }} />
       </span>
       <span className="font-mono">{pctLabel}</span>
@@ -613,10 +626,6 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const upEngines = allEngines.filter((e) => e.state === 'running' || e.state === 'external');
   const engineUp = upEngines.length > 0;
   const runningModel = upEngines[0]?.modelId || '';
-  const modelOptions = upEngines
-    .map((e) => ({ value: e.modelId || '', port: e.port }))
-    .filter((e) => e.value)
-    .filter((e, i, arr) => arr.findIndex((x) => x.value === e.value) === i);
 
   // Hydrate conversations + chat params from the user's profile dir on the
   // control plane (survives a fresh install / AppImage run). Then keep them in
@@ -711,7 +720,13 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
       setNotice({ tone: 'ok', text: 'Conversation compacted — prior messages stay on screen and the summary is injected as context. Keep chatting from here.' });
     } catch (e) {
-      setNotice({ tone: 'danger', text: e instanceof Error ? e.message : 'compaction failed' });
+      // A deliberate Stop mid-compaction throws AbortError (see
+      // summarizeConversation) — that's the user's own action, not a failure.
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        setNotice({ tone: 'warn', text: 'Compaction stopped.' });
+      } else {
+        setNotice({ tone: 'danger', text: e instanceof Error ? e.message : 'compaction failed' });
+      }
     } finally {
       setCompacting(false);
       abortRef.current = null;
@@ -812,25 +827,33 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           const idx = placeholderId ? msgs.findIndex((m) => m.id === placeholderId) : msgs.length - 1;
           const target = msgs[idx];
           if (target && target.role === 'assistant' && target.content.trim()) {
-            const gateRes = evaluate(target.content, effectiveVoice(params), {});
-            if (needsHumanize(gateRes)) {
+            // Retry up to HUMANIZE_MAX_DEPTH times: a rewrite can itself trip
+            // the gate (the model doesn't always follow the rewrite rules),
+            // so re-check each attempt and feed the best-so-far text back in
+            // rather than accepting the first pass unconditionally.
+            let current = target.content;
+            let gateRes = evaluate(current, effectiveVoice(params), {});
+            for (let attempt = 0; attempt < HUMANIZE_MAX_DEPTH && needsHumanize(gateRes) && !ac.signal.aborted; attempt++) {
               try {
                 const rewritten = await humanizeRewriteText({
                   model: useModel,
                   baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
                   priorMessages: msgs.slice(0, idx),
-                  originalText: target.content,
+                  originalText: current,
                   params,
                   signal: ac.signal,
                 });
-                if (!ac.signal.aborted && rewritten && rewritten.trim() && rewritten.trim() !== target.content.trim()) {
-                  setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
-                    ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: rewritten } : m)),
-                  }));
-                }
+                if (!rewritten || !rewritten.trim() || rewritten.trim() === current.trim()) break;
+                current = rewritten.trim();
+                gateRes = evaluate(current, effectiveVoice(params), {});
               } catch {
-                /* keep the original reply if the rewrite fails */
+                break; // keep the best rewrite obtained so far (or the original)
               }
+            }
+            if (!ac.signal.aborted && current.trim() !== target.content.trim()) {
+              setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
+                ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: current } : m)),
+              }));
             }
           }
         }
@@ -871,10 +894,52 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
          return;
       }
       
+      // Auto-compact: once this turn's usage crosses the configured share of
+      // the model's context window, silently fold the conversation into a
+      // summary checkpoint so the next message doesn't risk truncation.
+      // Reactive (checked after each reply) rather than Coder's proactive
+      // per-step check, since Chat turns are user-initiated, not an
+      // autonomous loop — the natural checkpoint is right after a reply
+      // lands, before the user's next message.
+      if (!ac.signal.aborted) {
+        try {
+          // Look up the engine actually serving `useModel`, not just the
+          // first/primary one — matters when multiple engines with different
+          // context sizes are running (same fix as ctxLimit above).
+          const limit = allEngines.find((e) => e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
+          const convForCompact = convsRef.current.find((c) => c.id === convId);
+          const msgsForCompact = convForCompact?.messages ?? [];
+          const idxForCompact = placeholderId ? msgsForCompact.findIndex((m) => m.id === placeholderId) : msgsForCompact.length - 1;
+          const finalMsg = msgsForCompact[idxForCompact];
+          const usedTok = finalMsg?.meta ? (finalMsg.meta.promptTokens ?? 0) + (finalMsg.meta.completionTokens ?? 0) : 0;
+          const thresholdPct = params.compactAt ?? 80;
+          if (convForCompact && limit && usedTok > 0 && usedTok >= (thresholdPct / 100) * limit) {
+            const prior: ChatMessage[] = convForCompact.compactedSummary
+              ? [{ role: 'user', content: frameCompactedSummary(convForCompact.compactedSummary) }]
+              : [];
+            const summary = await summarizeConversation({
+              model: useModel,
+              systemPrompt: params.systemPrompt,
+              history: [...prior, ...convForCompact.messages],
+              signal: ac.signal,
+            });
+            if (summary) {
+              const compacted: Conversation = { ...convForCompact, compactedSummary: summary, compactedCount: convForCompact.messages.length };
+              setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
+              setNotice({ tone: 'ok', text: `Auto-compacted at ${thresholdPct}% of context — prior messages stay on screen, summary injected as context.` });
+            }
+          }
+        } catch (compactError) {
+          // Best-effort like the humanize pass above: never take the turn
+          // down over this — the reply is already complete and shown.
+          console.warn('[chat] auto-compact skipped', compactError);
+        }
+      }
+
       setStreaming(false);
       abortRef.current = null;
     },
-    [engineUp, model, runningModel, params, onNavigate],
+    [engineUp, model, runningModel, params, onNavigate, status],
   );
 
   const send = useCallback(async () => {
@@ -953,9 +1018,9 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const conv = convsRef.current.find((c) => c.id === convId);
       if (!conv) return;
       const prior = conv.messages.slice(0, msgIndex);
-      const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
+      const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior })).catch((e) =>
+      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
@@ -969,9 +1034,9 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const msgs = conv.messages.slice();
       msgs[msgIndex] = { ...msgs[msgIndex], content: newText };
       const prior = msgs.slice(0, msgIndex + 1);
-      const asst: ChatMessage = { role: 'assistant', content: '', model: model || runningModel, meta: {} };
+      const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
       setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior })).catch((e) =>
+      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
@@ -1059,9 +1124,12 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const messages = active?.messages || [];
   const last = messages[messages.length - 1];
 
-  // Context-limit indicator: token usage of the latest completed request vs the
-  // running engine's --max-context (surfaced on the status payload).
-  const ctxLimit = status?.engine?.maxContext ?? null;
+  // Context-limit indicator: token usage of the latest completed request vs
+  // the --max-context of the engine actually serving this chat's model (not
+  // just the first/primary engine) — matters once more than one engine with
+  // a different context size is running. Falls back to the primary engine
+  // when the model isn't found among the known engines yet.
+  const ctxLimit = allEngines.find((e) => e.modelId === (model || runningModel))?.maxContext ?? status?.engine?.maxContext ?? null;
   const lastMeta =
     [...messages].reverse().find((m) => m.role === 'assistant' && m.meta && (m.meta.promptTokens || m.meta.completionTokens))?.meta ?? null;
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
@@ -1116,45 +1184,14 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
       {/* chat column */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-11 shrink-0 items-center gap-3 border-b border-line bg-panel/60 px-4">
-          <SelectField
-            value={model}
-            onChange={setModel}
-            disabled={streaming}
-            className="h-7 w-48 text-[12px]"
-            options={
-              modelOptions.length
-                ? Array.from(new Set([model, ...modelOptions.map((o) => o.value)].filter(Boolean))).map((v) => {
-                    const hit = modelOptions.find((o) => o.value === v);
-                    return { value: v, label: hit && upEngines.length > 1 ? `${v} · :${hit.port}` : v };
-                  })
-                : Array.from(new Set([runningModel, model].filter(Boolean))).map((v) => ({ value: v, label: v }))
-            }
-          />
-          <div className="flex items-center gap-1.5 text-[11.5px] text-faint">
-            {engineUp ? (
-              <>
-                <span className="h-1.5 w-1.5 rounded-full bg-ok" /> {upEngines.length > 1 ? `${upEngines.length} engines ready` : 'engine ready'}
-              </>
-            ) : (
-              <>
-                <span className={cn('h-1.5 w-1.5 rounded-full', engine?.state === 'starting' ? 'bg-warn pulse-dot' : 'bg-faint')} />
-                {engine?.state === 'starting' ? 'engine starting…' : 'engine offline'}
-              </>
-            )}
+        {(params.maxTokens || params.greedy) && (
+          <div className="flex h-11 shrink-0 items-center gap-1.5 border-b border-line bg-panel/60 px-4">
+            <div className="ml-auto flex items-center gap-1.5">
+              {params.maxTokens ? <Badge tone="neutral">max {formatTokens(params.maxTokens)}</Badge> : null}
+              {params.greedy && <Badge tone="info">greedy</Badge>}
+            </div>
           </div>
-          <div className="ml-auto flex items-center gap-1.5">
-            {params.thinking && (
-              <Badge tone="accent">
-                <BrainCircuit size={11} /> thinking{params.reasoningEffort ? `:${params.reasoningEffort}` : ''}
-              </Badge>
-            )}
-            {params.maxTokens ? <Badge tone="neutral">max {formatTokens(params.maxTokens)}</Badge> : null}
-            {params.greedy && <Badge tone="info">greedy</Badge>}
-          </div>
-        </div>
-
-        <ContextMeter used={ctxUsed} limit={ctxLimit} />
+        )}
 
         {!engineUp && (
           <div className="flex shrink-0 items-center gap-3 border-b border-warn/20 bg-warn/8 px-4 py-2 text-[12.5px] text-warn">
@@ -1212,6 +1249,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                       convId={activeId ?? ''}
                       index={i}
                       streaming={streaming && i === messages.length - 1}
+                      locked={streaming || compacting}
                       actions={msgActions}
                     />
                   </Fragment>
@@ -1339,7 +1377,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </div>
             )}
           </div>
-          <div className="mt-1.5 flex items-center justify-end px-1 text-[10.5px] text-faint">
+          <div className="mt-1.5 flex items-center justify-between px-1 text-[10.5px] text-faint">
+            <ContextMeter used={ctxUsed} limit={ctxLimit} />
             <span>
               last msg: {last?.meta?.decodeTokPerSec ? formatRate(last.meta.decodeTokPerSec) : '—'}
             </span>

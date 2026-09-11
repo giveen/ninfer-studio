@@ -12,7 +12,7 @@ import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
-import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
@@ -1018,6 +1018,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setTodos(next);
     setTodosUpdatedAt(Date.now());
   };
+  /** Briefly highlights the todos panel so a freshly-created list (empty →
+   *  populated) catches the eye instead of silently appearing in the sidebar. */
+  const [todosJustCreated, setTodosJustCreated] = useState(false);
+  const flashTodosCreated = () => {
+    setTodosJustCreated(false);
+    requestAnimationFrame(() => setTodosJustCreated(true));
+    window.setTimeout(() => setTodosJustCreated(false), 1800);
+  };
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
   // Re-pointed sidecar workspace + flush counter (see the workspace effect below);
@@ -1048,7 +1056,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; }
+  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; compactAt?: number; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -1745,8 +1753,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const addTodo = (raw: string) => {
     const content = raw.trim();
     if (!content) return;
+    const wasEmpty = todosRef.current.length === 0;
     mutateTodos((prev) => [...prev, { content, status: 'pending' }]);
     addLog({ type: 'todo', label: 'manual', detail: `added task: ${content.slice(0, 60)}` });
+    if (wasEmpty) flashTodosCreated();
   };
   const cycleTodo = (i: number) => {
     mutateTodos((prev) => prev.map((t, j) => (j === i ? { ...t, status: t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending' } : t)));
@@ -2770,8 +2780,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // system-prompt injection sees this list even before effects run,
             // then write through the pinned path (store lands in the run's
             // conversation even mid-switch; visible transcript mirrors it).
+            const wasEmpty = todosRef.current.length === 0;
             todosRef.current = cleaned;
             updateRunTodos(cleaned, Date.now());
+            if (wasEmpty && cleaned.length > 0) flashTodosCreated();
             result = JSON.stringify({ success: true, count: cleaned.length });
           }
         } else if (call.name === 'delegate') {
@@ -3471,8 +3483,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
 
     // Read the engine's context window so we can auto-compact once usage crosses
-    // 80% of max. Prefer the engine's own /v1/models advertisement, falling back
-    // to the sidecar-reported maxContext.
+    // the configured share of max (coderParams.compactAt, default 80%). Prefer
+    // the engine's own /v1/models advertisement, falling back to the
+    // sidecar-reported maxContext.
     let maxContext = 0;
     try {
       maxContext = (await getEngineContextSize(model)) ?? 0;
@@ -3484,7 +3497,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } catch { /* ignore */ }
     }
     setCtxLimit(maxContext > 0 ? maxContext : null);
-    const COMPACT_AT = 0.8;
+    const COMPACT_AT = (coderParams.compactAt ?? 80) / 100;
     const MAX_ATTEMPTS = 3;
     // Hard ceiling on agent turns so a non-terminating plan (or a model that
     // keeps emitting tool calls) can't loop forever — it stops with a clear
@@ -3527,10 +3540,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       while (true) {
         if (abortRef.current?.signal.aborted) break;
 
-        // Auto-compact when the model context is near (>=80%) or past (estimate
-        // >=100%) the window limit, so we never silently truncate mid-task.
-        // Use the recorded prompt-token count when the engine reports it; otherwise
-        // fall back to the local estimate (M3) so the 80% trigger still fires.
+        // Auto-compact when the model context is near (>=COMPACT_AT) or past
+        // (estimate >=100%) the window limit, so we never silently truncate
+        // mid-task. Use the recorded prompt-token count when the engine
+        // reports it; otherwise fall back to the local estimate (M3) so the
+        // trigger still fires.
         const est = estimateTokens(currentMessages);
         const recordedOrEst = Math.max(runTokensRef.current, est);
         const overBudget =
@@ -3544,6 +3558,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               systemPrompt: dynamicSystemRef.current,
               history: currentMessages,
               maxTokens: 2048,
+              signal: abortRef.current?.signal,
             });
             if (!summary) throw new Error('compaction produced no summary');
             currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
@@ -3554,17 +3569,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             noteRunTokens(0);
             continue;
           } catch (e) {
-            // Compaction is our only guard against context overflow — if it fails
-            // we must stop rather than send an oversized payload (P1 #3).
-            addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
-            updateRunMessages((prev) => [
-              ...prev,
-              {
-                role: 'system',
-                content:
-                  '⚠ Auto-compaction failed, so the run was stopped to avoid exceeding the model context window. Start a new conversation or compact manually.',
-              },
-            ]);
+            // A deliberate Stop mid-compaction throws AbortError (see
+            // summarizeConversation) — the run is already stopping, so don't
+            // pile on a "compaction failed" message for what the user asked for.
+            if (!(e instanceof DOMException && e.name === 'AbortError')) {
+              // Compaction is our only guard against context overflow — if it
+              // fails we must stop rather than send an oversized payload (P1 #3).
+              addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
+              updateRunMessages((prev) => [
+                ...prev,
+                {
+                  role: 'system',
+                  content:
+                    '⚠ Auto-compaction failed, so the run was stopped to avoid exceeding the model context window. Start a new conversation or compact manually.',
+                },
+              ]);
+            }
             break;
           }
         }
@@ -3682,21 +3702,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // wrap it too — a gate failure must keep the original reply, never
           // strand the streaming state.
           try {
-            const gateRes = evaluate(assistantMsg.content, effectiveVoice({ ...coderParams, humanize: true }, 'technical'), {});
-            if (needsHumanize(gateRes)) {
+            // Retry up to HUMANIZE_MAX_DEPTH times: a rewrite can itself trip
+            // the gate, so re-check each attempt and feed the best-so-far
+            // text back in rather than accepting the first pass unconditionally.
+            const voice = effectiveVoice({ ...coderParams, humanize: true }, 'technical');
+            let current = assistantMsg.content;
+            let gateRes = evaluate(current, voice, {});
+            for (let attempt = 0; attempt < HUMANIZE_MAX_DEPTH && needsHumanize(gateRes) && !abortRef.current?.signal.aborted; attempt++) {
               const rewritten = await humanizeRewriteText({
                 model,
                 baseSystem: dynamicSystemRef.current,
                 priorMessages: currentMessages.slice(0, currentMessages.length - 1),
-                originalText: assistantMsg.content,
+                originalText: current,
                 params: { thinking: coderParams.thinking, humanize: true, voiceProfile: coderParams.voiceProfile || 'technical' },
                 signal: abortRef.current?.signal,
               });
-              if (rewritten && rewritten.trim() && rewritten.trim() !== assistantMsg.content.trim()) {
-                const updated: ChatMessage = { ...assistantMsg, content: rewritten };
-                currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
-                updateRunMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
-              }
+              if (!rewritten || !rewritten.trim() || rewritten.trim() === current.trim()) break;
+              current = rewritten.trim();
+              gateRes = evaluate(current, voice, {});
+            }
+            if (current.trim() !== assistantMsg.content.trim()) {
+              const updated: ChatMessage = { ...assistantMsg, content: current };
+              currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
+              updateRunMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
             }
           } catch {
             /* keep the original reply if the gate or rewrite fails */
@@ -4890,6 +4918,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                     placeholder={String(DEFAULT_MAX_AGENT_STEPS)}
                   />
                 </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Once usage crosses this share of the model's context window, the run auto-summarizes and continues instead of risking truncation. Blank = default (80%).">
+                  compact at %
+                  <NumberField
+                    value={coderParams.compactAt ?? null}
+                    onChange={(v) => setCoderParams({ ...coderParams, compactAt: v })}
+                    onEmpty={() => setCoderParams({ ...coderParams, compactAt: undefined })}
+                    empty
+                    min={20}
+                    max={95}
+                    placeholder="80"
+                  />
+                </label>
                 <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
                   <Toggle checked={!!coderParams.promptCache} onChange={(v) => setCoderParams({ ...coderParams, promptCache: v })} /> prompt cache
                 </label>
@@ -4994,7 +5034,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       {/* Right: todos (agent-maintained via todo_write; the user can also
           edit directly — edits reach the agent on its next LLM call via the
           per-turn system-prompt injection) */}
-      <div className="flex w-64 flex-col border-l border-line bg-panel">
+      <div className={cn("flex w-64 flex-col border-l border-line bg-panel", todosJustCreated && "todo-flash")}>
         <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
           <CheckSquare size={14} /> Todos
           {todosUpdatedAt != null && (

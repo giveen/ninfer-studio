@@ -79,10 +79,10 @@ pub struct AppSettings {
     /// external clients (e.g. other coding harnesses) inherit these params without
     /// configuring each tool. Client-supplied fields win over these defaults.
     pub default_request_params: String,
-    /// Global default reasoning effort injected into
-    /// `chat_template_kwargs.reasoning_effort` for every proxied request
-    /// (client fields win). The dedicated UI control overrides the generic
-    /// default for this single key. Empty = unset.
+    /// Global default reasoning effort injected into the top-level
+    /// `reasoning_effort` field for every proxied request (client fields
+    /// win). The dedicated UI control overrides the generic default for
+    /// this single key. Empty = unset.
     pub reasoning_effort: String,
     /// Coding harness: the directory the "Code" mode is allowed to read/write/execute
     /// within. Every coder filesystem tool is confined to this root (path traversal

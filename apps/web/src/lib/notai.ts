@@ -110,7 +110,7 @@ export function effectiveSystemPrompt(params: ChatParams): string {
 
 const WORD_RE = /\b[A-Za-z]+(?:'[A-Za-z]+)?\b/g;
 const SENTENCE_RE = /(?<=[.!?])\s+(?=[A-Z"'”’])/g;
-const CONTRACTION_RE = /\b(?:[A-Za-z]+n't|[A-Za-z]+'(?:re|ve|ll|d|m|s))\b/i;
+const CONTRACTION_RE = /\b(?:[A-Za-z]+n't|[A-Za-z]+'(?:re|ve|ll|d|m|s))\b/gi;
 const PARTICIPIAL_OPENER_RE = /^([A-Za-z]+ing)\b[^.!?]{0,100},/;
 const TIER_ONE = new Set([
   'camaraderie', 'tapestry', 'palpable', 'intricate', 'vibrant', 'cacophony', 'solace',

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   BookmarkPlus,
   Box,
-  Cpu,
+  ChevronDown,
   Gauge,
   Layers3,
   Play,
@@ -16,7 +16,6 @@ import {
   Zap,
 } from 'lucide-react';
 import { getConfig, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine } from '../lib/api';
-import { useEngineLogs } from '../lib/liveLogs';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
@@ -25,7 +24,7 @@ import {
   subscribeLatestRequestMetrics,
   type LiveRequestMetrics,
 } from '../lib/liveMetrics';
-import { Badge, Button, CodeBlock, Field, LogPane, NumberField, SectionCard, Segmented, SelectField, Stat, TextField, Toggle, cn } from '../components/ui';
+import { Badge, Button, CodeBlock, Field, NumberField, SectionCard, Segmented, SelectField, Stat, TextField, Toggle, cn } from '../components/ui';
 
 const NAV_SECTIONS = [
   { id: 'top', label: 'Status' },
@@ -40,7 +39,6 @@ const NAV_SECTIONS = [
   { id: 'sampling', label: 'Sampling' },
   { id: 'misc', label: 'Misc' },
   { id: 'profiles', label: 'Profiles' },
-  { id: 'log', label: 'Log' },
 ] as const;
 
 function jumpTo(id: string) {
@@ -146,6 +144,31 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** One preset card: the name applies the preset; the chevron toggles the
+ *  (often long) description without triggering apply. Collapsed by default
+ *  so the preset grid stays scannable. */
+function PresetCard({ name, description, onApply }: { name: string; description: string; onApply: () => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="w-[220px] rounded-lg border border-line bg-inset transition-colors hover:border-accent/40 hover:bg-panel2">
+      <div className="flex items-center gap-1 pr-1">
+        <button type="button" onClick={onApply} className="min-w-0 flex-1 px-3 py-2 text-left text-[12.5px] font-semibold text-ink">
+          {name}
+        </button>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          title={open ? 'Hide description' : 'Show description'}
+          className="shrink-0 rounded p-1 text-faint hover:text-ink"
+        >
+          <ChevronDown size={13} className={cn('transition-transform', open && 'rotate-180')} />
+        </button>
+      </div>
+      {open && <div className="border-t border-line px-3 py-2 text-[11px] leading-snug text-faint">{description}</div>}
+    </div>
+  );
+}
+
 export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const engine = status?.engine;
   const gpu = status?.gpu;
@@ -157,7 +180,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const [saved, setSaved] = useState<SavedProfile[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [saveName, setSaveName] = useState('');
-  const liveLogs = useEngineLogs();
   const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
 
@@ -241,9 +263,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     const snapshot = { profile, artifact, saved };
     saveProfileState(snapshot).catch(() => undefined);
   }, [profile, artifact, saved, loaded]);
-
-  // The engine-log tail is shared with the dedicated Log tab via useEngineLogs
-  // (a single /api/logs poll for the whole app), so this pane just renders it.
 
   // Pick the most recently added artifact when none is explicitly chosen. Depends
   // on `artifact` too, so if it ever gets cleared (e.g. via loaded profile state)
@@ -599,17 +618,9 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
 
         {/* presets */}
         <SectionCard title="Presets" description="One-click profiles. Applying one fills every option below — review the command before starting." icon={<Rocket size={15} />} anchor="presets" collapsible>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-start gap-2">
             {PRESETS.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => applyPreset(p.id)}
-                title={p.description}
-                className="rounded-lg border border-line bg-inset px-3 py-2 text-left transition-colors hover:border-accent/40 hover:bg-panel2"
-              >
-                <div className="text-[12.5px] font-semibold text-ink">{p.name}</div>
-                <div className="mt-0.5 max-w-[220px] text-[11px] leading-snug text-faint">{p.description}</div>
-              </button>
+              <PresetCard key={p.id} name={p.name} description={p.description} onApply={() => applyPreset(p.id)} />
             ))}
           </div>
         </SectionCard>
@@ -698,7 +709,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                 ]}
               />
             </Field>
-            <Field label="Default reasoning effort" hint="Global default applied to every request via chat_template_kwargs.reasoning_effort. The Studio chat and external clients inherit it unless they set reasoning_effort themselves.">
+            <Field label="Default reasoning effort" hint="Global default applied to every request via the top-level reasoning_effort field. The Studio chat and external clients inherit it unless they set reasoning_effort themselves.">
               <SelectField
                 value={settings?.reasoningEffort ?? ''}
                 onChange={onReasoningEffort}
@@ -907,12 +918,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               })}
             </div>
           </SectionCard>
-
-        <SectionCard title="Engine log" description={engine?.logPath ? engine.logPath : 'log appears when the engine starts'} icon={<Cpu size={15} />} anchor="log" collapsible>
-          <div className="h-64">
-            <LogPane lines={liveLogs} />
-          </div>
-        </SectionCard>
       </div>
     </div>
   );
