@@ -614,9 +614,9 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
 /// winning:
 ///   1. `defaults_json` — a free-form JSON object merged as top-level defaults
 ///      (so external clients inherit per-tool config).
-///   2. `reasoning_effort` — a dedicated UI control that sets
-///      `chat_template_kwargs.reasoning_effort` for every request. It overrides
-///      the generic default for this single key (it's the explicit control).
+///   2. `reasoning_effort` — a dedicated UI control that sets the top-level
+///      `reasoning_effort` field for every request. It overrides the generic
+///      default for this single key (it's the explicit control).
 /// Returns the re-serialized body, or `None` if neither source applies / on any
 /// parse error.
 fn merge_default_request_params(
@@ -644,26 +644,14 @@ fn merge_default_request_params(
         }
     }
 
-    // 2. reasoning effort → chat_template_kwargs.reasoning_effort
+    // 2. reasoning effort → top-level reasoning_effort field
     //    (client explicit value wins; the dedicated control beats the generic
     //     default for this one key)
     if !re_trimmed.is_empty() {
         if let serde_json::Value::Object(body_map) = &mut body_val {
-            let client_has_re = body_map
-                .get("chat_template_kwargs")
-                .and_then(|v| v.get("reasoning_effort"))
-                .is_some();
-            if !client_has_re {
-                let ctk = body_map
-                    .entry("chat_template_kwargs")
-                    .or_insert(serde_json::Value::Object(Default::default()));
-                if let serde_json::Value::Object(m) = ctk {
-                    m.insert(
-                        "reasoning_effort".to_string(),
-                        serde_json::Value::String(reasoning_effort.to_string()),
-                    );
-                }
-            }
+            body_map
+                .entry("reasoning_effort")
+                .or_insert_with(|| serde_json::Value::String(reasoning_effort.to_string()));
         }
     }
 
