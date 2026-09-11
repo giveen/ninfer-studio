@@ -284,6 +284,13 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
           // A mid-load tab re-reads on restore; 'ready' lets readDisk take
           // the compare/adopt path instead of the unconditional-adopt path.
           status: t.status === 'loading' ? 'ready' : t.status,
+          // Drop the image payload: a 50 MB image is a ~67 MB base64 string.
+          // Restore always re-reads image tabs (readDisk refetches fs/b64), so
+          // caching the dataUrl in the snapshot is pure memory retention —
+          // with 8 ws × several image tabs this is O(hundreds of MB). The
+          // pane shows "Loading image…" until the re-read lands (immediately
+          // when the sidecar is ready, next refresh while a run holds it).
+          image: null,
           // Stale across a round-trip — refreshed by the restore re-read / CoderScreen's git poll.
           linting: false,
           diags: [],
@@ -418,8 +425,11 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       const t = tabsRef.current.find((x) => x.id === id);
       // Activation re-check (3.6): re-fetch disk content for the activated
       // code tab with the same compare/adopt/conflict logic — a `bash` edit to
-      // a previously-inactive tab must not survive silently.
-      if (t && t.kind === 'code' && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')) {
+      // a previously-inactive tab must not survive silently. Image tabs are
+      // re-fetched too (they can reach here with `image: null` after a
+      // workspace-restore while the sidecar was held — the snapshot drops
+      // dataUrls and the restore re-read was gated off).
+      if (t && (t.kind === 'code' || t.kind === 'image') && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')) {
         void readDisk(t.id, t.path, t.kind);
       }
       void refreshGitStatus();
