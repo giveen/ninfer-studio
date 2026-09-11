@@ -18,6 +18,7 @@ import { createReadStream, statSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { PlaywrightCrawler } from 'crawlee';
 import { Readability } from '@mozilla/readability';
 import TurndownService from 'turndown';
@@ -126,7 +127,7 @@ function loopbackSimple(method, url, { body, headers, signal } = {}) {
 
 
 const PORT = Number(process.env.SIDECAR_PORT || 8787);
-const SELF_DIR = path.dirname(new URL(import.meta.url).pathname);
+const SELF_DIR = path.dirname(fileURLToPath(import.meta.url)); // cross-platform (URL .pathname breaks on Windows: /E:/...)
 const SELF_FILE = path.join(SELF_DIR, 'server.js');
 // When this process started. Node loads server.js once at startup, so any edit
 // to the file after this moment is invisible to the running process — the exact
