@@ -931,7 +931,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; }
+  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -2474,7 +2474,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       let toolCalls: AgentToolCall[] = [];
       try {
         await trackedStream(
-          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }, coderParams.promptCache),
+          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           'subagent ' + label,
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
@@ -2563,7 +2563,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let content = '';
         let toolCalls: AgentToolCall[] = [];
         await trackedStream(
-          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
+          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           'worker',
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
@@ -2856,7 +2856,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const system = planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
           : dynamicSystemRef.current;
-        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
+        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
 
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
@@ -3963,6 +3963,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               <div className="flex items-center gap-4 flex-wrap">
                 <label className="flex items-center gap-1.5 text-[12px] text-mute">
                   <Toggle checked={coderParams.thinking} onChange={(v) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Reasoning effort sent to the engine as reasoning_effort (low/medium/high/xhigh). Default follows the thinking toggle; choosing a level forces thinking on.">
+                  think level
+                  <SelectField
+                    value={coderParams.thinkLevel || ''}
+                    onChange={(v) => setCoderParams({ ...coderParams, thinkLevel: (v || undefined) as CoderParams['thinkLevel'] })}
+                    options={[
+                      { value: '', label: 'default' },
+                      { value: 'low', label: 'low' },
+                      { value: 'medium', label: 'medium' },
+                      { value: 'high', label: 'high' },
+                      { value: 'xhigh', label: 'xhigh' },
+                    ]}
+                  />
                 </label>
                 <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
                   <Toggle checked={!!coderParams.promptCache} onChange={(v) => setCoderParams({ ...coderParams, promptCache: v })} /> prompt cache
