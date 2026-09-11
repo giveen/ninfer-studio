@@ -1124,6 +1124,10 @@ fn truncate_chars(s: &str, max: usize) -> (String, bool) {
 static TEXT_SEL: LazyLock<scraper::Selector> = LazyLock::new(|| {
     scraper::Selector::parse("*:not(script):not(style):not(noscript)").expect("text selector")
 });
+static IMG_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("img[src]").expect("img selector"));
+static LINK_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("a[href]").expect("link selector"));
 static DDG_RESULT: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result").expect("ddg selector"));
 static DDG_LINK: LazyLock<scraper::Selector> =
@@ -1134,10 +1138,16 @@ static COLLAPSE_WS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[ \t\x0b\x0c\r\n]+").expect("html regex"));
 
 /// HTML→text over a real DOM (html5ever via `scraper`): every text node whose
-/// parent isn't `script`/`style`/`noscript`, in document order. Entities come
-/// decoded from the parser; whitespace is collapsed. The sidecar uses
-/// Readability+Turndown (Node-only) — same shape, plain-text content.
-fn html_to_text(html: &str) -> String {
+/// parent isn't `script`/`style`/`noscript`, in document order, followed by
+/// the page's images and links as absolute Markdown `![alt](url)`/`[text](url)`
+/// references (resolved against `base`, the page's own URL — `src`/`href`
+/// are frequently relative). Without these, a model asked to "show a
+/// picture" or cite a source has no real URL to reach for and either
+/// hallucinates one or links to the page itself instead of the image.
+/// Entities come decoded from the parser; whitespace is collapsed. The
+/// sidecar uses Readability+Turndown (Node-only) for the same shape of
+/// output — plain text plus a Markdown-preserved image/link.
+fn html_to_text(html: &str, base: &reqwest::Url) -> String {
     use scraper::node::Node;
     let dom = scraper::Html::parse_document(html);
     let mut out = String::new();
@@ -1151,7 +1161,51 @@ fn html_to_text(html: &str) -> String {
             }
         }
     }
-    COLLAPSE_WS.replace_all(out.trim(), " ").into_owned()
+    let mut out = COLLAPSE_WS.replace_all(out.trim(), " ").into_owned();
+
+    let mut images: Vec<(String, String)> = Vec::new();
+    for el in dom.select(&IMG_SEL) {
+        if images.len() >= 20 {
+            break;
+        }
+        let Some(src) = el.value().attr("src") else { continue };
+        let Ok(abs) = base.join(src) else { continue };
+        let abs = abs.to_string();
+        if !images.iter().any(|(_, u)| u == &abs) {
+            let alt = el.value().attr("alt").unwrap_or("").replace('[', "(").replace(']', ")");
+            images.push((alt, abs));
+        }
+    }
+    if !images.is_empty() {
+        out.push_str("\n\n## Images on this page\n");
+        for (i, (alt, src)) in images.iter().enumerate() {
+            let alt = if alt.is_empty() { format!("image {}", i + 1) } else { alt.clone() };
+            out.push_str(&format!("![{alt}]({src})\n"));
+        }
+    }
+
+    let mut links: Vec<(String, String)> = Vec::new();
+    for el in dom.select(&LINK_SEL) {
+        if links.len() >= 20 {
+            break;
+        }
+        let Some(href) = el.value().attr("href") else { continue };
+        let Ok(abs) = base.join(href) else { continue };
+        let text = COLLAPSE_WS.replace_all(el.text().collect::<String>().trim(), " ").into_owned();
+        let text = if text.is_empty() { abs.to_string() } else { text };
+        let abs = abs.to_string();
+        if !links.iter().any(|(_, u)| u == &abs) {
+            links.push((text, abs));
+        }
+    }
+    if !links.is_empty() {
+        out.push_str("\n\n## Links on this page\n");
+        for (text, href) in &links {
+            out.push_str(&format!("- [{}]({href})\n", text.replace('[', "(").replace(']', ")")));
+        }
+    }
+
+    out
 }
 
 /// True when `ip` is a globally-routable address — i.e. not loopback,
@@ -1283,7 +1337,7 @@ pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
     bytes.truncate(2 * 1024 * 1024);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (content, ct) = if content_type.contains("html") {
-        (html_to_text(&text), "text/markdown".to_string())
+        (html_to_text(&text, &url), "text/markdown".to_string())
     } else {
         let ct = if content_type.is_empty() { "text/plain".to_string() } else { content_type };
         (text, ct)
@@ -2140,11 +2194,27 @@ mod tests {
 
     #[test]
     fn html_to_text_strips_markup() {
-        let out = html_to_text("<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>");
+        let base = reqwest::Url::parse("https://example.com/page").unwrap();
+        let out = html_to_text("<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>", &base);
         assert!(!out.contains('<'));
         assert!(!out.contains("evil()"));
         assert!(out.contains("Hi & bye"));
         assert!(out.contains('a'));
+    }
+
+    /// A model asked to show a picture or cite a source needs a real,
+    /// absolute URL — not just a page's stripped-down text — so the
+    /// fetched page's images/links are appended as resolved Markdown refs.
+    #[test]
+    fn html_to_text_preserves_image_and_link_urls() {
+        let base = reqwest::Url::parse("https://example.com/blog/post").unwrap();
+        let out = html_to_text(
+            r#"<html><body><p>See <a href="/about">the about page</a>.</p><img src="../cat.png" alt="A cat"><img src="https://cdn.example.com/dog.jpg"></body></html>"#,
+            &base,
+        );
+        assert!(out.contains("![A cat](https://example.com/cat.png)"), "{out}");
+        assert!(out.contains("![image 2](https://cdn.example.com/dog.jpg)"), "{out}");
+        assert!(out.contains("[the about page](https://example.com/about)"), "{out}");
     }
 
     #[test]

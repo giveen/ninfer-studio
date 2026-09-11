@@ -66,7 +66,7 @@ const CHAT_CAPABILITIES = [
   '# Rendering capabilities',
   '- This chat renders full Markdown, including images: to show a picture inline, emit `![alt](https://direct-image-url)` — the UI displays it as a real image.',
   '- You cannot generate images yourself. When the user attaches images or video, you can see their contents (vision input).',
-  '- web_fetch returns a page as text/Markdown and cannot fetch binary image data; to display an image, cite its direct URL in a Markdown image tag.',
+  '- web_fetch returns a page as text/Markdown and cannot fetch binary image data itself, but its output includes an "## Images on this page" section listing every image URL found on the page (already resolved to absolute URLs) — copy one of those verbatim into a Markdown image tag to actually display it. Do not invent or guess an image URL; if the page has none listed, say so instead of fabricating one.',
 ].join('\n');
 const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0]): string => {
   const base = effectiveSystemPrompt(params);
