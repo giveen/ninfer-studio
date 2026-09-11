@@ -1012,6 +1012,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
   const conventionsRef = useRef<string>('');
 
+  // Workspace-switch synchronization (shared by the Tree panel and the memory
+  // panel): both fetch RELATIVE to the control plane's *configured* workspace,
+  // which setCoderWorkspace() re-points asynchronously. A response that lands
+  // before the switch is confirmed belongs to the PREVIOUS workspace — so each
+  // panel applies a response only if (a) it is the newest fetch (seq refs) and
+  // (b) the control was confirmed at that workspace by then (wsAppliedRef,
+  // set in the setCoderWorkspace success handler below, which also bumps
+  // wsSynced to trigger the confirmed reload).
+  const wsAppliedRef = useRef(activeWsDir);
+  const treeSeqRef = useRef(0);
+  const memSeqRef = useRef(0);
+  const [wsSynced, setWsSynced] = useState(0);
+
   // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the sidecar
   // under its data dir, so it is never committed by accident. The agent sees it
   // only via system-prompt injection (memoryRef) — it can't read it as a file.
@@ -1022,14 +1035,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Pull the bank + learnings for the active workspace; called on workspace change
   // and after the critic / memory_update writes new learnings.
   const loadMemory = useCallback(async () => {
+    if (!activeWsDir) return;
+    const seq = ++memSeqRef.current;
     try {
       const m = await coderMemoryGet();
-      setMemory(m);
-      memoryRef.current = m;
+      // Same switch race as the tree: only adopt the newest response, and
+      // only once the control is confirmed at this workspace — otherwise a
+      // pre-switch response would land in memoryRef and leak the OTHER
+      // workspace's bank into this workspace's system prompt.
+      if (seq === memSeqRef.current && wsAppliedRef.current === activeWsDir) {
+        setMemory(m);
+        memoryRef.current = m;
+      }
     } catch {
       // memory is best-effort; keep the last good value rather than wiping UI.
     }
-  }, []);
+  }, [activeWsDir]);
 
   const loadCommits = useCallback(async () => {
     setCommitsLoading(true);
@@ -1064,10 +1085,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (activeWsDir) loadCommits();
   }, [activeWsDir, loadCommits]);
 
-  // Refresh the self-improving memory whenever the active workspace changes.
+  // Refresh the self-improving memory whenever the active workspace changes —
+  // and again once the control is confirmed at it (wsSynced), the only point
+  // at which the relative fetch is guaranteed to hit this workspace's store.
   useEffect(() => {
-    if (activeWsDir) loadMemory();
-  }, [activeWsDir, loadMemory]);
+    if (activeWsDir) void loadMemory();
+  }, [wsSynced, activeWsDir, loadMemory]);
 
   // Sync the safe-mode toggle with the sidecar's current state on mount.
   useEffect(() => {
@@ -1557,15 +1580,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
 
   // ---- File Tree panel: browse + system-prompt follow bindings ----
-  // The tree is fetched relative ('.') against the control plane's *configured*
-  // workspace, which setCoderWorkspace() points asynchronously. A fetch that
-  // lands before the switch completes would show the PREVIOUS workspace's
-  // files in this panel (and they'd stick, since nodes are shared state) —
-  // so a response only applies if (a) it is the newest fetch and (b) the
-  // control was confirmed pointed at this workspace by then (wsAppliedRef).
-  const wsAppliedRef = useRef(activeWsDir);
-  const treeSeqRef = useRef(0);
-  const [wsSynced, setWsSynced] = useState(0);
+  // See the wsAppliedRef/treeSeqRef note above — a tree response only applies
+  // if it is the newest fetch and the control is confirmed at this workspace.
   const loadTree = useCallback(async () => {
     if (!activeWsDir) return;
     const seq = ++treeSeqRef.current;
@@ -2341,8 +2357,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } else {
             try {
               const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' });
-              setMemory(m);
-              memoryRef.current = m;
+              // The write landed in the store the control points at *now*;
+              // adopt it into the active workspace's state only if that is
+              // still the confirmed workspace.
+              if (wsAppliedRef.current === activeWsDir) {
+                setMemory(m);
+                memoryRef.current = m;
+              }
               result = JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
             } catch (e) {
               result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
@@ -2616,8 +2637,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // An individual persistence failure must not break the run loop.
       }
     }
-    setMemory(m);
-    memoryRef.current = m;
+    // Adopt the final write response only if the control is still confirmed
+    // at the active workspace (it re-points async on workspace switches).
+    if (wsAppliedRef.current === activeWsDir) {
+      setMemory(m);
+      memoryRef.current = m;
+    }
   };
 
   const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean }) => {
@@ -4076,8 +4101,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         open={memOpen}
         onClose={() => setMemOpen(false)}
         memory={memory}
-        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { setMemory(m); memoryRef.current = m; })}
-        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { setMemory(m); memoryRef.current = m; })}
+        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { if (wsAppliedRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
+        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { if (wsAppliedRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
         onChanged={() => loadMemory()}
       />
       {showDir && (
