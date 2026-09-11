@@ -442,6 +442,10 @@ pub struct EngineInner {
     pub port: Option<u16>,
     pub artifact: Option<String>,
     pub model_id: Option<String>,
+    /// Context window of the loaded model: from the engine's /v1/models
+    /// (max_model_len) with a --max-context argv fallback, so the chat UI can
+    /// track usage without the user setting anything.
+    pub max_context: Option<u64>,
     pub argv: Option<Vec<String>>,
     pub started_at: Option<u64>,
     pub log_path: Option<String>,

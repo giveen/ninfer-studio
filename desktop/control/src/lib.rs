@@ -13,7 +13,7 @@ pub mod repo;
 pub mod types;
 
 use crate::engine::{
-    discover_engines, engine_health, engine_model_id, public_engine, refresh_engine_status,
+    discover_engines, engine_health, engine_model_info, public_engine, refresh_engine_status,
     start_engine, stop_engine, S, VRAM_FLOOR_GIB,
 };
 use crate::gpu::{gpu_stats, gpu_value};
@@ -239,7 +239,7 @@ async fn engines_public(state: &S) -> Vec<Value> {
         if p_port == Some(port) || p_pid == Some(d.pid) {
             continue;
         }
-        let model = engine_model_id(state, port).await;
+        let (model, _) = engine_model_info(state, port).await;
         out.push(json!({
             "state": "external",
             "pid": d.pid,
@@ -584,7 +584,8 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
         if cands.iter().any(|(p, _)| *p == port) {
             continue;
         }
-        if let Some(m) = engine_model_id(state, port).await {
+        let (m, _) = engine_model_info(state, port).await;
+        if let Some(m) = m {
             cands.push((port, Some(m)));
         }
     }

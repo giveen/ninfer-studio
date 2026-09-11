@@ -22,7 +22,8 @@ pub async fn engine_health(port: u16) -> bool {
         .unwrap_or(false)
 }
 
-pub async fn engine_model_id(state: &State, port: u16) -> Option<String> {
+/// Probe the engine's /v1/models for the model id and its context window.
+pub async fn engine_model_info(state: &State, port: u16) -> (Option<String>, Option<u64>) {
     let api_key = state.config.read().await.api_key.clone();
     let mut req = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/v1/models"))
@@ -30,9 +31,31 @@ pub async fn engine_model_id(state: &State, port: u16) -> Option<String> {
     if !api_key.is_empty() {
         req = req.bearer_auth(&api_key);
     }
-    let r = req.send().await.ok()?;
-    let body: Value = r.json().await.ok()?;
-    body["data"][0]["id"].as_str().map(|s| s.to_string())
+    let Some(r) = req.send().await.ok() else {
+        return (None, None);
+    };
+    let Ok(body) = r.json::<Value>().await else {
+        return (None, None);
+    };
+    let model = body["data"][0]["id"].as_str().map(|s| s.to_string());
+    let max_context = body["data"][0]["max_model_len"].as_u64();
+    (model, max_context)
+}
+
+/// --max-context out of a raw argv (fallback when /v1/models has not been
+/// probed yet, and for adopted engines).
+fn argv_max_context(argv: Option<&Vec<String>>) -> Option<u64> {
+    let argv = argv?;
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if let Some(rest) = a.strip_prefix("--max-context=") {
+            return rest.parse().ok();
+        }
+        if a == "--max-context" {
+            return it.next().and_then(|v| v.parse().ok());
+        }
+    }
+    None
 }
 
 /// Scan /proc for running `ninfer-serve` processes (Linux).
@@ -132,7 +155,9 @@ pub async fn refresh_engine_status(state: &State) {
                 if eng.state != "running" {
                     eng.state = "running".into();
                     if eng.model_id.is_none() {
-                        eng.model_id = engine_model_id(state, port).await;
+                        let (mid, mctx) = engine_model_info(state, port).await;
+                        eng.model_id = mid;
+                        eng.max_context = mctx;
                     }
                 }
             } else if eng.state == "starting" || eng.state == "running" {
@@ -189,7 +214,9 @@ pub async fn refresh_engine_status(state: &State) {
                     eng.pid = Some(p);
                 }
                 if eng.model_id.is_none() {
-                    eng.model_id = engine_model_id(state, port).await;
+                    let (mid, mctx) = engine_model_info(state, port).await;
+                        eng.model_id = mid;
+                        eng.max_context = mctx;
                 }
             } else {
                 eng.state = "stopped".into();
@@ -303,7 +330,9 @@ async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
     eng.pid = disc_pid.or(fallback_pid);
     eng.argv = disc_argv;
     eng.artifact = eng.artifact.clone().or(disc_artifact);
-    eng.model_id = engine_model_id(state, port).await;
+    let (mid, mctx) = engine_model_info(state, port).await;
+                        eng.model_id = mid;
+                        eng.max_context = mctx;
     eng.fail_reason = None;
     eng.log_path = Some(log_path_for(&state.data_dir, port));
 }
@@ -347,7 +376,9 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.port = Some(port);
         eng.artifact = artifact;
         eng.pid = pids.into_iter().next();
-        eng.model_id = engine_model_id(state, port).await;
+        let (mid, mctx) = engine_model_info(state, port).await;
+                        eng.model_id = mid;
+                        eng.max_context = mctx;
         eng.log_path = Some(log_path_for(&state.data_dir, port));
         eng.fail_reason = None;
         return json!({
@@ -530,7 +561,9 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
                 if eng.state == "starting" || eng.state == "running" {
                     eng.state = "running".into();
                     if eng.model_id.is_none() {
-                        eng.model_id = engine_model_id(st.as_ref(), port2).await;
+                        let (mid, mctx) = engine_model_info(st.as_ref(), port2).await;
+                        eng.model_id = mid;
+                        eng.max_context = mctx;
                     }
                 }
                 return;
@@ -662,6 +695,7 @@ pub fn public_engine(eng: &EngineInner) -> Value {
         "port": eng.port,
         "artifact": eng.artifact,
         "modelId": eng.model_id,
+        "maxContext": eng.max_context.or_else(|| argv_max_context(eng.argv.as_ref())),
         "argv": eng.argv,
         "startedAt": eng.started_at,
         "logPath": eng.log_path,
@@ -689,5 +723,20 @@ mod vram_tests {
     fn rejects_non_capacity_lines() {
         assert!(parse_capacity_line("2026-09-10 17:42:45.763  INFO  listening on http://127.0.0.1:8080 | model qwen3.8-27b | auth disabled").is_none());
         assert!(parse_capacity_line("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::argv_max_context;
+
+    #[test]
+    fn parses_both_max_context_forms() {
+        let space = vec!["ninfer-serve".to_string(), "--max-context".to_string(), "240000".to_string()];
+        assert_eq!(argv_max_context(Some(&space)), Some(240_000));
+        let eq = vec!["--max-context=128000".to_string()];
+        assert_eq!(argv_max_context(Some(&eq)), Some(128_000));
+        assert_eq!(argv_max_context(None), None);
+        assert_eq!(argv_max_context(Some(&vec!["--port".to_string(), "8080".to_string()])), None);
     }
 }
