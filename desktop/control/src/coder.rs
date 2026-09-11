@@ -1427,15 +1427,50 @@ fn mem_lock(store: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// GET /api/coder/memory — current bank + learnings for the active workspace.
+/// Optional `?workspace=<path>` override for the memory GET (see
+/// `resolve_mem_dir` — explicit target takes precedence over the global
+/// `coderWorkspace` pointer).
+#[derive(Deserialize)]
+pub struct MemQuery {
+    workspace: Option<String>,
+}
+
+/// Resolve this request's memory dir. An explicit `workspace` (GET query
+/// param / POST body field) takes precedence over the global
+/// `coderWorkspace` pointer: a caller that knows its target workspace (e.g.
+/// a UI panel mid-switch, while the pointer is being re-pointed
+/// asynchronously) can address the intended store directly. Without an
+/// override the global pointer is used (400 when it is unset).
+async fn resolve_mem_dir(
+    state: &S,
+    explicit: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let ws = match explicit.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(w) => w.to_string(),
+        None => {
+            let ws = state.config.read().await.coder_workspace.clone();
+            if ws.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "no workspace configured"})),
+                ));
+            }
+            ws
+        }
+    };
+    Ok(memory_dir(&state.data_dir, &memory_ws(&ws)))
+}
+
+/// GET /api/coder/memory — current bank + learnings for the configured
+/// workspace, or for the workspace named in `?workspace=` when given.
 pub async fn memory_get(
     AxumState(state): AxumState<S>,
+    Query(params): Query<MemQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    if ws.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
-    }
-    let dir = memory_dir(&state.data_dir, &memory_ws(&ws));
+    let dir = match resolve_mem_dir(&state, params.workspace.as_deref()).await {
+        Ok(dir) => dir,
+        Err(e) => return Err(e),
+    };
     let bank = read_mem_file(&dir, "bank.md", "").await;
     let learnings = read_learnings(&dir).await;
     Ok(Json(json!({"bank": bank, "learnings": learnings})))
@@ -1446,15 +1481,17 @@ pub async fn memory_get(
 ///   `{ bank }`            replace the markdown bank wholesale
 ///   `{ learning: {...} }` append one structured learning
 ///   `{ dropLearningId }`  drop a single learning (file rewritten, rest kept)
+/// An optional `{ workspace }` field addresses a store other than the
+/// configured one (see `resolve_mem_dir`).
 pub async fn memory_set(
     AxumState(state): AxumState<S>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    if ws.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
-    }
-    let dir = memory_dir(&state.data_dir, &memory_ws(&ws));
+    let explicit = req.get("workspace").and_then(|v| v.as_str());
+    let dir = match resolve_mem_dir(&state, explicit).await {
+        Ok(dir) => dir,
+        Err(e) => return Err(e),
+    };
     // Hold the per-store lock across the whole read-modify-write so a
     // concurrent append can't be lost to a stale drop rewrite.
     let store_key = dir.to_string_lossy().into_owned();
@@ -1626,7 +1663,7 @@ mod tests {
 
         // No workspace configured → 400.
         state.config.write().await.coder_workspace = String::new();
-        let e = memory_get(ws()).await.unwrap_err();
+        let e = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap_err();
         assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(e.1.0.get("error").and_then(|v| v.as_str()), Some("no workspace configured"));
 
@@ -1664,14 +1701,56 @@ mod tests {
 
         // Workspace B: fully isolated (no bank, no learnings leak across).
         state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
-        let r5 = memory_get(ws()).await.unwrap().0;
+        let r5 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
         assert_eq!(r5.get("bank").and_then(|v| v.as_str()), Some(""));
         assert_eq!(r5.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
         // …and A still has its bank + learning.
         state.config.write().await.coder_workspace = ws_a.to_string_lossy().into_owned();
-        let r6 = memory_get(ws()).await.unwrap().0;
+        let r6 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
         assert_eq!(r6.get("bank").and_then(|v| v.as_str()), Some(bank));
         assert_eq!(r6.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn memory_explicit_workspace_override() {
+        // An explicit `workspace` (query param / body field) must address
+        // the named store even when the global pointer is elsewhere — the
+        // UI mid-switch safety case. Omitted falls back to the pointer
+        // (legacy behavior); pointer unset without an override → 400.
+        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-explicit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws_a = tmp.join("ws-a");
+        let ws_b = tmp.join("ws-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let ws = || AxumState(state.clone());
+        let a = ws_a.to_string_lossy().into_owned();
+        let q_a = || Query(MemQuery { workspace: Some(a.clone()) });
+        let q_none = || Query(MemQuery { workspace: None });
+
+        // Pointer → B. An explicit-A POST lands in A's store…
+        state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
+        let r = memory_set(ws(), Json(json!({"workspace": a, "learning": {"text": "for A only", "kind": "tip"}}))).await.unwrap().0;
+        assert_eq!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+        // …and the pointer's store (B) stayed empty.
+        let rb = memory_get(ws(), q_none()).await.unwrap().0;
+        assert_eq!(rb.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
+        // Explicit GET reads A.
+        let ra = memory_get(ws(), q_a()).await.unwrap().0;
+        let la = ra.get("learnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(la.len(), 1);
+        assert_eq!(la[0].get("text").and_then(|v| v.as_str()), Some("for A only"));
+
+        // No pointer, no override → 400…
+        state.config.write().await.coder_workspace = String::new();
+        let e = memory_get(ws(), q_none()).await.unwrap_err();
+        assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST);
+        // …but an explicit override works with no pointer at all.
+        let ok = memory_get(ws(), q_a()).await.unwrap().0;
+        assert_eq!(ok.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1722,7 +1801,7 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
-        let final_state = memory_get(ws()).await.unwrap().0;
+        let final_state = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
         let learnings = final_state.get("learnings").and_then(|v| v.as_array()).unwrap();
         // All 8 appends must survive (only the seed was a drop target).
         let texts: Vec<String> = learnings
