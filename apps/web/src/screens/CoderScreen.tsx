@@ -16,9 +16,8 @@ import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize,
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
 
-const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
-
 /** Cheap guard used by the commit-approval gate: does this shell command commit? */
 const isGitCommitCommand = (cmd: string): boolean => {
   const c = cmd.replace(/^\s*(sudo|env|time|setsid|nice)\s+/, '').trim();
@@ -4493,7 +4492,7 @@ function FilePickerModal({
                 {isImagePath(n.path) ? <Image size={13} /> : <File size={13} />} {n.name}
                 {n.size != null &&
                   (n.size > maxBytes ? (
-                    <span className="text-danger text-[10px]">over 5 MB</span>
+                    <span className="text-danger text-[10px]">over 50 MB</span>
                   ) : (
                     <span className="text-faint text-[10px]">{Math.ceil(n.size / 1024)} KB</span>
                   ))}
@@ -4522,7 +4521,7 @@ function FilePickerModal({
           )}
         </div>
         <div className="flex items-center justify-between border-t border-line p-2">
-          <span className="text-[11px] text-faint">Select files (≤5 MB each). Images embed as pictures; others inline as text.</span>
+          <span className="text-[11px] text-faint">Select files (≤50 MB each). Images embed as pictures; others inline as text.</span>
           <Button variant="primary" size="sm" disabled={selectedNodes.length === 0} onClick={() => onAttachSelected(selectedNodes)}>
             Attach {selectedNodes.length || ''} selected
           </Button>
