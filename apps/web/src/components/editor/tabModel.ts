@@ -90,6 +90,16 @@ const MAX_TABS = 24;
 const POLL_MS = 8000;
 const NOTFOUND_RE = /not found|ENOENT|HTTP 404/i;
 
+/** `postJSON` resolves the body even on 4xx/5xx (it has no `r.ok` check,
+ *  unlike `getJSON`) — so an HTTP error that carries a JSON body arrives here
+ *  as a "successful" result. Return the error string when the body is an
+ *  API error object (error string, none of the success fields), else null. */
+function apiErrorBody(v: unknown): string | null {
+  const o = v as { error?: string; content?: unknown; binary?: unknown; dataUrl?: unknown } | null;
+  if (o && typeof o === 'object' && typeof o.error === 'string' && o.content == null && o.binary == null && o.dataUrl == null) return o.error;
+  return null;
+}
+
 /** Git status badge color per letter (M=green, A=info, U/D/R=warn). */
 export const GIT_BADGE_CLASS: Record<string, string> = {
   M: 'text-ok',
@@ -163,24 +173,35 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
   }, [opts.activeWsDir]);
 
   /** Read disk for one tab and apply the compare/adopt/conflict logic
-   *  (spec 3.6). `forceAdopt`: after an explicit reload / conflict-reload the
-   *  user has already chosen to take the disk content, so skip the dirty gate. */
+   *  (spec 3.6). `path`/`kind` are passed in (they are stable per tab) because
+   *  `tabsRef.current` is only refreshed in a post-render effect — a fresh tab
+   *  created in the same event is NOT in the ref yet. `forceAdopt`: after an
+   *  explicit reload / conflict-reload the user has already chosen to take the
+   *  disk content, so skip the dirty gate.
+   *  NOTE: `postJSON` resolves the body even on 4xx/5xx (no `r.ok` check), so
+   *  API error bodies ({"error": …}) are normalized into throws here — that is
+   *  what drives the notfound / conflict / error paths below. */
   const readDisk = useCallback(
-    async (id: string, forceAdopt = false) => {
+    async (id: string, path: string, kind: FileKind, forceAdopt = false) => {
       const gen = genRef.current;
       const seq = (readSeqRef.current.get(id) || 0) + 1;
       readSeqRef.current.set(id, seq);
-      const tab = tabsRef.current.find((t) => t.id === id);
-      if (!tab) return;
       const stillValid = (): boolean => gen === genRef.current && (readSeqRef.current.get(id) || 0) === seq;
       try {
-        const r = await coderRead(tab.path);
+        const rRaw: unknown = await coderRead(path);
+        const rErr = apiErrorBody(rRaw);
+        if (rErr) throw new Error(rErr);
+        const r = rRaw as { content?: string; binary?: boolean; truncated?: boolean };
         if (!stillValid()) return;
         if (r.binary) {
-          if (tab.kind === 'image') {
-            let img: Awaited<ReturnType<typeof coderReadBase64>>;
+          if (kind === 'image') {
+            let img: { dataUrl?: string; size?: number; mime?: string; error?: string };
             try {
-              img = await coderReadBase64(tab.path);
+              const raw: unknown = await coderReadBase64(path);
+              const imgErr = apiErrorBody(raw);
+              if (imgErr) throw new Error(imgErr);
+              img = raw as { dataUrl?: string; size?: number; mime?: string; error?: string };
+              if (!img.dataUrl) throw new Error('image read failed');
             } catch (e) {
               if (!stillValid()) return;
               // e.g. >5 MB image — show the error text in the pane.
@@ -188,7 +209,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
               return;
             }
             if (!stillValid()) return;
-            patchTab(id, (t) => ({ ...t, status: 'ready', image: { dataUrl: img.dataUrl, size: img.size, mime: img.mime }, baseBytes: img.size }));
+            patchTab(id, (t) => ({ ...t, status: 'ready', image: { dataUrl: img.dataUrl!, size: img.size ?? 0, mime: img.mime ?? '' }, baseBytes: img.size ?? 0 }));
           } else {
             patchTab(id, (t) => ({ ...t, status: 'binary' }));
           }
@@ -304,7 +325,9 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       const gen = genRef.current;
       const seq = ++lintSeqRef.current;
       try {
-        await coderWrite(t.path, doc);
+        const wRaw: unknown = await coderWrite(t.path, doc);
+        const wErr = apiErrorBody(wRaw);
+        if (wErr) throw new Error(wErr);
         if (gen !== genRef.current) return;
         const bytes = new TextEncoder().encode(doc).length;
         patchTab(targetId, (x) => ({ ...x, dirty: false, base: doc, baseBytes: bytes, diskChanged: false, status: 'ready', diags: [], error: undefined }));
@@ -330,7 +353,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       // code tab with the same compare/adopt/conflict logic — a `bash` edit to
       // a previously-inactive tab must not survive silently.
       if (t && t.kind === 'code' && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')) {
-        void readDisk(id);
+        void readDisk(t.id, t.path, t.kind);
       }
       void refreshGitStatus();
     },
@@ -373,7 +396,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       setActiveTabId(id);
       setNotice(null);
       void refreshGitStatus();
-      void readDisk(id);
+      void readDisk(id, path, fk.kind);
       return true;
     },
     [setActive, refreshGitStatus, readDisk],
@@ -417,7 +440,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       const t = tabsRef.current.find((x) => x.id === id);
       if (!t || !ready()) return;
       if (!skipConfirm && t.dirty && !window.confirm('Discard unsaved changes?')) return;
-      await readDisk(id, true);
+      await readDisk(id, t.path, t.kind, true);
     },
     [readDisk],
   );
@@ -444,7 +467,12 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     if (o.sidecarReady && !o.sidecarReady()) return;
     const ids = tabsRef.current.filter((t) => t.kind === 'code' && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')).map((t) => t.id);
     if (ids.length === 0) return;
-    await Promise.all(ids.map((id) => readDisk(id)));
+    await Promise.all(
+      ids.map((id) => {
+        const t = tabsRef.current.find((x) => x.id === id);
+        return t ? readDisk(id, t.path, t.kind) : Promise.resolve();
+      }),
+    );
   }, [readDisk]);
 
   // 8 s poll while a run is active: active code tab only (covers `bash` edits
@@ -459,7 +487,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       if (!id) return;
       const t = tabsRef.current.find((x) => x.id === id);
       if (t && t.kind === 'code' && !t.truncated && (t.status === 'ready' || t.status === 'conflict')) {
-        void readDisk(id);
+        void readDisk(t.id, t.path, t.kind);
       }
     }, POLL_MS);
     return () => clearInterval(timer);

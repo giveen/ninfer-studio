@@ -6,7 +6,7 @@ export type LangId =
   | 'sql' | 'php' | 'go' | 'yaml' | 'plain';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
-export const isImagePath = (p: string) => IMAGE_EXT.has((p.split('.').pop() || '').toLowerCase());
+export const isImagePath = (p: string) => IMAGE_EXT.has('.' + (p.split('.').pop() || '').toLowerCase());
 
 /** Image check wins first (.svg is xml-ish by extension but an image here). */
 export function fileKind(path: string): { kind: FileKind; lang: LangId } {
