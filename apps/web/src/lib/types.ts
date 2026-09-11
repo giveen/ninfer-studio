@@ -64,6 +64,9 @@ export interface AppSettings {
   enginePort: number;
   apiKey: string;
   hfCli: string;
+  /** Optional HuggingFace token for hf downloads. Redacted in API responses:
+   *  only "********" (stored) or "" (unset) ever reaches the UI. */
+  hfToken?: string;
   buildCommand: string;
   lintCommand: string;
   testCommand: string;

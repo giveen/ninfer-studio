@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
-import { downloadModel } from '../lib/api';
+import { downloadModel, saveConfig } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
 import type { DownloadRec, StatusPayload } from '../lib/types';
 import { Badge, Button, Field, SectionCard, TextField, cn } from '../components/ui';
@@ -58,6 +58,8 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   const [dlRepo, setDlRepo] = useState('');
   const [dlFile, setDlFile] = useState('');
   const [dlError, setDlError] = useState<string | null>(null);
+  const [hfTokenDraft, setHfTokenDraft] = useState('');
+  const hfTokenStored = !!status?.config.hfToken;
 
   const startCustom = async () => {
     if (!dlRepo || !dlFile) return;
@@ -68,6 +70,11 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
     } catch (e) {
       setDlError(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  const saveHfToken = async () => {
+    await saveConfig({ hfToken: hfTokenDraft.trim() });
+    setHfTokenDraft('');
   };
 
   const catalog = status?.artifacts ? status.artifacts : [];
@@ -207,6 +214,28 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
           icon={<Download size={15} />}
         >
           <div className="space-y-2.5">
+            <Field
+              label="HuggingFace token (optional)"
+              hint={
+                hfTokenStored
+                  ? 'A token is saved — downloads use it for faster, non-rate-limited transfers. Type a new one to replace it.'
+                  : 'Set one for faster, non-rate-limited downloads from gated or busy repos. Stored locally, sent only to hf as HF_TOKEN.'
+              }
+            >
+              <div className="flex items-center gap-2">
+                <TextField
+                  type="password"
+                  value={hfTokenDraft}
+                  onChange={(v) => setHfTokenDraft(v)}
+                  placeholder={hfTokenStored ? '******** (saved)' : 'hf_…'}
+                  className="font-mono text-[12px]"
+                  spellCheck={false}
+                />
+                <Button size="sm" variant="ghost" onClick={saveHfToken} disabled={!hfTokenDraft.trim()}>
+                  save
+                </Button>
+              </div>
+            </Field>
             <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
               <Field label="HF repository" hint="e.g. neroued/Qwen3.8-27B-nvfp4-NInfer">
                 <TextField value={dlRepo} onChange={(v) => setDlRepo(v)} placeholder="neroued/Qwen3.8-27B-NInfer" className="font-mono text-[12px]" />

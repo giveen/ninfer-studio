@@ -172,7 +172,7 @@ async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
         "lastStart": serde_json::to_value(&*last_start).unwrap(),
         "gpu": gpu,
         "vram": vram,
-        "config": config,
+        "config": redact_config(config),
         "artifacts": models["artifacts"],
         "catalog": ARTIFACTS,
         "downloads": downloads,
@@ -358,7 +358,24 @@ async fn gpu(AxumState(state): AxumState<S>) -> Json<Value> {
 
 async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
     let c = state.config.read().await;
-    Json(serde_json::to_value(&*c).unwrap())
+    Json(redact_config(serde_json::to_value(&*c).unwrap()))
+}
+
+/// The token shape the UI sees when one is stored. The real token is never
+/// sent back over the API; the UI echoes this mask (or "") for untouched
+/// fields and set_config preserves the stored secret on seeing it.
+const HF_TOKEN_MASK: &str = "********";
+
+fn redact_config(mut v: Value) -> Value {
+    let set = v
+        .get("hfToken")
+        .and_then(|t| t.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("hfToken".into(), json!(if set { HF_TOKEN_MASK } else { "" }));
+    }
+    v
 }
 
 async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -382,6 +399,13 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     if let Some(v) = body.get("hfCli").and_then(|v| v.as_str()) {
         merged.hf_cli = v.into();
     }
+    if let Some(v) = body.get("hfToken").and_then(|v| v.as_str()) {
+        // "********" = untouched field (the UI only ever has the mask) — keep
+        // the stored secret. Any other value, including "", replaces it.
+        if v != HF_TOKEN_MASK {
+            merged.hf_token = v.into();
+        }
+    }
     if let Some(v) = body.get("buildCommand").and_then(|v| v.as_str()) {
         merged.build_command = v.into();
     }
@@ -395,7 +419,7 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
         let mut c = state.config.write().await;
         *c = merged.clone();
     }
-    Ok(Json(serde_json::to_value(&merged).unwrap()))
+    Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
 }
 
 // ---------------------------------------------------------------------------

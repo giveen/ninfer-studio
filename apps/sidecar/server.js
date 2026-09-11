@@ -222,6 +222,9 @@ const defaultConfig = {
   enginePort: 8080,
   apiKey: '',
   hfCli: 'hf',
+  // Optional HuggingFace token for faster (non-rate-limited) downloads.
+  // Redacted in API responses: the UI only sees "********" or "".
+  hfToken: '',
   buildCommand: 'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)',
   lintCommand: '',
   testCommand: '',
@@ -242,11 +245,23 @@ async function loadConfig() {
   }
 }
 
+// The token shape the UI sees when one is stored; the real token never
+// crosses the API. saveConfig treats the mask as "untouched — keep stored".
+const HF_TOKEN_MASK = '********';
+
+function redactConfig(c) {
+  return { ...c, hfToken: c.hfToken ? HF_TOKEN_MASK : '' };
+}
+
 async function saveConfig(patch) {
+  if (typeof patch.hfToken === 'string' && patch.hfToken !== HF_TOKEN_MASK) {
+    config = { ...config, hfToken: patch.hfToken };
+  }
+  delete patch.hfToken;
   config = { ...config, ...patch };
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(path.join(DATA_DIR, 'config.json'), JSON.stringify(config, null, 2));
-  return config;
+  return redactConfig(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -824,10 +839,20 @@ function largestFileSize(dir) {
 }
 
 // Resolve total size via `hf download --dry-run --json` (no actual transfer).
+// HF_TOKEN (optional, from config) unlocks faster non-rate-limited downloads;
+// passed via env, never argv — argv is world-readable in /proc/<pid>/cmdline.
+function hfEnv() {
+  return {
+    ...process.env,
+    PATH: `${process.env.PATH}:${os.homedir()}/.local/bin:/usr/local/bin`,
+    ...(config.hfToken ? { HF_TOKEN: config.hfToken } : {}),
+  };
+}
+
 function hfDryRun(cli, repo, file, dir) {
   return new Promise((resolve) => {
     const cp = spawn(cli, ['download', repo, file, '--local-dir', dir, '--dry-run', '--json'], {
-      env: { ...process.env, PATH: `${process.env.PATH}:${os.homedir()}/.local/bin:/usr/local/bin` },
+      env: hfEnv(),
     });
     let out = '';
     cp.stdout.on('data', (c) => (out += c));
@@ -852,7 +877,7 @@ async function startDownload({ repo, file, localDir, hfCli }) {
   const totalBytes = await hfDryRun(cli, repo, file, dir);
   const id = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const proc = spawn(cli, ['download', repo, file, '--local-dir', dir], {
-    env: { ...process.env, PATH: `${process.env.PATH}:${os.homedir()}/.local/bin:/usr/local/bin` },
+    env: hfEnv(),
   });
   const rec = {
     id,
@@ -2377,7 +2402,7 @@ const server = createServer(async (req, res) => {
         engines: await enginesPublic(),
         lastStart,
         gpu,
-        config,
+        config: redactConfig(config),
         artifacts: models.artifacts,
         catalog: ARTIFACTS,
         downloads: downloadsPublic(),
@@ -2386,7 +2411,7 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    if (p === '/api/config' && req.method === 'GET') return sendJson(res, 200, config);
+    if (p === '/api/config' && req.method === 'GET') return sendJson(res, 200, redactConfig(config));
 
     if (p === '/api/config' && req.method === 'POST') {
       const body = await readBody(req, 1 << 20);

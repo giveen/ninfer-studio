@@ -38,6 +38,10 @@ pub struct AppSettings {
     pub engine_port: u16,
     pub api_key: String,
     pub hf_cli: String,
+    /// Optional HuggingFace token, passed to `hf download` as HF_TOKEN to
+    /// unlock faster (non-rate-limited) downloads. Redacted in API responses —
+    /// the UI only ever sees the mask or "".
+    pub hf_token: String,
     pub build_command: String,
     /// Command run in the Coder workspace after agent edits (lint/typecheck).
     /// Empty = unset. Falls back to `build_command` when empty.
@@ -72,6 +76,7 @@ impl Default for AppSettings {
             engine_port: 8080,
             api_key: String::new(),
             hf_cli: "hf".into(),
+            hf_token: String::new(),
             build_command: "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)".into(),
             lint_command: String::new(),
             test_command: String::new(),

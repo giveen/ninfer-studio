@@ -135,12 +135,12 @@ export function HintTip({ text }: { text: string }) {
 const inputCls =
   'h-8.5 w-full rounded-lg border border-line bg-inset px-2.5 text-[13px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none';
 
-export const TextField = forwardRef<HTMLInputElement, { value: string; onChange: (v: string) => void; placeholder?: string; className?: string; spellCheck?: boolean }>(
-  function TextField({ value, onChange, placeholder, className, spellCheck = false }, ref) {
+export const TextField = forwardRef<HTMLInputElement, { value: string; onChange: (v: string) => void; placeholder?: string; className?: string; spellCheck?: boolean; type?: string }>(
+  function TextField({ value, onChange, placeholder, className, spellCheck = false, type = 'text' }, ref) {
     return (
       <input
         ref={ref}
-        type="text"
+        type={type}
         value={value}
         spellCheck={spellCheck}
         placeholder={placeholder}

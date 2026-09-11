@@ -73,16 +73,20 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         std::process::id()
     );
 
-    let Ok(mut child) = tokio::process::Command::new(&cli)
-        .arg("download")
+    let hf_token = state.config.read().await.hf_token.clone();
+    let mut cmd = tokio::process::Command::new(&cli);
+    cmd.arg("download")
         .arg(repo)
         .arg(file)
         .arg("--local-dir")
         .arg(&dir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    else {
+        .stderr(std::process::Stdio::piped());
+    // Token goes via env, never argv — argv is world-readable in /proc.
+    if !hf_token.is_empty() {
+        cmd.env("HF_TOKEN", hf_token);
+    }
+    let Ok(mut child) = cmd.spawn() else {
         return json!({ "ok": false, "message": format!("could not spawn {cli}") });
     };
     let pid = child.id();
