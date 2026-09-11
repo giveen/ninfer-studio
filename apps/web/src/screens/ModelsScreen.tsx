@@ -85,14 +85,14 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
       <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
         <SectionCard
           title="Downloaded artifacts"
-          description={`Scanned from ${modelsDir} — only explicitly registered .ninfer artifacts are loadable by the engine.`}
+          description="Only explicitly registered .ninfer artifacts are loadable by the engine."
           icon={<Layers size={15} />}
           actions={<Badge tone="accent">{artifacts.length} local</Badge>}
         >
           {artifacts.length === 0 ? (
             <div className="py-6 text-center">
               <p className="text-[13px] text-mute">No .ninfer artifacts in the models directory yet.</p>
-              <p className="mt-1 text-[12px] text-faint">Download one from the catalog below — files land in {modelsDir || 'the configured models dir'}.</p>
+              <p className="mt-1 text-[12px] text-faint">Download one from the catalog below — files land in your configured models directory.</p>
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
