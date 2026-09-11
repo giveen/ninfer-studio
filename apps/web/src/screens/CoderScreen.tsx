@@ -29,6 +29,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
    - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
     - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
+    - Trivial lookups (current git branch, a version number, whether a file exists, a config value) deserve ONE direct tool call and an immediate answer. Never delegate them to a subagent and never chain extra tool calls once you have the answer — reply at once.
 2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
 3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself. For long-running commands (builds, test suites), pass \`background:true\` to \`bash\` and poll the returned job with \`bash_poll\` until \`done:true\` instead of blocking.
 4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
@@ -1076,6 +1077,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => {
     if (!coderWs || seeded.current) return;
     seeded.current = true;
+    // Remount (screen switch or app restart) with a persisted workspace:
+    // restore the last active conversation instead of presenting an empty
+    // transcript — the store survives, so the visible state must too.
+    const existing = storeRef.current.workspaces[coderWs];
+    if (existing) {
+      const convId = existing.activeConv ?? existing.order[existing.order.length - 1];
+      if (convId && existing.conversations[convId]) {
+        setStore((prev) => ({ ...prev, activeWs: coderWs, activeConv: convId }));
+        loadConv(coderWs, convId);
+      } else {
+        setMessages([]);
+        setLedger([]);
+        setTodos([]);
+        lastPromptTokensRef.current = 0;
+      }
+      return;
+    }
     setStore((prev) => {
       if (prev.workspaces[coderWs]) return prev;
       const id = newConvId();
