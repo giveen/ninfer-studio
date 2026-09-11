@@ -1126,20 +1126,36 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [messages, ledger, todos, activeWs, activeConv]);
 
   // Keep the sidecar's coder workspace pointed at the active workspace.
+  // Each set is chained after the previous one's completion: the `cancelled`
+  // flag only suppresses THIS effect's callback — an already-sent POST still
+  // reaches the server. Without serialization, rapid A→B→A switching could
+  // let B's POST complete after A's, leaving the control on B while the UI
+  // believes it is on A (and concurrent POSTs could interleave their config
+  // writes server-side). Chaining guarantees switch order == request order,
+  // so the server always ends on the latest workspace.
+  const wsSetQueueRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     if (!activeWsDir) return;
     let cancelled = false;
     setWsBusy(true);
-    setCoderWorkspace(activeWsDir)
-      .then(() => {
-        if (cancelled) return;
-        // Control confirmed at this workspace — from here on a relative tree
-        // fetch is valid, so (re)load the panel against the right root.
-        wsAppliedRef.current = activeWsDir;
-        setWsSynced((n) => n + 1);
-      })
-      .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
-      .finally(() => { if (!cancelled) setWsBusy(false); });
+    wsSetQueueRef.current = wsSetQueueRef.current
+      .catch(() => undefined) // a previous failure must not clog the queue
+      .then(() => setCoderWorkspace(activeWsDir))
+      .then(
+        () => {
+          if (cancelled) return;
+          // Control confirmed at this workspace — from here on a relative
+          // tree fetch is valid, so (re)load the panel against the right root.
+          wsAppliedRef.current = activeWsDir;
+          setWsSynced((n) => n + 1);
+        },
+        (e) => {
+          if (!cancelled) console.warn('Failed to set coder workspace on sidecar:', e);
+        },
+      )
+      .finally(() => {
+        if (!cancelled) setWsBusy(false);
+      });
     return () => { cancelled = true; };
   }, [activeWsDir]);
 
