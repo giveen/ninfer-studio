@@ -708,6 +708,10 @@ interface ConvMeta {
   messages: ChatMessage[];
   ledger: LogEntry[];
   todos: TodoItem[];
+  /** When this conversation's task list last changed (tool call or user
+   *  edit) — persisted per conversation so switching never shows another
+   *  conversation's "last updated" time. */
+  todosUpdatedAt?: number;
   lastPromptTokens: number;
   archived?: boolean;
   checkpoints?: Checkpoint[];
@@ -783,6 +787,22 @@ function stripExtPrefix(p: string): string {
     if (rest.startsWith(unc)) return '\\\\' + rest.slice(unc.length).replace(/\//g, '\\');
   }
   return rest;
+}
+
+/** Render the live task list as a system-prompt block. Injected into the
+ *  supervisor's system prompt every turn so the plan (a) survives
+ *  auto-compaction of the conversation and (b) reflects user edits made
+ *  mid-run (added/removed/retasked items) on the very next LLM call. */
+function todoSystemBlock(todos: TodoItem[]): string {
+  const mark = (s: string) => (s === 'completed' ? 'x' : s === 'in_progress' ? '~' : ' ');
+  // An empty list still gets a block, with an explicit marker: the
+  // conversation (and any compaction summary) may still contain an older
+  // non-empty list, so without this the next turn has no system-level
+  // signal the plan is now empty and could resume stale work.
+  const lines = todos.length
+    ? todos.map((t, i) => `${i + 1}. [${mark(t.status)}] ${t.content}`)
+    : ['(no active tasks — the task list was cleared; do not resume work from an earlier plan unless the user asks or re-adds a task)'];
+  return `\n\n# Current task list (live — maintained by todo_write, editable by the user; keep it in sync with your actual progress)\n${lines.join('\n')}\n`;
 }
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
@@ -943,6 +963,41 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const askRef = useRef<string | null>(null);
   const [ledger, setLedger] = useState<LogEntry[]>(initialMeta?.ledger ?? []);
   const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
+  /** When the task list last changed (tool call or user edit) — shown in the
+   *  panel header. Per conversation (ConvMeta.todosUpdatedAt), so switching
+   *  conversations can't leak another conversation's time into the header. */
+  const [todosUpdatedAt, setTodosUpdatedAt] = useState<number | null>(initialMeta?.todosUpdatedAt ?? null);
+  /** Mirror of `todos` for the run loop: the loop's closure sees stale state,
+   *  so the per-turn system-prompt injection reads this ref instead. Kept in
+   *  sync synchronously (applyTodos) — a useEffect sync alone lands one tick
+   *  late, and handleToolCalls → runAgent can build the next request before
+   *  effects run, which would send the previous list to the LLM. */
+  const todosRef = useRef<TodoItem[]>(todos);
+  useEffect(() => { todosRef.current = todos; }, [todos]);
+  /** Bumped on every user edit of the list (add / cycle / remove / restore)
+   *  — lets an in-flight todo_write tell its snapshot was generated from a
+   *  stale list. */
+  const todosRevRef = useRef(0);
+  /** The revision captured when the current LLM request was built — its
+   *  system prompt carried the list as of that moment. */
+  const todosRevAtReqStartRef = useRef(0);
+  /** Apply a new task list in the same tick: run-loop ref + state (+ optional
+   *  header timestamp). */
+  const applyTodos = (next: TodoItem[], ts?: number | null) => {
+    todosRef.current = next;
+    setTodos(next);
+    if (ts !== undefined) setTodosUpdatedAt(ts);
+  };
+  /** User-side mutation: functional edit + revision bump + timestamp, all
+   *  synchronous, so the next LLM call (even before a re-render) sees it. */
+  const mutateTodos = (fn: (prev: TodoItem[]) => TodoItem[]) => {
+    const next = fn(todosRef.current);
+    todosRevRef.current += 1;
+    todosRef.current = next;
+    setTodos(next);
+    setTodosUpdatedAt(Date.now());
+  };
+  const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -1213,7 +1268,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const msgs = m.messages ?? [];
     setMessages(msgs);
     setLedger(m.ledger ?? []);
-    setTodos(m.todos ?? []);
+    applyTodos(m.todos ?? [], m.todosUpdatedAt ?? null);
   };
 
   // Persist the active conversation's live state back into the store.
@@ -1232,14 +1287,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         ? firstUser.content.replace(/\s+/g, ' ').trim().slice(0, 48) || (meta?.title ?? 'New conversation')
         : (meta?.title ?? 'New conversation');
       const base = meta ?? { id: activeConv, title: 'New conversation', updatedAt: Date.now(), messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
-      const updated: ConvMeta = { ...base, id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, lastPromptTokens: lastPromptTokensRef.current, checkpoints: meta?.checkpoints ?? [] };
+      const updated: ConvMeta = { ...base, id: activeConv, title, updatedAt: Date.now(), messages, ledger, todos, todosUpdatedAt: todosUpdatedAt ?? undefined, lastPromptTokens: lastPromptTokensRef.current, checkpoints: meta?.checkpoints ?? [] };
       const order = wsd.order.includes(activeConv) ? wsd.order : [...wsd.order, activeConv];
       return {
         ...prev,
         workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: updated }, order } },
       };
     });
-  }, [messages, ledger, todos, activeWs, activeConv]);
+  }, [messages, ledger, todos, todosUpdatedAt, activeWs, activeConv]);
 
   // Keep the sidecar's coder workspace pointed at the active workspace.
   // Each set is chained after the previous one's completion: the `cancelled`
@@ -1292,7 +1347,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } else {
         setMessages([]);
         setLedger([]);
-        setTodos([]);
+        applyTodos([], null);
         lastPromptTokensRef.current = 0;
       }
       return;
@@ -1305,7 +1360,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
     setMessages([]);
     setLedger([]);
-    setTodos([]);
+    applyTodos([], null);
     lastPromptTokensRef.current = 0;
   }, [coderWs]);
 
@@ -1325,7 +1380,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
     setMessages([]);
     setLedger([]);
-    setTodos([]);
+    applyTodos([], null);
     lastPromptTokensRef.current = 0;
   };
   /** Fork the active conversation: duplicate its transcript into a new thread. */
@@ -1412,7 +1467,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } else {
       setMessages([]);
       setLedger([]);
-      setTodos([]);
+      applyTodos([], null);
       lastPromptTokensRef.current = 0;
     }
   };
@@ -1431,7 +1486,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     else {
       setMessages([]);
       setLedger([]);
-      setTodos([]);
+      applyTodos([], null);
       lastPromptTokensRef.current = 0;
     }
   };
@@ -1479,7 +1534,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       else {
         setMessages([]);
         setLedger([]);
-        setTodos([]);
+        applyTodos([], null);
         lastPromptTokensRef.current = 0;
       }
     }
@@ -1514,7 +1569,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       else {
         setMessages([]);
         setLedger([]);
-        setTodos([]);
+        applyTodos([], null);
         lastPromptTokensRef.current = 0;
       }
     }
@@ -1527,6 +1582,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
     setLedger((prev) => [...prev.slice(-999), { ...safe, id: crypto.randomUUID(), time: Date.now() }]);
+  };
+
+  // ---- Todos: user actions (the panel is no longer read-only). Edits take
+  // effect on the agent's next LLM call via the per-turn system-prompt
+  // injection (todoSystemBlock + todosRef), so the human can retask, drop a
+  // spinning step, or add work mid-run without waiting for the next agent
+  // todo_write. User edits persist with the conversation (todos in ConvMeta).
+  const addTodo = (raw: string) => {
+    const content = raw.trim();
+    if (!content) return;
+    mutateTodos((prev) => [...prev, { content, status: 'pending' }]);
+    addLog({ type: 'todo', label: 'manual', detail: `added task: ${content.slice(0, 60)}` });
+  };
+  const cycleTodo = (i: number) => {
+    mutateTodos((prev) => prev.map((t, j) => (j === i ? { ...t, status: t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending' } : t)));
+  };
+  const removeTodo = (i: number) => {
+    mutateTodos((prev) => prev.filter((_, j) => j !== i));
+    addLog({ type: 'todo', label: 'manual', detail: 'removed a task' });
   };
   // Rebuild the system prompt, refreshing the codebase map so the agent sees files
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
@@ -1798,7 +1872,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const keptMessages = messages.slice(0, cp.messages);
     const keptLedger = ledger.slice(0, cp.ledger);
     setMessages(keptMessages);
-    setTodos(cp.todos);
+    applyTodos(cp.todos, null);
     setLedger([...keptLedger, { id: crypto.randomUUID(), time: Date.now(), type: 'compact', label: 'restore', detail: `restored checkpoint ${cp.label}` }]);
     // Write the store explicitly: restoring to an empty transcript would trip
     // the L1 anti-clobber guard in the persist effect and lose the restore.
@@ -1806,7 +1880,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const wsd = prev.workspaces[activeWs];
       const meta = wsd?.conversations[activeConv];
       if (!wsd || !meta) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, messages: keptMessages, todos: cp.todos, updatedAt: Date.now() } } } } };
+      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, messages: keptMessages, todos: cp.todos, todosUpdatedAt: undefined, updatedAt: Date.now() } } } } };
     });
   };
   const deleteCheckpoint = (id: string) => {
@@ -2393,8 +2467,36 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify({ question: args.question, status: 'awaiting_user' });
         } else if (call.name === 'todo_write') {
           logType = 'todo'; logDetail = 'Updated task list';
-          setTodos(args.todos || []);
-          result = JSON.stringify({ success: true });
+          // Validate: the JSON schema is model-hint only. Reject malformed
+          // items instead of stringifying them into real tasks — `String(...)`
+          // would turn `{}` into "[object Object]" and arrays into
+          // comma-joined text, which would then render and reach the system
+          // prompt. The schema requires a string; non-strings don't qualify.
+          const raw: unknown = Array.isArray(args.todos) ? args.todos : [];
+          const cleaned: TodoItem[] = [];
+          for (const t of raw as Array<Record<string, unknown>>) {
+            const content = t && typeof t.content === 'string' ? t.content.trim() : '';
+            if (!content) continue; // malformed (non-string/empty) — skip
+            cleaned.push({
+              content,
+              status: t.status === 'in_progress' ? 'in_progress' : t.status === 'completed' ? 'completed' : 'pending',
+            });
+          }
+          // Stale-write guard: todo_write replaces the WHOLE list, and this
+          // response was generated from the list sent in `system` at request
+          // build time. If the user edited the list while the request was
+          // in flight, the model's snapshot is older than the user's edits —
+          // discard it rather than clobber newer user state (the model sees
+          // the user's list in the next turn's system prompt and can
+          // re-emit if its plan is still the right one).
+          if (todosRevRef.current > todosRevAtReqStartRef.current) {
+            logDetail = 'Task list update discarded (edited mid-run)';
+            addLog({ type: 'todo', label: 'todo_write', detail: 'discarded: list edited by the user mid-run' });
+            result = JSON.stringify({ success: false, reason: 'the task list was edited by the user while this response was being generated, so this update was not applied. The current list is in your system prompt — re-emit todo_write with the full intended list if your plan is still correct.' });
+          } else {
+            applyTodos(cleaned, Date.now());
+            result = JSON.stringify({ success: true, count: cleaned.length });
+          }
         } else if (call.name === 'memory_update') {
           // Declared in TOOLS but previously unhandled — calls landed in the
           // "Unknown tool" branch and the learning was silently lost.
@@ -2951,11 +3053,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // into inventing tool markup for an undeclared tool.
         const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : TOOLS;
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
-        const system = planMode
+        const system = (planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
-          : dynamicSystemRef.current;
+          : dynamicSystemRef.current) + todoSystemBlock(todosRef.current);
+        // Baseline for the stale todo_write guard: this request's system
+        // prompt carried the list as of this moment.
+        todosRevAtReqStartRef.current = todosRevRef.current;
         const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
-
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
@@ -4186,24 +4290,58 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
       </div>
 
-      {/* Right: todos */}
+      {/* Right: todos (agent-maintained via todo_write; the user can also
+          edit directly — edits reach the agent on its next LLM call via the
+          per-turn system-prompt injection) */}
       <div className="flex w-64 flex-col border-l border-line bg-panel">
         <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
           <CheckSquare size={14} /> Todos
+          {todosUpdatedAt != null && (
+            <span className="ml-auto font-mono text-[10px] font-normal text-faint" title="Last updated (agent todo_write or your edit)">
+              {new Date(todosUpdatedAt).toLocaleTimeString([], { hour12: false })}
+            </span>
+          )}
         </div>
         <div className="flex-1 p-2 text-[11.5px] text-mute overflow-auto">
           {todos.length === 0 ? 'No pending tasks.' : (
             <div className="space-y-1.5">
               {todos.map((t, i) => (
-                <div key={i} className={cn("flex items-start gap-2", t.status === 'completed' ? 'opacity-50 line-through' : '')}>
-                  <span className="mt-0.5 shrink-0">
+                <div key={i} className={cn("group flex items-start gap-2", t.status === 'completed' ? 'opacity-50 line-through' : '')}>
+                  <button
+                    type="button"
+                    className="mt-0.5 shrink-0 cursor-pointer hover:opacity-70"
+                    title={`${t.status} — click to advance to ${t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending'}`}
+                    onClick={() => cycleTodo(i)}
+                  >
                     {t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '⏳' : '☐'}
-                  </span>
-                  <span className={t.status === 'in_progress' ? 'text-accent font-medium' : ''}>{t.content}</span>
+                  </button>
+                  <span className={cn('min-w-0 flex-1 break-words', t.status === 'in_progress' ? 'text-accent font-medium' : '')}>{t.content}</span>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded p-0.5 text-faint opacity-0 group-hover:opacity-100 hover:text-danger"
+                    title="Remove task (takes effect on the agent's next step)"
+                    onClick={() => removeTodo(i)}
+                  >
+                    <X size={12} />
+                  </button>
                 </div>
               ))}
             </div>
           )}
+        </div>
+        <div className="shrink-0 border-t border-line p-2">
+          <form className="flex items-center gap-1.5" onSubmit={(e) => { e.preventDefault(); addTodo(todoDraft); setTodoDraft(''); }}>
+            <input
+              value={todoDraft}
+              onChange={(e) => setTodoDraft(e.target.value)}
+              placeholder="add a task…"
+              className="min-w-0 flex-1 rounded border border-line bg-inset px-2 py-1 text-[11px] outline-none focus:border-accent/50"
+            />
+            <Button size="sm" variant="ghost" type="submit" disabled={!todoDraft.trim()} title="Add a task to the agent's plan — visible to it on its next step">
+              <Plus size={13} /> add
+            </Button>
+          </form>
+          <p className="mt-1 text-[10px] text-faint">Click a status to cycle it · your edits reach the agent on its next step</p>
         </div>
       </div>
 
