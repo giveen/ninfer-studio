@@ -3045,6 +3045,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return groups;
   }, [messages]);
 
+  // Auto-scroll the transcript as the agent streams new messages/tools, but
+  // only while the user is pinned near the bottom — scrolling up to read
+  // history must not yank the view back down. Mirrors the Chat screen and
+  // the Log pane (stick-to-bottom, re-engage when they return to the end).
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const transcriptStick = useRef(true);
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (el && transcriptStick.current) el.scrollTop = el.scrollHeight;
+  }, [messageGroups]);
+
   const boundPaths = activeMeta?.boundPaths ?? [];
 
   const renderTree = (list: FileNode[], depth: number): React.ReactNode => (
@@ -3763,7 +3774,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </SidebarSection>
         )}
 
-        <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
+        <div
+          ref={transcriptRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            transcriptStick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          }}
+          className="flex-1 overflow-auto bg-panel2 space-y-4 p-4"
+        >
           {planMode && (
             <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 text-[11.5px] text-accent flex items-center gap-2">
               <BrainCircuit size={13} className="shrink-0" />
