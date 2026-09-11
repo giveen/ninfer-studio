@@ -2301,9 +2301,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'todo'; logDetail = 'Updated task list';
           setTodos(args.todos || []);
           result = JSON.stringify({ success: true });
+        } else if (call.name === 'memory_update') {
+          // Declared in TOOLS but previously unhandled — calls landed in the
+          // "Unknown tool" branch and the learning was silently lost.
+          const kind = args.kind === 'avoid' || args.kind === 'success' ? args.kind : 'tip';
+          logType = 'todo'; logDetail = `memory: ${kind}`;
+          const res = await coderMemoryAddLearning({ text: String(args.text || ''), kind });
+          result = JSON.stringify(res ?? { success: true });
         } else if (call.name === 'delegate') {
           logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, abortRef.current?.signal ?? new AbortController().signal, 6, Array.isArray(args.tools) ? args.tools : undefined);
+          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, abortRef.current?.signal ?? new AbortController().signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined);
           result = JSON.stringify({ summary: res });
         } else if (call.name === 'subagent') {
           // Implementation subagent (worker): spawn a focused agent, capture its
@@ -2313,7 +2320,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logDetail = `subagent: ${task.slice(0, 40)}`;
           addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
           const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
-          const workerTools = Array.isArray(args.tools) ? args.tools : undefined;
+          const workerTools = Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined;
           let preTree = '';
           try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
           let res = { summary: '', diff: '', ok: false };
@@ -2439,7 +2446,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const runSubagent = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'delegate']);
+    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search']);
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
     for (let step = 0; step < maxSteps; step++) {
@@ -2461,7 +2468,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       for (const call of toolCalls) {
         if (call.name === 'delegate') {
           const args = JSON.parse(call.arguments);
-          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools : undefined, depth + 1);
+          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
         } else {
           const res = await runReadOnlyCall(call);
@@ -2500,7 +2507,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || '')));
         case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000));
         case 'delegate': {
-          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools : undefined, depth + 1);
+          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
           return JSON.stringify({ summary: r });
         }
         default: return JSON.stringify({ error: `worker cannot use tool: ${call.name}` });
