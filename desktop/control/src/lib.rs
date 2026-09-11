@@ -68,6 +68,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))
+        .route("/api/coder/memory", get(coder::memory_get).post(coder::memory_set))
         .route("/api/coder/glob", post(coder::glob))
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/web/search", post(coder::web_search))
