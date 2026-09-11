@@ -59,6 +59,20 @@ const DEFAULT_PARAMS: ChatParams = {
   maxTokens: null as unknown as number,
 };
 
+/** The chat UI renders full Markdown (images included), but without a
+ *  capability statement the model assumes a text-only terminal and refuses
+ *  to show pictures. Tell it what the interface can do. */
+const CHAT_CAPABILITIES = [
+  '# Rendering capabilities',
+  '- This chat renders full Markdown, including images: to show a picture inline, emit `![alt](https://direct-image-url)` — the UI displays it as a real image.',
+  '- You cannot generate images yourself. When the user attaches images or video, you can see their contents (vision input).',
+  '- web_fetch returns a page as text/Markdown and cannot fetch binary image data; to display an image, cite its direct URL in a Markdown image tag.',
+].join('\n');
+const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0]): string => {
+  const base = effectiveSystemPrompt(params);
+  return base ? `${base}\n\n${CHAT_CAPABILITIES}` : CHAT_CAPABILITIES;
+};
+
 const CHAT_TOOLS = [
   {
     type: "function",
@@ -727,7 +741,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
 
       await streamChat(
-        buildChatRequest(useModel, effectiveSystemPrompt(params), history, params, { tools: CHAT_TOOLS }),
+        buildChatRequest(useModel, chatSystemWithCapabilities(params), history, params, { tools: CHAT_TOOLS }),
         ac.signal,
         {
           onReasoningDelta: (d) => {
