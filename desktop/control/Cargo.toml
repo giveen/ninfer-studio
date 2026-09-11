@@ -7,15 +7,15 @@ description = "NInfer Studio control plane: engine process supervision, model ma
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.7", features = ["fs", "cors"] }
 tower = { version = "0.5", features = ["util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
-reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+base64 = "0.23"
+reqwest = { version = "0.13", features = ["stream", "json", "rustls"], default-features = false }
 ignore = "0.4"
 globset = "0.4"
 scraper = "0.27"
 regex = "1.10"
 futures-util = "0.3"
-dirs = "6"
+dirs = "7"
