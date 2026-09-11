@@ -48,6 +48,7 @@ const WORKER_SYSTEM = `You are a focused implementation subagent inside a coding
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
+- If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
 - When the task is complete, STOP calling tools and reply with a concise summary: what you changed, the files touched, and any build/test commands you ran.
 - Stay strictly scoped to the assigned task.`;
 
@@ -670,6 +671,24 @@ const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_com
 const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
 const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
+/** Tool names an implementation `subagent` worker may use by default — the
+ *  same set `runWorker` falls back to when no allow-list is given. Used to
+ *  validate a model-supplied `tools` allow-list for the `subagent` tool
+ *  (unlike `delegate`, which is read-only-only, `subagent`'s whole point is
+ *  writing/running things, so it must NOT be filtered against
+ *  READONLY_TOOL_NAMES — that would silently strip write/edit/bash). */
+const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+
+/** Filter a model-supplied tool allow-list against `allowed`, falling back to
+ *  `undefined` (caller's default set) when nothing survives the filter — an
+ *  empty array is still truthy in JS, so without this an all-invalid or
+ *  all-filtered-out request would silently leave a subagent with ZERO tools
+ *  instead of a sensible default. */
+function filterToolAllowList(raw: unknown, allowed: Set<string>): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const filtered = raw.map(String).filter((t) => allowed.has(t));
+  return filtered.length ? filtered : undefined;
+}
 
 /** Binaries bash may run in plan mode (inspection only). */
 const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
@@ -2357,6 +2376,67 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // in-flight one instead of only taking effect on the next loop turn.
     const toolSignal = abortRef.current?.signal ?? new AbortController().signal;
 
+    // Fast path: a turn made entirely of `delegate` calls is exactly the
+    // fan-out-research case the tool's own description promises runs "in
+    // parallel" — but the general loop below always ran everything one at a
+    // time, delegate included. Run them concurrently here instead. Any turn
+    // that mixes in another tool type falls through to the general
+    // sequential loop unchanged: mutating/approval-gated tools need strict
+    // ordering, and delegate alone never does (it's read-only and never
+    // touches the git working tree).
+    if (calls.length > 1 && calls.every((c) => c.name === 'delegate')) {
+      const results = await Promise.all(calls.map(async (call) => {
+        const t0 = performance.now();
+        let result = '';
+        let logType: LogEntry['type'] = 'error';
+        let logDetail = '';
+        try {
+          const args = JSON.parse(call.arguments);
+          const permVerdict = checkPerm(call.name, args);
+          if (permVerdict !== null) {
+            logDetail = `${call.name} blocked`;
+            // A parallel batch can't safely show one interactive approval
+            // dialog per call — they'd race the single pending-approval
+            // slot. Refuse here so the model can retry this one alone,
+            // where 'ask' still works correctly (single-delegate turns
+            // fall through to the general loop below).
+            result = JSON.stringify({
+              error: permVerdict === 'ask'
+                ? `'${call.name}' requires interactive approval and can't run inside a parallel batch — call it alone.`
+                : permVerdict,
+            });
+          } else {
+            logType = 'ask';
+            logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
+            const res = await runSubagent(
+              'delegate',
+              `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`,
+              modelRef.current,
+              toolSignal,
+              6,
+              filterToolAllowList(args.tools, READONLY_TOOL_NAMES),
+            );
+            result = JSON.stringify({ summary: res });
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          logDetail = msg;
+          result = JSON.stringify({ error: msg });
+        }
+        const durationMs = Math.round(performance.now() - t0);
+        addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
+        const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
+        if (maybeSummarized !== result) {
+          addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
+        }
+        return { call, content: maybeSummarized };
+      }));
+      for (const { call, content } of results) {
+        nextMessages.push({ role: 'tool', content, tool_call_id: call.id, name: call.name });
+      }
+      return nextMessages;
+    }
+
     for (const call of calls) {
       let result = '';
       const t0 = performance.now();
@@ -2696,7 +2776,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         } else if (call.name === 'delegate') {
           logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined);
+          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES));
           result = JSON.stringify({ summary: res });
         } else if (call.name === 'subagent') {
           // Implementation subagent (worker): spawn a focused agent, capture its
@@ -2706,7 +2786,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logDetail = `subagent: ${task.slice(0, 40)}`;
           addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
           const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
-          const workerTools = Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined;
+          // BUG FIX: this used to filter against READONLY_TOOL_NAMES, which
+          // silently stripped write/edit/apply_patch/bash whenever a caller
+          // passed a tools list (exactly what the tool's own description
+          // tells the model to do) — an implementation subagent with no
+          // write tools, or with none at all if every requested tool got
+          // filtered out. WORKER_TOOL_NAMES is the correct allow-list.
+          const workerTools = filterToolAllowList(args.tools, WORKER_TOOL_NAMES);
           // Track the run so it shows live in the Jobs panel, same as
           // delegate/scout (runSubagent) — this was previously invisible
           // since it calls runWorker directly instead of runSubagent.
@@ -2715,21 +2801,38 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             let preTree = '';
             try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
+            const ideation = await runIdeation(task, wmodel, toolSignal);
+            addLog({ type: 'read', label: 'subagent', detail: ideation ? `ideation: ${ideation.slice(0, 150)}` : 'ideation pass produced no candidates' });
             let res = { summary: '', diff: '', ok: false };
             let critique = '';
+            let prevCritique = '';
+            // null = critic never actually reviewed anything (criticMode off,
+            // or every attempt produced an empty diff) — distinct from an
+            // explicit rejection, so a caller can tell "not reviewed" apart
+            // from "reviewed and rejected."
+            let criticApproved: boolean | null = null;
             const MAX_WORKER_CRIT = 2;
             for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
               const p = attempt === 0
-                ? `TASK (implement now):\n${task}`
+                ? `TASK (implement now):\n${task}${ideation ? `\n\nCandidate approaches to consider (from an ideation pass -- pick one, don't just list them):\n${ideation}` : ''}`
                 : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
               res = await runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
               if (criticMode && res.diff.trim()) {
                 const c = await runCritic(res.diff, task);
+                criticApproved = c.approved;
                 if (c.learnings.length) {
                   await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
                 }
                 if (!c.approved) {
-                  critique = c.issues;
+                  // Stuck detection: if the reviewer raises the same
+                  // (non-empty) issues again, the worker isn't converging on
+                  // a fix — stop burning the remaining retries on a repeat.
+                  if (attempt > 0 && c.issues.trim() && c.issues.trim().toLowerCase() === prevCritique.trim().toLowerCase()) {
+                    critique = c.issues;
+                    addLog({ type: 'error', label: 'critic', detail: 'same issues raised again — worker not converging, stopping retries early' });
+                    break;
+                  }
+                  prevCritique = critique = c.issues;
                   addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
                   continue;
                 }
@@ -2746,8 +2849,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               }
             } catch { /* keep res.diff */ }
             mutated = true;
-            result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
-            addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
+            // The worker's own `ok` only means "ran without error/budget
+            // exhaustion" — it says nothing about review. Fold in the critic's
+            // verdict so a supervisor reading `ok` can't mistake "rejected
+            // twice and we gave up" for success; `criticApproved` carries the
+            // raw tri-state for anything that wants to distinguish
+            // not-reviewed from reviewed-and-rejected.
+            const ok = res.ok && criticApproved !== false;
+            result = JSON.stringify({ summary: res.summary, diff, ok, criticApproved });
+            addLog({ type: ok ? 'bash' : 'error', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
           } finally {
             setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
           }
@@ -2831,18 +2941,40 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch { /* unknown — fail closed below */ }
     return 1;
   };
-  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal): Promise<string> => {
+  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal, model: string): Promise<string> => {
     try {
       const args = JSON.parse(call.arguments);
+      // `deny` and denyPaths are enforced server-side regardless of caller
+      // (see coder.rs's enforce_perm), but `ask` can only be enforced here —
+      // the server has no way to pause and prompt a human. Without this, a
+      // tool the user tiered "ask" would silently run for a delegate/scout
+      // subagent while still correctly pausing for the supervisor.
+      const permVerdict = checkPerm(call.name, args);
+      if (permVerdict !== null) {
+        if (permVerdict === 'ask') {
+          const detail = String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
+          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
+          const ok = await requestApproval(call.name, detail);
+          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+        } else {
+          return JSON.stringify({ error: permVerdict });
+        }
+      }
+      let result: string;
       switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
+        case 'read': result = JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal)); break;
+        case 'grep': result = JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal)); break;
+        case 'glob': result = JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal)); break;
+        case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
+        case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
+        case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
+      // Same giant-output protection the supervisor's own loop gets — without
+      // it, a subagent's own multi-step context balloons on a big file read
+      // or verbose command with no compaction at all, unlike the top level.
+      return await maybeSummarizeTool(call.name, result, model, signal);
     } catch (e) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
@@ -2882,10 +3014,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       for (const call of toolCalls) {
         if (call.name === 'delegate') {
           const args = JSON.parse(call.arguments);
-          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
+          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
         } else {
-          const res = await runReadOnlyCall(call, signal);
+          const res = await runReadOnlyCall(call, signal, model);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
         }
       }
@@ -2898,8 +3030,34 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // handleToolCalls, so it never pollutes the supervisor transcript or trips the
   // commit/ask gates). Read-only fan-out (`delegate`) recurses into runSubagent.
   const runWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
+    const raw = await dispatchWorkerCall(call, signal, model, depth);
+    // Same giant-output protection the supervisor's own loop gets. Cheap for
+    // every short-circuit path above (denials, errors, `{summary}` wrappers)
+    // — maybeSummarizeTool bails out immediately for anything without a
+    // stdout/stderr/content field or under its size threshold.
+    return maybeSummarizeTool(call.name, raw, model, signal);
+  };
+
+  const dispatchWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
     try {
       const args = JSON.parse(call.arguments);
+      // Same reasoning as runReadOnlyCall: `ask` can only be enforced
+      // client-side, and this dispatcher (a worker's own tool calls) never
+      // went through checkPerm at all, so an "ask"-tiered tool would
+      // silently execute for a worker even though the supervisor's own call
+      // to the same tool correctly pauses for a human.
+      const permVerdict = checkPerm(call.name, args);
+      if (permVerdict !== null) {
+        if (permVerdict === 'ask') {
+          const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
+          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
+          const ok = await requestApproval(call.name, detail);
+          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+        } else {
+          return JSON.stringify({ error: permVerdict });
+        }
+      }
       switch (call.name) {
         case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
         case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
@@ -2950,7 +3108,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || ''), signal));
         case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal));
         case 'delegate': {
-          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
+          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
           return JSON.stringify({ summary: r });
         }
         default: return JSON.stringify({ error: `worker cannot use tool: ${call.name}` });
@@ -2958,6 +3116,55 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch (e) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
+  };
+
+  /** Summarize a worker turn that was cut off by the token limit, so the next
+   *  step sees a coherent "what was attempted" note instead of raw truncated
+   *  (possibly mid-codeblock) text polluting its own context. */
+  const summarizeCutoff = async (partial: string, model: string, signal: AbortSignal): Promise<string> => {
+    const snippet = partial.length <= 9000 ? partial : `${partial.slice(0, 3500)}\n...[middle omitted]...\n${partial.slice(-5500)}`;
+    let out = '';
+    try {
+      await trackedStream(
+        buildChatRequest(
+          model,
+          "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
+          [{ role: 'user', content: `CUT-OFF ATTEMPT:\n${snippet}` }],
+          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 512 } as ChatParams,
+          {},
+          coderParams.promptCache,
+        ),
+        signal,
+        'worker-cutoff-summary',
+        { onContentDelta: (t) => { out += t; } },
+      );
+    } catch { /* best-effort — fall through to the generic message below */ }
+    return out.trim() || '(the cut-off attempt could not be summarized)';
+  };
+
+  /** Fresh-context brainstorm before any code is written: propose several
+   *  genuinely distinct candidate approaches with pitfalls, no code yet. One
+   *  cheap call that steers the worker away from committing to the first
+   *  idea that comes to mind. Best-effort — an empty result just means the
+   *  worker proceeds without ideation notes. */
+  const runIdeation = async (task: string, model: string, signal: AbortSignal): Promise<string> => {
+    let out = '';
+    try {
+      await trackedStream(
+        buildChatRequest(
+          model,
+          'You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.',
+          [{ role: 'user', content: `TASK:\n${task}` }],
+          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: 0.4, maxTokens: 1024 } as ChatParams,
+          {},
+          coderParams.promptCache,
+        ),
+        signal,
+        'ideation',
+        { onContentDelta: (t) => { out += t; } },
+      );
+    } catch { /* best-effort */ }
+    return out.trim();
   };
 
   // Run an autonomous implementation worker: a focused agent loop that shares the
@@ -2973,9 +3180,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     depth = 0,
   ): Promise<{ summary: string; diff: string; ok: boolean }> => {
     if (depth > 3) return { summary: '(worker depth limit reached)', diff: '', ok: false };
-    const allowed = allowedTools
-      ? new Set(allowedTools)
-      : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+    const allowed = allowedTools ? new Set(allowedTools) : WORKER_TOOL_NAMES;
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let preTree = '';
     try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal)).stdout.trim(); } catch { /* no git */ }
@@ -2992,12 +3197,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (signal.aborted) break;
         let content = '';
         let toolCalls: AgentToolCall[] = [];
+        let finishReason: string | undefined;
         await trackedStream(
           buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           'worker',
-          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
+          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; }, onDone: (meta) => { finishReason = meta.finishReason; } },
         );
+        if (finishReason === 'length' && toolCalls.length === 0) {
+          // Cut off mid-generation with no tool call parsed — the raw text is
+          // likely a half-written code block or mid-sentence. Feeding that
+          // straight back as the "assistant" turn tends to confuse the next
+          // step, so summarize it instead (mirrors GVS5H's cut-off handling).
+          const digest = await summarizeCutoff(content, model, signal);
+          summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
+          msgs = [...msgs, { role: 'assistant', content: `[cut off at the token limit — summary of the partial attempt]\n${digest}` }];
+          continue;
+        }
         summary = content.trim() || summary;
         msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
         if (toolCalls.length === 0) break;
@@ -3051,7 +3267,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     let content = '';
     try {
       await trackedStream(
-        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
+        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 2048 } as ChatParams, {}),
         abortRef.current?.signal ?? new AbortController().signal,
         'critic',
         { onContentDelta: (t) => { content += t; } },
@@ -3107,6 +3323,71 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (wsAppliedDirRef.current === activeWsDir) {
       setMemory(m);
       memoryRef.current = m;
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Standalone Verify/Critic actions — Verify and Critic also work as one-click
+  // checks against whatever is on disk right now, independent of the Verify/
+  // Critic toggles (which only gate an agent run's own finish condition). Plan
+  // and Scout have no standalone equivalent: Scout only makes sense ahead of a
+  // run it feeds context into, and Plan only means anything as a constraint on
+  // an upcoming run — neither has a "thing that already exists" to check.
+  // ---------------------------------------------------------------------------
+  const [verifyNowBusy, setVerifyNowBusy] = useState(false);
+  const [criticNowBusy, setCriticNowBusy] = useState(false);
+
+  const runVerifyNow = async () => {
+    if (verifyNowBusy || running) return;
+    setVerifyNowBusy(true);
+    const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
+    if (!cmds.lint && !cmds.build && !cmds.test) {
+      addLog({ type: 'error', label: 'verify', detail: 'no lint/build/test command detected for this workspace' });
+      setVerifyNowBusy(false);
+      return;
+    }
+    addLog({ type: 'read', label: 'verify', detail: 'checking current working tree…' });
+    try {
+      const v = await runPostEditChecks({}, '', abortRef.current?.signal);
+      if (v.linter_error) {
+        addLog({ type: 'error', label: 'verify', detail: `lint failed: ${String(v.linter_error).slice(0, 200)}` });
+      } else if (v.test_error) {
+        addLog({ type: 'error', label: 'verify', detail: `tests failed: ${String(v.test_error).slice(0, 200)}` });
+      } else {
+        addLog({ type: 'bash', label: 'verify', detail: 'lint/test passed' });
+      }
+    } catch (e) {
+      addLog({ type: 'error', label: 'verify', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setVerifyNowBusy(false);
+    }
+  };
+
+  const runCriticNow = async () => {
+    if (criticNowBusy || running) return;
+    setCriticNowBusy(true);
+    addLog({ type: 'read', label: 'critic', detail: 'reviewing current diff…' });
+    try {
+      const d = await coderDiff();
+      if (!d.diff || !d.diff.trim()) {
+        addLog({ type: 'error', label: 'critic', detail: 'no uncommitted changes to review' });
+        return;
+      }
+      const taskText = [...messages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content
+        || 'Review the current uncommitted changes for correctness and quality.';
+      const c = await runCritic(d.diff, taskText);
+      if (c.learnings.length) {
+        await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
+      }
+      addLog({
+        type: c.approved ? 'bash' : 'error',
+        label: 'critic',
+        detail: c.approved ? 'approved' : (c.issues || 'changes requested').slice(0, 300),
+      });
+    } catch (e) {
+      addLog({ type: 'error', label: 'critic', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setCriticNowBusy(false);
     }
   };
 
@@ -4354,12 +4635,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
           <button
             type="button"
+            onClick={() => void runVerifyNow()}
+            disabled={running || verifyNowBusy}
+            title="Run now: lint/test the current working tree on disk, independent of the Verify toggle"
+            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+          >
+            <Play size={11} className={verifyNowBusy ? 'animate-pulse' : ''} />
+          </button>
+          <button
+            type="button"
             onClick={() => setCriticMode((v) => !v)}
             disabled={running}
             title={criticMode ? 'Critic ON: a model reviews the diff and can bounce it back for fixes before the run finishes' : 'Critic OFF'}
             className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', criticMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
           >
             Critic
+          </button>
+          <button
+            type="button"
+            onClick={() => void runCriticNow()}
+            disabled={running || criticNowBusy}
+            title="Run now: get a critic review of the current uncommitted diff, independent of the Critic toggle"
+            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+          >
+            <Play size={11} className={criticNowBusy ? 'animate-pulse' : ''} />
           </button>
           <button
             type="button"
