@@ -1,0 +1,42 @@
+name: CI / Rust control
+
+# Tests for the Rust control plane (desktop/control): every /api/* handler,
+# the serve-arg builder parity test (TS fixture shared with CI / Sidecar),
+# and the workspace/memory unit + concurrency suites. Locked mode keeps
+# Cargo.lock from drifting when Cargo.toml changes.
+
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'desktop/control/tests/parity/**'
+      - '.github/workflows/ci-rust.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'desktop/control/tests/parity/**'
+      - '.github/workflows/ci-rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test (ninfier-control)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Run control-plane tests
+        run: cargo test --locked --manifest-path desktop/Cargo.toml -p ninfier-control

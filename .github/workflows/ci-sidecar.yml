@@ -1,0 +1,50 @@
+name: CI / Sidecar + args parity
+
+# The sidecar is intentionally zero-dependency (no install step), and its
+# server.js boots a real HTTP listener on import — so it must never be
+# imported by tests. CI therefore (1) syntax-checks both sidecar modules and
+# (2) enforces TS-side launch-arg parity via scripts/args-parity.mjs against
+# the shared fixture that the Rust side checks under `cargo test` (CI / Rust).
+#
+# The fixture (desktop/control/tests/parity/) is shared by both parity checks,
+# so changes to it run this workflow too.
+
+on:
+  pull_request:
+    paths:
+      - 'apps/sidecar/**'
+      - 'scripts/args-parity.mjs'
+      - 'desktop/control/tests/parity/**'
+      - '.github/workflows/ci-sidecar.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'apps/sidecar/**'
+      - 'scripts/args-parity.mjs'
+      - 'desktop/control/tests/parity/**'
+      - '.github/workflows/ci-sidecar.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-sidecar-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sidecar:
+    name: syntax check + args parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntax-check sidecar modules
+        run: |
+          node --check apps/sidecar/server.js
+          node --check apps/sidecar/serve-args.js
+      - name: Engine launch-arg parity (TS builder vs shared fixture)
+        run: node scripts/args-parity.mjs
