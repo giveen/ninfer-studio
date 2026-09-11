@@ -199,10 +199,6 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
               </tbody>
             </table>
           </div>
-          <p className="mt-3 text-[11.5px] leading-relaxed text-faint">
-            Downloads run <span className="font-mono">hf download &lt;repo&gt; &lt;file&gt; --local-dir {modelsDir || 'models/'}</span> via the sidecar and land directly in the models directory.
-            Artifacts are self-contained: weights + tokenizer + chat template + media frontend.
-          </p>
         </SectionCard>
 
         <SectionCard
