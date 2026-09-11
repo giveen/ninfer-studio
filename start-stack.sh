@@ -4,8 +4,18 @@
 # sidecar adopts it at startup (engineHealth check) and we skip a reload.
 # Runs the sidecar on the host network namespace so its 127.0.0.1 reaches the
 # engine (the harness sandbox gives background jobs an isolated loopback).
+#
+# No machine-specific paths are baked in — everything comes from the
+# environment, and settings persist in config.json after the first run:
+#   NINFER_DIR       engine checkout (optional; seeds config)
+#   MODELS_DIR       models dir      (default: $NINFER_DIR/models)
+#   CODER_WORKSPACE  Coder workspace (optional; seeds config)
+#   ARTIFACT         .ninfer artifact to auto-start (optional)
+#   ENGINE_PORT      engine port     (default: 8080)
 set -u
-SIDECAR_DIR=/mnt/storage/Projects/ninfier-ui/apps/sidecar
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SIDECAR_DIR="$ROOT/apps/sidecar"
+ENGINE_PORT="${ENGINE_PORT:-8080}"
 LOG=/tmp/ninfier-stack.log
 exec > "$LOG" 2>&1
 echo "[stack] starting at $(date -Is)"
@@ -22,23 +32,34 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 
-echo "[stack] pushing config"
-curl -s -X POST http://127.0.0.1:8787/api/config -H 'content-type: application/json' \
-  -d '{"ninferPath":"/mnt/storage/ninfer","modelsDir":"/mnt/storage/ninfer/models","enginePort":8080,"coderWorkspace":"/mnt/storage/Projects/ninfier-ui"}' >/dev/null
-
-if curl -s -o /dev/null http://127.0.0.1:8080/health; then
-  echo "[stack] engine already up on :8080 — adopting, no reload"
+if [ -n "${NINFER_DIR:-}" ]; then
+  MODELS_DIR="${MODELS_DIR:-$NINFER_DIR/models}"
+  echo "[stack] pushing config"
+  curl -s -X POST http://127.0.0.1:8787/api/config -H 'content-type: application/json' \
+    -d "$(printf '{"ninferPath":"%s","modelsDir":"%s","enginePort":%s,"coderWorkspace":"%s"}' \
+      "$NINFER_DIR" "$MODELS_DIR" "$ENGINE_PORT" "${CODER_WORKSPACE:-}")" >/dev/null
 else
-  echo "[stack] starting engine under sidecar"
-  curl -s -X POST http://127.0.0.1:8787/api/engine/start -H 'content-type: application/json' \
-    -d '{"profile":{"port":8080,"host":"127.0.0.1","modelId":"qwen-coder","maxContext":32768},"artifact":"/mnt/storage/ninfer/models/qwen3_8_27b_nvfp4.ninfer"}'
-  echo
-  for i in $(seq 1 300); do
-    if curl -s -o /dev/null http://127.0.0.1:8080/health; then
-      echo "[stack] engine up after ${i}s"; break
-    fi
-    sleep 1
-  done
+  echo "[stack] NINFER_DIR not set — keeping existing config.json"
+fi
+
+if curl -s -o /dev/null http://127.0.0.1:$ENGINE_PORT/health; then
+  echo "[stack] engine already up on :$ENGINE_PORT — adopting, no reload"
+else
+  if [ -n "${ARTIFACT:-}" ]; then
+    echo "[stack] starting engine under sidecar"
+    curl -s -X POST http://127.0.0.1:8787/api/engine/start -H 'content-type: application/json' \
+      -d "$(printf '{"profile":{"port":%s,"host":"127.0.0.1","modelId":"qwen-coder","maxContext":32768},"artifact":"%s"}' \
+        "$ENGINE_PORT" "$ARTIFACT")"
+    echo
+    for i in $(seq 1 300); do
+      if curl -s -o /dev/null http://127.0.0.1:$ENGINE_PORT/health; then
+        echo "[stack] engine up after ${i}s"; break
+      fi
+      sleep 1
+    done
+  else
+    echo "[stack] no ARTIFACT set and no engine on :$ENGINE_PORT — start one from the UI"
+  fi
 fi
 
 echo "[stack] stack ready; waiting on sidecar pid=$SIDECAR_PID"

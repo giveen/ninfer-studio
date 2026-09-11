@@ -972,9 +972,19 @@ async function startUpdate(action) {
     if (!cmd) return { ok: false, message: 'buildCommand is not configured' };
   }
 
+  // Rebuilding links a fresh engine binary — over a running engine the link
+  // step fails (text file busy) or the binary is clobbered mid-execution.
+  // Stop the engine first and let the kernel release the file.
+  let stoppedNote = '';
+  if (action === 'build' && (engine.state === 'running' || engine.state === 'starting' || engine.state === 'stopping') && engine.pid) {
+    await stopEngine({});
+    await new Promise((r) => setTimeout(r, 500));
+    stoppedNote = '▪ engine was stopped for the rebuild\n';
+  }
+
   const id = `upd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const proc = spawn('sh', ['-c', cmd], { cwd: repo });
-  const rec = { id, action, cmd, pid: proc.pid, out: '', exitCode: null, done: false, failed: false, startedAt: Date.now() };
+  const rec = { id, action, cmd, pid: proc.pid, out: stoppedNote, exitCode: null, done: false, failed: false, startedAt: Date.now() };
   updateJob = rec;
   const pump = (c) => {
     rec.out = (rec.out + c.toString()).slice(-200_000);

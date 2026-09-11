@@ -67,13 +67,29 @@ pub async fn start_update(state: &S, action: &str) -> Value {
         return json!({ "ok": false, "message": "buildCommand is not configured" });
     }
 
+    // Rebuilding links a fresh build/apps/ninfer-serve — over a running engine
+    // the link step fails (text file busy) or the binary is clobbered
+    // mid-execution. Stop the engine first and let the kernel release the file.
+    let mut stopped_note = String::new();
+    if action == "build" {
+        let running = {
+            let eng = state.engine.read().await;
+            matches!(eng.state.as_str(), "running" | "starting" | "stopping") && eng.pid.is_some()
+        };
+        if running {
+            crate::engine::stop_engine(state, None).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            stopped_note = "▪ engine was stopped for the rebuild\n".into();
+        }
+    }
+
     let id = format!("upd_{:x}_{}", now_ms(), std::process::id());
     let mut rec = crate::types::UpdateJob {
         id: id.clone(),
         action: action.to_string(),
         cmd: cmd.clone(),
         pid: None,
-        out: String::new(),
+        out: stopped_note,
         exit_code: None,
         done: false,
         failed: false,

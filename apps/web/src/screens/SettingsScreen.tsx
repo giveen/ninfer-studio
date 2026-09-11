@@ -205,15 +205,20 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
         <SectionCard title="About">
           <div className="space-y-2 text-[12.5px] leading-relaxed text-mute">
             <p>
-              <span className="font-semibold text-ink">NInfer Studio</span> is a from-scratch desktop UI for the{' '}
-              NInfer engine: a full configuration surface for every{' '}
-              <span className="font-mono text-[12px]">ninfer-serve</span> option, artifact management, and a streaming chat window.
+              <span className="font-semibold text-ink">NInfer Studio</span>{' '}
+              <span className="font-mono text-[11.5px] text-faint">v{__APP_VERSION__}</span> is a from-scratch desktop control surface for
+              the NInfer engine: full configuration for every <span className="font-mono text-[12px]">ninfer-serve</span> option with
+              per-GPU presets, the artifact catalog with one-click Hugging Face downloads, a streaming chat window with vision and
+              thinking controls, and an agentic Coder mode backed by the same engine.
             </p>
             <p>
-              Architecture: a zero-dependency Node 22 control plane (the sidecar) supervises the engine process, scans models, reports GPU state, and proxies the
-              OpenAI/Anthropic HTTP API. The web app is the UI; in a packaged release the same control plane ships as the Tauri Rust core.
+              Architecture: a React 19 + Vite + Tailwind UI. In packaged releases the control plane is a Rust (Tauri/axum) core that
+              supervises the engine, scans models, reports GPU + VRAM state, and proxies the OpenAI/Anthropic HTTP API; in development
+              the same plane runs as a zero-dependency Node sidecar.
             </p>
-            <p className="font-mono text-[11.5px] text-faint">engine: C++/CUDA, sm_120a · ui: React 19 + Vite 7 + Tailwind 4 · control plane: Node 22</p>
+            <p className="font-mono text-[11.5px] text-faint">
+              engine: C++/CUDA, sm_120a · ui: React 19 + Vite 7 + Tailwind 4 · control plane: Rust axum (packaged) / Node 22 (dev)
+            </p>
           </div>
         </SectionCard>
       </div>
