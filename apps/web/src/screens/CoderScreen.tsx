@@ -666,6 +666,8 @@ interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; app
 const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
 const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
+/** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
+const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
 const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
 
@@ -1027,7 +1029,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; }
+  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -3196,8 +3198,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const MAX_ATTEMPTS = 3;
     // Hard ceiling on agent turns so a non-terminating plan (or a model that
     // keeps emitting tool calls) can't loop forever — it stops with a clear
-    // message instead (release blocker #1).
-    const MAX_AGENT_STEPS = 60;
+    // message instead (release blocker #1). User-adjustable in the params
+    // panel (coderParams.maxAgentSteps); falls back to the default.
+    const MAX_AGENT_STEPS = coderParams.maxAgentSteps || DEFAULT_MAX_AGENT_STEPS;
     // Bounded self-repair: when the agent tries to "finish" right after a tool
     // action failed, nudge it to fix the error instead of declaring success (#6).
     const MAX_REPAIR = 3;
@@ -4311,7 +4314,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             title={ctxLimit != null ? `${formatTokens(ctxTokens)} of ${formatTokens(ctxLimit)} context tokens used (last request)` : 'Context usage appears after the first agent request'}
           >
             {ctxLimit != null ? `ctx ${formatTokens(ctxTokens)} / ${formatTokens(ctxLimit)}` : `ctx ${formatTokens(ctxTokens)}`}
-            {(running || agentSteps > 0) && <span className="text-mute"> · step {agentSteps}/60</span>}
+            {(running || agentSteps > 0) && <span className="text-mute"> · step {agentSteps}/{coderParams.maxAgentSteps || DEFAULT_MAX_AGENT_STEPS}</span>}
           </span>
           <button
             type="button"
@@ -4565,6 +4568,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                       { value: 'high', label: 'high' },
                       { value: 'xhigh', label: 'xhigh' },
                     ]}
+                  />
+                </label>
+                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Hard ceiling on agent turns per run — the run stops with a warning instead of looping forever once it's hit. Blank = default (60).">
+                  max steps
+                  <NumberField
+                    value={coderParams.maxAgentSteps ?? null}
+                    onChange={(v) => setCoderParams({ ...coderParams, maxAgentSteps: v })}
+                    onEmpty={() => setCoderParams({ ...coderParams, maxAgentSteps: undefined })}
+                    empty
+                    min={1}
+                    max={500}
+                    placeholder={String(DEFAULT_MAX_AGENT_STEPS)}
                   />
                 </label>
                 <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
