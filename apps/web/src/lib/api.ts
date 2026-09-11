@@ -257,7 +257,12 @@ export function buildChatRequest(
     stream_options: { include_usage: true },
     enable_thinking: enableThinking,
   };
-  if (effort) body.reasoning_effort = effort;
+  // The engine reads this from chat_template_kwargs.reasoning_effort (see
+  // merge_default_request_params in desktop/control/src/lib.rs and the
+  // sidecar's proxyToEngine) — a top-level `reasoning_effort` is not that
+  // key, so it was silently ignored and every request fell back to the
+  // chat template's own default (effectively always max effort for Qwen3).
+  if (effort) body.chat_template_kwargs = { reasoning_effort: effort };
   if (params.preserveThinking !== undefined) body.preserve_thinking = params.preserveThinking;
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
   if (params.greedy) body.temperature = 0;
