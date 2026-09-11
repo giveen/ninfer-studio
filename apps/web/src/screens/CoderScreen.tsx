@@ -7,7 +7,7 @@ import { Markdown } from '../components/Markdown';
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
@@ -896,8 +896,47 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const coderParamsRef = useRef(coderParams);
   coderParamsRef.current = coderParams;
   const [showCoderParams, setShowCoderParams] = useState(false);
+  // Live LLM phase indicator: 'prefill' = request sent, no tokens back yet
+  // (the long silent stretch on big contexts); 'decode' = tokens streaming.
+  const [llmPhase, setLlmPhase] = useState<{ stage: 'prefill' | 'decode'; label: string; since: number; chars: number } | null>(null);
+  const [nowTick, setNowTick] = useState(Date.now());
+  useEffect(() => {
+    if (!llmPhase) return;
+    const t = setInterval(() => setNowTick(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [llmPhase ? 1 : 0]);
   const [commitsOpen, setCommitsOpen] = useState(true);
   const [permsOpen, setPermsOpen] = useState(true);
+
+  /** streamChat wrapper that drives the prefill/decode phase indicator. */
+  const trackedStream = async (
+    req: Record<string, unknown>,
+    signal: AbortSignal,
+    label: string,
+    cb: ChatStreamCallbacks,
+  ) => {
+    setLlmPhase({ stage: 'prefill', label, since: Date.now(), chars: 0 });
+    try {
+      return await streamChat(req, signal, {
+        ...cb,
+        onContentDelta: (t) => {
+          setLlmPhase((p) => (p ? { ...p, stage: 'decode', chars: p.chars + t.length } : p));
+          cb.onContentDelta?.(t);
+        },
+        onReasoningDelta: (t) => {
+          setLlmPhase((p) => (p ? { ...p, stage: 'decode', chars: p.chars + t.length } : p));
+          cb.onReasoningDelta?.(t);
+        },
+        onDone: (m) => {
+          setLlmPhase(null);
+          cb.onDone?.(m);
+        },
+      });
+    } catch (e) {
+      setLlmPhase(null);
+      throw e;
+    }
+  };
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
   // Background shell jobs started by the agent (tracked per workspace so the
@@ -2350,9 +2389,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       let content = '';
       let toolCalls: AgentToolCall[] = [];
       try {
-        await streamChat(
+        await trackedStream(
           buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
+          'subagent ' + label,
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
         );
       } catch (e) {
@@ -2438,9 +2478,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (signal.aborted) break;
         let content = '';
         let toolCalls: AgentToolCall[] = [];
-        await streamChat(
+        await trackedStream(
           buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
+          'worker',
           { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
         );
         summary = content.trim() || summary;
@@ -2488,9 +2529,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         : CRITIC_SYSTEM;
     let content = '';
     try {
-      await streamChat(
+      await trackedStream(
         buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
         abortRef.current?.signal ?? new AbortController().signal,
+        'critic',
         { onContentDelta: (t) => { content += t; } },
       );
     } catch {
@@ -2738,7 +2780,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           reasoning = '';
           toolCalls = [];
           try {
-            await streamChat(req, abortRef.current.signal, {
+            await trackedStream(req, abortRef.current.signal, 'agent', {
               onContentDelta: (text) => { content += text; },
               onReasoningDelta: (text) => { reasoning += text; },
               onToolCalls: (calls) => { toolCalls = calls; },
@@ -3776,6 +3818,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           )}
         </div>
         <div className="border-t border-line bg-panel p-3">
+          {llmPhase && (
+            <div className="mb-2 flex items-center gap-2 rounded-md border border-accent/25 bg-accent/8 px-2.5 py-1.5 text-[11.5px] text-mute">
+              <BrainCircuit size={13} className="animate-pulse text-accent" />
+              <span className="font-medium text-ink">
+                {llmPhase.stage === 'prefill' ? 'Model reading context (prefill)' : 'Model writing (decode)'}
+              </span>
+              <span className="text-faint">
+                · {llmPhase.label} · {((nowTick - llmPhase.since) / 1000).toFixed(1)}s · {llmPhase.chars.toLocaleString()} chars
+              </span>
+            </div>
+          )}
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-2">
               {attachments.map((a) => (
