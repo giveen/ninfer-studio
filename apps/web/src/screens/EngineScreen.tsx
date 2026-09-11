@@ -660,7 +660,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         <SectionCard title="Context & memory" description="Per-sequence context ceiling and the shared Main-Text KV pool. 'auto' sizes from free GPU memory (1 GiB headroom)." icon={<Gauge size={15} />} anchor="memory" collapsible>
           <div className={grid3}>
             <Field label="Max context" hint="Per-sequence logical token ceiling. Native model limit is 262,144; practical allocation depends on artifact, media, and KV type.">
-              <NumberField value={profile.maxContext ?? null} onChange={(v) => set('maxContext', v)} onEmpty={() => setU('maxContext', undefined)} min={0} placeholder="serve default 8192" />
+              <NumberField value={profile.maxContext ?? null} onChange={(v) => set('maxContext', v)} onEmpty={() => setU('maxContext', undefined)} min={0} max={262144} placeholder="serve default 8192" />
             </Field>
             <div className="flex flex-col gap-1.5">
               <span className="flex items-center gap-1.5 text-[12px] font-medium uppercase tracking-wider text-mute">KV capacity</span>
