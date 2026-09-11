@@ -1131,6 +1131,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     let cancelled = false;
     setWsBusy(true);
     setCoderWorkspace(activeWsDir)
+      .then(() => {
+        if (cancelled) return;
+        // Control confirmed at this workspace — from here on a relative tree
+        // fetch is valid, so (re)load the panel against the right root.
+        wsAppliedRef.current = activeWsDir;
+        setWsSynced((n) => n + 1);
+      })
       .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
       .finally(() => { if (!cancelled) setWsBusy(false); });
     return () => { cancelled = true; };
@@ -1534,14 +1541,26 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
 
   // ---- File Tree panel: browse + system-prompt follow bindings ----
+  // The tree is fetched relative ('.') against the control plane's *configured*
+  // workspace, which setCoderWorkspace() points asynchronously. A fetch that
+  // lands before the switch completes would show the PREVIOUS workspace's
+  // files in this panel (and they'd stick, since nodes are shared state) —
+  // so a response only applies if (a) it is the newest fetch and (b) the
+  // control was confirmed pointed at this workspace by then (wsAppliedRef).
+  const wsAppliedRef = useRef(activeWsDir);
+  const treeSeqRef = useRef(0);
+  const [wsSynced, setWsSynced] = useState(0);
   const loadTree = useCallback(async () => {
     if (!activeWsDir) return;
+    const seq = ++treeSeqRef.current;
     setTreeLoading(true);
     try {
       const t = await coderTree(6, '.');
-      setTreeNodes(t.nodes ?? []);
-    } catch { setTreeNodes([]); }
-    finally { setTreeLoading(false); }
+      if (seq === treeSeqRef.current && wsAppliedRef.current === activeWsDir) {
+        setTreeNodes(t.nodes ?? []);
+      }
+    } catch { if (seq === treeSeqRef.current) setTreeNodes([]); }
+    finally { if (seq === treeSeqRef.current) setTreeLoading(false); }
   }, [activeWsDir]);
 
   const onExpandDir = useCallback(async (node: FileNode) => {
@@ -1590,7 +1609,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, []);
 
   // Load/refresh the tree whenever the active (possibly worktree-bound) directory changes.
-  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, treeOpen, loadTree]);
+  useEffect(() => { if (treeOpen) void loadTree(); }, [wsSynced, treeOpen, loadTree]);
 
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
