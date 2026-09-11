@@ -1274,6 +1274,23 @@ fn mem_dir(data_dir: &Path, ws: &str) -> PathBuf {
     data_dir.join("coder-memory").join(&slug[start..])
 }
 
+/// Resolve this workspace's memory dir, migrating one-time from the slug a
+/// pre-fix Windows build would have written (back then the stored workspace
+/// carried the `\\?\` extended prefix from canonicalize, so memory lived
+/// under a slug with four extra leading underscores). Renames the old dir
+/// into place once; after that the clean dir exists and this is a no-op.
+fn memory_dir(data_dir: &Path, ws: &str) -> PathBuf {
+    let dir = mem_dir(data_dir, ws);
+    let prefixed = mem_dir(data_dir, &format!("\\\\?\\{ws}"));
+    if !dir.exists() && prefixed.exists() {
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&prefixed, &dir);
+    }
+    dir
+}
+
 /// Read a memory file, returning `def` when it doesn't exist (sidecar behavior).
 async fn read_mem_file(dir: &Path, name: &str, def: &str) -> String {
     match tokio::fs::read_to_string(dir.join(name)).await {
@@ -1362,7 +1379,7 @@ pub async fn memory_get(
     if ws.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
     }
-    let dir = mem_dir(&state.data_dir, ws.trim());
+    let dir = memory_dir(&state.data_dir, ws.trim());
     let bank = read_mem_file(&dir, "bank.md", "").await;
     let learnings = read_learnings(&dir).await;
     Ok(Json(json!({"bank": bank, "learnings": learnings})))
@@ -1381,7 +1398,7 @@ pub async fn memory_set(
     if ws.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
     }
-    let dir = mem_dir(&state.data_dir, ws.trim());
+    let dir = memory_dir(&state.data_dir, ws.trim());
 
     if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
         write_mem_file(&dir, "bank.md", bank).await?;
@@ -1468,6 +1485,28 @@ mod tests {
         // Long paths keep their tail (slice(-160)).
         let long: String = "a".repeat(200);
         assert_eq!(slug(&long).len(), 160);
+    }
+
+    #[test]
+    fn memory_dir_migrates_prefixed_slug_dir() {
+        // Simulate a pre-fix store: memory written under the slug of the
+        // `\\?\\`-prefixed workspace string.
+        let root = std::env::temp_dir().join(format!("ninfier-memtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = "C:\\tmp";
+        let clean = mem_dir(&root, ws);
+        let old = mem_dir(&root, &format!("\\\\?\\{ws}"));
+        assert_ne!(clean, old);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("bank.md"), "# kept").unwrap();
+        // Migration: old dir renamed into the clean slug dir.
+        let got = memory_dir(&root, ws);
+        assert_eq!(got, clean);
+        assert!(clean.exists(), "old dir must be migrated into place");
+        assert_eq!(std::fs::read_to_string(clean.join("bank.md")).unwrap(), "# kept");
+        // Idempotent: second call is a no-op.
+        assert_eq!(memory_dir(&root, ws), clean);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
