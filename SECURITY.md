@@ -55,3 +55,17 @@ This project takes a pragmatic stance on third-party advisories:
   (which holds settings, not secrets) out of shared locations.
 - Closing the window hides to the tray and keeps the engine alive by design — quit
   explicitly from the tray menu to stop the engine.
+- **Coding harness confinement is asymmetric by design.** The `fs/*`, `grep`, and
+  `glob` endpoints (`desktop/control/src/coder.rs`) lexically confine every path to
+  the configured workspace. `exec`, however, runs a real `bash -lc <command>` whose
+  *starting* directory is confined but whose shell is not sandboxed (no chroot/
+  namespace/seccomp) — `cd /`, an absolute path, or a symlink reaches anywhere the
+  OS user can. Safe mode (on by default) blocks a fixed set of destructive patterns
+  before spawning, but that's a blocklist, not a security boundary — it does not
+  make `exec` workspace-confined the way the file tools are.
+- **`web_fetch` only reaches public hosts.** The URL an agent (or content it reads)
+  passes to `web_fetch` is resolved and checked against loopback/RFC1918/link-local/
+  CGNAT/multicast ranges — including through redirects — before any request is
+  made, so it cannot be used to reach the loopback control plane or other services
+  on the local network (SSRF). `web_search` is unaffected since its target host
+  (DuckDuckGo) isn't attacker-controlled.

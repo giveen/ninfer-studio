@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use base64::Engine as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -532,6 +533,12 @@ pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> R
     Ok(Json(json!({"path": rel, "mime": mime, "dataUrl": data_url, "size": buf.len()})))
 }
 
+/// Run a shell command via `bash -lc`. Unlike `fs_*`/`grep`/`glob`, this is
+/// **not** confined to the workspace: `within_ws` only picks the starting
+/// `cwd` (or resumes a session's), and the shell itself is unsandboxed — a
+/// `cd /`, absolute path, or symlink reaches anywhere the OS user can. Safe
+/// mode (default on) blocks a fixed set of destructive patterns before
+/// spawning, but that's a blocklist, not a security boundary. See SECURITY.md.
 pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let command = req.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if command.trim().is_empty() {
@@ -1077,23 +1084,119 @@ fn html_to_text(html: &str) -> String {
     COLLAPSE_WS.replace_all(out.trim(), " ").into_owned()
 }
 
+/// True when `ip` is a globally-routable address — i.e. not loopback,
+/// private (RFC 1918 / ULA), link-local, CGNAT, multicast, broadcast, or
+/// unspecified. Used to keep `web_fetch` off the loopback control plane and
+/// the local network (SSRF).
+fn is_global_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_global_ipv4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_global_ipv4(&v4),
+            None => is_global_ipv6(v6),
+        },
+    }
+}
+
+fn is_global_ipv4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || o[0] == 0                              // "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64))  // 100.64.0.0/10 CGNAT
+}
+
+fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
+    let seg0 = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (seg0 & 0xfe00) == 0xfc00  // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80) // fe80::/10 link-local
+}
+
+/// Reject `url` unless its scheme is http(s) and its host resolves only to
+/// globally-routable addresses — blocks fetching the loopback control plane
+/// (or any other internal/LAN service) via a tool an agent can call on
+/// untrusted content (fetched pages, files in the workspace).
+async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, Json<Value>)> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "only http/https URLs are allowed"}))));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "url has no host"}))))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_global_ip(&ip) {
+            Ok(())
+        } else {
+            Err((StatusCode::FORBIDDEN, Json(json!({"error": "refusing to fetch a private/loopback/link-local address"}))))
+        };
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("dns lookup failed: {e}")}))))?
+        .peekable();
+    if addrs.peek().is_none() {
+        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "dns lookup returned no addresses"}))));
+    }
+    for addr in addrs {
+        if !is_global_ip(&addr.ip()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")})),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn web_fetch(AxumState(_state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const MAX_REDIRECTS: u8 = 5;
     let raw = match req.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "url required"})))),
     };
-    let url = reqwest::Url::parse(&raw)
+    let mut url = reqwest::Url::parse(&raw)
         .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid url"}))))?;
     let client = reqwest::Client::builder()
         .user_agent("ninfier-studio/0.1")
         .timeout(Duration::from_secs(25))
+        // Redirects are followed manually below so each hop can be
+        // re-checked against the SSRF guard — otherwise a public URL could
+        // 302 straight into the loopback control plane or the LAN.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("client failed: {e}")}))))?;
-    let resp = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("fetch failed: {e}")}))))?;
+    let mut redirects = 0u8;
+    let resp = loop {
+        ensure_public_http_url(&url).await?;
+        let resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("fetch failed: {e}")}))))?;
+        if resp.status().is_redirection() {
+            let Some(location) = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()) else {
+                break resp;
+            };
+            if redirects >= MAX_REDIRECTS {
+                return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "too many redirects"}))));
+            }
+            redirects += 1;
+            url = url
+                .join(location)
+                .map_err(|_| (StatusCode::BAD_GATEWAY, Json(json!({"error": "invalid redirect location"}))))?;
+            continue;
+        }
+        break resp;
+    };
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -1892,6 +1995,47 @@ mod tests {
         ] {
             assert!(detect_destructive(cmd).is_none(), "should allow: {cmd}");
         }
+    }
+
+    #[test]
+    fn global_ip_classification_blocks_internal_ranges() {
+        let blocked = [
+            "127.0.0.1", "127.53.0.1", "10.0.0.1", "172.16.5.1", "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0", "255.255.255.255",
+            "::1", "fe80::1", "fc00::1", "fd12::1",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ];
+        for ip in blocked {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_global_ip(&parsed), "should block {ip}");
+        }
+        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        for ip in allowed {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_global_ip(&parsed), "should allow {ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_http_url_rejects_loopback_and_non_http_schemes() {
+        for url in [
+            "http://127.0.0.1/api/coder/workspace",
+            "http://localhost:8787/api/status",
+            "http://[::1]:8787/",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert!(ensure_public_http_url(&parsed).await.is_err(), "should reject {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_http_url_allows_public_ip_literal() {
+        let parsed = reqwest::Url::parse("http://93.184.216.34/").unwrap();
+        assert!(ensure_public_http_url(&parsed).await.is_ok());
     }
 
     #[test]
