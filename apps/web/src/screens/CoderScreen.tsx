@@ -725,7 +725,32 @@ function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
 }
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
+  // Windows migration: older builds stored the workspace key with Rust's
+  // extended-length prefix (`\\?\\C:\tmp` from canonicalize) while the
+  // picker produces the plain form — the mismatch made every start seed a
+  // duplicate workspace with a fresh conversation. Merge prefixed entries
+  // into their plain twin (deduped by conversation id).
+  for (const [key, ws] of Object.entries(workspaces)) {
+    if (!key.startsWith('\\\\?\\') && !key.startsWith('//?/')) continue;
+    const plain = key.slice(4);
+    delete workspaces[key];
+    const twin = workspaces[plain];
+    if (!twin) {
+      workspaces[plain] = ws;
+      continue;
+    }
+    const merged: WsData = { ...twin, conversations: { ...twin.conversations }, order: [...twin.order], expanded: twin.expanded || ws.expanded };
+    for (const [cid, conv] of Object.entries(ws.conversations)) {
+      if (!merged.conversations[cid]) {
+        merged.conversations[cid] = conv;
+        merged.order.push(cid);
+      }
+    }
+    merged.activeConv = twin.activeConv && merged.conversations[twin.activeConv] ? twin.activeConv : merged.order[0] ?? '';
+    workspaces[plain] = merged;
+  }
   let activeWs = s.activeWs;
+  if (activeWs.startsWith('\\\\?\\') || activeWs.startsWith('//?/')) activeWs = activeWs.slice(4);
   let activeConv = s.activeConv;
   if (!activeWs || !workspaces[activeWs]) {
     activeWs = Object.keys(workspaces)[0] ?? '';
