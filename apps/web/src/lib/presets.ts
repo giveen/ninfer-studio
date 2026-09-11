@@ -21,11 +21,11 @@ export const PRESETS: Preset[] = [
     id: 'long-context-mtp3',
     name: 'Long context MTP3',
     description:
-      '240k context, FP8 KV, 2 lanes, 2 device + 8 host state slots, 8 GiB host KV, MTP3 with optimized head, vision, thinking preserved. Fits the 3.6-27B (~18.2 GiB loaded) and the pre-repack 3.8 gw-int (19.0 GiB loaded, ~3.3 GiB free — the published RTX 5090 run). Fresh 3.8 gw-int downloads (19.0 GiB file, ~21.3 loaded) overflow at 240k fp8 — use 192k there, or k8v4 to keep 320k.',
+      '240k context, FP8 KV, 2 lanes, 2 device + 8 host state slots, 8 GiB host KV, MTP3 with optimized head, vision, thinking preserved. Fits the 3.6-27B (~18.2 GiB loaded) and the pre-repack 3.8 gw-int (19.0 GiB loaded, ~3.3 GiB free — the published RTX 5090 run). Fresh 3.8 gw-int downloads (19.0 GiB file, ~21.3 loaded) overflow at 240k fp8 — use 192k there, or k8v4 to keep 320k. KV capacity is `auto` (sizes from free VRAM, 1 GiB headroom): a fixed 240k here would exactly fill the shared pool with one sequence, leaving no room for the 2nd lane to actually admit anything near full context concurrently.',
     profile: {
       port: 8080,
       maxContext: 240_000,
-      kvCapacity: 240_000,
+      kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'fp8',
       deviceStateSlots: 2,
@@ -127,11 +127,11 @@ export const PRESETS: Preset[] = [
     id: 'max-fidelity-bf16',
     name: 'Max fidelity 128k (bf16 KV)',
     description:
-      'RTX 5090 (32 GB), gw-int artifacts: 128k context with full-precision bf16 KV — best long-range recall. Local 3.8 gw-int (~19.0 GiB loaded) → ~29.3 GiB total, ~2.4 GiB free; 3.6-27B (~18.2) → ~3.5 free. Fresh 3.8 downloads (~21.3 loaded) must drop to 96k. nvfp4 artifacts do not fit at 128k.',
+      'RTX 5090 (32 GB), gw-int artifacts: 128k context with full-precision bf16 KV — best long-range recall. Local 3.8 gw-int (~19.0 GiB loaded) → ~29.3 GiB total, ~2.4 GiB free; 3.6-27B (~18.2) → ~3.5 free. Fresh 3.8 downloads (~21.3 loaded) must drop to 96k. nvfp4 artifacts do not fit at 128k. KV capacity is `auto` rather than a fixed 128k — a fixed pool exactly matching max-context leaves no room for the 2nd lane to admit a second sizeable request; `auto` claims what free VRAM allows (1 GiB headroom) instead, so watch the free-GiB figures above for how much a concurrent request actually has to work with.',
     profile: {
       port: 8080,
       maxContext: 128_000,
-      kvCapacity: 128_000,
+      kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'bf16',
       deviceStateSlots: 2,
@@ -147,11 +147,11 @@ export const PRESETS: Preset[] = [
     id: 'nvfp4-serving-c4',
     name: 'Multi-client serving C=4 (nvfp4 artifact)',
     description:
-      'RTX 5090 (32 GB): the 3.8 nvfp4 artifact (loads ~20.0 GiB local / ~22.1 fresh) + fp8 KV at 160k, four concurrent lanes with queued overflow (16 pending, 60 s timeout). ~28.5-30.6 GiB total — fresh downloads are at the 1.8 GiB floor; drop to 144k if the capacity line shows under 2 GiB free. For 2-4 simultaneous clients.',
+      'RTX 5090 (32 GB): the 3.8 nvfp4 artifact (loads ~20.0 GiB local / ~22.1 fresh) + fp8 KV, four concurrent lanes with queued overflow (16 pending, 60 s timeout). ~28.5-30.6 GiB total — fresh downloads are at the 1.8 GiB floor; drop max-context if the capacity line shows under 2 GiB free. KV capacity is `auto`, not a fixed 160k: a fixed pool the same size as max-context fits exactly ONE full-context sequence, so a single long-running session (e.g. an agentic coding job) can fill the whole shared pool and leave every other concurrent request queued until it hits the pending timeout and fails — the "4 lanes" only actually hold 4 requests at once when their combined context fits in the pool. `auto` gives the shared pool real headroom beyond one session; for genuinely reliable 4-way concurrency at full 160k context each, size VRAM (or lower per-client context) accordingly. For 2-4 simultaneous clients that are not all running near-max-context at once.',
     profile: {
       port: 8080,
       maxContext: 160_000,
-      kvCapacity: 160_000,
+      kvCapacity: 'auto',
       maxConcurrency: 4,
       maxPendingRequests: 16,
       pendingTimeoutMs: 60_000,
@@ -190,11 +190,11 @@ export const PRESETS: Preset[] = [
     id: 'moe-35b-a3b',
     name: '35B-A3B MoE (128k, fp8)',
     description:
-      'RTX 5090 (32 GB): the Qwen3.6-35B-A3B MoE (21.2 GiB file, ~23.8 loaded — only ~3B params active per token, so decode is fast) at 128k fp8 context, 2 lanes, MTP3. ~28.8 GiB total, ~2.4 GiB free. 64k if you want comfortable headroom.',
+      'RTX 5090 (32 GB): the Qwen3.6-35B-A3B MoE (21.2 GiB file, ~23.8 loaded — only ~3B params active per token, so decode is fast) at 128k fp8 context, 2 lanes, MTP3. ~28.8 GiB total, ~2.4 GiB free. 64k if you want comfortable headroom. KV capacity is `auto` rather than a fixed 128k, since a pool exactly matching max-context leaves no room for the 2nd lane to admit a second sizeable request alongside a large one.',
     profile: {
       port: 8080,
       maxContext: 128_000,
-      kvCapacity: 128_000,
+      kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'fp8',
       deviceStateSlots: 2,
@@ -210,11 +210,11 @@ export const PRESETS: Preset[] = [
     id: 'ultra-context-k8v4',
     name: 'Ultra context 256k (k8v4)',
     description:
-      'RTX 5090 (32 GB), gw-int artifacts: full 262,144-token native window via k8v4 KV (FP8 keys, NVFP4 values — ~33 tok/MiB → ~7.9 GiB pool). Local 3.8 gw-int (loads 19.0 GiB) → ~27 GiB total; fresh 3.8 downloads (~21.3 loaded) → ~29 GiB — both fit with headroom. Watch long-range recall (4-bit V).',
+      'RTX 5090 (32 GB), gw-int artifacts: full 262,144-token native window via k8v4 KV (FP8 keys, NVFP4 values — ~33 tok/MiB → ~7.9 GiB pool at the full window). Local 3.8 gw-int (loads 19.0 GiB) → ~27 GiB total; fresh 3.8 downloads (~21.3 loaded) → ~29 GiB — both fit with headroom. Watch long-range recall (4-bit V). KV capacity is `auto`, not a fixed 262,144: at this context size a fixed pool the same size as max-context is already the whole ~7.9 GiB budget for ONE sequence, so the 2nd lane would have nothing left to admit a concurrent full-window request — `auto` at least claims whatever free VRAM remains instead of hard-capping at exactly one window.',
     profile: {
       port: 8080,
       maxContext: 262_144,
-      kvCapacity: 262_144,
+      kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'k8v4',
       deviceStateSlots: 2,

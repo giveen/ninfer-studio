@@ -265,12 +265,10 @@ export function buildChatRequest(
     stream_options: { include_usage: true },
     enable_thinking: enableThinking,
   };
-  // The engine reads this from chat_template_kwargs.reasoning_effort (see
-  // merge_default_request_params in desktop/control/src/lib.rs and the
-  // sidecar's proxyToEngine) — a top-level `reasoning_effort` is not that
-  // key, so it was silently ignored and every request fell back to the
-  // chat template's own default (effectively always max effort for Qwen3).
-  if (effort) body.chat_template_kwargs = { reasoning_effort: effort };
+  // The engine only accepts `enable_thinking`/`preserve_thinking` inside
+  // chat_template_kwargs; any other key there (including reasoning_effort)
+  // is rejected outright. reasoning_effort must be a top-level field.
+  if (effort) body.reasoning_effort = effort;
   if (params.preserveThinking !== undefined) body.preserve_thinking = params.preserveThinking;
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
   if (params.greedy) body.temperature = 0;
@@ -297,7 +295,43 @@ export async function streamChat(
   // Accumulate streamed tool calls (native OpenAI function calling).
   const toolAcc: Array<{ id: string; type: string; name: string; arguments: string }> = [];
 
+  // Defensive split-boundary guard: `content` should never contain a literal
+  // think tag (docs: reasoning is returned separately as reasoning_content).
+  // Occasionally the model emits "</think>" as ordinary text right at the
+  // reasoning/answer boundary and it leaks into a content delta. Buffer
+  // content and, if a close tag turns up, redirect everything through it to
+  // reasoning instead of showing raw "</think>" text mid-reply — matching the
+  // engine's own non-streaming rule (content = text after the last </think>).
+  // A tag can also split across two chunks, so hold back a short tail
+  // (shorter than either tag) until we're sure it isn't a partial match.
+  const THINK_CLOSE = '</think>';
+  const TAG_HOLDBACK = '<think>'.length - 1;
+  let contentBuf = '';
+  const flushContent = (text: string) => {
+    if (!text) return;
+    cb.onContentDelta?.(text);
+  };
+  const pushContent = (text: string) => {
+    if (firstContentAt === null) firstContentAt = performance.now();
+    contentBuf += text;
+    const closeIdx = contentBuf.lastIndexOf(THINK_CLOSE);
+    if (closeIdx !== -1) {
+      const leaked = contentBuf.slice(0, closeIdx + THINK_CLOSE.length);
+      contentBuf = contentBuf.slice(closeIdx + THINK_CLOSE.length);
+      cb.onReasoningDelta?.(leaked);
+    }
+    if (contentBuf.length > TAG_HOLDBACK) {
+      const safe = contentBuf.slice(0, contentBuf.length - TAG_HOLDBACK);
+      contentBuf = contentBuf.slice(contentBuf.length - TAG_HOLDBACK);
+      flushContent(safe);
+    }
+  };
+
   const finish = () => {
+    if (contentBuf) {
+      flushContent(contentBuf);
+      contentBuf = '';
+    }
     if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
     const calls = toolAcc
       .filter(Boolean)
@@ -364,10 +398,7 @@ export async function streamChat(
       if (choice) {
         const d = choice.delta ?? {};
         if (d.reasoning_content) cb.onReasoningDelta?.(d.reasoning_content);
-        if (d.content) {
-          if (firstContentAt === null) firstContentAt = performance.now();
-          cb.onContentDelta?.(d.content);
-        }
+        if (d.content) pushContent(d.content);
         // Native tool calling: accumulate streamed tool_call deltas by index.
         const tcs = (choice.delta as { tool_calls?: Array<{ index?: number; id?: string; type?: string; function?: { name?: string; arguments?: string } }> } | undefined)?.tool_calls;
         if (Array.isArray(tcs)) {
@@ -513,14 +544,25 @@ export function summarizeConversation(opts: {
     maxTokens: opts.maxTokens ?? 2048,
   };
   const body = buildChatRequest(opts.model, opts.systemPrompt, [...opts.history, instruction], summaryParams);
+  const signal = opts.signal ?? AbortSignal.timeout(180_000);
   return new Promise<string>((resolve, reject) => {
     let acc = '';
-    streamChat(body, opts.signal ?? AbortSignal.timeout(180_000), {
+    streamChat(body, signal, {
       onContentDelta: (d) => {
         acc += d;
         opts.onDelta?.(d);
       },
-      onDone: () => resolve(acc.trim()),
+      // streamChat resolves onDone (rather than rejecting) even on abort, so a
+      // partial mid-generation summary would otherwise look like a successful
+      // compaction and get applied as the conversation's new context
+      // checkpoint — silently truncating history instead of just cancelling.
+      // Reject here so every caller's existing "compaction failed" handling
+      // (which already treats a thrown error as best-effort/no-op) catches
+      // this instead of a corrupted checkpoint being written.
+      onDone: () => {
+        if (signal.aborted) { reject(new DOMException('Compaction aborted', 'AbortError')); return; }
+        resolve(acc.trim());
+      },
       onError: (m) => reject(new Error(m)),
     });
   });

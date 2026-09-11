@@ -72,7 +72,7 @@ export interface AppSettings {
   testCommand: string;
   /** JSON object merged (as defaults) into every proxied /v1 request body. */
   defaultRequestParams: string;
-  /** Global default reasoning effort injected into chat_template_kwargs.reasoning_effort for every proxied request (client fields win). '' = unset. */
+  /** Global default reasoning effort injected into the top-level reasoning_effort field for every proxied request (client fields win). '' = unset. */
   reasoningEffort: string;
   /** Coding harness: the directory the "Code" mode may read/write/execute within. Empty = not configured. */
   coderWorkspace: string;
@@ -292,6 +292,9 @@ export interface ChatParams {
   humanize?: boolean;
   /** Not-Ai voice/genre profile applied when `humanize` is on. */
   voiceProfile?: string;
+  /** Auto-compact once usage reaches this percent of the model's context
+   *  window (1-99). Undefined = default (80). */
+  compactAt?: number;
   thinking: boolean;
   reasoningEffort?: '' | 'none' | 'low' | 'medium' | 'xhigh';
   preserveThinking?: boolean;

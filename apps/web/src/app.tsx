@@ -102,11 +102,6 @@ export function App() {
             <n.icon size={18} strokeWidth={1.8} />
           </button>
         ))}
-        <div className="mt-auto pb-1 text-center text-[9.5px] font-medium uppercase tracking-wider text-faint">
-          NInfer
-          <br />
-          Studio
-        </div>
       </nav>
 
       {/* main column */}
@@ -129,11 +124,6 @@ export function App() {
             {error && (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-danger/40 bg-danger/10 px-2.5 py-1 text-danger" title={error}>
                 sidecar unreachable
-              </span>
-            )}
-            {status?.engine && (
-              <span className="hidden font-mono text-[11px] md:inline">
-                {status.engine.artifact ? status.engine.artifact.split('/').pop() : 'no artifact'}
               </span>
             )}
           </div>

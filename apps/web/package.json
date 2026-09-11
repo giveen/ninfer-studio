@@ -38,14 +38,11 @@
     "@uiw/react-codemirror": "^4.25.11",
     "codemirror": "^6.0.2",
     "highlight.js": "^11.12.0",
-    "katex": "^0.16.22",
     "lucide-react": "^1.45.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
-    "rehype-katex": "^7.0.1",
-    "remark-gfm": "^4.0.1",
-    "remark-math": "^6.0.0"
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.12",
