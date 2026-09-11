@@ -41,34 +41,32 @@ export default defineConfig({
     target: 'es2022',
     // Split heavy vendor libraries into their own chunks so no single file trips
     // Vite's 500 kB warning and so browsers can cache them independently.
+    // Rolldown (Vite 8) only accepts a function-form manualChunks — the
+    // object map Vite 7 understood hard-fails the build
+    // ("manualChunks is not a function"). Same four vendor chunks as before.
     rollupOptions: {
       output: {
-        manualChunks: {
-          codemirror: [
-            '@uiw/react-codemirror',
-            'codemirror',
-            '@codemirror/lang-javascript',
-            '@codemirror/lang-json',
-            '@codemirror/lang-python',
-            '@codemirror/lang-markdown',
-            '@codemirror/lang-html',
-            '@codemirror/lang-css',
-            '@codemirror/lang-rust',
-            '@codemirror/lang-cpp',
-            '@codemirror/lang-java',
-            '@codemirror/lang-sql',
-            '@codemirror/lang-php',
-            '@codemirror/lang-go',
-            '@codemirror/lang-xml',
-            '@codemirror/lang-yaml',
-            '@codemirror/language',
-            '@codemirror/state',
-            '@codemirror/view',
-            '@lezer/highlight',
-          ],
-          markdown: ['react-markdown', 'remark-gfm', 'highlight.js'],
-          icons: ['lucide-react'],
-          radix: ['@radix-ui/react-dialog', '@radix-ui/react-popover', '@radix-ui/react-switch'],
+        manualChunks(id: string): string | undefined {
+          if (!id.includes('node_modules')) return undefined;
+          if (
+            id.includes('@codemirror') ||
+            id.includes('@uiw/react-codemirror') ||
+            id.includes('@lezer') ||
+            id.includes('/codemirror/')
+          ) {
+            return 'codemirror';
+          }
+          if (
+            id.includes('react-markdown') ||
+            id.includes('remark-') ||
+            id.includes('rehype-') ||
+            id.includes('highlight.js')
+          ) {
+            return 'markdown';
+          }
+          if (id.includes('lucide-react')) return 'icons';
+          if (id.includes('@radix-ui')) return 'radix';
+          return undefined;
         },
       },
     },
