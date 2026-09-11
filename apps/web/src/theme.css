@@ -242,3 +242,48 @@ input[type='number'] {
   color: var(--color-accent);
   animation: stream-caret 0.9s step-end infinite;
 }
+
+/* code editor (CodeMirror 6) */
+.cm-editor {
+  background: var(--color-inset);
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  height: 100%;
+}
+.cm-editor .cm-scroller {
+  font-family: inherit;
+  line-height: inherit;
+  overflow: auto;
+}
+.cm-editor.cm-focused {
+  outline: none;
+}
+.cm-editor .cm-gutters {
+  background: var(--color-inset);
+  color: var(--color-faint);
+  border-right: 1px solid var(--color-line);
+}
+.cm-editor .cm-activeLine {
+  background: rgba(255, 255, 255, 0.04);
+}
+.cm-editor .cm-activeLineGutter {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--color-mute);
+}
+.cm-editor .cm-selectionMatch {
+  background: rgba(183, 240, 74, 0.12);
+}
+.cm-editor .cm-cursor {
+  border-left-color: var(--color-accent);
+}
+.cm-editor ::selection {
+  background: rgba(183, 240, 74, 0.28);
+}
+.cm-editor .cm-panels {
+  background: var(--color-panel2);
+  color: var(--color-mute);
+  font-size: 11px;
+  border-top: 1px solid var(--color-line);
+}

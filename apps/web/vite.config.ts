@@ -44,6 +44,28 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
+          codemirror: [
+            '@uiw/react-codemirror',
+            'codemirror',
+            '@codemirror/lang-javascript',
+            '@codemirror/lang-json',
+            '@codemirror/lang-python',
+            '@codemirror/lang-markdown',
+            '@codemirror/lang-html',
+            '@codemirror/lang-css',
+            '@codemirror/lang-rust',
+            '@codemirror/lang-cpp',
+            '@codemirror/lang-java',
+            '@codemirror/lang-sql',
+            '@codemirror/lang-php',
+            '@codemirror/lang-go',
+            '@codemirror/lang-xml',
+            '@codemirror/lang-yaml',
+            '@codemirror/language',
+            '@codemirror/state',
+            '@codemirror/view',
+            '@lezer/highlight',
+          ],
           markdown: ['react-markdown', 'remark-gfm', 'highlight.js'],
           icons: ['lucide-react'],
           radix: ['@radix-ui/react-dialog', '@radix-ui/react-popover', '@radix-ui/react-switch'],

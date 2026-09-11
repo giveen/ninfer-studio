@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { X, RefreshCw, GitCommit, ShieldAlert, FileDiff } from 'lucide-react';
 import { Button, cn } from './ui';
+import { lineClass } from './diffStyle';
 import type { CoderDiffResult } from '../lib/api';
 
 interface DiffReviewModalProps {
@@ -13,29 +14,6 @@ interface DiffReviewModalProps {
   onApprove?: () => void;
   fetchDiff: () => Promise<CoderDiffResult>;
   title?: string;
-}
-
-/** Classify one unified-diff line so we can color it. */
-function lineClass(line: string): string {
-  if (line.startsWith('+')) return 'text-ok bg-ok/[0.06]';
-  if (line.startsWith('-')) return 'text-danger bg-danger/[0.06]';
-  if (line.startsWith('@@')) return 'text-accent';
-  if (
-    line.startsWith('diff --git') ||
-    line.startsWith('---') ||
-    line.startsWith('+++') ||
-    line.startsWith('index ') ||
-    line.startsWith('new file') ||
-    line.startsWith('deleted file') ||
-    line.startsWith('similarity') ||
-    line.startsWith('rename ') ||
-    line.startsWith('old mode') ||
-    line.startsWith('new mode') ||
-    line.startsWith('Binary ')
-  ) {
-    return 'text-faint';
-  }
-  return 'text-ink/75';
 }
 
 export function DiffReviewModal({ open, mode, onClose, onApprove, fetchDiff, title }: DiffReviewModalProps) {

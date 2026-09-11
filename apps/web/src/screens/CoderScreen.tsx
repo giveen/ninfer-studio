@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -7,14 +7,18 @@ import { Markdown } from '../components/Markdown';
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
+import { isImagePath } from '../lib/fileKind';
+import { parseDiagnostics } from '../lib/diagnostics';
+import { fetchFileDiff } from '../lib/gitStatus';
+import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
 
 const ATTACH_MAX_BYTES = 5 * 1024 * 1024;
-const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
-const isImagePath = (p: string) => IMAGE_EXT.has((p.split('.').pop() || '').toLowerCase());
+const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
+
 /** Cheap guard used by the commit-approval gate: does this shell command commit? */
 const isGitCommitCommand = (cmd: string): boolean => {
   const c = cmd.replace(/^\s*(sudo|env|time|setsid|nice)\s+/, '').trim();
@@ -854,27 +858,6 @@ function loadStore(): CoderStore {
 }
 
 // ---- Verification gate helpers ------------------------------------------------
-/** Parse common linter/test output into structured {file,line,col,message} diagnostics. */
-function parseDiagnostics(cmd: string, output: string): Array<{ file?: string; line?: number; col?: number; severity?: string; message: string }> {
-  const out: Array<{ file?: string; line?: number; col?: number; severity?: string; message: string }> = [];
-  const lines = (output || '').split('\n');
-  for (const raw of lines) {
-    let m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+)\((\d+),(\d+)\):\s*(error|warning):\s*(.+)$/);
-    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
-    m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+):\s*(error|warning):\s*(.+)$/);
-    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
-    m = raw.match(/^([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+)\s+(error|warning)\s+(.+?)\s+\S+$/);
-    if (m) { out.push({ file: m[1], line: +m[2], col: +m[3], severity: m[4], message: m[5] }); continue; }
-    m = raw.match(/error(?:\[[^\]]+\])?:\s*(.+?)\s*\(([^\s()]+\.[A-Za-z0-9]+):(\d+):(\d+)\)/);
-    if (m) { out.push({ file: m[2], line: +m[3], col: +m[4], severity: 'error', message: m[1] }); continue; }
-  }
-  for (const raw of lines) {
-    const m = raw.match(/^(FAILED|ERROR)\s+([^\s()]+\.[A-Za-z0-9]+)::(.+)$/);
-    if (m) out.push({ file: m[2], message: `${m[1]} ${m[3]}` });
-  }
-  return out.slice(0, 100);
-}
-
 /** Detect lint/test/build commands: explicit config first, else infer from manifests. */
 async function detectCommands(): Promise<{ lint?: string; test?: string; build?: string }> {
   try {
@@ -961,7 +944,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [treeLoading, setTreeLoading] = useState(false);
   const [treeExpanded, setTreeExpanded] = useState<Record<string, boolean>>({});
   const [treeChildren, setTreeChildren] = useState<Record<string, FileNode[]>>({});
-  const [previewFile, setPreviewFile] = useState<{ path: string; content: string; loading: boolean } | null>(null);
 
   // Commit history of the active workspace (populated from `git log`).
   const [commits, setCommits] = useState<CoderCommit[]>([]);
@@ -1074,6 +1056,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [commitApproval, setCommitApproval] = useState(false);
   // Diff-review viewer (opened from the toolbar "Diff" button).
   const [diffViewOpen, setDiffViewOpen] = useState(false);
+  /** Per-file diff (opened from a file tab's Diff button). */
+  const [fileDiffPath, setFileDiffPath] = useState<string | null>(null);
   // Commit-approval pending dialog (the agent asked to commit while the gate is ON).
   const [commitReviewOpen, setCommitReviewOpen] = useState(false);
   const commitResolveRef = useRef<((ok: boolean) => void) | null>(null);
@@ -1723,19 +1707,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     void refreshRepoMap();
   }, [activeWs, activeConv, refreshRepoMap]);
 
-  const openPreview = useCallback(async (path: string) => {
-    setPreviewFile({ path, content: '', loading: true });
-    try {
-      const r = await coderRead(path, 0, 400);
-      setPreviewFile({ path, content: r.binary ? '(binary file — not shown)' : (r.content ?? '(empty)'), loading: false });
-    } catch (e) {
-      setPreviewFile({ path, content: `[error reading file: ${e instanceof Error ? e.message : String(e)}]`, loading: false });
-    }
-  }, []);
-
-  // Load/refresh the tree whenever the active (possibly worktree-bound) directory changes.
-  useEffect(() => { if (treeOpen) void loadTree(); }, [wsSynced, treeOpen, loadTree]);
-
+  // Load/refresh the tree whenever the active (possibly worktree-bound) directory
+  // changes, or the sidecar re-point is flushed after a held mid-run switch.
+  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsSynced, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
     if (running || !activeWsDir || commits.length === 0) return;
@@ -1818,6 +1792,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, checkpoints: (meta.checkpoints ?? []).filter((c) => c.id !== id) } } } } };
     });
   };
+  /** undoFileEdit is defined before the tabs hook (which needs it as its
+   *  onUndoEdit); this ref keeps the refresh path one-way (no cyclic dep). */
+  const tabsRefreshRef = useRef<() => void>(() => {});
+
   /** File-grained undo: revert the active file to its state before the most recent
    * commit that touched it (creating a recoverable undo commit). If the file has
    * only uncommitted changes, they're discarded; if it was created in that
@@ -1829,13 +1807,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const refresh = async () => {
       loadCommits();
       refreshRepoMap();
-      try {
-        const r = await coderRead(path);
-        setPreviewFile((cur) => (cur && cur.path === path ? { ...cur, content: r.content ?? '', loading: false } : cur));
-      } catch {
-        // File was removed by the undo — close its preview.
-        setPreviewFile((cur) => (cur && cur.path === path ? null : cur));
-      }
+      // Re-fetch open tabs (adopt the new disk content or flag a conflict).
+      tabsRefreshRef.current();
     };
     if (!window.confirm(`Undo the last edit to ${path}?\n\nReverts this file to its previous committed state (a new undo commit is created).`)) return;
     addLog({ type: 'bash', label: 'undo-file', detail: path });
@@ -1876,6 +1849,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     await refresh();
   }, [running, activeWsDir, loadCommits, refreshRepoMap]);
+
+  // ---- File tabs (VS Code-style center column: Chat + open file tabs) ----
+  const tabs = useFileTabs({
+    activeWsDir,
+    running,
+    // Mid-run sidecar-hold gate: while a run pins the sidecar to another
+    // workspace, every sidecar-touching tab op no-ops (the wsHeld chip explains).
+    sidecarReady: () => wsAppliedRef.current === activeWsDir,
+    getLintCommand: () => detectedCmdsRef.current?.lint || detectedCmdsRef.current?.build || null,
+    onUndoEdit: (p) => { void undoFileEdit(p); },
+  });
+  tabsRefreshRef.current = () => { void tabs.refreshOpenTabs(); void tabs.refreshGitStatus(); };
+  // Refresh git badges once a new workspace's sidecar re-point is flushed.
+  useEffect(() => {
+    void tabs.refreshGitStatus();
+  }, [tabs.refreshGitStatus, wsSynced, activeWsDir]);
+
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
   const setPerms = (next: PermConfig) => {
@@ -3060,7 +3050,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
         if (toolCalls.length > 0) {
           const before = currentMessages.length;
-          currentMessages = await handleToolCalls(toolCalls, currentMessages, refreshRepoMap);
+          // Agent mutated files: refresh repo map, re-fetch open tabs (adopt or
+          // conflict per tab), and refresh git badges.
+          currentMessages = await handleToolCalls(toolCalls, currentMessages, async () => {
+            await refreshRepoMap();
+            await tabs.refreshOpenTabs();
+            await tabs.refreshGitStatus();
+          });
           // Keep the Commit History panel live as the agent commits changes.
           loadCommits();
           // Append only the new tool results to the visible transcript.
@@ -3271,8 +3267,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWs, activeConv]);
   useEffect(() => {
     const el = transcriptRef.current;
-    if (el && transcriptStick.current) el.scrollTop = el.scrollHeight;
-  }, [messageGroups]);
+    // While a file tab is active the chat panel is display:none (all dims 0) —
+    // skip force-scrolling the hidden node; the existing re-pin logic decides
+    // on re-show.
+    if (el && transcriptStick.current && !tabs.activeTabId) el.scrollTop = el.scrollHeight;
+  }, [messageGroups, tabs.activeTabId]);
 
   const boundPaths = activeMeta?.boundPaths ?? [];
 
@@ -3291,11 +3290,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                   <span className="truncate">{n.name}</span>
                 </button>
               ) : (
-                <button type="button" className="flex min-w-0 flex-1 items-center gap-1 text-left" onClick={() => void openPreview(n.path)} title={n.path}>
-                  <span className="w-3 shrink-0" />
-                  <File size={12} className="shrink-0 text-mute" />
-                  <span className="truncate">{n.name}</span>
-                </button>
+                <>
+                  <button type="button" className="flex min-w-0 flex-1 items-center gap-1 text-left" onClick={() => tabs.openFile(n.path)} title={n.path}>
+                    <span className="w-3 shrink-0" />
+                    <File size={12} className="shrink-0 text-mute" />
+                    <span className="truncate">{n.name}</span>
+                  </button>
+                  {tabs.statusMap.get(n.path) ? (
+                    <span className={cn('shrink-0 font-mono text-[10px] font-bold', GIT_BADGE_CLASS[tabs.statusMap.get(n.path)!])} title={`git status: ${tabs.statusMap.get(n.path)}`}>
+                      {tabs.statusMap.get(n.path)}
+                    </span>
+                  ) : null}
+                </>
               )}
               <button
                 type="button"
@@ -3842,8 +3848,48 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </button>
       )}
 
-      {/* Center: conversation messages */}
+      {/* Center: VS Code-style tab container (Chat tab + one tab per open file) */}
       <div className="flex min-w-0 flex-1 flex-col">
+        {/* tab strip */}
+        <div className="flex h-8 shrink-0 items-center overflow-x-auto border-b border-line bg-panel">
+          <button
+            type="button"
+            className={cn('flex h-full shrink-0 items-center gap-1.5 border-r border-line px-3 text-[11.5px]', !tabs.activeTabId ? 'bg-panel2 text-ink' : 'text-mute hover:text-ink')}
+            onClick={() => tabs.setActive(null)}
+            title="Chat"
+          >
+            <MessageSquare size={12} className="shrink-0" /> Chat
+            {running && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="agent run in flight" />}
+          </button>
+          {tabs.tabs.map((t) => (
+            <div key={t.id} className="flex h-full shrink-0 items-center border-r border-line">
+              <button
+                type="button"
+                className={cn('flex h-full min-w-0 items-center gap-1.5 px-2.5 text-[11.5px]', tabs.activeTabId === t.id ? 'bg-panel2 text-ink' : 'text-mute hover:text-ink')}
+                onClick={() => tabs.setActive(t.id)}
+                title={t.path}
+              >
+                {t.kind === 'image' ? <Image size={12} className="shrink-0" /> : <File size={12} className="shrink-0" />}
+                <span className="max-w-32 truncate font-mono text-[11px]">{t.path.split(/[\/]/).pop()}</span>
+                {t.gitStatus && (
+                  <span className={cn('shrink-0 font-mono text-[10px] font-bold', GIT_BADGE_CLASS[t.gitStatus])} title={`git status: ${t.gitStatus}`}>
+                    {t.gitStatus}
+                  </span>
+                )}
+                {t.status === 'conflict' && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="changed elsewhere since you opened it" />}
+                {t.dirty && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="unsaved changes" />}
+              </button>
+              <button type="button" className="shrink-0 px-1 text-faint hover:text-ink" onClick={() => tabs.closeTab(t.id)} title={`Close ${t.path}`}>
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+          {tabs.notice && <span className="ml-2 shrink-0 text-[10.5px] text-warn">{tabs.notice}</span>}
+        </div>
+        <div className="min-h-0 flex-1">
+          {/* Chat panel: always mounted, hidden (never unmounted) while a file tab
+              is active — DOM scroll, composer draft, in-flight streaming survive. */}
+          <div style={{ display: tabs.activeTabId ? 'none' : undefined }} className="flex h-full min-h-0 flex-col">
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px]">
           <Folder size={13} className="text-accent" />
           <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
@@ -4006,6 +4052,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           ref={transcriptRef}
           onScroll={(e) => {
             const el = e.currentTarget;
+            // Hidden chat panel (file tab active): dims are all 0, the stick
+            // check would mis-fire as "pinned" — skip it.
+            if (tabs.activeTabId) return;
             transcriptStick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
           }}
           className="flex-1 overflow-auto bg-panel2 space-y-4 p-4"
@@ -4184,6 +4233,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             </div>
           )}
         </div>
+          </div>
+          {tabs.tabs.map((t) => (
+            <div key={t.id} style={{ display: tabs.activeTabId === t.id ? undefined : 'none' }} className="flex h-full min-h-0 flex-col">
+              <Suspense fallback={<div className="flex h-full items-center justify-center text-[11.5px] text-faint">Loading editor…</div>}>
+                <LazyEditorPane
+                  tab={t}
+                  active={tabs.activeTabId === t.id}
+                  onDocChange={(id, doc) => tabs.onDocChange(id, doc)}
+                  onSave={(id) => { void tabs.saveTab(id); }}
+                  onReload={(id) => { void tabs.reloadTab(id); }}
+                  onUndo={() => tabs.undoEdit(t.id)}
+                  onDiff={(path) => setFileDiffPath(path)}
+                  onResolve={(id, kind) => tabs.resolveConflict(id, kind)}
+                  undoDisabled={running}
+                />
+              </Suspense>
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Right: todos */}
@@ -4296,6 +4364,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         onApprove={() => commitResolveRef.current?.(true)}
         fetchDiff={coderDiff}
       />
+      {/* Per-file diff vs HEAD (opened from a file tab's Diff button; staged
+          changes included — `git diff HEAD`). */}
+      <DiffReviewModal
+        open={fileDiffPath !== null}
+        mode="view"
+        title={fileDiffPath ?? undefined}
+        onClose={() => setFileDiffPath(null)}
+        fetchDiff={() => (fileDiffPath ? fetchFileDiff(fileDiffPath) : Promise.resolve({ files: [], diff: '' }))}
+      />
       {/* Self-improving memory: per-repo bank (markdown) + extracted learnings. */}
       <MemoryModal
         open={memOpen}
@@ -4328,29 +4405,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         />
       )}
 
-      {previewFile && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setPreviewFile(null)}>
-          <div className="w-[640px] max-h-[80vh] flex flex-col rounded-xl border border-line bg-panel shadow-xl" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-2 border-b border-line p-3">
-              <File size={14} />
-              <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{previewFile.path}</span>
-              <button
-                type="button"
-                title="Undo the last edit to this file (reverts it to its previous committed state)"
-                className="text-faint hover:text-warn disabled:opacity-40"
-                disabled={running}
-                onClick={() => undoFileEdit(previewFile.path)}
-              >
-                <Undo2 size={16} />
-              </button>
-              <button type="button" className="text-faint hover:text-ink" onClick={() => setPreviewFile(null)}><X size={16} /></button>
-            </div>
-            <div className="flex-1 overflow-auto p-3 font-mono text-[11.5px] whitespace-pre-wrap">
-              {previewFile.loading ? 'Loading…' : previewFile.content}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
