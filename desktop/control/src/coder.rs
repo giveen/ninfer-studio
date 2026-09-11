@@ -1245,6 +1245,197 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
     }
 }
 
+// ---------------------------------------------------------------------------
+// Coder self-improving memory (per-workspace, stored OUTSIDE the user's repo so
+// it never gets committed). Byte-compatible twin of the sidecar's `memDirFor` /
+// `readMemFile` / `writeMemFile` / `readLearnings` — both processes share
+// <DATA_DIR>/coder-memory/<slug>/:
+//   bank.md           curated markdown bank, injected into the system prompt
+//   learnings.jsonl   append-only structured learning entries
+// ---------------------------------------------------------------------------
+
+/// `<DATA_DIR>/coder-memory/<slug>`, where `slug` is the workspace path with
+/// every non-`[\w.-]` char mapped to `_`, kept to its last 160 chars — the
+/// exact transform the sidecar's `memDirFor` applies
+/// (`String(ws).replace(/[^\w.-]/g, '_').slice(-160)`), so sidecar- and app-written memory stay
+/// interchangeable.
+fn mem_dir(data_dir: &Path, ws: &str) -> PathBuf {
+    let slug: String = ws
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let start = slug.len().saturating_sub(160);
+    data_dir.join("coder-memory").join(&slug[start..])
+}
+
+/// Read a memory file, returning `def` when it doesn't exist (sidecar behavior).
+async fn read_mem_file(dir: &Path, name: &str, def: &str) -> String {
+    match tokio::fs::read_to_string(dir.join(name)).await {
+        Ok(t) => t,
+        Err(_) => def.to_string(),
+    }
+}
+
+/// Parse `learnings.jsonl`: one JSON object per line, blank/invalid lines skipped.
+async fn read_learnings(dir: &Path) -> Vec<Value> {
+    let raw = read_mem_file(dir, "learnings.jsonl", "").await;
+    raw.split('\n')
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Create the memory dir and write a file (sidecar `writeMemFile`).
+async fn write_mem_file(dir: &Path, name: &str, content: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("mkdir failed: {e}")}))))?;
+    tokio::fs::write(dir.join(name), content)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
+    Ok(())
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC) — the same shape as Node's
+/// `new Date().toISOString()` (Hinnant's civil-from-days algorithm).
+fn iso_now() -> (String, u64) {
+    let (secs, ms_part) = {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (ms / 1000, ms % 1000)
+    };
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(secs / 86_400);
+    (
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60, ms_part
+        ),
+        secs * 1000 + ms_part,
+    )
+}
+
+/// Hinnant's `civil_from_days`: days since 1970-01-01 → (year, month, day).
+fn civil_from_days(days: u64) -> (i64, u32, u32) {
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (mp as i64 + if mp < 10 { 3 } else { -9 }) as u32;
+    let y = yoe as i64 + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
+/// 5-char base36 suffix for learning ids — cheap entropy, no extra dep
+/// (the sidecar uses `Math.random().toString(36).slice(2, 7)`).
+fn mem_rand_suffix() -> String {
+    use std::sync::atomic::AtomicU64;
+    static CTR: AtomicU64 = AtomicU64::new(0x2545F4914F6CDD1D);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = now_ns
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(CTR.fetch_add(0x9E3779B97F4A7C15, Ordering::SeqCst));
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    (0..5).map(|i| ALPHABET[((n >> (6 + 6 * i)) % 36) as usize] as char).collect()
+}
+
+/// GET /api/coder/memory — current bank + learnings for the active workspace.
+pub async fn memory_get(
+    AxumState(state): AxumState<S>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ws = state.config.read().await.coder_workspace.clone();
+    if ws.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
+    }
+    let dir = mem_dir(&state.data_dir, ws.trim());
+    let bank = read_mem_file(&dir, "bank.md", "").await;
+    let learnings = read_learnings(&dir).await;
+    Ok(Json(json!({"bank": bank, "learnings": learnings})))
+}
+
+/// POST /api/coder/memory — apply at most one of the three body shapes and
+/// return the refreshed `{bank, learnings}` (sidecar-compatible):
+///   `{ bank }`            replace the markdown bank wholesale
+///   `{ learning: {...} }` append one structured learning
+///   `{ dropLearningId }`  drop a single learning (file rewritten, rest kept)
+pub async fn memory_set(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ws = state.config.read().await.coder_workspace.clone();
+    if ws.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
+    }
+    let dir = mem_dir(&state.data_dir, ws.trim());
+
+    if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
+        write_mem_file(&dir, "bank.md", bank).await?;
+    }
+    if let Some(learning) = req.get("learning").and_then(|v| v.as_object()) {
+        if let Some(text) = learning.get("text").and_then(|v| v.as_str()) {
+            let (ts, now_ms) = iso_now();
+            let entry = json!({
+                "id": format!("l_{now_ms}_{}", mem_rand_suffix()),
+                "text": text,
+                "kind": learning.get("kind").and_then(|v| v.as_str()).unwrap_or("tip"),
+                "provenance": learning.get("provenance").and_then(|v| v.as_str()).unwrap_or(""),
+                "task": learning.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+                "ts": ts,
+            });
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("mkdir failed: {e}")}))))?;
+            use tokio::io::AsyncWriteExt as _;
+            let mut f = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("learnings.jsonl"))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
+            let line = format!("{}\n", serde_json::to_string(&entry).unwrap_or_default());
+            f.write_all(line.as_bytes())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
+        }
+    }
+    if let Some(drop_id) = req.get("dropLearningId").and_then(|v| v.as_str()) {
+        let keep: Vec<Value> = read_learnings(&dir)
+            .await
+            .into_iter()
+            .filter(|l| l.get("id").and_then(|v| v.as_str()) != Some(drop_id))
+            .collect();
+        let content = if keep.is_empty() {
+            String::new()
+        } else {
+            keep.iter()
+                .map(|l| serde_json::to_string(l).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        write_mem_file(&dir, "learnings.jsonl", &content).await?;
+    }
+
+    let bank = read_mem_file(&dir, "bank.md", "").await;
+    let learnings = read_learnings(&dir).await;
+    Ok(Json(json!({"bank": bank, "learnings": learnings})))
+}
+
 /// Expand an empty or ~-prefixed path to the user's home directory.
 fn expand_home(p: &str) -> String {
     let home = std::env::var("HOME")
@@ -1262,6 +1453,35 @@ fn expand_home(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_slug_matches_sidecar_transform() {
+        // The sidecar's `String(ws).replace(/[^\w.-]/g, '_').slice(-160)` —
+        // on Windows path.resolve keeps `E:` + `\` separators, so both map
+        // to `_` (two underscores after the drive letter).
+        let slug = |ws: &str| -> String {
+            mem_dir(Path::new("D:/data"), ws).file_name().unwrap().to_string_lossy().into_owned()
+        };
+        assert_eq!(slug("E:/GitHub/PublicRepos/ninfer-studio"), "E__GitHub_PublicRepos_ninfer-studio");
+        // Backslash vs slash paths must slug identically (Windows interop).
+        assert_eq!(slug("E:\\GitHub\\proj"), slug("E:/GitHub/proj"));
+        // Long paths keep their tail (slice(-160)).
+        let long: String = "a".repeat(200);
+        assert_eq!(slug(&long).len(), 160);
+    }
+
+    #[test]
+    fn iso_now_shape_matches_js_toisostring() {
+        let (ts, ms) = iso_now();
+        // 2026-07-06T09:41:00.000Z — fixed 24-char shape, Z-suffixed.
+        assert_eq!(ts.len(), 24);
+        assert!(ts.ends_with('Z'));
+        assert!(ts[4..5].contains('-') && ts[10..11].contains('T') && ts[13..14].contains(':'));
+        assert!(ms > 1_700_000_000_000); // sanity: post-2023 epoch millis
+        // Spot-check the civil-day math at known instants.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));      // epoch
+        assert_eq!(civil_from_days(20_454), (2026, 1, 1)); // 2026-01-01
+    }
 
     #[test]
     fn destructive_commands_are_flagged() {
