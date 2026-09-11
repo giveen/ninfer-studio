@@ -580,12 +580,12 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
             <div key={i} className={cn("p-2 rounded border", m.role === 'tool' ? 'bg-inset border-transparent' : 'bg-panel border-accent/20')}>
               <div className="font-semibold text-[10px] text-faint mb-1 uppercase tracking-wider">{m.role === 'assistant' ? 'Garrulous' : m.role} {m.name ? `· ${m.name}` : ''}</div>
               {m.reasoning && (
-                <div className="text-[11px] text-mute border-l-2 border-accent/50 pl-2 mb-2 italic whitespace-pre-wrap">{m.reasoning}</div>
+                <div className="break-words text-[11px] text-mute border-l-2 border-accent/50 pl-2 mb-2 italic whitespace-pre-wrap">{m.reasoning}</div>
               )}
               {m.content && m.role !== 'tool' && (
                 m.role === 'assistant'
                   ? <div className="markdown text-[12px] leading-relaxed"><Markdown>{m.content}</Markdown></div>
-                  : <div className="text-[12px] whitespace-pre-wrap">{m.content}</div>
+                  : <div className="break-words text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (
                  <ToolResultBlock name={m.name!} content={m.content} />
@@ -3729,7 +3729,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       )}
 
       {/* Center: conversation messages */}
-      <div className="flex flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px]">
           <Folder size={13} className="text-accent" />
           <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
