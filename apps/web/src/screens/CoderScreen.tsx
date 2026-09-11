@@ -2984,7 +2984,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           model,
           "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
           [{ role: 'user', content: `CUT-OFF ATTEMPT:\n${snippet}` }],
-          { thinking: false, maxTokens: 512 } as ChatParams,
+          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 512 } as ChatParams,
           {},
           coderParams.promptCache,
         ),
@@ -3123,7 +3123,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     let content = '';
     try {
       await trackedStream(
-        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: false, maxTokens: 2048 } as ChatParams, {}),
+        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 2048 } as ChatParams, {}),
         abortRef.current?.signal ?? new AbortController().signal,
         'critic',
         { onContentDelta: (t) => { content += t; } },
@@ -3179,6 +3179,71 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (wsAppliedDirRef.current === activeWsDir) {
       setMemory(m);
       memoryRef.current = m;
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // Standalone Verify/Critic actions — Verify and Critic also work as one-click
+  // checks against whatever is on disk right now, independent of the Verify/
+  // Critic toggles (which only gate an agent run's own finish condition). Plan
+  // and Scout have no standalone equivalent: Scout only makes sense ahead of a
+  // run it feeds context into, and Plan only means anything as a constraint on
+  // an upcoming run — neither has a "thing that already exists" to check.
+  // ---------------------------------------------------------------------------
+  const [verifyNowBusy, setVerifyNowBusy] = useState(false);
+  const [criticNowBusy, setCriticNowBusy] = useState(false);
+
+  const runVerifyNow = async () => {
+    if (verifyNowBusy || running) return;
+    setVerifyNowBusy(true);
+    const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
+    if (!cmds.lint && !cmds.build && !cmds.test) {
+      addLog({ type: 'error', label: 'verify', detail: 'no lint/build/test command detected for this workspace' });
+      setVerifyNowBusy(false);
+      return;
+    }
+    addLog({ type: 'read', label: 'verify', detail: 'checking current working tree…' });
+    try {
+      const v = await runPostEditChecks({}, '', abortRef.current?.signal);
+      if (v.linter_error) {
+        addLog({ type: 'error', label: 'verify', detail: `lint failed: ${String(v.linter_error).slice(0, 200)}` });
+      } else if (v.test_error) {
+        addLog({ type: 'error', label: 'verify', detail: `tests failed: ${String(v.test_error).slice(0, 200)}` });
+      } else {
+        addLog({ type: 'bash', label: 'verify', detail: 'lint/test passed' });
+      }
+    } catch (e) {
+      addLog({ type: 'error', label: 'verify', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setVerifyNowBusy(false);
+    }
+  };
+
+  const runCriticNow = async () => {
+    if (criticNowBusy || running) return;
+    setCriticNowBusy(true);
+    addLog({ type: 'read', label: 'critic', detail: 'reviewing current diff…' });
+    try {
+      const d = await coderDiff();
+      if (!d.diff || !d.diff.trim()) {
+        addLog({ type: 'error', label: 'critic', detail: 'no uncommitted changes to review' });
+        return;
+      }
+      const taskText = [...messages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content
+        || 'Review the current uncommitted changes for correctness and quality.';
+      const c = await runCritic(d.diff, taskText);
+      if (c.learnings.length) {
+        await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
+      }
+      addLog({
+        type: c.approved ? 'bash' : 'error',
+        label: 'critic',
+        detail: c.approved ? 'approved' : (c.issues || 'changes requested').slice(0, 300),
+      });
+    } catch (e) {
+      addLog({ type: 'error', label: 'critic', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setCriticNowBusy(false);
     }
   };
 
@@ -4426,12 +4491,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
           <button
             type="button"
+            onClick={() => void runVerifyNow()}
+            disabled={running || verifyNowBusy}
+            title="Run now: lint/test the current working tree on disk, independent of the Verify toggle"
+            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+          >
+            <Play size={11} className={verifyNowBusy ? 'animate-pulse' : ''} />
+          </button>
+          <button
+            type="button"
             onClick={() => setCriticMode((v) => !v)}
             disabled={running}
             title={criticMode ? 'Critic ON: a model reviews the diff and can bounce it back for fixes before the run finishes' : 'Critic OFF'}
             className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', criticMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
           >
             Critic
+          </button>
+          <button
+            type="button"
+            onClick={() => void runCriticNow()}
+            disabled={running || criticNowBusy}
+            title="Run now: get a critic review of the current uncommitted diff, independent of the Critic toggle"
+            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+          >
+            <Play size={11} className={criticNowBusy ? 'animate-pulse' : ''} />
           </button>
           <button
             type="button"
