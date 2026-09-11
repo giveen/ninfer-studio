@@ -784,6 +784,17 @@ function stripExtPrefix(p: string): string {
   }
   return rest;
 }
+
+/** Render the live task list as a system-prompt block. Injected into the
+ *  supervisor's system prompt every turn so the plan (a) survives
+ *  auto-compaction of the conversation and (b) reflects user edits made
+ *  mid-run (added/removed/retasked items) on the very next LLM call. */
+function todoSystemBlock(todos: TodoItem[]): string {
+  if (!todos.length) return '';
+  const mark = (s: string) => (s === 'completed' ? 'x' : s === 'in_progress' ? '~' : ' ');
+  const lines = todos.map((t, i) => `${i + 1}. [${mark(t.status)}] ${t.content}`);
+  return `\n\n# Current task list (live — maintained by todo_write, editable by the user; keep it in sync with your actual progress)\n${lines.join('\n')}\n`;
+}
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
   // Windows migration: older builds stored the workspace key with Rust's
@@ -943,6 +954,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const askRef = useRef<string | null>(null);
   const [ledger, setLedger] = useState<LogEntry[]>(initialMeta?.ledger ?? []);
   const [todos, setTodos] = useState<TodoItem[]>(initialMeta?.todos ?? []);
+  /** When the task list last changed (tool call or user edit) — shown in the panel header. */
+  const [todosUpdatedAt, setTodosUpdatedAt] = useState<number | null>(null);
+  /** Mirror of `todos` for the run loop: the loop's closure sees stale state,
+   *  so the per-turn system-prompt injection reads this ref instead. */
+  const todosRef = useRef<TodoItem[]>(todos);
+  useEffect(() => { todosRef.current = todos; }, [todos]);
+  const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -1527,6 +1545,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
     setLedger((prev) => [...prev.slice(-999), { ...safe, id: crypto.randomUUID(), time: Date.now() }]);
+  };
+
+  // ---- Todos: user actions (the panel is no longer read-only). Edits take
+  // effect on the agent's next LLM call via the per-turn system-prompt
+  // injection (todoSystemBlock + todosRef), so the human can retask, drop a
+  // spinning step, or add work mid-run without waiting for the next agent
+  // todo_write. User edits persist with the conversation (todos in ConvMeta).
+  const touchTodos = () => setTodosUpdatedAt(Date.now());
+  const addTodo = (raw: string) => {
+    const content = raw.trim();
+    if (!content) return;
+    setTodos((prev) => [...prev, { content, status: 'pending' }]);
+    touchTodos();
+    addLog({ type: 'todo', label: 'manual', detail: `added task: ${content.slice(0, 60)}` });
+  };
+  const cycleTodo = (i: number) => {
+    setTodos((prev) => prev.map((t, j) => (j === i ? { ...t, status: t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending' } : t)));
+    touchTodos();
+  };
+  const removeTodo = (i: number) => {
+    setTodos((prev) => prev.filter((_, j) => j !== i));
+    touchTodos();
+    addLog({ type: 'todo', label: 'manual', detail: 'removed a task' });
   };
   // Rebuild the system prompt, refreshing the codebase map so the agent sees files
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
@@ -2393,8 +2434,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify({ question: args.question, status: 'awaiting_user' });
         } else if (call.name === 'todo_write') {
           logType = 'todo'; logDetail = 'Updated task list';
-          setTodos(args.todos || []);
-          result = JSON.stringify({ success: true });
+          // Validate: the JSON schema is model-hint only — coerce malformed
+          // entries (bad status string, empty content) instead of rendering
+          // unknown statuses as pending.
+          const raw: unknown = Array.isArray(args.todos) ? args.todos : [];
+          const cleaned: TodoItem[] = (raw as Array<Record<string, unknown>>) 
+            .map((t): TodoItem => ({
+              content: String(t?.content ?? '').trim(),
+              status: t?.status === 'in_progress' ? 'in_progress' : t?.status === 'completed' ? 'completed' : 'pending',
+            }))
+            .filter((t) => t.content);
+          setTodos(cleaned);
+          setTodosUpdatedAt(Date.now());
+          result = JSON.stringify({ success: true, count: cleaned.length });
         } else if (call.name === 'memory_update') {
           // Declared in TOOLS but previously unhandled — calls landed in the
           // "Unknown tool" branch and the learning was silently lost.
@@ -2951,11 +3003,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // into inventing tool markup for an undeclared tool.
         const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : TOOLS;
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
-        const system = planMode
+        const system = (planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
-          : dynamicSystemRef.current;
+          : dynamicSystemRef.current) + todoSystemBlock(todosRef.current);
         const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
-
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
@@ -4186,24 +4237,58 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
       </div>
 
-      {/* Right: todos */}
+      {/* Right: todos (agent-maintained via todo_write; the user can also
+          edit directly — edits reach the agent on its next LLM call via the
+          per-turn system-prompt injection) */}
       <div className="flex w-64 flex-col border-l border-line bg-panel">
         <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
           <CheckSquare size={14} /> Todos
+          {todosUpdatedAt != null && (
+            <span className="ml-auto font-mono text-[10px] font-normal text-faint" title="Last updated (agent todo_write or your edit)">
+              {new Date(todosUpdatedAt).toLocaleTimeString([], { hour12: false })}
+            </span>
+          )}
         </div>
         <div className="flex-1 p-2 text-[11.5px] text-mute overflow-auto">
           {todos.length === 0 ? 'No pending tasks.' : (
             <div className="space-y-1.5">
               {todos.map((t, i) => (
-                <div key={i} className={cn("flex items-start gap-2", t.status === 'completed' ? 'opacity-50 line-through' : '')}>
-                  <span className="mt-0.5 shrink-0">
+                <div key={i} className={cn("group flex items-start gap-2", t.status === 'completed' ? 'opacity-50 line-through' : '')}>
+                  <button
+                    type="button"
+                    className="mt-0.5 shrink-0 cursor-pointer hover:opacity-70"
+                    title={`${t.status} — click to advance to ${t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending'}`}
+                    onClick={() => cycleTodo(i)}
+                  >
                     {t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '⏳' : '☐'}
-                  </span>
-                  <span className={t.status === 'in_progress' ? 'text-accent font-medium' : ''}>{t.content}</span>
+                  </button>
+                  <span className={cn('min-w-0 flex-1 break-words', t.status === 'in_progress' ? 'text-accent font-medium' : '')}>{t.content}</span>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded p-0.5 text-faint opacity-0 group-hover:opacity-100 hover:text-danger"
+                    title="Remove task (takes effect on the agent's next step)"
+                    onClick={() => removeTodo(i)}
+                  >
+                    <X size={12} />
+                  </button>
                 </div>
               ))}
             </div>
           )}
+        </div>
+        <div className="shrink-0 border-t border-line p-2">
+          <form className="flex items-center gap-1.5" onSubmit={(e) => { e.preventDefault(); addTodo(todoDraft); setTodoDraft(''); }}>
+            <input
+              value={todoDraft}
+              onChange={(e) => setTodoDraft(e.target.value)}
+              placeholder="add a task…"
+              className="min-w-0 flex-1 rounded border border-line bg-inset px-2 py-1 text-[11px] outline-none focus:border-accent/50"
+            />
+            <Button size="sm" variant="ghost" type="submit" disabled={!todoDraft.trim()} title="Add a task to the agent's plan — visible to it on its next step">
+              <Plus size={13} /> add
+            </Button>
+          </form>
+          <p className="mt-1 text-[10px] text-faint">Click a status to cycle it · your edits reach the agent on its next step</p>
         </div>
       </div>
 
