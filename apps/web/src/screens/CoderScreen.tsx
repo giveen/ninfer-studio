@@ -671,6 +671,24 @@ const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_com
 const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
 const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
+/** Tool names an implementation `subagent` worker may use by default — the
+ *  same set `runWorker` falls back to when no allow-list is given. Used to
+ *  validate a model-supplied `tools` allow-list for the `subagent` tool
+ *  (unlike `delegate`, which is read-only-only, `subagent`'s whole point is
+ *  writing/running things, so it must NOT be filtered against
+ *  READONLY_TOOL_NAMES — that would silently strip write/edit/bash). */
+const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+
+/** Filter a model-supplied tool allow-list against `allowed`, falling back to
+ *  `undefined` (caller's default set) when nothing survives the filter — an
+ *  empty array is still truthy in JS, so without this an all-invalid or
+ *  all-filtered-out request would silently leave a subagent with ZERO tools
+ *  instead of a sensible default. */
+function filterToolAllowList(raw: unknown, allowed: Set<string>): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const filtered = raw.map(String).filter((t) => allowed.has(t));
+  return filtered.length ? filtered : undefined;
+}
 
 /** Binaries bash may run in plan mode (inspection only). */
 const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
@@ -2358,6 +2376,67 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // in-flight one instead of only taking effect on the next loop turn.
     const toolSignal = abortRef.current?.signal ?? new AbortController().signal;
 
+    // Fast path: a turn made entirely of `delegate` calls is exactly the
+    // fan-out-research case the tool's own description promises runs "in
+    // parallel" — but the general loop below always ran everything one at a
+    // time, delegate included. Run them concurrently here instead. Any turn
+    // that mixes in another tool type falls through to the general
+    // sequential loop unchanged: mutating/approval-gated tools need strict
+    // ordering, and delegate alone never does (it's read-only and never
+    // touches the git working tree).
+    if (calls.length > 1 && calls.every((c) => c.name === 'delegate')) {
+      const results = await Promise.all(calls.map(async (call) => {
+        const t0 = performance.now();
+        let result = '';
+        let logType: LogEntry['type'] = 'error';
+        let logDetail = '';
+        try {
+          const args = JSON.parse(call.arguments);
+          const permVerdict = checkPerm(call.name, args);
+          if (permVerdict !== null) {
+            logDetail = `${call.name} blocked`;
+            // A parallel batch can't safely show one interactive approval
+            // dialog per call — they'd race the single pending-approval
+            // slot. Refuse here so the model can retry this one alone,
+            // where 'ask' still works correctly (single-delegate turns
+            // fall through to the general loop below).
+            result = JSON.stringify({
+              error: permVerdict === 'ask'
+                ? `'${call.name}' requires interactive approval and can't run inside a parallel batch — call it alone.`
+                : permVerdict,
+            });
+          } else {
+            logType = 'ask';
+            logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
+            const res = await runSubagent(
+              'delegate',
+              `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`,
+              modelRef.current,
+              toolSignal,
+              6,
+              filterToolAllowList(args.tools, READONLY_TOOL_NAMES),
+            );
+            result = JSON.stringify({ summary: res });
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          logDetail = msg;
+          result = JSON.stringify({ error: msg });
+        }
+        const durationMs = Math.round(performance.now() - t0);
+        addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
+        const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
+        if (maybeSummarized !== result) {
+          addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
+        }
+        return { call, content: maybeSummarized };
+      }));
+      for (const { call, content } of results) {
+        nextMessages.push({ role: 'tool', content, tool_call_id: call.id, name: call.name });
+      }
+      return nextMessages;
+    }
+
     for (const call of calls) {
       let result = '';
       const t0 = performance.now();
@@ -2697,7 +2776,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         } else if (call.name === 'delegate') {
           logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined);
+          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES));
           result = JSON.stringify({ summary: res });
         } else if (call.name === 'subagent') {
           // Implementation subagent (worker): spawn a focused agent, capture its
@@ -2707,7 +2786,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logDetail = `subagent: ${task.slice(0, 40)}`;
           addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
           const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
-          const workerTools = Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined;
+          // BUG FIX: this used to filter against READONLY_TOOL_NAMES, which
+          // silently stripped write/edit/apply_patch/bash whenever a caller
+          // passed a tools list (exactly what the tool's own description
+          // tells the model to do) — an implementation subagent with no
+          // write tools, or with none at all if every requested tool got
+          // filtered out. WORKER_TOOL_NAMES is the correct allow-list.
+          const workerTools = filterToolAllowList(args.tools, WORKER_TOOL_NAMES);
           // Track the run so it shows live in the Jobs panel, same as
           // delegate/scout (runSubagent) — this was previously invisible
           // since it calls runWorker directly instead of runSubagent.
@@ -2716,11 +2801,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             let preTree = '';
             try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
-            addLog({ type: 'read', label: 'subagent', detail: 'ideation pass (candidate approaches)' });
             const ideation = await runIdeation(task, wmodel, toolSignal);
+            addLog({ type: 'read', label: 'subagent', detail: ideation ? `ideation: ${ideation.slice(0, 150)}` : 'ideation pass produced no candidates' });
             let res = { summary: '', diff: '', ok: false };
             let critique = '';
             let prevCritique = '';
+            // null = critic never actually reviewed anything (criticMode off,
+            // or every attempt produced an empty diff) — distinct from an
+            // explicit rejection, so a caller can tell "not reviewed" apart
+            // from "reviewed and rejected."
+            let criticApproved: boolean | null = null;
             const MAX_WORKER_CRIT = 2;
             for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
               const p = attempt === 0
@@ -2729,14 +2819,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               res = await runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
               if (criticMode && res.diff.trim()) {
                 const c = await runCritic(res.diff, task);
+                criticApproved = c.approved;
                 if (c.learnings.length) {
                   await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
                 }
                 if (!c.approved) {
-                  // Stuck detection: if the reviewer raises the same issues
-                  // again, the worker isn't converging on a fix — stop
-                  // burning the remaining retries on a repeat.
-                  if (attempt > 0 && c.issues.trim().toLowerCase() === prevCritique.trim().toLowerCase()) {
+                  // Stuck detection: if the reviewer raises the same
+                  // (non-empty) issues again, the worker isn't converging on
+                  // a fix — stop burning the remaining retries on a repeat.
+                  if (attempt > 0 && c.issues.trim() && c.issues.trim().toLowerCase() === prevCritique.trim().toLowerCase()) {
                     critique = c.issues;
                     addLog({ type: 'error', label: 'critic', detail: 'same issues raised again — worker not converging, stopping retries early' });
                     break;
@@ -2758,8 +2849,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               }
             } catch { /* keep res.diff */ }
             mutated = true;
-            result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
-            addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
+            // The worker's own `ok` only means "ran without error/budget
+            // exhaustion" — it says nothing about review. Fold in the critic's
+            // verdict so a supervisor reading `ok` can't mistake "rejected
+            // twice and we gave up" for success; `criticApproved` carries the
+            // raw tri-state for anything that wants to distinguish
+            // not-reviewed from reviewed-and-rejected.
+            const ok = res.ok && criticApproved !== false;
+            result = JSON.stringify({ summary: res.summary, diff, ok, criticApproved });
+            addLog({ type: ok ? 'bash' : 'error', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
           } finally {
             setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
           }
@@ -2843,18 +2941,40 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch { /* unknown — fail closed below */ }
     return 1;
   };
-  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal): Promise<string> => {
+  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal, model: string): Promise<string> => {
     try {
       const args = JSON.parse(call.arguments);
+      // `deny` and denyPaths are enforced server-side regardless of caller
+      // (see coder.rs's enforce_perm), but `ask` can only be enforced here —
+      // the server has no way to pause and prompt a human. Without this, a
+      // tool the user tiered "ask" would silently run for a delegate/scout
+      // subagent while still correctly pausing for the supervisor.
+      const permVerdict = checkPerm(call.name, args);
+      if (permVerdict !== null) {
+        if (permVerdict === 'ask') {
+          const detail = String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
+          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
+          const ok = await requestApproval(call.name, detail);
+          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+        } else {
+          return JSON.stringify({ error: permVerdict });
+        }
+      }
+      let result: string;
       switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
+        case 'read': result = JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal)); break;
+        case 'grep': result = JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal)); break;
+        case 'glob': result = JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal)); break;
+        case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
+        case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
+        case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
+      // Same giant-output protection the supervisor's own loop gets — without
+      // it, a subagent's own multi-step context balloons on a big file read
+      // or verbose command with no compaction at all, unlike the top level.
+      return await maybeSummarizeTool(call.name, result, model, signal);
     } catch (e) {
       return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
@@ -2894,10 +3014,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       for (const call of toolCalls) {
         if (call.name === 'delegate') {
           const args = JSON.parse(call.arguments);
-          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
+          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
         } else {
-          const res = await runReadOnlyCall(call, signal);
+          const res = await runReadOnlyCall(call, signal, model);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
         }
       }
@@ -2910,8 +3030,34 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // handleToolCalls, so it never pollutes the supervisor transcript or trips the
   // commit/ask gates). Read-only fan-out (`delegate`) recurses into runSubagent.
   const runWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
+    const raw = await dispatchWorkerCall(call, signal, model, depth);
+    // Same giant-output protection the supervisor's own loop gets. Cheap for
+    // every short-circuit path above (denials, errors, `{summary}` wrappers)
+    // — maybeSummarizeTool bails out immediately for anything without a
+    // stdout/stderr/content field or under its size threshold.
+    return maybeSummarizeTool(call.name, raw, model, signal);
+  };
+
+  const dispatchWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
     try {
       const args = JSON.parse(call.arguments);
+      // Same reasoning as runReadOnlyCall: `ask` can only be enforced
+      // client-side, and this dispatcher (a worker's own tool calls) never
+      // went through checkPerm at all, so an "ask"-tiered tool would
+      // silently execute for a worker even though the supervisor's own call
+      // to the same tool correctly pauses for a human.
+      const permVerdict = checkPerm(call.name, args);
+      if (permVerdict !== null) {
+        if (permVerdict === 'ask') {
+          const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
+          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
+          const ok = await requestApproval(call.name, detail);
+          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+        } else {
+          return JSON.stringify({ error: permVerdict });
+        }
+      }
       switch (call.name) {
         case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
         case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
@@ -2962,7 +3108,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || ''), signal));
         case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal));
         case 'delegate': {
-          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
+          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
           return JSON.stringify({ summary: r });
         }
         default: return JSON.stringify({ error: `worker cannot use tool: ${call.name}` });
@@ -3034,9 +3180,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     depth = 0,
   ): Promise<{ summary: string; diff: string; ok: boolean }> => {
     if (depth > 3) return { summary: '(worker depth limit reached)', diff: '', ok: false };
-    const allowed = allowedTools
-      ? new Set(allowedTools)
-      : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+    const allowed = allowedTools ? new Set(allowedTools) : WORKER_TOOL_NAMES;
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let preTree = '';
     try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal)).stdout.trim(); } catch { /* no git */ }
