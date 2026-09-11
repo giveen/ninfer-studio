@@ -150,6 +150,8 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const gpu = status?.gpu;
   const artifacts = status?.artifacts || [];
   const [profile, setProfile] = useState<EngineProfile>(() => ({ ...PRESETS[1].profile }));
+  /** The preset the current profile came from (badge next to the launch command). */
+  const [appliedPresetId, setAppliedPresetId] = useState<string | null>(() => PRESETS[1].id);
   const [artifact, setArtifact] = useState<string>('');
   const [saved, setSaved] = useState<SavedProfile[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -173,7 +175,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     getProfileState()
       .then((s) => {
         if (cancelled) return;
-        if (s.profile) setProfile({ ...BLANK_PROFILE, ...s.profile });
+        if (s.profile) { setProfile({ ...BLANK_PROFILE, ...s.profile }); setAppliedPresetId(null); }
         else setProfile({ ...PRESETS[1].profile });
         // Only restore a *non-empty* artifact. A persisted "" means "no explicit
         // choice", and restoring it would clobber the auto-selected artifact if
@@ -350,8 +352,15 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     const p = PRESETS.find((x) => x.id === id);
     if (!p) return;
     setProfile({ ...BLANK_PROFILE, ...p.profile, port: profile.port });
+    setAppliedPresetId(id);
     setNotice({ tone: 'ok', text: `preset “${p.name}” applied — review the generated command before starting.` });
   };
+  /** Preset shown next to the generated command; "(modified)" when the profile
+   *  has drifted from the preset's values (port excluded). */
+  const appliedPreset = appliedPresetId ? PRESETS.find((p) => p.id === appliedPresetId) : null;
+  const presetMatches = appliedPreset
+    ? Object.entries(appliedPreset.profile).every(([k, v]) => (profile as unknown as Record<string, unknown>)[k] === v)
+    : false;
 
   const saveCurrent = () => {
     const name = saveName.trim() || `profile-${saved.length + 1}`;
@@ -583,9 +592,14 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           actions={
             <div className="flex items-center gap-2">
               {running && engine?.argv && <Badge tone="ok">running</Badge>}
-              <Button size="sm" variant="subtle" onClick={() => applyPreset('long-context-mtp3')}>
-                long-context preset
-              </Button>
+              {appliedPreset && (
+                <span title={presetMatches ? `Preset "${appliedPreset.name}" is active` : `Profile changed since "${appliedPreset.name}" was applied`}>
+                  <Badge tone={presetMatches ? 'info' : 'warn'}>
+                    {appliedPreset.name}
+                    {!presetMatches && ' (modified)'}
+                  </Badge>
+                </span>
+              )}
             </div>
           }
         >
@@ -891,7 +905,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
                       <p className="truncate font-mono text-[12px] text-ink">{s.name}</p>
                       <p className="truncate text-[11px] text-faint">{bits.join(' · ')}</p>
                     </div>
-                    <Button size="sm" variant="primary" onClick={() => { setProfile({ ...BLANK_PROFILE, ...s.profile, port: profile.port }); setNotice({ tone: 'ok', text: `loaded “${s.name}” — review the generated command, then stop + start the engine` }); }}>
+                    <Button size="sm" variant="primary" onClick={() => { setProfile({ ...BLANK_PROFILE, ...s.profile, port: profile.port }); setAppliedPresetId(null); setNotice({ tone: 'ok', text: `loaded “${s.name}” — review the generated command, then stop + start the engine` }); }}>
                       load
                     </Button>
                     <button className="text-faint hover:text-danger" title="Delete profile" onClick={() => setSaved((x) => x.filter((y) => y.name !== s.name))}>

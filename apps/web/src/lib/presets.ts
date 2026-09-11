@@ -124,26 +124,6 @@ export const PRESETS: Preset[] = [
     },
   },
   {
-    id: 'ultra-context-k8v4',
-    name: 'Ultra context 320k (k8v4)',
-    description:
-      'RTX 5090 (32 GB), gw-int artifacts: 320k context via k8v4 KV (FP8 keys, NVFP4 values — 1.33× fp8 density). Local 3.8 gw-int (loads 19.0 GiB) → ~28.7 GiB total, ~2.5 GiB free; 3.6-27B (~18.2 GiB) is comfier. Fresh 3.8 downloads (19.0 GiB file → ~21.3 loaded) should drop to 256k. Watch long-range recall (4-bit V).',
-    profile: {
-      port: 8080,
-      maxContext: 320_000,
-      kvCapacity: 320_000,
-      maxConcurrency: 2,
-      kvDtype: 'k8v4',
-      deviceStateSlots: 2,
-      hostStateSlots: 8,
-      hostKvMib: 8192,
-      spec: 'mtp',
-      draftTokens: 3,
-      lmHeadDraft: true,
-      preserveThinking: true,
-    },
-  },
-  {
     id: 'max-fidelity-bf16',
     name: 'Max fidelity 128k (bf16 KV)',
     description:
@@ -218,26 +198,6 @@ export const PRESETS: Preset[] = [
       maxConcurrency: 2,
       kvDtype: 'fp8',
       deviceStateSlots: 2,
-      hostStateSlots: 8,
-      hostKvMib: 8192,
-      spec: 'mtp',
-      draftTokens: 3,
-      lmHeadDraft: true,
-      preserveThinking: true,
-    },
-  },
-  {
-    id: 'experimental-nvfp4-kv-480k',
-    name: 'Experimental 480k (NVFP4 KV)',
-    description:
-      'RTX 5090 (32 GB), single lane: 480k context via NVFP4 KV (2× fp8 density). Fits the local 3.8 gw-int (19.0 loaded → ~28.6 total) and 3.6-27B (~27.8); fresh 3.8 downloads (~21.3 loaded) must use 384k. Experimental: 4-bit K/V costs long-range recall — verify answers on long documents before trusting them.',
-    profile: {
-      port: 8080,
-      maxContext: 480_000,
-      kvCapacity: 480_000,
-      maxConcurrency: 1,
-      kvDtype: 'nvfp4',
-      deviceStateSlots: 1,
       hostStateSlots: 8,
       hostKvMib: 8192,
       spec: 'mtp',

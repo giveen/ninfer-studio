@@ -26,9 +26,10 @@ Linux, WebView2 on Windows) for the
   concurrency, speculative decoding (MTP / DFlash / DFlash2), vision & media budgets,
   context-cache tiers, sampling defaults, logging — plus a live **generated launch
   command** and one-click **presets**, including five **RTX 5090 presets** calibrated
-  from the engine's own measured KV density across all five registered artifacts
-  (320k k8v4, 128k bf16, C=4 nvfp4 serving, 96k low-latency, 128k MoE, experimental
-  480k NVFP4 KV).
+  from the engine's own measured KV density across the registered artifacts
+  (128k bf16, C=4 nvfp4 serving, 96k low-latency, 128k MoE, 192k long-context MTP).
+  Contexts stay within the variants' native window — the engine does no rope
+  scaling, so `max_context` above a variant's native capacity fails at startup.
 - **VRAM safety floor** — after load, Studio tails the engine's `capacity` log line
   (its own runtime/free VRAM accounting) and warns when free VRAM drops under the
   1.8 GiB safety floor, before an OOM can kill the run mid-generation. Works for
