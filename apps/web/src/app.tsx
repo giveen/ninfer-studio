@@ -138,8 +138,16 @@ export function App() {
         </header>
 
         <main className="min-h-0 flex-1 overflow-hidden">
-          {screen === 'chat' && <ChatScreen status={status} onNavigate={setScreen} />}
-          {screen === 'code' && <CoderScreen coderWs={coderWs} />}
+          {/* Chat and Coder keep running when you navigate away (their agent
+              loops are plain async closures — unmounting would leave them
+              working invisibly with a frozen transcript). Keep them mounted
+              and merely hidden; the other screens are cheap to remount. */}
+          <div className={cn('h-full', screen !== 'chat' && 'hidden')}>
+            <ChatScreen status={status} onNavigate={setScreen} />
+          </div>
+          <div className={cn('h-full', screen !== 'code' && 'hidden')}>
+            <CoderScreen coderWs={coderWs} />
+          </div>
           {screen === 'engine' && <EngineScreen status={status} />}
           {screen === 'models' && <ModelsScreen status={status} />}
           {screen === 'settings' && <SettingsScreen status={status} />}
