@@ -992,6 +992,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Background shell jobs started by the agent (tracked per workspace so the
   // sidebar panel can poll + kill them without digging through the transcript).
   const [bgJobs, setBgJobs] = useState<{ id: string; command: string; ws: string }[]>([]);
+  /** Live subagent runs (delegate / subagent / scout) for the Jobs panel. */
+  const [activeSubs, setActiveSubs] = useState<{ id: string; label: string; task: string; since: number }[]>([]);
+  const [subTick, setSubTick] = useState(Date.now());
+  useEffect(() => {
+    if (activeSubs.length === 0) return;
+    const t = setInterval(() => setSubTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [activeSubs.length]);
   const [jobStatus, setJobStatus] = useState<Record<string, CoderJob>>({});
   const [jobsOpen, setJobsOpen] = useState(true);
   /** Poll unfinished jobs while the panel is open (3s cadence, stops when all done). */
@@ -2446,6 +2454,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const runSubagent = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
+    // Track the run so it shows live in the Jobs panel.
+    const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+    setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), since: Date.now() }]);
+    try {
+      return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
+    } finally {
+      setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+    }
+  };
+  const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
+    if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search']);
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
@@ -3590,9 +3609,19 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           {jobsOpen && (() => {
             const wsJobs = bgJobs.filter((j) => j.ws === activeWs);
-            if (wsJobs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
+            const subs = activeSubs;
+            if (wsJobs.length === 0 && subs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
             return (
               <div className="max-h-40 space-y-1 overflow-auto">
+                {subs.map((s) => (
+                  <div key={s.id} className="rounded border border-accent/25 bg-accent/8 px-2 py-1" title={s.task}>
+                    <div className="flex items-center gap-2">
+                      <BrainCircuit size={11} className="shrink-0 animate-pulse text-accent" />
+                      <span className="min-w-0 flex-1 truncate text-[10.5px] text-mute">{s.label} — {s.task}</span>
+                      <span className="shrink-0 text-[10px] text-faint">{Math.max(1, Math.round((subTick - s.since) / 1000))}s</span>
+                    </div>
+                  </div>
+                ))}
                 {wsJobs.map((j) => {
                   const s = jobStatus[j.id];
                   const done = s?.done ?? false;
