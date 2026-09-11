@@ -503,7 +503,7 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
 
 /// Base64 file read for image/file attachments (mirrors `/api/coder/fs/b64`).
 pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    const MAX_ATTACH_BYTES: usize = 5 * 1024 * 1024;
+    const MAX_ATTACH_BYTES: usize = 50 * 1024 * 1024;
     let ws = state.config.read().await.coder_workspace.clone();
     let ws_root = coder_root(&ws)?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
@@ -515,7 +515,7 @@ pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> R
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
     if buf.len() > MAX_ATTACH_BYTES {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": format!("file is {} bytes; attachment limit is 5 MB", buf.len())}))));
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": format!("file is {} bytes; attachment limit is 50 MB", buf.len())}))));
     }
     let ext = rel.rsplit('.').next().unwrap_or("").to_lowercase();
     let mime = match ext.as_str() {

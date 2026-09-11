@@ -1966,9 +1966,9 @@ async function handleCoder(req, res, p, url) {
       } catch {
         return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
       }
-      const MAX_ATTACH_BYTES = 5 * 1024 * 1024;
+      const MAX_ATTACH_BYTES = 50 * 1024 * 1024;
       if (buf.length > MAX_ATTACH_BYTES) {
-        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 5 MB` });
+        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 50 MB` });
       }
       const ext = (body?.path || full).split('.').pop()?.toLowerCase() || '';
       const mime = (
