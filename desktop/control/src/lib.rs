@@ -14,7 +14,7 @@ pub mod types;
 
 use crate::engine::{
     discover_engines, engine_health, engine_model_id, public_engine, refresh_engine_status,
-    start_engine, stop_engine, S,
+    start_engine, stop_engine, S, VRAM_FLOOR_GIB,
 };
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models, start_download};
@@ -142,6 +142,22 @@ async fn health() -> Json<Value> {
 // ---------------------------------------------------------------------------
 async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
     refresh_engine_status(&state).await;
+    let vram = {
+        let eng = state.engine.read().await;
+        match (eng.port, eng.state.as_str()) {
+            (Some(port), s) if s == "running" || s == "starting" => engine::vram_status(&state.data_dir, port)
+                .await
+                .map(|(runtime_gib, free_gib)| {
+                    json!({
+                        "runtimeGib": runtime_gib,
+                        "freeGib": free_gib,
+                        "floorGib": VRAM_FLOOR_GIB,
+                        "under": free_gib < VRAM_FLOOR_GIB,
+                    })
+                }),
+            _ => None,
+        }
+    };
     let engine = public_engine(&*state.engine.read().await);
     let last_start = state.last_start.read().await;
     let engines = engines_public(&state).await;
@@ -155,6 +171,7 @@ async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
         "engines": engines,
         "lastStart": serde_json::to_value(&*last_start).unwrap(),
         "gpu": gpu,
+        "vram": vram,
         "config": config,
         "artifacts": models["artifacts"],
         "catalog": ARTIFACTS,

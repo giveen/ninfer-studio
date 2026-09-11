@@ -415,6 +415,16 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
             engine again.
           </div>
         )}
+        {status?.vram?.under && (
+          <div className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
+            <span className="font-medium">VRAM safety floor breached.</span>{' '}
+            The engine reports only <code className="font-mono">{Number(status.vram.freeGib ?? 0).toFixed(2)} GiB</code> free
+            after load (floor: {status.vram.floorGib} GiB, runtime{' '}
+            <code className="font-mono">{Number(status.vram.runtimeGib ?? 0).toFixed(2)} GiB</code>). Any growth — CUDA graph
+            re-capture, media buffers, other GPU apps — can OOM the run. Stop the engine and reduce context/KV capacity, use a denser
+            KV dtype (k8v4 or nvfp4), or switch to a smaller artifact.
+          </div>
+        )}
         {/* status row */}
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Stat

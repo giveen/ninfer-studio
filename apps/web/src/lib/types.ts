@@ -105,6 +105,10 @@ export interface StatusPayload {
   engines?: EngineStatus[];
   lastStart?: LastStart | null;
   gpu: GpuStats;
+  /** Engine-reported VRAM accounting from the last `capacity |` log line
+   *  (present while the engine runs; `under` flags free VRAM below the 1.8 GiB
+   *  safety floor). */
+  vram?: { runtimeGib: number; freeGib: number; floorGib: number; under: boolean } | null;
   config: AppSettings;
   artifacts: ModelArtifact[];
   catalog: CatalogEntry[];
