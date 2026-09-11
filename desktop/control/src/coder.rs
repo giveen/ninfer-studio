@@ -182,7 +182,12 @@ pub async fn workspace_set(
                 }
             }
         };
-        ws = ws_path.to_string_lossy().into_owned();
+        // canonicalize() on Windows returns the extended-length form
+        // (`\\?\C:\...`); the UI keys workspaces by the plain picker path,
+        // so strip the prefix or the store duplicates the workspace on the
+        // next start.
+        let plain = crate::types::strip_extended_prefix(&ws_path.to_string_lossy()).to_string();
+        ws = plain;
         exists = ws_path.is_dir();
     } else {
         ws = String::new();
@@ -1262,6 +1267,23 @@ fn expand_home(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_extended_prefix_matches_windows_canonicalize_form() {
+        use crate::types::strip_extended_prefix;
+        assert_eq!(strip_extended_prefix("\\\\?\\C:\\tmp"), "C:\\tmp");
+        assert_eq!(strip_extended_prefix("\\\\?/C:/tmp"), "C:/tmp");
+        assert_eq!(strip_extended_prefix("//?/C:/tmp"), "C:/tmp");
+        // UNC: canonicalize yields `\\?\UNC\server\share` — a bare
+        // `UNC\server\share` would be relative, so the leading UNC
+        // separators must be restored to the picker's `\\server\share`.
+        assert_eq!(strip_extended_prefix("\\\\?\\UNC\\server\\share"), "\\\\server\\share");
+        assert_eq!(strip_extended_prefix("\\\\?/UNC/server/share"), "\\\\server\\share");
+        // Plain paths pass through untouched.
+        assert_eq!(strip_extended_prefix("C:\\tmp"), "C:\\tmp");
+        assert_eq!(strip_extended_prefix("/home/dev/x"), "/home/dev/x");
+        assert_eq!(strip_extended_prefix(""), "");
+    }
 
     #[test]
     fn destructive_commands_are_flagged() {

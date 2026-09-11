@@ -27,6 +27,32 @@ pub enum AppEvent {
 // ---------------------------------------------------------------------------
 // App settings (persisted to <data>/config.json)
 // ---------------------------------------------------------------------------
+
+/// Strip the Windows extended-length prefix (`\\?\` or `//?/`) that
+/// `std::fs::canonicalize` adds to most absolute paths on Windows, so the
+/// stored workspace string matches the plain form the UI's directory picker
+/// produces (`C:\tmp`, not `\\?\C:\tmp`) — otherwise the web store (keyed
+/// by the plain path) can't find the persisted workspace on the next start
+/// and spawns a duplicate entry with a fresh conversation.
+///
+/// UNC paths need care: canonicalize yields `\\?\UNC\server\share`, and a
+/// bare `UNC\server\share` would be a *relative* path — so the leading UNC
+/// separators are restored and the tail is normalized to backslashes,
+/// giving `\\server\share` (the picker's form).
+pub fn strip_extended_prefix(p: &str) -> String {
+    for pre in ["\\\\?\\", "\\\\?/", "//?/"] {
+        if let Some(rest) = p.strip_prefix(pre) {
+            for unc in ["UNC\\", "UNC/"] {
+                if let Some(tail) = rest.strip_prefix(unc) {
+                    return format!("\\\\{}", tail.replace('/', "\\"));
+                }
+            }
+            return rest.to_string();
+        }
+    }
+    p.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {

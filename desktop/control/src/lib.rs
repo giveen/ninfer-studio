@@ -19,7 +19,7 @@ use crate::engine::{
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models, start_download};
 use crate::repo::{start_update, update_public};
-use crate::types::{AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, ProfileState, SavedProfile, State};
+use crate::types::{strip_extended_prefix, AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, ProfileState, SavedProfile, State};
 use tokio::sync::mpsc::UnboundedSender;
 use axum::body::Body;
 use axum::extract::{Query, Request, State as AxumState};
@@ -803,6 +803,10 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
             if cfg.build_command.is_empty() {
                 cfg.build_command = defaults.build_command;
             }
+            // Legacy values may carry the Windows extended-length prefix
+            // (`\\?\`) from an older canonicalize; normalize so the UI
+            // (which keys workspaces by plain paths) matches on restart.
+            cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
             *state.config.write().await = cfg;
         }
     }

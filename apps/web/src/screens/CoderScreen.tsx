@@ -773,9 +773,44 @@ function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
   }
   return msgs;
 }
+function stripExtPrefix(p: string): string {
+  let rest: string | null = null;
+  for (const pre of ['\\\\?\\', '\\\\?/', '//?/']) {
+    if (p.startsWith(pre)) { rest = p.slice(pre.length); break; }
+  }
+  if (rest === null) return p;
+  for (const unc of ['UNC\\', 'UNC/']) {
+    if (rest.startsWith(unc)) return '\\\\' + rest.slice(unc.length).replace(/\//g, '\\');
+  }
+  return rest;
+}
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
-  let activeWs = s.activeWs;
+  // Windows migration: older builds stored the workspace key with Rust's
+  // extended-length prefix (`\\?\\C:\tmp` from canonicalize) while the
+  // picker produces the plain form — the mismatch made every start seed a
+  // duplicate workspace with a fresh conversation. Merge prefixed entries
+  // into their plain twin (deduped by conversation id).
+  for (const [key, ws] of Object.entries(workspaces)) {
+    const plain = stripExtPrefix(key);
+    if (plain === key) continue;
+    delete workspaces[key];
+    const twin = workspaces[plain];
+    if (!twin) {
+      workspaces[plain] = ws;
+      continue;
+    }
+    const merged: WsData = { ...twin, conversations: { ...twin.conversations }, order: [...twin.order], expanded: twin.expanded || ws.expanded };
+    for (const [cid, conv] of Object.entries(ws.conversations)) {
+      if (!merged.conversations[cid]) {
+        merged.conversations[cid] = conv;
+        merged.order.push(cid);
+      }
+    }
+    merged.activeConv = twin.activeConv && merged.conversations[twin.activeConv] ? twin.activeConv : merged.order[0] ?? '';
+    workspaces[plain] = merged;
+  }
+  let activeWs = stripExtPrefix(s.activeWs);
   let activeConv = s.activeConv;
   if (!activeWs || !workspaces[activeWs]) {
     activeWs = Object.keys(workspaces)[0] ?? '';
