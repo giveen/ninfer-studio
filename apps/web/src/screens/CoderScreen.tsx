@@ -2393,6 +2393,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         logDetail = msg;
+        // Feed the failure back to the model instead of an empty result so it
+        // can adapt (retry differently, skip, or report) rather than guess.
+        result = JSON.stringify({ error: msg });
       }
       
       const durationMs = Math.round(performance.now() - t0);
@@ -3038,7 +3041,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch (err: unknown) {
       const isAbort = err instanceof Error && err.name === 'AbortError';
       if (!isAbort) {
-        addLog({ type: 'error', label: 'System Error', detail: err instanceof Error ? err.message : String(err) });
+        const msg = err instanceof Error ? err.message : String(err);
+        addLog({ type: 'error', label: 'System Error', detail: msg });
+        // The ledger line alone is easy to miss — surface run-death in the
+        // transcript itself so a dead run never looks like a silent stop
+        // ("subagents did their job and then nothing").
+        setMessages((prev) => [...prev, { role: 'user', displayName: 'System', content: `[Run failed: ${msg}]`, error: true }]);
       }
     } finally {
       setRunning(false);
