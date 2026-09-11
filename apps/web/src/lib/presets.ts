@@ -206,6 +206,46 @@ export const PRESETS: Preset[] = [
       preserveThinking: true,
     },
   },
+  {
+    id: 'ultra-context-k8v4',
+    name: 'Ultra context 256k (k8v4)',
+    description:
+      'RTX 5090 (32 GB), gw-int artifacts: full 262,144-token native window via k8v4 KV (FP8 keys, NVFP4 values — ~33 tok/MiB → ~7.9 GiB pool). Local 3.8 gw-int (loads 19.0 GiB) → ~27 GiB total; fresh 3.8 downloads (~21.3 loaded) → ~29 GiB — both fit with headroom. Watch long-range recall (4-bit V).',
+    profile: {
+      port: 8080,
+      maxContext: 262_144,
+      kvCapacity: 262_144,
+      maxConcurrency: 2,
+      kvDtype: 'k8v4',
+      deviceStateSlots: 2,
+      hostStateSlots: 8,
+      hostKvMib: 8192,
+      spec: 'mtp',
+      draftTokens: 3,
+      lmHeadDraft: true,
+      preserveThinking: true,
+    },
+  },
+  {
+    id: 'ultra-context-nvfp4',
+    name: 'Ultra context 256k (NVFP4 KV)',
+    description:
+      'RTX 5090 (32 GB), single lane: the full 262,144-token native window via NVFP4 KV (~49 tok/MiB → ~5.3 GiB pool). Fits every registered artifact with room to spare (fresh 3.8 gw-int ~21.3 loaded → ~27 GiB total). Single sequence owns the whole window; NVFP4 KV costs long-range recall — verify answers on long documents before trusting them.',
+    profile: {
+      port: 8080,
+      maxContext: 262_144,
+      kvCapacity: 262_144,
+      maxConcurrency: 1,
+      kvDtype: 'nvfp4',
+      deviceStateSlots: 1,
+      hostStateSlots: 8,
+      hostKvMib: 8192,
+      spec: 'mtp',
+      draftTokens: 3,
+      lmHeadDraft: true,
+      preserveThinking: true,
+    },
+  },
 ];
 
 export const KV_DTYPES = ['bf16', 'int8', 'fp8', 'nvfp4', 'k8v4'] as const;
