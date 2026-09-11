@@ -3339,6 +3339,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     runAgent(compactedContext(messages).concat(msg), { scout: !resuming, pin: resumePin ?? undefined });
   };
 
+  // True while a run is in flight in a DIFFERENT conversation than the one on
+  // screen. The Stop button is disabled there so the user can't stop (or try to
+  // track) a run they can't see — switch to the running conversation (marked
+  // with the pulsing dot / header chip) to stop it.
+  const runElsewhere = running && !!runConv && (runConv.ws !== activeWs || runConv.convId !== activeConv);
+
   const stop = () => {
     abortRef.current?.abort();
     // Never leave the agent loop parked on an approval dialog after Stop.
@@ -4364,7 +4370,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               disabled={running || !activeWs || pendingQuestion !== null}
             />
             {running ? (
-               <Button variant="danger" onClick={stop}><Square size={14} /> Stop</Button>
+               <Button variant="danger" onClick={stop} disabled={runElsewhere}
+                 title={runElsewhere && runConv
+                   ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
+                   : 'Stop the running agent'}><Square size={14} /> Stop</Button>
             ) : (
                <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0 || pendingQuestion !== null}><Play size={14} /> Run</Button>
             )}
