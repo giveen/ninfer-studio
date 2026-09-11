@@ -1,6 +1,6 @@
 [package]
 name = "ninfier-studio"
-version = "0.2.6"
+version = "0.2.9"
 edition = "2021"
 description = "NInfer Studio — native Linux desktop shell (Tauri 2) hosting the NInfer control plane + web UI."
 
