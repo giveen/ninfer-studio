@@ -790,6 +790,28 @@ async function detectCommands(): Promise<{ lint?: string; test?: string; build?:
   return {};
 }
 
+/** Collapsible sidebar section: chevron toggles a bounded region so no single
+ *  panel can push the rest of the sidebar out of view. */
+function SidebarSection({
+  title, icon, defaultOpen = false, children,
+}: { title: string; icon?: React.ReactNode; defaultOpen?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="mb-3">
+      <button
+        type="button"
+        className="mb-1.5 flex w-full items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint hover:text-ink"
+        onClick={() => setOpen((o) => !o)}
+      >
+        {icon}
+        {title}
+        <ChevronDown size={12} className={`ml-auto shrink-0 transition-transform ${open ? '' : '-rotate-90'}`} />
+      </button>
+      {open && children}
+    </div>
+  );
+}
+
 export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [store, setStore] = useState<CoderStore>(loadStore);
   const storeRef = useRef(store);
@@ -3152,8 +3174,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
 
         {/* Session Ledger */}
+        <SidebarSection title="Session Ledger" defaultOpen={false}>
         <div className="max-h-44 shrink-0 overflow-auto border-t border-line p-2">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">Session Ledger</div>
           <div className="space-y-1.5">
             {ledger.map((l) => (
               <div key={l.id} className="flex flex-col gap-0.5 border-l-2 border-line pl-2 ml-1 text-[10.5px]">
@@ -3174,17 +3196,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
           </div>
         </div>
+        </SidebarSection>
 
         {/* Safe mode — blocks destructive shell commands (release blocker #2) */}
+        <SidebarSection title="Safe Mode" icon={<Shield size={13} />} defaultOpen={true}>
         <div className="shrink-0 border-t border-line p-2">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-              <Shield size={13} /> Safe Mode
-            </div>
             <button
               type="button"
               onClick={() => toggleSafeMode(!coderSafeMode)}
-              className={cn("rounded px-2 py-0.5 text-[11px] font-medium", coderSafeMode ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              className={cn("ml-auto rounded px-2 py-0.5 text-[11px] font-medium", coderSafeMode ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
               title={coderSafeMode ? 'Destructive commands are blocked' : 'Destructive commands are allowed'}
             >
               {coderSafeMode ? 'ON' : 'OFF'}
@@ -3192,16 +3213,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>
         </div>
+        </SidebarSection>
         {/* Sandbox — wraps the agent shell in bwrap (workspace read-write, host read-only) */}
+        <SidebarSection title="Sandbox" icon={<Shield size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-              <Shield size={13} /> Sandbox
-            </div>
             <button
               type="button"
               onClick={() => toggleSandbox(!coderSandbox)}
-              className={cn('rounded px-2 py-0.5 text-[11px] font-medium', coderSandbox ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              className={cn('ml-auto rounded px-2 py-0.5 text-[11px] font-medium', coderSandbox ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
               title={coderSandbox ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)' : 'Agent shell runs directly on the host'}
             >
               {coderSandbox ? 'ON' : 'OFF'}
@@ -3209,16 +3229,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
         </div>
+        </SidebarSection>
         {/* Commit approval — gate: the agent cannot commit without human sign-off */}
+        <SidebarSection title="Commit approval" icon={<GitCommit size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-              <GitCommit size={13} /> Commit approval
-            </div>
             <button
               type="button"
               onClick={() => setCommitApproval((v) => !v)}
-              className={cn('rounded px-2 py-0.5 text-[11px] font-medium', commitApproval ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
+              className={cn('ml-auto rounded px-2 py-0.5 text-[11px] font-medium', commitApproval ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
               title={commitApproval ? 'Agent commits require your approval of the working-tree diff' : 'Agent may commit freely (auto-commits on every write)'}
             >
               {commitApproval ? 'ON' : 'OFF'}
@@ -3226,10 +3245,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </div>
           <p className="mt-1 text-[10.5px] text-faint">When ON, the agent cannot commit until you review the working-tree-vs-HEAD diff and approve. Auto-commits on write/edit are paused so only intentional, reviewed commits land.</p>
         </div>
+        </SidebarSection>
         {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
+        <SidebarSection title="Permissions" icon={<Shield size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
-          <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            <Shield size={13} /> Permissions
+          <div className="mb-1.5 flex items-center">
             <button
               type="button"
               className="ml-auto rounded p-0.5 text-faint hover:text-ink"
@@ -3312,11 +3332,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </>
           )}
         </div>
+        </SidebarSection>
 
         {/* Commit History — git log of the active workspace */}
+        <SidebarSection title="Commit History" icon={<GitCommit size={13} />} defaultOpen={false}>
         <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
-          <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            <GitCommit size={13} /> Commit History
+          <div className="mb-2 flex items-center gap-2">
             <button
               type="button"
               className="ml-auto rounded p-0.5 text-faint hover:text-ink"
@@ -3374,10 +3395,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             </div>
           )}
         </div>
+        </SidebarSection>
         {/* Background Jobs — live view of detached shell jobs for this workspace */}
+        <SidebarSection title="Jobs" icon={<Terminal size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
-          <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            <Terminal size={13} /> Jobs
+          <div className="mb-1.5 flex items-center">
             <button
               type="button"
               className="ml-auto rounded p-0.5 text-faint hover:text-ink"
@@ -3448,6 +3470,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             );
           })()}
         </div>
+        </SidebarSection>
       </div>
 
       {/* Middle: file tree + system-prompt follow bindings */}
@@ -3603,9 +3626,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           </button>
         </div>
         {showCheckpoints && activeWs && (
+          <SidebarSection title="Checkpoints" icon={<BookmarkPlus size={13} />} defaultOpen={false}>
           <div className="shrink-0 border-b border-line bg-panel px-4 py-2">
-            <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
-              <BookmarkPlus size={13} /> Checkpoints
+            <div className="mb-1.5 flex items-center">
               <button
                 type="button"
                 className="ml-auto rounded border border-line px-2 py-px text-[10.5px] normal-case tracking-normal text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
@@ -3646,6 +3669,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               </div>
             )}
           </div>
+          </SidebarSection>
         )}
 
         <div className="flex-1 overflow-auto bg-panel2 space-y-4 p-4">
@@ -3919,7 +3943,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       />
       {showDir && (
         <DirBrowser
-          initialPath={activeWs || '/'}
+          initialPath="~"
           onPick={(p) => { handleAddWorkspace(p); setShowDir(false); }}
           onClose={() => setShowDir(false)}
         />

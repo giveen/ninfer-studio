@@ -1219,9 +1219,13 @@ pub async fn web_search(AxumState(_state): AxumState<S>, Json(req): Json<Value>)
 /// root. Deliberately NOT confined to the workspace (it picks the workspace).
 /// Unreadable roots return exists:false rather than an error, like the sidecar.
 pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
-    let root = params.get("root").map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("/");
-    match tokio::fs::metadata(root).await {
-        Ok(m) if m.is_dir() => match tokio::fs::read_dir(root).await {
+    let raw = params.get("root").map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("~");
+    // Empty or ~-prefixed roots resolve to the home directory (the picker's
+    // natural start point); `root` in the response is always the RESOLVED
+    // absolute path so the UI can navigate from it directly.
+    let root = expand_home(raw);
+    match tokio::fs::metadata(&root).await {
+        Ok(m) if m.is_dir() => match tokio::fs::read_dir(&root).await {
             Ok(mut rd) => {
                 let mut dirs = Vec::new();
                 while let Ok(Some(e)) = rd.next_entry().await {
@@ -1238,6 +1242,21 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
         },
         Ok(_) => Json(json!({"root": root, "exists": true, "isDir": false, "dirs": []})),
         Err(e) => Json(json!({"root": root, "exists": false, "isDir": false, "dirs": [], "error": e.to_string()})),
+    }
+}
+
+/// Expand an empty or ~-prefixed path to the user's home directory.
+fn expand_home(p: &str) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/".to_string());
+    let home = home.trim_end_matches('/');
+    if p.is_empty() || p == "~" {
+        return home.to_string();
+    }
+    match p.strip_prefix("~/") {
+        Some(rest) => format!("{home}/{rest}"),
+        None => p.to_string(),
     }
 }
 #[cfg(test)]

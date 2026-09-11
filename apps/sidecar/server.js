@@ -2457,7 +2457,13 @@ const server = createServer(async (req, res) => {
     // workspace at an existing directory. Unreadable/missing roots return
     // exists:false rather than an error so the picker can still render.
     if (p === '/api/coder/dirs' && req.method === 'GET') {
-      const root = (url.searchParams.get('root') || '/').trim() || '/';
+      // Empty or ~-prefixed roots resolve to the home directory (the picker's
+      // natural start point); `root` in the response is always the RESOLVED
+      // absolute path so the UI can navigate from it directly. Keep 1:1 with
+      // coder::dirs in desktop/control/src/coder.rs.
+      const raw = (url.searchParams.get('root') || '~').trim() || '~';
+      const home = os.homedir().replace(/\/+$/, '');
+      const root = !raw || raw === '~' ? home : raw.startsWith('~/') ? `${home}/${raw.slice(2)}` : raw;
       try {
         const st = await fs.stat(root);
         if (!st.isDirectory()) {

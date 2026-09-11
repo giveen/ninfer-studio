@@ -56,6 +56,7 @@ pub fn build_router(state: S) -> Router {
         // Coding harness — control-plane endpoints (mirror apps/sidecar/server.js)
         .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
         .route("/api/coder/tree", get(coder::tree))
+        .route("/api/coder/dirs", get(coder::dirs))
         .route("/api/coder/repo_map", get(coder::repo_map))
         .route("/api/coder/fs/read", post(coder::fs_read))
         .route("/api/coder/fs/write", post(coder::fs_write))

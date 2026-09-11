@@ -9,8 +9,9 @@ interface DirBrowserProps {
 }
 
 /** Modal that navigates the host filesystem so the user can point a workspace
- *  at an existing directory (mirrors deepseek-harness's directory-picker flow). */
-export function DirBrowser({ initialPath = '/', onPick, onClose }: DirBrowserProps) {
+ *  at an existing directory (mirrors deepseek-harness's directory-picker flow).
+ *  Starts at the user's home directory (`~` resolves server-side). */
+export function DirBrowser({ initialPath = '~', onPick, onClose }: DirBrowserProps) {
   const [current, setCurrent] = useState(initialPath);
   const [dirs, setDirs] = useState<string[]>([]);
   const [exists, setExists] = useState(true);
@@ -18,12 +19,14 @@ export function DirBrowser({ initialPath = '/', onPick, onClose }: DirBrowserPro
   const [loading, setLoading] = useState(false);
 
   const load = (root: string) => {
-    const r = root.trim() || '/';
+    const r = root.trim() || '~';
     setLoading(true);
     setError(null);
     coderDirs(r)
       .then((res) => {
-        setCurrent(r);
+        // The server resolves `~` and returns the absolute path — adopt it so
+        // Up/child navigation and the footer preview use a real path.
+        setCurrent(res.root || r);
         setExists(res.exists && res.isDir);
         setDirs(res.dirs || []);
       })
