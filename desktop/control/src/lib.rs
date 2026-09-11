@@ -77,10 +77,55 @@ pub fn build_router(state: S) -> Router {
         .fallback_service(
             tower_http::services::ServeDir::new(dist).not_found_service(spa),
         )
-        // Allow the bundled webview (origin tauri://localhost) to call the
-        // in-process control plane on 127.0.0.1:8787 (cross-origin in release
-        // builds). Permissive is acceptable for a loopback-only local app.
-        .layer(tower_http::cors::CorsLayer::permissive())
+        // The bundled webview (origin tauri://localhost) may call the
+        // in-process control plane on 127.0.0.1 cross-origin in release
+        // builds; dev Vite proxies server-side. Anything else — i.e. random
+        // websites — must not be able to call this API: allow-list origins
+        // instead of the previous permissive CORS, and reject foreign Host
+        // headers (DNS rebinding) below.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin([
+                    header::HeaderValue::from_static("tauri://localhost"),
+                    header::HeaderValue::from_static("http://tauri.localhost"),
+                    header::HeaderValue::from_static("http://localhost:5173"),
+                    header::HeaderValue::from_static("http://127.0.0.1:5173"),
+                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([header::CONTENT_TYPE]),
+        )
+        .layer(axum::middleware::from_fn(guard_local_host))
+}
+
+/// Reject requests whose Host (or Origin) does not point at this machine.
+/// A loopback API is still browser-reachable through DNS rebinding: an
+/// attacker page rebinds its own domain to 127.0.0.1 and the browser sends
+/// same-origin requests with the attacker's Host header. Checking Host closes
+/// that vector for every route at once.
+async fn guard_local_host(req: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    // Strip the port ("[::1]:8787" -> "[::1]"); IPv6 literals keep brackets.
+    let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host_ok = matches!(bare, "127.0.0.1" | "localhost" | "[::1]" | "::1" | "tauri.localhost");
+    let origin_ok = match req.headers().get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        Some(o) => {
+            let bare = o
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_start_matches("tauri://");
+            bare.starts_with("127.0.0.1")
+                || bare.starts_with("localhost")
+                || bare.starts_with("[::1]")
+                || bare.starts_with("tauri.localhost")
+        }
+        None => true, // non-browser clients (curl, the engine probe) send none
+    };
+    if host_ok && origin_ok {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "forbidden host").into_response()
+    }
 }
 
 pub async fn serve(state: S, port: u16) -> std::io::Result<()> {

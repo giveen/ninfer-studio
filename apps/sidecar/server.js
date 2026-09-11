@@ -73,7 +73,7 @@ function startBgJob(command, relCwd, timeoutMs, sessionId) {
   execCommand(command, relCwd, timeoutMs, sessionId, { onSpawn: (proc) => { rec.proc = proc; } }).then((r) => {
     Object.assign(rec, { done: true, proc: null, exitCode: r.exitCode, timedOut: !!r.timedOut, truncated: !!r.truncated, stdout: r.stdout || '', stderr: r.stderr || '' });
   }).catch((e) => {
-    Object.assign(rec, { done: true, proc: null, stdout: '', stderr: String(e?.message || e) });
+    Object.assign(rec, { done: true, proc: null, stdout: '', stderr: e instanceof Error ? e.message : String(e) });
   });
   return id;
 }
@@ -1885,7 +1885,8 @@ async function handleCoder(req, res, p, url) {
           truncated: (diff.stdout || '').length > 60000,
         });
       } catch (e) {
-        return sendJson(res, 200, { files: [], diff: '', error: String(e?.message || e) });
+        console.error('[coder] diff failed:', e instanceof Error ? e.stack : e);
+        return sendJson(res, 200, { files: [], diff: '', error: 'diff failed — see sidecar log' });
       }
     }
     if (p === '/api/coder/memory' && req.method === 'GET') {
@@ -2190,11 +2191,24 @@ async function handleCoder(req, res, p, url) {
 // ---------------------------------------------------------------------------
 // HTTP layer
 // ---------------------------------------------------------------------------
+// Reflect the Origin in CORS only when it is this machine or the Tauri
+// webview. A loopback API is otherwise callable by any website the user
+// visits; combined with DNS rebinding that turns every route into a remote
+// file/exec primitive.
+function corsOrigin(req) {
+  const origin = req.headers.origin || '';
+  const local =
+    /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(origin) ||
+    origin.startsWith('tauri://') ||
+    origin.startsWith('http://tauri.localhost');
+  return local ? { 'access-control-allow-origin': origin } : {};
+}
+
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
     'content-type': 'application/json',
-    'access-control-allow-origin': '*',
+    ...corsOrigin(res.req),
     'access-control-allow-headers': 'content-type, authorization, x-api-key',
     'access-control-allow-methods': 'GET,POST,OPTIONS',
   });
@@ -2368,7 +2382,7 @@ async function proxyToEngine(req, res, targetPath) {
         'content-type': upstreamRes.headers['content-type'] || 'application/json',
         'cache-control': 'no-cache',
         'x-request-id': upstreamRes.headers['x-request-id'] || '',
-        'access-control-allow-origin': '*',
+        ...corsOrigin(req),
       });
       if (req.method === 'HEAD') return res.end();
       upstreamRes.on('data', (chunk) => {
@@ -2393,9 +2407,16 @@ const server = createServer(async (req, res) => {
   const p = url.pathname;
 
   try {
+    // DNS-rebinding guard: browsers send the (rebound) attacker domain as
+    // Host; local clients send loopback names. No Host header = HTTP/1.0
+    // client, which cannot be a browser and cannot rebind.
+    const bareHost = (req.headers.host || '').replace(/:\d+$/, '');
+    if (bareHost && !['127.0.0.1', 'localhost', '[::1]', '::1'].includes(bareHost)) {
+      return sendJson(res, 403, { error: 'forbidden host' });
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'access-control-allow-origin': '*',
+        ...corsOrigin(req),
         'access-control-allow-headers': 'content-type, authorization, x-api-key',
         'access-control-allow-methods': 'GET,POST,OPTIONS',
       });
@@ -2511,7 +2532,8 @@ const server = createServer(async (req, res) => {
           .sort((a, b) => a.localeCompare(b));
         return sendJson(res, 200, { root, exists: true, isDir: true, dirs });
       } catch (e) {
-        return sendJson(res, 200, { root, exists: false, isDir: false, dirs: [], error: e instanceof Error ? e.message : String(e) });
+        console.error('[coder] dirs scan failed:', e instanceof Error ? e.stack : e);
+        return sendJson(res, 200, { root, exists: false, isDir: false, dirs: [], error: 'scan failed — see sidecar log' });
       }
     }
 

@@ -690,7 +690,7 @@ const CONV_KEY = 'ninfier.coder.conversations.v2';
 const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
 
 function newConvId(): string {
-  return 'conv-' + Math.random().toString(36).slice(2, 10);
+  return 'conv-' + crypto.randomUUID();
 }
 function emptyConv(id: string): ConvMeta {
   return { id, title: 'New conversation', updatedAt: Date.now(), messages: [], ledger: [], todos: [], lastPromptTokens: 0 };
@@ -1348,7 +1348,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
-    setLedger((prev) => [...prev.slice(-999), { ...safe, id: Math.random().toString(36).slice(2), time: Date.now() }]);
+    setLedger((prev) => [...prev.slice(-999), { ...safe, id: crypto.randomUUID(), time: Date.now() }]);
   };
   // Rebuild the system prompt, refreshing the codebase map so the agent sees files
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
@@ -1582,7 +1582,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (r.exitCode === 0 && /^[0-9a-f]{5,40}$/i.test((r.stdout || '').trim())) commit = (r.stdout || '').trim();
     } catch { /* not a git repo — transcript-only checkpoint */ }
     const cp: Checkpoint = {
-      id: 'cp-' + Math.random().toString(36).slice(2, 10),
+      id: 'cp-' + crypto.randomUUID(),
       time: Date.now(), label: commit ? commit.slice(0, 7) : 'transcript',
       commit, messages: messages.length, ledger: ledger.length, todos,
     };
@@ -1616,7 +1616,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const keptLedger = ledger.slice(0, cp.ledger);
     setMessages(keptMessages);
     setTodos(cp.todos);
-    setLedger([...keptLedger, { id: Math.random().toString(36).slice(2), time: Date.now(), type: 'compact', label: 'restore', detail: `restored checkpoint ${cp.label}` }]);
+    setLedger([...keptLedger, { id: crypto.randomUUID(), time: Date.now(), type: 'compact', label: 'restore', detail: `restored checkpoint ${cp.label}` }]);
     // Write the store explicitly: restoring to an empty transcript would trip
     // the L1 anti-clobber guard in the persist effect and lose the restore.
     setStore((prev) => {
