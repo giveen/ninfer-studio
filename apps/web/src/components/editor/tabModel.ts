@@ -3,7 +3,9 @@
  *
  * UI-free (no JSX): owns the tab list, live docs (ref map — see the doc-churn
  * note below), dirty/conflict tracking, the mid-run sidecar-hold gate, the
- * workspace-switch generation guard, save-and-lint, and git status badges.
+ * workspace-switch generation guard + per-workspace tab snapshots (open tabs
+ * and unsaved docs persist across a workspace round-trip), save-and-lint,
+ * and git status badges.
  *
  * Doc-churn control: the hook lives inside CoderScreen (a ~4700-line
  * component), so per-keystroke React state would re-render the whole screen on
@@ -87,7 +89,17 @@ export interface FileTabsApi {
 }
 
 const MAX_TABS = 24;
+/** Cap on remembered per-workspace tab sets (LRU-ish: first-inserted evicted). */
+const MAX_WS_SNAPSHOTS = 8;
 const POLL_MS = 8000;
+
+/** Serializable per-workspace tab state, restored on workspace round-trip. */
+interface WsSnapshot {
+  tabs: EditorTab[];
+  /** Live (unsaved) docs: tab id → current editor text. */
+  docs: Map<string, string>;
+  activeTabId: string | null;
+}
 const NOTFOUND_RE = /not found|ENOENT|HTTP 404/i;
 
 /** `postJSON` resolves the body even on 4xx/5xx (it has no `r.ok` check,
@@ -135,6 +147,11 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
   const lintSeqRef = useRef(0);
   /** Live docs: tab id → current editor text (updated per keystroke). */
   const docRef = useRef(new Map<string, string>());
+  /** Per-workspace snapshots of the open tab set (see the switch effect
+   *  below) + the last-seen activeWsDir, so a switch can snapshot the
+   *  workspace being left and restore the one being entered. */
+  const perWsRef = useRef(new Map<string, WsSnapshot>());
+  const prevWsRef = useRef<string | null>(null);
 
   const ready = (): boolean => {
     const o = optsRef.current;
@@ -159,18 +176,6 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     },
     [],
   );
-
-  // ---- Workspace switch: close ALL tabs, invalidate in-flight reads, reset
-  // the git-status map (known stale-content bug class — do not reintroduce).
-  useEffect(() => {
-    genRef.current += 1;
-    readSeqRef.current.clear();
-    docRef.current.clear();
-    setTabs([]);
-    setActiveTabId(null);
-    setStatusMap(new Map());
-    setNotice(null);
-  }, [opts.activeWsDir]);
 
   /** Read disk for one tab and apply the compare/adopt/conflict logic
    *  (spec 3.6). `path`/`kind` are passed in (they are stable per tab) because
@@ -255,6 +260,68 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     },
     [patchTab],
   );
+
+  // ---- Workspace switch: snapshot the tabs of the workspace being left
+  // (VS Code-style: open tabs AND unsaved docs persist per workspace),
+  // restore the target workspace's snapshot if it has one, and re-read every
+  // restored tab against disk — the existing compare/adopt/conflict logic
+  // means a file edited while we were away is adopted (clean tab) or raises
+  // the conflict banner (dirty tab), never a silent overwrite. In-flight
+  // reads from the old generation are invalidated as before (known
+  // stale-content bug class — do not reintroduce).
+  useEffect(() => {
+    genRef.current += 1;
+    const prevWs = prevWsRef.current;
+    const curTabs = tabsRef.current;
+    if (prevWs && prevWs !== opts.activeWsDir && curTabs.length > 0) {
+      const docs = new Map<string, string>();
+      const snap: EditorTab[] = curTabs.map((t) => {
+        const live = docRef.current.get(t.id) ?? t.doc;
+        docs.set(t.id, live);
+        return {
+          ...t,
+          doc: live,
+          // A mid-load tab re-reads on restore; 'ready' lets readDisk take
+          // the compare/adopt path instead of the unconditional-adopt path.
+          status: t.status === 'loading' ? 'ready' : t.status,
+          // Stale across a round-trip — refreshed by the restore re-read / CoderScreen's git poll.
+          linting: false,
+          diags: [],
+          gitStatus: undefined,
+        };
+      });
+      perWsRef.current.set(prevWs, { tabs: snap, docs, activeTabId: activeTabIdRef.current });
+      if (perWsRef.current.size > MAX_WS_SNAPSHOTS) {
+        const oldest = perWsRef.current.keys().next().value;
+        if (oldest != null) perWsRef.current.delete(oldest);
+      }
+    }
+    prevWsRef.current = opts.activeWsDir;
+    readSeqRef.current.clear();
+    docRef.current.clear();
+    setStatusMap(new Map());
+    setNotice(null);
+    const snap = opts.activeWsDir ? perWsRef.current.get(opts.activeWsDir) : undefined;
+    if (!snap) {
+      setTabs([]);
+      setActiveTabId(null);
+      return;
+    }
+    perWsRef.current.delete(opts.activeWsDir!);
+    for (const [id, doc] of snap.docs) docRef.current.set(id, doc);
+    setTabs(snap.tabs);
+    setActiveTabId(snap.activeTabId);
+    // Sidecar-hold gate: while a run pins the sidecar elsewhere, show the
+    // snapshot as-is; the next refresh (activation re-check / run poll /
+    // wsFlushed git poll) picks up the disk state.
+    if (ready()) {
+      void Promise.all(
+        snap.tabs
+          .filter((t) => (t.kind === 'code' ? !t.truncated : true))
+          .map((t) => readDisk(t.id, t.path, t.kind)),
+      );
+    }
+  }, [opts.activeWsDir, readDisk]);
 
   const refreshGitStatus = useCallback(async () => {
     const o = optsRef.current;

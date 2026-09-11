@@ -223,6 +223,12 @@ export default function EditorPane(props: EditorPaneProps) {
             value={tab.doc}
             readOnly={tab.truncated}
             theme="none"
+            // The @uiw wrapper renders its own <div class="cm-theme"> around
+            // .cm-editor with no height of its own; without h-full the
+            // .cm-editor { height: 100% } resolves against an auto-height
+            // parent and the editor grows to content height, clipping in the
+            // overflow-hidden box with no scrollbar.
+            className="h-full"
             height="100%"
             basicSetup={{ foldGutter: true, highlightActiveLine: true, autocompletion: true }}
             extensions={extensions}
