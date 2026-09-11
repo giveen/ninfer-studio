@@ -2320,29 +2320,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   /** Stage + auto-commit one file, returning a bounded unified-diff preview. */
-  const commitFile = async (path: string, message: string): Promise<{ ok: boolean; preview: string }> => {
+  const commitFile = async (path: string, message: string, signal?: AbortSignal): Promise<{ ok: boolean; preview: string }> => {
     const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000);
+    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000, undefined, false, signal);
     if (c.exitCode !== 0) return { ok: false, preview: '' };
-    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000);
+    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal);
     return { ok: true, preview: (d.stdout || '').slice(0, 4000) };
   };
   /** Post-edit verification: lint (falls back to build) then test, each bounded.
    * Returns extra result fields; the first failure stops the chain so the
    * model sees one error to fix at a time. */
-  const runPostEditChecks = async (res: unknown, preview: string): Promise<Record<string, unknown>> => {
+  const runPostEditChecks = async (res: unknown, preview: string, signal?: AbortSignal): Promise<Record<string, unknown>> => {
     const out: Record<string, unknown> = { ...(res as Record<string, unknown>), ...(preview ? { preview_diff: preview } : {}) };
     const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
     const lintCmd = cmds.lint || cmds.build;
     if (lintCmd) {
-      const check = await coderExec(lintCmd, undefined, 120000);
+      const check = await coderExec(lintCmd, undefined, 120000, undefined, false, signal);
       if (check.exitCode !== 0) {
         const diags = parseDiagnostics(lintCmd, check.stderr || check.stdout || '');
         return { ...out, linter_error: (check.stderr || check.stdout || '').slice(0, 8000), diagnostics: diags };
       }
     }
     if (cmds.test) {
-      const t = await coderExec(cmds.test, undefined, 180000);
+      const t = await coderExec(cmds.test, undefined, 180000, undefined, false, signal);
       if (t.exitCode !== 0) {
         const diags = parseDiagnostics(cmds.test, t.stderr || t.stdout || '');
         return { ...out, test_error: (t.stderr || t.stdout || '').slice(0, 8000), diagnostics: diags };
@@ -2353,7 +2353,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
     let mutated = false;
-    
+    // Passed to every tool-call API call below so Stop actually cancels an
+    // in-flight one instead of only taking effect on the next loop turn.
+    const toolSignal = abortRef.current?.signal ?? new AbortController().signal;
+
     for (const call of calls) {
       let result = '';
       const t0 = performance.now();
@@ -2416,7 +2419,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             if (commitBlocked) {
               result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
             } else {
-              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true);
+              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true, toolSignal);
               result = JSON.stringify(res);
               if (args.background === true) mutated = true;
               if (res.jobId) {
@@ -2429,7 +2432,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } else if (call.name === 'bash_poll') {
           logType = 'bash'; logDetail = `poll ${args.jobId}`;
           try {
-            const res = await coderJob(String(args.jobId || ''));
+            const res = await coderJob(String(args.jobId || ''), toolSignal);
             result = JSON.stringify(res);
             setJobStatus((prev) => ({ ...prev, [res.jobId]: res }));
           } catch (e) {
@@ -2437,43 +2440,43 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;
-          const res = await coderRead(args.path, args.offset, args.limit);
+          const res = await coderRead(args.path, args.offset, args.limit, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'write') {
           logType = 'write'; logDetail = args.path;
-          const res = await coderWrite(args.path, args.content);
+          const res = await coderWrite(args.path, args.content, toolSignal);
           mutated = true;
           if (commitApproval) {
             // Gate ON: don't auto-commit; let the human review + approve a real commit.
-            result = JSON.stringify(await runPostEditChecks(res, ''));
+            result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
           } else {
-            const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`);
-            result = JSON.stringify(await runPostEditChecks(res, preview));
+            const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`, toolSignal);
+            result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
           }
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
-          const res = await coderEdit(args.path, args.old, args.new, args.replaceAll);
+          const res = await coderEdit(args.path, args.old, args.new, args.replaceAll, toolSignal);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
             if (commitApproval) {
-              result = JSON.stringify(await runPostEditChecks(res, ''));
+              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
-              const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`);
-              result = JSON.stringify(await runPostEditChecks(res, preview));
+              const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`, toolSignal);
+              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
         } else if (call.name === 'apply_patch') {
           logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
-          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []);
+          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], toolSignal);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
             if (commitApproval) {
-              result = JSON.stringify(await runPostEditChecks(res, ''));
+              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
-              const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`);
-              result = JSON.stringify(await runPostEditChecks(res, preview));
+              const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`, toolSignal);
+              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
         } else if (call.name === 'git_branch') {
@@ -2481,7 +2484,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           if (action === 'list') {
-            const r = await coderExec(`git branch --show-current && git branch --format='%(refname:short)'`, undefined, 15000);
+            const r = await coderExec(`git branch --show-current && git branch --format='%(refname:short)'`, undefined, 15000, undefined, false, toolSignal);
             const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
             result = JSON.stringify({ current: lines[0] || '', branches: lines.slice(1), ...r });
           } else if (action === 'create' || action === 'switch') {
@@ -2492,7 +2495,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify({ error: `invalid branch name: ${name}` });
             } else {
               const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
-              const r = await coderExec(cmd, undefined, 30000);
+              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
               result = JSON.stringify(r);
               if (r.exitCode === 0) mutated = true;
             }
@@ -2504,7 +2507,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'bash'; logDetail = `git worktree ${action}${args.path ? ` ${args.path}` : ''}`;
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           if (action === 'list') {
-            const r = await coderExec('git worktree list', undefined, 15000);
+            const r = await coderExec('git worktree list', undefined, 15000, undefined, false, toolSignal);
             const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
             result = JSON.stringify({ worktrees: lines, ...r });
           } else if (action === 'add') {
@@ -2516,7 +2519,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
             } else {
               const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
-              const r = await coderExec(cmd, undefined, 30000);
+              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
               result = JSON.stringify(r);
               if (r.exitCode === 0) {
                 // Link the conversation to this new worktree
@@ -2548,36 +2551,36 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             }
             return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
           };
-          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000);
+          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, undefined, false, toolSignal);
           const branch = (br.stdout || '').trim();
           if (!branch || branch === 'HEAD') {
             result = JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
           } else {
-            const st = await coderExec('git status --porcelain', undefined, 10000);
+            const st = await coderExec('git status --porcelain', undefined, 10000, undefined, false, toolSignal);
             if ((st.stdout || '').trim()) {
               result = JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
             } else {
-              const rm = await coderExec('git remote', undefined, 10000);
+              const rm = await coderExec('git remote', undefined, 10000, undefined, false, toolSignal);
               const remote = (rm.stdout || '').trim().split('\n')[0];
               if (!remote) {
                 result = JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
               } else {
                 const base = String(args.base || '').trim()
-                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000)).stdout.trim()
+                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, undefined, false, toolSignal)).stdout.trim()
                   || 'main';
-                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000);
+                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, undefined, false, toolSignal);
                 if (push.exitCode !== 0) {
                   result = JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
                 } else {
-                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000);
+                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, undefined, false, toolSignal);
                   if ((gh.stdout || '').trim() === 'yes') {
                     let cmd = `gh pr create --title ${q(args.title)} --body ${q(args.body || '')}`;
                     if (base) cmd += ` --base ${q(base)}`;
-                    const pr = await coderExec(cmd, undefined, 60000);
+                    const pr = await coderExec(cmd, undefined, 60000, undefined, false, toolSignal);
                     const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
                     result = JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
                   } else {
-                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000);
+                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, undefined, false, toolSignal);
                     const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
                     result = JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
                   }
@@ -2587,27 +2590,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         } else if (call.name === 'repo_search') {
           logType = 'read'; logDetail = `search: ${String(args.query ?? '').slice(0, 30)}`;
-          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15);
+          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, toolSignal);
           result = JSON.stringify(sr);
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
-          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200);
+          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'glob') {
           logType = 'glob'; logDetail = args.pattern;
-          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200);
+          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'ast_grep') {
           logType = 'grep'; logDetail = `[AST] ${args.pattern}`;
-          const res = await coderExec(`sg -p '${args.pattern.replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000);
+          const res = await coderExec(`sg -p '${args.pattern.replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'web_fetch') {
           logType = 'web'; logDetail = args.url;
-          const res = await coderWebFetch(args.url);
+          const res = await coderWebFetch(args.url, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'web_search') {
           logType = 'web'; logDetail = args.query;
-          const res = await coderWebSearch(args.query);
+          const res = await coderWebSearch(args.query, toolSignal);
           result = JSON.stringify(res);
         } else if (call.name === 'git_commit') {
           logType = 'bash'; logDetail = `git commit ${args.files}`;
@@ -2631,7 +2634,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             : ['-A'];
           const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
           const message = args.message || 'Agent commit';
-          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000);
+          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, undefined, false, toolSignal);
           result = JSON.stringify(commitRes);
           // Note: a commit doesn't change the file tree, so we deliberately do
           // NOT set mutated=true (which would trigger a repo-map rescan, M5).
@@ -2644,7 +2647,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const refArg = ref ? q(ref) : '';
           const pathArg = pathTokens.map(q).join(' ');
           const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
-          const diffRes = await coderExec(cmd, undefined, 30000);
+          const diffRes = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
           result = JSON.stringify(diffRes);
         } else if (call.name === 'ask_user') {
           // Pause the run and surface the question to the user. We record the
@@ -2691,16 +2694,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             updateRunTodos(cleaned, Date.now());
             result = JSON.stringify({ success: true, count: cleaned.length });
           }
-        } else if (call.name === 'memory_update') {
-          // Declared in TOOLS but previously unhandled — calls landed in the
-          // "Unknown tool" branch and the learning was silently lost.
-          const kind = args.kind === 'avoid' || args.kind === 'success' ? args.kind : 'tip';
-          logType = 'todo'; logDetail = `memory: ${kind}`;
-          const res = await coderMemoryAddLearning({ text: String(args.text || ''), kind });
-          result = JSON.stringify(res ?? { success: true });
         } else if (call.name === 'delegate') {
           logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, abortRef.current?.signal ?? new AbortController().signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined);
+          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined);
           result = JSON.stringify({ summary: res });
         } else if (call.name === 'subagent') {
           // Implementation subagent (worker): spawn a focused agent, capture its
@@ -2718,7 +2714,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label: 'subagent', task: task.slice(0, 100), since: Date.now(), ws: activeWsDir }]);
           try {
             let preTree = '';
-            try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
+            try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
             let res = { summary: '', diff: '', ok: false };
             let critique = '';
             const MAX_WORKER_CRIT = 2;
@@ -2726,7 +2722,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               const p = attempt === 0
                 ? `TASK (implement now):\n${task}`
                 : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
-              res = await runWorker('subagent', p, wmodel, abortRef.current?.signal ?? new AbortController().signal, 12, workerTools);
+              res = await runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
               if (criticMode && res.diff.trim()) {
                 const c = await runCritic(res.diff, task);
                 if (c.learnings.length) {
@@ -2743,9 +2739,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // Net diff across all worker attempts (git write-tree before/after).
             let diff = res.diff;
             try {
-              const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
+              const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim();
               if (preTree && postTree && preTree !== postTree) {
-                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
+                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, toolSignal);
                 diff = (d.stdout || '').slice(0, 60000);
               }
             } catch { /* keep res.diff */ }
@@ -2769,7 +2765,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             result = JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
           } else {
             try {
-              const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' });
+              const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' }, toolSignal);
               // The write landed in the store the control points at *now*;
               // adopt it into the active workspace's state only if that is
               // still the confirmed workspace.
@@ -2835,16 +2831,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch { /* unknown — fail closed below */ }
     return 1;
   };
-  const runReadOnlyCall = async (call: AgentToolCall): Promise<string> => {
+  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal): Promise<string> => {
     try {
       const args = JSON.parse(call.arguments);
       switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
+        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal));
+        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
+        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
+        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
     } catch (e) {
@@ -2889,7 +2885,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
         } else {
-          const res = await runReadOnlyCall(call);
+          const res = await runReadOnlyCall(call, signal);
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
         }
       }
@@ -2905,16 +2901,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     try {
       const args = JSON.parse(call.arguments);
       switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query));
-        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15));
-        case 'write': return JSON.stringify(await coderWrite(args.path, args.content));
-        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll));
-        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []));
+        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal));
+        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
+        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
+        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
+        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, signal));
+        case 'write': return JSON.stringify(await coderWrite(args.path, args.content, signal));
+        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll, signal));
+        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], signal));
         case 'bash': {
           const command0 = String(args.command || '');
           // Same risky-command + commit-approval HITL gates the supervisor's
@@ -2942,7 +2938,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // environment (export / venv / conda activation) survive across calls;
           // background jobs get their own process and stay stateless.
           const sid = !args.background && activeWsDir ? 'sh:' + activeWsDir : (args.background ? activeWsDir : undefined);
-          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true);
+          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true, signal);
           // Register with the Jobs panel — previously a worker's background
           // job had no panel entry and so no way to see or kill it.
           if (res.jobId) {
@@ -2951,8 +2947,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
           return JSON.stringify(res);
         }
-        case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || '')));
-        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000));
+        case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || ''), signal));
+        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal));
         case 'delegate': {
           const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined, depth + 1);
           return JSON.stringify({ summary: r });
@@ -2982,11 +2978,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let preTree = '';
-    try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
+    try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal)).stdout.trim(); } catch { /* no git */ }
     let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
     let summary = '';
+    // Set only when the loop runs out of steps without the model finishing —
+    // used below so that outcome is reported like every other bounded loop
+    // (delegate/scout already return "(subagent step budget reached)")
+    // instead of silently returning ok:true with a thin/empty summary.
+    let budgetReached = false;
     try {
-      for (let step = 0; step < maxSteps; step++) {
+      let step = 0;
+      for (; step < maxSteps; step++) {
         if (signal.aborted) break;
         let content = '';
         let toolCalls: AgentToolCall[] = [];
@@ -3004,10 +3006,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
         }
       }
+      if (step >= maxSteps) budgetReached = true;
     } catch (e) {
       summary = `(worker ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
     }
+    if (budgetReached) {
+      summary = `(worker ${label} reached its step budget of ${maxSteps} before finishing — partial work may be present)${summary ? `\n\nLast partial output:\n${summary}` : ''}`;
+    }
     let diff = '';
+    // Deliberately not gated on `signal` (unlike the loop above): even after
+    // a Stop, whatever the worker already changed on disk should still be
+    // surfaced as a diff instead of silently discarded.
     try {
       const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
       if (preTree && postTree && preTree !== postTree) {
@@ -3443,7 +3452,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // than finishing with broken code.
           let bounced = false;
           if (verifyMode && repairCount < MAX_REPAIR) {
-            const v = await runPostEditChecks({}, '');
+            const v = await runPostEditChecks({}, '', abortRef.current?.signal);
             if (v.linter_error || v.test_error) {
               repairCount++;
               const summary = String(v.linter_error || v.test_error || '').slice(0, 2500);
