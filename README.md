@@ -29,8 +29,18 @@ Linux, WebView2 on Windows) for the
   from the engine's own measured KV density across the registered artifacts
   (192k long-context MTP, 128k bf16, C=4 nvfp4 serving, 96k low-latency, 128k MoE,
   and two 256k ultra-context presets at the variants' full 262,144-token native
-  window — k8v4 dual-lane and NVFP4 single-lane). The engine does no rope scaling,
-  so `max_context` above a variant's native capacity fails at startup.
+  window — k8v4 dual-lane and NVFP4 single-lane) plus a **community-validated**
+  262k fp8 profile ported from `headpiece747/ninfer-5090-windows` (MTP5, prefill
+  chunk 1024). The engine does no rope scaling, so `max_context` above a variant's
+  native 262,144 fails at startup.
+- **Community ecosystem** — the engine (`Neroued/ninfer`) has an active community:
+  63 GitHub repos and ~20 Hugging Face `.ninfer` artifact repos. Notable forks add
+  features upstream lacks (splickz's `rk4v4-e8` E8-lattice 4-bit KV with YaRN-style
+  rope scaling for ~600k-token contexts; Azhu9701's NVMe disk cache and MTP7).
+  Studio targets upstream and deliberately does not emit fork-only flags — they
+  fail upstream validation. Upstream `--spec mtp` accepts draft tokens 1–5 only;
+  dflash/dflash2 accept 1–15. At 262k context on a 32 GB card, keep
+  `--max-concurrency` at 1–4 (community-verified: C=8 fails startup).
 - **VRAM safety floor** — after load, Studio tails the engine's `capacity` log line
   (its own runtime/free VRAM accounting) and warns when free VRAM drops under the
   1.8 GiB safety floor, before an OOM can kill the run mid-generation. Works for

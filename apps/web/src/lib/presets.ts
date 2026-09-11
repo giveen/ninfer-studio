@@ -246,6 +246,27 @@ export const PRESETS: Preset[] = [
       preserveThinking: true,
     },
   },
+  {
+    id: 'community-262k-fp8',
+    name: 'Community 262k fp8 (5090)',
+    description:
+      'Community-validated profile (headpiece747/ninfer-5090-windows): full 262,144-token window, fp8 KV (~24.9 tok/MiB → ~10.1 GiB pool), single lane, prefill-chunk 1024, MTP5 — the upstream draft ceiling (~207–221 tok/s decode, ~80% acceptance measured). Best recall of the quantized KV types. On a 20 GiB nvfp4 artifact expect ~30 GiB total: right at the safety floor, watch the VRAM warning.',
+    profile: {
+      port: 8080,
+      maxContext: 262_144,
+      kvCapacity: 262_144,
+      maxConcurrency: 1,
+      prefillChunk: 1024,
+      kvDtype: 'fp8',
+      deviceStateSlots: 1,
+      hostStateSlots: 8,
+      hostKvMib: 8192,
+      spec: 'mtp',
+      draftTokens: 5,
+      lmHeadDraft: true,
+      preserveThinking: true,
+    },
+  },
 ];
 
 export const KV_DTYPES = ['bf16', 'int8', 'fp8', 'nvfp4', 'k8v4'] as const;
