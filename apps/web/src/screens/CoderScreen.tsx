@@ -48,6 +48,7 @@ const WORKER_SYSTEM = `You are a focused implementation subagent inside a coding
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
+- If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
 - When the task is complete, STOP calling tools and reply with a concise summary: what you changed, the files touched, and any build/test commands you ran.
 - Stay strictly scoped to the assigned task.`;
 
@@ -2715,12 +2716,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             let preTree = '';
             try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
+            addLog({ type: 'read', label: 'subagent', detail: 'ideation pass (candidate approaches)' });
+            const ideation = await runIdeation(task, wmodel, toolSignal);
             let res = { summary: '', diff: '', ok: false };
             let critique = '';
+            let prevCritique = '';
             const MAX_WORKER_CRIT = 2;
             for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
               const p = attempt === 0
-                ? `TASK (implement now):\n${task}`
+                ? `TASK (implement now):\n${task}${ideation ? `\n\nCandidate approaches to consider (from an ideation pass -- pick one, don't just list them):\n${ideation}` : ''}`
                 : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
               res = await runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
               if (criticMode && res.diff.trim()) {
@@ -2729,7 +2733,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                   await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
                 }
                 if (!c.approved) {
-                  critique = c.issues;
+                  // Stuck detection: if the reviewer raises the same issues
+                  // again, the worker isn't converging on a fix — stop
+                  // burning the remaining retries on a repeat.
+                  if (attempt > 0 && c.issues.trim().toLowerCase() === prevCritique.trim().toLowerCase()) {
+                    critique = c.issues;
+                    addLog({ type: 'error', label: 'critic', detail: 'same issues raised again — worker not converging, stopping retries early' });
+                    break;
+                  }
+                  prevCritique = critique = c.issues;
                   addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
                   continue;
                 }
@@ -2960,6 +2972,55 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
   };
 
+  /** Summarize a worker turn that was cut off by the token limit, so the next
+   *  step sees a coherent "what was attempted" note instead of raw truncated
+   *  (possibly mid-codeblock) text polluting its own context. */
+  const summarizeCutoff = async (partial: string, model: string, signal: AbortSignal): Promise<string> => {
+    const snippet = partial.length <= 9000 ? partial : `${partial.slice(0, 3500)}\n...[middle omitted]...\n${partial.slice(-5500)}`;
+    let out = '';
+    try {
+      await trackedStream(
+        buildChatRequest(
+          model,
+          "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
+          [{ role: 'user', content: `CUT-OFF ATTEMPT:\n${snippet}` }],
+          { thinking: false, maxTokens: 512 } as ChatParams,
+          {},
+          coderParams.promptCache,
+        ),
+        signal,
+        'worker-cutoff-summary',
+        { onContentDelta: (t) => { out += t; } },
+      );
+    } catch { /* best-effort — fall through to the generic message below */ }
+    return out.trim() || '(the cut-off attempt could not be summarized)';
+  };
+
+  /** Fresh-context brainstorm before any code is written: propose several
+   *  genuinely distinct candidate approaches with pitfalls, no code yet. One
+   *  cheap call that steers the worker away from committing to the first
+   *  idea that comes to mind. Best-effort — an empty result just means the
+   *  worker proceeds without ideation notes. */
+  const runIdeation = async (task: string, model: string, signal: AbortSignal): Promise<string> => {
+    let out = '';
+    try {
+      await trackedStream(
+        buildChatRequest(
+          model,
+          'You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.',
+          [{ role: 'user', content: `TASK:\n${task}` }],
+          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: 0.4, maxTokens: 1024 } as ChatParams,
+          {},
+          coderParams.promptCache,
+        ),
+        signal,
+        'ideation',
+        { onContentDelta: (t) => { out += t; } },
+      );
+    } catch { /* best-effort */ }
+    return out.trim();
+  };
+
   // Run an autonomous implementation worker: a focused agent loop that shares the
   // workspace. Captures the net working-tree change (git write-tree before/after)
   // so the supervisor gets a clean per-task diff regardless of commits/edits.
@@ -2992,12 +3053,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         if (signal.aborted) break;
         let content = '';
         let toolCalls: AgentToolCall[] = [];
+        let finishReason: string | undefined;
         await trackedStream(
           buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
           signal,
           'worker',
-          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
+          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; }, onDone: (meta) => { finishReason = meta.finishReason; } },
         );
+        if (finishReason === 'length' && toolCalls.length === 0) {
+          // Cut off mid-generation with no tool call parsed — the raw text is
+          // likely a half-written code block or mid-sentence. Feeding that
+          // straight back as the "assistant" turn tends to confuse the next
+          // step, so summarize it instead (mirrors GVS5H's cut-off handling).
+          const digest = await summarizeCutoff(content, model, signal);
+          summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
+          msgs = [...msgs, { role: 'assistant', content: `[cut off at the token limit — summary of the partial attempt]\n${digest}` }];
+          continue;
+        }
         summary = content.trim() || summary;
         msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
         if (toolCalls.length === 0) break;
