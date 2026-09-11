@@ -6,6 +6,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import type { ReactNode } from 'react';
+import { openExternalLink } from '../lib/externalLink';
 
 function textOf(node: ReactNode): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -102,7 +103,13 @@ export function Markdown({ children }: { children: string }) {
         },
         a: ({ href, children }) => {
           return (
-            <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline transition-colors break-words">
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-accent hover:underline transition-colors break-words"
+              onClick={(e) => openExternalLink(e, href)}
+            >
               {children}
             </a>
           );

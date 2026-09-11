@@ -15,6 +15,7 @@ import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderE
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
+import { openExternalLink } from '../lib/externalLink';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -463,7 +464,7 @@ function WebSearchResultView({ data }: { data: any }) {
         {data.results?.length === 0 && <div className="text-faint text-xs italic">No results found.</div>}
         {data.results?.map((r: any, i: number) => (
           <div key={i} className="flex flex-col gap-0.5">
-            <a href={r.url} target="_blank" rel="noreferrer" className="text-[11px] text-accent hover:underline truncate">{r.url}</a>
+            <a href={r.url} target="_blank" rel="noreferrer" className="text-[11px] text-accent hover:underline truncate" onClick={(e) => openExternalLink(e, r.url)}>{r.url}</a>
             <div className="text-[11px] text-mute line-clamp-2">{r.snippet}</div>
           </div>
         ))}
