@@ -1269,17 +1269,23 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn strip_extended_prefix_matches_windows_canonicalize_form() {
         use crate::types::strip_extended_prefix;
         assert_eq!(strip_extended_prefix("\\\\?\\C:\\tmp"), "C:\\tmp");
         assert_eq!(strip_extended_prefix("\\\\?/C:/tmp"), "C:/tmp");
         assert_eq!(strip_extended_prefix("//?/C:/tmp"), "C:/tmp");
+        // UNC: canonicalize yields `\\?\UNC\server\share` — a bare
+        // `UNC\server\share` would be relative, so the leading UNC
+        // separators must be restored to the picker's `\\server\share`.
+        assert_eq!(strip_extended_prefix("\\\\?\\UNC\\server\\share"), "\\\\server\\share");
+        assert_eq!(strip_extended_prefix("\\\\?/UNC/server/share"), "\\\\server\\share");
         // Plain paths pass through untouched.
         assert_eq!(strip_extended_prefix("C:\\tmp"), "C:\\tmp");
         assert_eq!(strip_extended_prefix("/home/dev/x"), "/home/dev/x");
         assert_eq!(strip_extended_prefix(""), "");
     }
+
+    #[test]
     fn destructive_commands_are_flagged() {
         // LazyLock compiles every pattern on first use — a bad port panics here.
         for cmd in [

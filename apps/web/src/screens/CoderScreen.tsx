@@ -723,6 +723,17 @@ function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
   }
   return msgs;
 }
+function stripExtPrefix(p: string): string {
+  let rest: string | null = null;
+  for (const pre of ['\\\\?\\', '\\\\?/', '//?/']) {
+    if (p.startsWith(pre)) { rest = p.slice(pre.length); break; }
+  }
+  if (rest === null) return p;
+  for (const unc of ['UNC\\', 'UNC/']) {
+    if (rest.startsWith(unc)) return '\\\\' + rest.slice(unc.length).replace(/\//g, '\\');
+  }
+  return rest;
+}
 function normalizeStore(s: CoderStore): CoderStore {
   const workspaces = { ...s.workspaces };
   // Windows migration: older builds stored the workspace key with Rust's
@@ -731,8 +742,8 @@ function normalizeStore(s: CoderStore): CoderStore {
   // duplicate workspace with a fresh conversation. Merge prefixed entries
   // into their plain twin (deduped by conversation id).
   for (const [key, ws] of Object.entries(workspaces)) {
-    if (!key.startsWith('\\\\?\\') && !key.startsWith('//?/')) continue;
-    const plain = key.slice(4);
+    const plain = stripExtPrefix(key);
+    if (plain === key) continue;
     delete workspaces[key];
     const twin = workspaces[plain];
     if (!twin) {
@@ -749,8 +760,7 @@ function normalizeStore(s: CoderStore): CoderStore {
     merged.activeConv = twin.activeConv && merged.conversations[twin.activeConv] ? twin.activeConv : merged.order[0] ?? '';
     workspaces[plain] = merged;
   }
-  let activeWs = s.activeWs;
-  if (activeWs.startsWith('\\\\?\\') || activeWs.startsWith('//?/')) activeWs = activeWs.slice(4);
+  let activeWs = stripExtPrefix(s.activeWs);
   let activeConv = s.activeConv;
   if (!activeWs || !workspaces[activeWs]) {
     activeWs = Object.keys(workspaces)[0] ?? '';
