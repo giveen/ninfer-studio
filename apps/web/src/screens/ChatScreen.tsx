@@ -295,13 +295,30 @@ const MessageRow = memo(function MessageRow({
           ) : (
             <>
               {m.attachments && m.attachments.length > 0 && (
-                <div className="mb-2 flex flex-wrap gap-1.5">
-                  {m.attachments.map((a, i) => (
-                    <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
-                      {a.kind === 'image' ? '🖼' : a.kind === 'video' ? '🎞' : '📄'} {a.name}
-                      {a.dataUrl && <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>}
-                    </span>
-                  ))}
+                <div className="mb-2 flex flex-wrap items-start gap-2">
+                  {m.attachments.map((a, i) =>
+                    a.kind === 'image' && a.dataUrl ? (
+                      <figure key={i} className="max-w-[280px]">
+                        <img
+                          src={a.dataUrl}
+                          alt={a.name}
+                          className="max-h-64 w-auto max-w-full rounded-md border border-line bg-panel2 object-contain"
+                          loading="lazy"
+                        />
+                        <figcaption className="mt-0.5 truncate text-[10.5px] text-faint">{a.name}</figcaption>
+                      </figure>
+                    ) : a.kind === 'video' && a.dataUrl ? (
+                      <figure key={i} className="max-w-[280px]">
+                        <video src={a.dataUrl} controls className="max-h-64 w-auto max-w-full rounded-md border border-line bg-black" />
+                        <figcaption className="mt-0.5 truncate text-[10.5px] text-faint">{a.name}</figcaption>
+                      </figure>
+                    ) : (
+                      <span key={i} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11px] text-mute">
+                        {a.kind === 'image' ? '🖼' : a.kind === 'video' ? '🎞' : '📄'} {a.name}
+                        {a.dataUrl && <span className="text-faint">{formatBytes(a.dataUrl.length * 0.75)}</span>}
+                      </span>
+                    ),
+                  )}
                 </div>
               )}
               {m.content && <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>}
@@ -1196,7 +1213,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             <div className="mb-2 flex flex-wrap gap-1.5 px-1">
               {attachments.map((a, i) => (
                 <span key={i} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
-                  {a.kind === 'image' ? '🖼' : '🎞'} {a.name}
+                  {a.kind === 'image' && a.dataUrl ? (
+                    <img src={a.dataUrl} alt="" className="h-7 w-7 rounded border border-line object-cover" />
+                  ) : a.kind === 'image' ? '🖼' : '🎞'}
+                  <span className="max-w-[140px] truncate">{a.name}</span>
                   <button type="button" onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))} className="text-faint hover:text-danger">
                     <X size={12} />
                   </button>
