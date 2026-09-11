@@ -1258,11 +1258,14 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
 /// every non-`[\w.-]` char mapped to `_`, kept to its last 160 chars — the
 /// exact transform the sidecar's `memDirFor` applies
 /// (`String(ws).replace(/[^\w.-]/g, '_').slice(-160)`), so sidecar- and app-written memory stay
-/// interchangeable.
+/// interchangeable. JS regexes match **UTF-16 code units**, so a non-BMP char
+/// (e.g. an emoji) contributes two `_` — process `encode_utf16()` to keep the
+/// two implementations in agreement (and slice the last 160 of those units).
 fn mem_dir(data_dir: &Path, ws: &str) -> PathBuf {
-    let slug: String = ws
-        .chars()
-        .map(|c| {
+    let units: Vec<char> = ws
+        .encode_utf16()
+        .map(|u| {
+            let c = char::from_u32(u as u32).unwrap_or('_');
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
                 c
             } else {
@@ -1270,8 +1273,47 @@ fn mem_dir(data_dir: &Path, ws: &str) -> PathBuf {
             }
         })
         .collect();
-    let start = slug.len().saturating_sub(160);
-    data_dir.join("coder-memory").join(&slug[start..])
+    let start = units.len().saturating_sub(160);
+    data_dir
+        .join("coder-memory")
+        .join(units[start..].iter().copied().collect::<String>())
+}
+
+/// Strip the Windows extended-length prefix (`\\?\` / `\\?/` / `//?/`) that
+/// `std::fs::canonicalize` adds, so the slug matches the plain form the
+/// sidecar's `path.resolve` produces. (PR #7 carries the public twin in
+/// `types.rs` for the workspace-identity fix; kept private here so the two
+/// PRs stay independently mergeable.)
+fn strip_ext_prefix(p: &str) -> &str {
+    for pre in ["\\\\?\\", "\\\\?/", "//?/"] {
+        if let Some(rest) = p.strip_prefix(pre) {
+            return rest;
+        }
+    }
+    p
+}
+
+/// The workspace string to slug — the same absolute-path policy as the
+/// sidecar's `path.resolve(ws)`: canonicalize when the path exists (real
+/// absolute path, `..` collapsed); otherwise best-effort (absolute as-is,
+/// relative joined against the control plane's cwd). Without this, a
+/// persisted *relative* workspace would slug here as relative while the
+/// sidecar slugs the cwd-resolved absolute path — silently splitting the
+/// store. The `\\?\` prefix is stripped so the slug is stable across the
+/// workspace-identity fix.
+fn memory_ws(ws: &str) -> String {
+    let ws = ws.trim();
+    if let Ok(c) = std::fs::canonicalize(Path::new(ws)) {
+        return strip_ext_prefix(&c.to_string_lossy()).to_string();
+    }
+    let joined = if Path::new(ws).is_absolute() {
+        PathBuf::from(ws)
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(ws)
+    };
+    strip_ext_prefix(&joined.to_string_lossy()).to_string()
 }
 
 /// Resolve this workspace's memory dir, migrating one-time from the slug a
@@ -1371,6 +1413,20 @@ fn mem_rand_suffix() -> String {
     (0..5).map(|i| ALPHABET[((n >> (6 + 6 * i)) % 36) as usize] as char).collect()
 }
 
+/// Per-store mutation lock: `memory_set` is a read-modify-write (a drop
+/// rewrites the whole JSONL), so concurrent agent/critic/UI writes to the
+/// same store must serialize or a stale rewrite can clobber a newer append.
+/// Keyed by store dir so different workspaces never contend.
+static MEMORY_LOCKS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn mem_lock(store: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = MEMORY_LOCKS.lock().unwrap();
+    map.entry(store.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// GET /api/coder/memory — current bank + learnings for the active workspace.
 pub async fn memory_get(
     AxumState(state): AxumState<S>,
@@ -1379,7 +1435,7 @@ pub async fn memory_get(
     if ws.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
     }
-    let dir = memory_dir(&state.data_dir, ws.trim());
+    let dir = memory_dir(&state.data_dir, &memory_ws(&ws));
     let bank = read_mem_file(&dir, "bank.md", "").await;
     let learnings = read_learnings(&dir).await;
     Ok(Json(json!({"bank": bank, "learnings": learnings})))
@@ -1398,7 +1454,12 @@ pub async fn memory_set(
     if ws.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
     }
-    let dir = memory_dir(&state.data_dir, ws.trim());
+    let dir = memory_dir(&state.data_dir, &memory_ws(&ws));
+    // Hold the per-store lock across the whole read-modify-write so a
+    // concurrent append can't be lost to a stale drop rewrite.
+    let store_key = dir.to_string_lossy().into_owned();
+    let store_lock = mem_lock(&store_key);
+    let _guard = store_lock.lock().await;
 
     if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
         write_mem_file(&dir, "bank.md", bank).await?;
@@ -1488,6 +1549,26 @@ mod tests {
     }
 
     #[test]
+    fn memory_slug_matches_js_utf16_semantics() {
+        // JS replaces per UTF-16 code unit: an emoji is a surrogate pair →
+        // TWO underscores, BMP non-ASCII → one.
+        let slug = |ws: &str| -> String {
+            mem_dir(Path::new("D:/data"), ws).file_name().unwrap().to_string_lossy().into_owned()
+        };
+        assert_eq!(slug("C:/w💡ork"), "C__w__ork"); // 💡 = two units → "__"
+        assert_eq!(slug("C:/wéork"), "C__w_ork"); // é = one unit → "_"
+        // Same input must slug identically regardless of implementation.
+        let js_style: String = "C:/w💡ork"
+            .encode_utf16()
+            .map(|u| {
+                let c = char::from_u32(u as u32).unwrap_or('_');
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }
+            })
+            .collect();
+        assert_eq!(slug("C:/w💡ork"), js_style);
+    }
+
+    #[test]
     fn memory_dir_migrates_prefixed_slug_dir() {
         // Simulate a pre-fix store: memory written under the slug of the
         // `\\?\\`-prefixed workspace string.
@@ -1507,6 +1588,156 @@ mod tests {
         // Idempotent: second call is a no-op.
         assert_eq!(memory_dir(&root, ws), clean);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_ws_normalizes_relative_and_prefixed() {
+        // A persisted relative or prefixed workspace must slug the same as
+        // its plain absolute form (sidecar `path.resolve` parity).
+        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let plain = tmp.to_string_lossy().into_owned();
+        let a = memory_ws(&plain);
+        assert!(Path::new(&a).is_absolute(), "not absolute: {a}");
+        assert!(!a.starts_with("\\\\?\\"), "prefix not stripped: {a}");
+        // Prefixed input resolves to the same key as the plain one.
+        let b = memory_ws(&format!("\\\\?\\{plain}"));
+        assert_eq!(a, b);
+        // A not-yet-existing *relative* path is joined against the cwd
+        // (path.resolve behavior), so it can never slug bare-relative.
+        let rel = memory_ws("does/not/exist-yet");
+        assert!(Path::new(&rel).is_absolute(), "relative slug: {rel}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn memory_handler_round_trip() {
+        // Handler-level persistence regression: bank replace, JSONL append
+        // fields, drop rewrite, per-workspace isolation, and the no-workspace
+        // 400 — against a temp DATA_DIR, like coder_round_trip.
+        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-handler-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws_a = tmp.join("ws-a");
+        let ws_b = tmp.join("ws-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let ws = || AxumState(state.clone());
+
+        // No workspace configured → 400.
+        state.config.write().await.coder_workspace = String::new();
+        let e = memory_get(ws()).await.unwrap_err();
+        assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(e.1.0.get("error").and_then(|v| v.as_str()), Some("no workspace configured"));
+
+        // Workspace A: append → exact entry shape (id prefix, kind,
+        // provenance default, task, ISO ts), then bank replace, both returned.
+        state.config.write().await.coder_workspace = ws_a.to_string_lossy().into_owned();
+        let r = memory_set(ws(), Json(json!({"learning": {"text": "run pnpm test", "kind": "tip", "provenance": "tool", "task": "t1"}})))
+            .await
+            .unwrap()
+            .0;
+        let l0 = r.get("learnings").and_then(|v| v.as_array()).unwrap()[0].clone();
+        assert!(l0.get("id").and_then(|v| v.as_str()).unwrap().starts_with("l_"));
+        assert_eq!(l0.get("text").and_then(|v| v.as_str()), Some("run pnpm test"));
+        assert_eq!(l0.get("kind").and_then(|v| v.as_str()), Some("tip"));
+        assert_eq!(l0.get("provenance").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(l0.get("task").and_then(|v| v.as_str()), Some("t1"));
+        assert!(l0.get("ts").and_then(|v| v.as_str()).unwrap().ends_with('Z'));
+        assert_eq!(r.get("bank").and_then(|v| v.as_str()), Some(""));
+        let bank = "# Bank\n- a";
+        let r2 = memory_set(ws(), Json(json!({"bank": bank}))).await.unwrap().0;
+        assert_eq!(r2.get("bank").and_then(|v| v.as_str()), Some(bank));
+        // The append landed on disk as JSONL under the clean slug.
+        let on_disk = read_learnings(&memory_dir(&state.data_dir, &memory_ws(&ws_a.to_string_lossy()))).await;
+        assert_eq!(on_disk.len(), 1);
+
+        // Second append, then drop the first — rewrite keeps the rest.
+        let r3 = memory_set(ws(), Json(json!({"learning": {"text": "second", "kind": "avoid"}}))).await.unwrap().0;
+        let learnings = r3.get("learnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(learnings.len(), 2);
+        let first_id = learnings[0].get("id").and_then(|v| v.as_str()).unwrap().to_string();
+        let r4 = memory_set(ws(), Json(json!({"dropLearningId": first_id}))).await.unwrap().0;
+        let learnings = r4.get("learnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(learnings.len(), 1);
+        assert_eq!(learnings[0].get("text").and_then(|v| v.as_str()), Some("second"));
+
+        // Workspace B: fully isolated (no bank, no learnings leak across).
+        state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
+        let r5 = memory_get(ws()).await.unwrap().0;
+        assert_eq!(r5.get("bank").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(r5.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
+        // …and A still has its bank + learning.
+        state.config.write().await.coder_workspace = ws_a.to_string_lossy().into_owned();
+        let r6 = memory_get(ws()).await.unwrap().0;
+        assert_eq!(r6.get("bank").and_then(|v| v.as_str()), Some(bank));
+        assert_eq!(r6.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn memory_drop_serializes_under_lock() {
+        // A concurrent drop + append must not lose the append (per-store lock
+        // holds across the drop's read-modify-write).
+        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
+        let ws = || AxumState(state.clone());
+
+        // Seed one entry.
+        let r = memory_set(ws(), Json(json!({"learning": {"text": "seed", "kind": "tip"}}))).await.unwrap().0;
+        let seed_id = r.get("learnings").and_then(|v| v.as_array()).unwrap()[0]
+            .get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+        // Fire many appends and drops concurrently; the final state must equal
+        // seed + (appends that weren't dropped) — nothing but the dropped id
+        // may be lost.
+        let mut handles = vec![];
+        for i in 0..8 {
+            let s = state.clone();
+            handles.push(tokio::spawn(async move {
+                let r = memory_set(
+                    AxumState(s.clone()),
+                    Json(json!({"learning": {"text": format!("append-{i}"), "kind": "tip"}})),
+                )
+                .await
+                .unwrap()
+                .0;
+                // Every response is a consistent full snapshot.
+                assert!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len() >= 1);
+            }));
+            if i % 2 == 0 {
+                let s = state.clone();
+                let id = seed_id.clone();
+                handles.push(tokio::spawn(async move {
+                    let r = memory_set(AxumState(s), Json(json!({"dropLearningId": id}))).await.unwrap().0;
+                    assert!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len() >= 1);
+                }));
+            }
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let final_state = memory_get(ws()).await.unwrap().0;
+        let learnings = final_state.get("learnings").and_then(|v| v.as_array()).unwrap();
+        // All 8 appends must survive (only the seed was a drop target).
+        let texts: Vec<String> = learnings
+            .iter()
+            .map(|l| l.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        for i in 0..8 {
+            assert!(texts.contains(&format!("append-{i}")), "append-{i} lost");
+        }
+        // No duplicate ids from concurrent appends.
+        let ids: Vec<&str> = learnings.iter().filter_map(|l| l.get("id").and_then(|v| v.as_str())).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "duplicate ids under concurrency");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
