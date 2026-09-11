@@ -647,6 +647,56 @@ const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
 /** Tool names the read-only scout and plan mode may use. */
 const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
+
+/** Binaries bash may run in plan mode (inspection only). */
+const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
+/** Read-only git subcommands allowed in plan mode. */
+const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'tag', 'remote', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
+
+/** True when a bash command is pure inspection (plan mode). Conservative:
+ *  rejects shell composition (redirection, pipes, chaining, substitution)
+ *  outright, then allow-lists the first word — and for git, the subcommand. */
+function isReadOnlyCommand(cmd: string): boolean {
+  if (!cmd) return false;
+  if (/[>|;&`]|\$\(/.test(cmd)) return false;
+  const words = cmd.split(/\s+/).filter(Boolean);
+  const first = words[0].replace(/^.*\//, '');
+  if (first === 'git') return words.length >= 2 && READONLY_GIT.has(words[1]);
+  return READONLY_BASH.has(first);
+}
+
+/** Recover tool calls a model emitted as <tool_call> markup in plain text
+ *  (the engine returns markup naming an undeclared tool instead of parsing
+ *  it into native tool_calls). Handles both the JSON form and the
+ *  <function=name><parameter=k>v</parameter> form. */
+function parseMarkupToolCalls(text: string): AgentToolCall[] {
+  const calls: AgentToolCall[] = [];
+  for (const m of text.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)) {
+    const body = m[1].trim();
+    let name = '';
+    let args: Record<string, unknown> = {};
+    if (/^\s*\{/.test(body)) {
+      try {
+        const j = JSON.parse(body);
+        name = String(j.name ?? '');
+        if (j.arguments && typeof j.arguments === 'object') args = j.arguments;
+      } catch { /* fall through to the XML-ish form */ }
+    }
+    if (!name) {
+      const fn = body.match(/<function=([\w.-]+)>/);
+      if (!fn) continue;
+      name = fn[1];
+      for (const p of body.matchAll(/<parameter=([\w.-]+)>([\s\S]*?)<\/parameter>/g)) args[p[1]] = p[2];
+    }
+    if (name) calls.push({ id: 'markup-' + crypto.randomUUID(), name, arguments: JSON.stringify(args) });
+  }
+  return calls;
+}
+
+/** Strip tool-call markup from reply text so it doesn't pollute the transcript. */
+function stripToolMarkup(text: string): string {
+  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+}
 interface ConvMeta {
   /** Linked worktree path for this conversation, relative to the main workspace. */
   worktree?: string;
@@ -1747,7 +1797,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   /** Human-readable denial reason, or `'ask'` when the user must decide, or null. */
   const checkPerm = (name: string, args: Record<string, unknown>): string | 'ask' | null => {
     if (planMode && MUTATING_TOOLS.has(name)) {
-      return 'Plan mode is read-only — the run cannot write files or execute commands. Turn Plan off to apply changes.';
+      if (name === 'bash') {
+        // Plan mode keeps bash for investigation, locked to inspection commands.
+        const cmd = typeof args.command === 'string' ? args.command.trim() : '';
+        if (!isReadOnlyCommand(cmd)) {
+          return 'Plan mode is read-only — bash may only run inspection commands (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show, …); redirection, pipes, and chaining are rejected. Turn Plan off to execute anything that changes state.';
+        }
+      } else {
+        return 'Plan mode is read-only — the run cannot write files or execute commands. Turn Plan off to apply changes.';
+      }
     }
     if ((perms.tools[name] ?? 'allow') === 'deny') {
       return `Denied by workspace permissions (${name} is set to deny).`;
@@ -2764,9 +2822,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         
         // Plan mode advertises read-only tools only; the permission gate in
         // handleToolCalls enforces it even if the model tries otherwise.
-        const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name)) : TOOLS;
+        // Plan mode keeps read-only tools PLUS bash (enforced to inspection
+        // commands by checkPerm), so investigation doesn't push the model
+        // into inventing tool markup for an undeclared tool.
+        const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : TOOLS;
+        const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
         const system = planMode
-          ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete plan. Do NOT call write, edit, apply_patch, bash, git_commit, or git_branch — they are disabled. End with a step-by-step plan and wait for the user.`
+          ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
           : dynamicSystemRef.current;
         const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
 
@@ -2804,6 +2866,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         }
         
+        // Engine fallback: when the model emits tool markup as plain text (the
+        // engine returns markup naming an undeclared tool instead of parsing
+        // it), recover the calls so the run proceeds instead of dead-airing.
+        // Undeclared ones are dropped with an explanatory note the model sees.
+        if (toolCalls.length === 0 && /<tool_call>/.test(content)) {
+          const declared = new Set(activeTools.map((t) => t.function.name));
+          const recovered = parseMarkupToolCalls(content);
+          const usable = recovered.filter((c) => declared.has(c.name));
+          if (usable.length > 0) {
+            content = stripToolMarkup(content);
+            toolCalls = usable;
+            const dropped = recovered.filter((c) => !declared.has(c.name)).map((c) => c.name);
+            addLog({ type: 'error', label: 'markup', detail: `recovered ${usable.length} tool call(s) from text markup${dropped.length ? `; dropped undeclared: ${dropped.join(', ')}` : ''}` });
+            if (dropped.length) {
+              content += `\n\n[System: your <tool_call> markup for ${dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${[...declared].join(', ')}. Use the native tool-call format.]`;
+            }
+          }
+        }
+
         // A response with neither content nor tool calls is a no-op (the engine
         // produced nothing actionable). Don't push a blank bubble into the
         // transcript or the model context, and don't treat it as "done" — just
