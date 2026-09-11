@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Code2, Cpu, MessagesSquare, Settings2, Layers } from 'lucide-react';
+import { Activity, Code2, Cpu, MessagesSquare, Settings2, Layers, Terminal } from 'lucide-react';
 import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
@@ -9,13 +9,15 @@ import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { CoderScreen } from './screens/CoderScreen';
+import { LogScreen } from './screens/LogScreen';
 
-type Screen = 'chat' | 'code' | 'engine' | 'models' | 'settings';
+type Screen = 'chat' | 'code' | 'engine' | 'log' | 'models' | 'settings';
 
 const NAV: Array<{ id: Screen; label: string; icon: typeof MessagesSquare }> = [
   { id: 'chat', label: 'Chat', icon: MessagesSquare },
   { id: 'code', label: 'Code', icon: Code2 },
   { id: 'engine', label: 'Engine', icon: Cpu },
+  { id: 'log', label: 'Log', icon: Terminal },
   { id: 'models', label: 'Models', icon: Layers },
   { id: 'settings', label: 'Settings', icon: Settings2 },
 ];
@@ -137,20 +139,31 @@ export function App() {
           </div>
         </header>
 
+        {/* All screens stay mounted; the inactive ones are hidden via CSS.
+            Unmounting on tab switch destroys in-flight work: a running
+            chat/coder stream keeps its fetch alive after unmount but its
+            state updates are dropped, so the reply never shows (and the turn
+            is lost from the debounced save). Hiding keeps streams, drafts,
+            params, and scroll positions alive across tabs. */}
         <main className="min-h-0 flex-1 overflow-hidden">
-          {/* Chat and Coder keep running when you navigate away (their agent
-              loops are plain async closures — unmounting would leave them
-              working invisibly with a frozen transcript). Keep them mounted
-              and merely hidden; the other screens are cheap to remount. */}
           <div className={cn('h-full', screen !== 'chat' && 'hidden')}>
             <ChatScreen status={status} onNavigate={setScreen} />
           </div>
           <div className={cn('h-full', screen !== 'code' && 'hidden')}>
             <CoderScreen coderWs={coderWs} />
           </div>
-          {screen === 'engine' && <EngineScreen status={status} />}
-          {screen === 'models' && <ModelsScreen status={status} />}
-          {screen === 'settings' && <SettingsScreen status={status} />}
+          <div className={cn('h-full', screen !== 'engine' && 'hidden')}>
+            <EngineScreen status={status} />
+          </div>
+          <div className={cn('h-full', screen !== 'log' && 'hidden')}>
+            <LogScreen status={status} />
+          </div>
+          <div className={cn('h-full', screen !== 'models' && 'hidden')}>
+            <ModelsScreen status={status} />
+          </div>
+          <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
+            <SettingsScreen status={status} />
+          </div>
         </main>
       </div>
     </div>

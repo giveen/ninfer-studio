@@ -72,8 +72,23 @@ pub struct DiscoveredEngine {
     pub artifact: Option<String>,
 }
 
-/// Scan /proc for ninfer-serve processes and pull (pid, port, argv, artifact).
+/// Find locally-running ninfer-serve processes, with (pid, port, argv, artifact).
+/// Linux: /proc scan (argv + port from cmdline). Windows: tasklist + netstat
+/// (argv unavailable without WMI — callers treat empty argv as "not readable").
 pub async fn discover_engines() -> Vec<DiscoveredEngine> {
+    #[cfg(not(windows))]
+    {
+        discover_engines_proc().await
+    }
+    #[cfg(windows)]
+    {
+        discover_engines_windows()
+    }
+}
+
+/// Scan /proc for ninfer-serve processes and pull (pid, port, argv, artifact).
+#[cfg(not(windows))]
+async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
     let mut out: Vec<DiscoveredEngine> = Vec::new();
     let Ok(entries) = tokio::fs::read_dir("/proc").await else {
         return out;
@@ -132,6 +147,108 @@ pub async fn discover_engines() -> Vec<DiscoveredEngine> {
             argv: args,
             artifact,
         });
+    }
+    out
+}
+
+/// Windows: no /proc. `tasklist` gives the `ninfer-serve.exe` pids and
+/// `netstat` which ports they listen on; joined by pid — port ownership is
+/// what stop_engine signals, so it is authoritative.
+#[cfg(windows)]
+fn discover_engines_windows() -> Vec<DiscoveredEngine> {
+    let serve_pids = tasklist_serve_pids();
+    if serve_pids.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<DiscoveredEngine> = Vec::new();
+    let mut seen: Vec<u32> = Vec::new();
+    for (port, pid) in netstat_listeners() {
+        if serve_pids.contains(&pid) && !seen.contains(&pid) {
+            seen.push(pid);
+            out.push(DiscoveredEngine {
+                pid,
+                port: Some(port),
+                argv: vec![],
+                artifact: None,
+            });
+        }
+    }
+    // serve processes not (yet) listening — e.g. still starting up
+    for pid in &serve_pids {
+        if !seen.contains(pid) {
+            out.push(DiscoveredEngine {
+                pid: *pid,
+                port: None,
+                argv: vec![],
+                artifact: None,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn tasklist_serve_pids() -> Vec<u32> {
+    let out = match std::process::Command::new("tasklist").args(["/FO", "CSV", "/NH"]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+    parse_tasklist_serve_pids(&out)
+}
+
+#[cfg(windows)]
+fn netstat_listeners() -> Vec<(u16, u32)> {
+    let out = match std::process::Command::new("netstat").args(["-ano", "-p", "tcp"]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+    parse_netstat_listeners(&out)
+}
+
+/// Parse `tasklist /FO CSV /NH` output into the pids of `ninfer-serve.exe`.
+/// Lines look like: `"ninfer-serve.exe","1234","Console","1","150,000 K"`.
+#[cfg(any(windows, test))]
+fn parse_tasklist_serve_pids(output: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in output.lines() {
+        let mut it = line.split('"');
+        let _lead = it.next();
+        let name = it.next().unwrap_or("");
+        let _sep = it.next();
+        let pid = it.next().and_then(|p| p.parse::<u32>().ok());
+        if name.eq_ignore_ascii_case("ninfer-serve.exe") {
+            if let Some(pid) = pid {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// Parse `netstat -ano -p tcp` output into (port, pid) for LISTENING entries.
+/// Lines look like:
+/// `TCP    127.0.0.1:8080       0.0.0.0:0              LISTENING       5678`.
+#[cfg(any(windows, test))]
+fn parse_netstat_listeners(output: &str) -> Vec<(u16, u32)> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 || f[3] != "LISTENING" {
+            continue;
+        }
+        // local address is "ip:port" or "[v6]:port" — port follows the last ':'
+        let port: u16 = match f[1].rsplit_once(':') {
+            Some((_, p)) => match p.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let pid: u32 = match f[4].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        out.push((port, pid));
     }
     out
 }
@@ -359,23 +476,59 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             "message": reason,
         });
     }
-    let engine_binary = std::path::Path::new(ninfer_path)
-        .join("build")
-        .join("apps")
-        .join("ninfer-serve");
+    // Resolve the engine binary from the configured path. Accepts (private
+    // Windows support):
+    //   * a direct file path, e.g. E:\ninfer-windows-...\ninfer-serve.exe
+    //   * a directory containing ninfer-serve.exe (Windows release layout)
+    //   * a directory with build/apps/ninfer-serve (Linux dev checkout)
+    let configured = std::path::Path::new(ninfer_path);
+    let engine_binary = if configured.is_file() {
+        configured.to_path_buf()
+    } else if configured.join("ninfer-serve.exe").is_file() {
+        configured.join("ninfer-serve.exe")
+    } else {
+        configured.join("build").join("apps").join("ninfer-serve")
+    };
+    if !engine_binary.is_file() {
+        let mut eng = state.engine.write().await;
+        eng.state = "failed".into();
+        eng.fail_reason = Some(format!("engine binary not found: {}", engine_binary.display()));
+        let reason = format!(
+            "Engine binary not found at {} — point the Ninfer path at ninfer-serve (or its folder) in Settings.",
+            engine_binary.display()
+        );
+        state.emit(AppEvent::EngineFailed {
+            reason: Some(reason.clone()),
+        });
+        return json!({
+            "ok": false,
+            "code": "binary_missing",
+            "message": reason,
+        });
+    }
 
     let port = profile.port.unwrap_or(cfg.engine_port);
     let artifact = artifact.filter(|a| !a.is_empty());
 
     // adopt-don't-kill: something already serves this port
     if engine_health(port).await {
-        let pids = find_external_serve_pids().await;
+        // Adopt the PID that actually owns THIS port. Discovery carries
+        // (pid, port) pairs; a bare first-PID pick with engines on two ports
+        // could record the OTHER engine, and a later Stop would kill it.
+        // Fall back to the first discovered PID when the port can't be
+        // resolved (e.g. netstat couldn't attribute the listener).
+        let discovered = discover_engines().await;
+        let pid = discovered
+            .iter()
+            .find(|d| d.port == Some(port))
+            .map(|d| d.pid)
+            .or_else(|| discovered.first().map(|d| d.pid));
         let mut eng = state.engine.write().await;
         eng.state = "external".into();
         eng.adopted = true;
         eng.port = Some(port);
         eng.artifact = artifact;
-        eng.pid = pids.into_iter().next();
+        eng.pid = pid;
         let (mid, mctx) = engine_model_info(state, port).await;
                         eng.model_id = mid;
                         eng.max_context = mctx;
@@ -639,12 +792,17 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
                 });
             match pid {
                 None => {
-                    let mut eng = state.engine.write().await;
-                    eng.state = "stopped".into();
-                    return json!({ "ok": true, "message": "no engine process found" });
+                    // the port is served (we only get here with the engine already
+                    // health-probed) but its owning process could not be
+                    // identified. Report honestly and keep the state `external` —
+                    // the next reconcile re-checks health and keeps the adoption.
+                    return json!({
+                        "ok": false,
+                        "message": "external engine is serving, but its process could not be identified — stop it manually (Ctrl+C in its terminal window)"
+                    });
                 }
                 Some(pid) => {
-                    let ok = nix_kill(pid, 15);
+                    let ok = signal_engine_pid(pid);
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                     let mut eng = state.engine.write().await;
                     eng.state = "stopped".into();
@@ -665,7 +823,7 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
         let mut eng = state.engine.write().await;
         eng.state = "stopping".into();
     }
-    let ok = nix_kill(target, 15); // SIGTERM
+    let ok = signal_engine_pid(target);
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let mut eng = state.engine.write().await;
     eng.state = "stopped".into();
@@ -678,14 +836,30 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
     }
 }
 
-/// Send a POSIX signal via `kill(1)` (avoids a libc dependency).
-fn nix_kill(pid: u32, sig: i32) -> bool {
-    std::process::Command::new("kill")
-        .arg(format!("-{sig}"))
-        .arg(pid.to_string())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Signal a foreign engine process to stop.
+/// POSIX: SIGTERM via `kill(1)` (avoids a libc dependency).
+/// Windows: no portable graceful signal exists for a foreign console process,
+/// so force-kill via `taskkill /F` — the same thing tokio already does when
+/// stopping our own child on Windows.
+fn signal_engine_pid(pid: u32) -> bool {
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("kill")
+            .arg("-15")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/F", "/PID"])
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
 }
 
 pub fn public_engine(eng: &EngineInner) -> Value {
@@ -738,5 +912,53 @@ mod argv_tests {
         assert_eq!(argv_max_context(Some(&eq)), Some(128_000));
         assert_eq!(argv_max_context(None), None);
         assert_eq!(argv_max_context(Some(&vec!["--port".to_string(), "8080".to_string()])), None);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::{parse_netstat_listeners, parse_tasklist_serve_pids};
+
+    #[test]
+    fn tasklist_picks_serve_pids_and_ignores_the_rest() {
+        let out = "\
+\"Image Name\",\"PID\",\"Session Name\",\"Session#\",\"Mem Usage\"
+\"System\",\"4\",\"Services\",\"0\",\"1,052 K\"
+\"explorer.exe\",\"4321\",\"Console\",\"1\",\"20,000 K\"
+\"ninfer-serve.exe\",\"1234\",\"Console\",\"1\",\"150,000 K\"
+\"NINFER-SERVE.EXE\",\"5678\",\"Console\",\"1\",\"151,000 K\"
+\"ninfer.exe\",\"7\",\"Console\",\"1\",\"1,000 K\"
+";
+        assert_eq!(parse_tasklist_serve_pids(out), vec![1234, 5678]);
+    }
+
+    #[test]
+    fn tasklist_handles_garbage_lines() {
+        assert_eq!(parse_tasklist_serve_pids("INFO: No Task running\n\n"), Vec::<u32>::new());
+        // missing/invalid pid is skipped
+        assert_eq!(
+            parse_tasklist_serve_pids("\"ninfer-serve.exe\",\"\",\"Console\",\"1\",\"5 K\"\n"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn netstat_picks_listening_entries_only() {
+        let out = "
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234
+  TCP    127.0.0.1:8080         0.0.0.0:0              LISTENING       5678
+  TCP    [::1]:8081             [::]:0                 LISTENING       9999
+  TCP    127.0.0.1:8080         127.0.0.1:51234        ESTABLISHED     5678
+  TCP    127.0.0.1:99999        0.0.0.0:0              LISTENING       42
+";
+        let ls = parse_netstat_listeners(out);
+        assert!(ls.contains(&(135, 1234)));
+        assert!(ls.contains(&(8080, 5678)));
+        assert!(ls.contains(&(8081, 9999)));
+        // the ESTABLISHED row and the out-of-range port are excluded
+        assert_eq!(ls.len(), 3);
     }
 }
