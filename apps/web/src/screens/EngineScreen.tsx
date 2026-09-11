@@ -15,7 +15,8 @@ import {
   Video,
   Zap,
 } from 'lucide-react';
-import { getConfig, getLogs, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine } from '../lib/api';
+import { getConfig, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine } from '../lib/api';
+import { useEngineLogs } from '../lib/liveLogs';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
@@ -156,7 +157,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const [saved, setSaved] = useState<SavedProfile[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [saveName, setSaveName] = useState('');
-  const [logs, setLogs] = useState<string[]>([]);
+  const liveLogs = useEngineLogs();
   const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
 
@@ -241,18 +242,8 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     saveProfileState(snapshot).catch(() => undefined);
   }, [profile, artifact, saved, loaded]);
 
-  useEffect(() => {
-    if (!engine?.logPath && engine?.state !== 'stopped') return;
-    const t = setInterval(async () => {
-      try {
-        const r = await getLogs(300);
-        setLogs(r.lines);
-      } catch {
-        /* sidecar busy */
-      }
-    }, 2000);
-    return () => clearInterval(t);
-  }, [engine?.logPath, engine?.state, engine?.startedAt]);
+  // The engine-log tail is shared with the dedicated Log tab via useEngineLogs
+  // (a single /api/logs poll for the whole app), so this pane just renders it.
 
   // Pick the most recently added artifact when none is explicitly chosen. Depends
   // on `artifact` too, so if it ever gets cleared (e.g. via loaded profile state)
@@ -919,7 +910,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
 
         <SectionCard title="Engine log" description={engine?.logPath ? engine.logPath : 'log appears when the engine starts'} icon={<Cpu size={15} />} anchor="log" collapsible>
           <div className="h-64">
-            <LogPane lines={logs} />
+            <LogPane lines={liveLogs} />
           </div>
         </SectionCard>
       </div>

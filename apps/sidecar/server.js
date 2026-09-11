@@ -14,6 +14,8 @@
 
 import { createServer, request as httpRequest } from 'node:http';
 import { execFile, spawn, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
 import { createReadStream, statSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -530,15 +532,37 @@ async function startEngine(profile, artifactPath) {
     deadline: Date.now() + 180_000,
   };
 
-  const engineBinary = config.ninferPath ? path.join(config.ninferPath, 'build', 'apps', 'ninfer-serve') : '';
-  if (!engineBinary) {
+  // Resolve the engine binary from the configured path (cross-platform):
+  //   * a direct file path (e.g. E:\...\ninfer-serve.exe) → used as-is
+  //   * a directory containing ninfer-serve.exe (Windows release layout)
+  //   * a directory with build/apps/ninfer-serve (Linux dev checkout)
+  const isFile = (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const candidates = config.ninferPath
+    ? [
+        path.resolve(config.ninferPath),
+        path.join(config.ninferPath, 'ninfer-serve.exe'),
+        path.join(config.ninferPath, 'build', 'apps', 'ninfer-serve'),
+      ]
+    : [];
+  const engineBinary = candidates.find(isFile) ?? candidates[candidates.length - 1] ?? '';
+  if (!config.ninferPath) {
     markFailed('Engine path not configured — open Settings and set the Ninfer path.');
     return { ok: false, code: 'not_configured', message: 'Engine path not configured — open Settings and set the Ninfer path.' };
+  }
+  if (!engineBinary || !isFile(engineBinary)) {
+    markFailed(`Engine binary not found: ${engineBinary} — point the Ninfer path at ninfer-serve (or its folder) in Settings.`);
+    return { ok: false, code: 'binary_missing', message: `Engine binary not found: ${engineBinary}` };
   }
   const proc = spawn(engineBinary, [artifact, ...args], {
     cwd: path.dirname(engineBinary),
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PATH: `${process.env.PATH}:${os.homedir()}/.local/bin` },
+    env: { ...process.env, PATH: [process.env.PATH, `${os.homedir()}/.local/bin`].join(path.delimiter) },
   });
   engineProc = proc;
   engine.pid = proc.pid;
@@ -616,8 +640,14 @@ async function stopEngine({ externalPid } = {}) {
       const pid =
         all.find((d) => d.port === engine.port)?.pid ??
         (isDefault ? all.find((d) => !d.port)?.pid : undefined);
-      if (!pid) { engine.state = 'stopped'; return { ok: true, message: 'no engine process found' }; }
+      if (!pid) {
+        // serving but unidentifiable (e.g. tasklist/netstat unavailable) — report
+        // honestly; keep 'external' so the next reconcile re-verifies health.
+        return { ok: false, message: 'external engine is serving, but its process could not be identified — stop it manually (Ctrl+C in its terminal window)' };
+      }
       engine.state = 'stopping';
+      // Node on Windows ignores the signal and force-terminates (≈ taskkill /F),
+      // the platform's graceful-stop equivalent for a foreign console process.
       try { process.kill(pid, 'SIGTERM'); } catch (err) { engine.state = 'stopped'; return { ok: false, message: err.message }; }
       await new Promise((r) => setTimeout(r, 1500));
       engine.state = 'stopped';
@@ -635,6 +665,7 @@ async function stopEngine({ externalPid } = {}) {
 }
 
 async function discoverEngines() {
+  if (process.platform === 'win32') return discoverEnginesWindows();
   const out = [];
   let entries = [];
   try {
@@ -668,6 +699,70 @@ async function discoverEngines() {
       }
       out.push({ pid: Number(entry), port, artifact, argv: args });
     } catch { /* process vanished */ }
+  }
+  return out;
+}
+
+// Windows: no /proc. `tasklist` gives the ninfer-serve.exe pids, `netstat`
+// which ports they listen on; joined by pid — port ownership is what
+// stopEngine signals, so it is authoritative. Same contract as the Rust twin
+// (desktop/control/src/engine.rs). argv is unavailable without WMI → empty
+// (the UI renders that as "running command not readable").
+async function discoverEnginesWindows() {
+  let tasklist, netstat;
+  try {
+    // Async (non-blocking) + bounded timeout: discovery runs on every status
+    // refresh and a hung tasklist/netstat must not block the event loop (and
+    // with it, log polling and engine control). Both are independent, so run
+    // them in parallel.
+    [tasklist, netstat] = await Promise.all([
+      execFileAsync('tasklist', ['/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }),
+      execFileAsync('netstat', ['-ano', '-p', 'tcp'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }),
+    ]);
+  } catch {
+    return [];
+  }
+  const servePids = parseTasklistServePids(tasklist);
+  if (!servePids.size) return [];
+  const out = [];
+  const seen = new Set();
+  for (const [port, pid] of parseNetstatListeners(netstat)) {
+    if (servePids.has(pid) && !seen.has(pid)) {
+      seen.add(pid);
+      out.push({ pid, port, artifact: null, argv: [] });
+    }
+  }
+  // serve processes not (yet) listening — e.g. still starting up
+  for (const pid of servePids) {
+    if (!seen.has(pid)) out.push({ pid, port: null, artifact: null, argv: [] });
+  }
+  return out;
+}
+
+// tasklist CSV rows: "ninfer-serve.exe","1234","Console","1","150,000 K"
+function parseTasklistServePids(output) {
+  const pids = new Set();
+  for (const line of output.split(/\r?\n/)) {
+    const parts = line.split('"');
+    if (parts.length > 3 && parts[1].toLowerCase() === 'ninfer-serve.exe') {
+      const pid = Number(parts[3]);
+      if (Number.isInteger(pid) && pid > 0) pids.add(pid);
+    }
+  }
+  return pids;
+}
+
+// netstat rows: TCP    127.0.0.1:8080       0.0.0.0:0    LISTENING    5678
+function parseNetstatListeners(output) {
+  const out = [];
+  for (const line of output.split(/\r?\n/)) {
+    const f = line.trim().split(/\s+/).filter(Boolean);
+    if (f.length < 5 || f[3] !== 'LISTENING') continue;
+    const m = /:(\d+)$/.exec(f[1]);
+    if (!m) continue;
+    const port = Number(m[1]);
+    const pid = Number(f[4]);
+    if (Number.isInteger(port) && port > 0 && Number.isInteger(pid) && pid > 0) out.push([port, pid]);
   }
   return out;
 }
@@ -1966,9 +2061,9 @@ async function handleCoder(req, res, p, url) {
       } catch {
         return sendJson(res, 404, { error: 'file not found: ' + (body?.path || '') });
       }
-      const MAX_ATTACH_BYTES = 5 * 1024 * 1024;
+      const MAX_ATTACH_BYTES = 50 * 1024 * 1024;
       if (buf.length > MAX_ATTACH_BYTES) {
-        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 5 MB` });
+        return sendJson(res, 413, { error: `file is ${buf.length} bytes; attachment limit is 50 MB` });
       }
       const ext = (body?.path || full).split('.').pop()?.toLowerCase() || '';
       const mime = (
