@@ -1505,8 +1505,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const abortRef = useRef<AbortController | null>(null);
   const modelRef = useRef<string>('qwen-coder');
-  /** Lint/test/build commands resolved once per run (config, else manifest detection). */
-  const detectedCmdsRef = useRef<{ lint?: string; test?: string; build?: string }>({});
+  /** Lint/test/build commands resolved once per run (config, else manifest
+   *  detection) — cached PER WORKSPACE: the cache is neither keyed nor reset
+   *  by activeWsDir, so a save-lint in workspace B must not execute the
+   *  relative lint/build command detected in workspace A. */
+  const detectedCmdsByWsRef = useRef(new Map<string, { lint?: string; test?: string; build?: string }>());
 
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
@@ -1857,7 +1860,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Mid-run sidecar-hold gate: while a run pins the sidecar to another
     // workspace, every sidecar-touching tab op no-ops (the wsHeld chip explains).
     sidecarReady: () => wsAppliedRef.current === activeWsDir,
-    getLintCommand: () => detectedCmdsRef.current?.lint || detectedCmdsRef.current?.build || null,
+    getLintCommand: () => {
+      const c = activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined;
+      return c?.lint || c?.build || null;
+    },
     onUndoEdit: (p) => { void undoFileEdit(p); },
   });
   tabsRefreshRef.current = () => { void tabs.refreshOpenTabs(); void tabs.refreshGitStatus(); };
@@ -1865,6 +1871,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => {
     void tabs.refreshGitStatus();
   }, [tabs.refreshGitStatus, wsSynced, activeWsDir]);
+  // Content refresh only when the flush actually lands (wsSynced bumped):
+  // a held mid-run switch — and even a plain switch's in-flight POST — skips
+  // the restore re-reads (sidecarReady is false until the confirmed
+  // workspace), so this is the point at which rereading open tabs (code AND
+  // image — the snapshot drops image payloads) is guaranteed to hit the
+  // right workspace. Gated on the delta so a plain activeWsDir change (no
+  // flush) doesn't double-read the tabs the flush will cover anyway.
+  const wsSyncedPrevRef = useRef(wsSynced);
+  useEffect(() => {
+    const flushed = wsSynced !== wsSyncedPrevRef.current;
+    wsSyncedPrevRef.current = wsSynced;
+    if (!flushed) return;
+    void tabs.refreshOpenTabs();
+  }, [tabs.refreshOpenTabs, wsSynced]);
 
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
@@ -2060,7 +2080,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
    * model sees one error to fix at a time. */
   const runPostEditChecks = async (res: unknown, preview: string): Promise<Record<string, unknown>> => {
     const out: Record<string, unknown> = { ...(res as Record<string, unknown>), ...(preview ? { preview_diff: preview } : {}) };
-    const cmds = detectedCmdsRef.current;
+    const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
     const lintCmd = cmds.lint || cmds.build;
     if (lintCmd) {
       const check = await coderExec(lintCmd, undefined, 120000);
@@ -2769,8 +2789,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
     // after file mutations during the run (P1 #6).
     await refreshRepoMap();
-    // Auto-detect lint/test/build commands once per run (config, else manifests).
-    detectedCmdsRef.current = await detectCommands();
+    // Auto-detect lint/test/build commands once per run (config, else
+    // manifests) — cached under the workspace the run started in.
+    {
+      const m = detectedCmdsByWsRef.current;
+      if (!m.has(activeWsDir) && m.size >= 8) m.delete(m.keys().next().value!);
+      m.set(activeWsDir, await detectCommands());
+    }
 
     abortRef.current = new AbortController();
 

@@ -218,7 +218,15 @@ export default function EditorPane(props: EditorPaneProps) {
       )}
       {showEditor && (
         <div className="min-h-0 flex-1 overflow-hidden">
+          {/* Keyed on tab.id + docRev: the CM6 instance remounts ONLY on an
+              external doc push (load/adopt/save-ack/restore/conflict-reload).
+              Within one mount cycle the `value` prop is constant, so @uiw's
+              `value !== doc.toString()` replace-dispatch (fired on any
+              re-render, e.g. the first dirty-flag or git-badge render) can
+              never overwrite live editor content — the editor is
+              uncontrolled between pushes and undo history survives. */}
           <ReactCodeMirror
+            key={`${tab.id}:${tab.docRev}`}
             ref={cmRef}
             value={tab.doc}
             readOnly={tab.truncated}

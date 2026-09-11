@@ -7,12 +7,16 @@ export type GitFileStatus = 'M' | 'A' | 'U' | 'D' | 'R';
 const shellQuote = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
 /** git status --porcelain v1 → Map<workspace-relative path, letter>.
- *  Never throws: not a git repo / exec failure → empty map (no badges). */
+ *  Never throws: not a git repo / exec failure → empty map (no badges).
+ *  `-uall` lists every untracked file individually — plain porcelain
+ *  collapses an untracked DIRECTORY to a single `?? dir/` entry, and newly
+ *  created files under it would then get no `U` badge (tree rows are
+ *  dir/file, the map is keyed by exact path). */
 export async function fetchGitStatusMap(): Promise<Map<string, GitFileStatus>> {
   const map = new Map<string, GitFileStatus>();
   let r;
   try {
-    r = await coderExec('git status --porcelain', undefined, 10000);
+    r = await coderExec('git status --porcelain -uall', undefined, 10000);
   } catch {
     return map;
   }
@@ -45,7 +49,12 @@ export async function fetchGitStatusMap(): Promise<Map<string, GitFileStatus>> {
 }
 
 /** Per-file diff vs HEAD (staged changes included — bare `git diff` is
- *  worktree-vs-index and would show nothing once anything is staged). */
+ *  worktree-vs-index and would show nothing once anything is staged).
+ *  A clean file returns an EMPTY file list (the modal shows "No uncommitted
+ *  changes" — a synthetic single-file entry for an empty diff would render
+ *  a blank "1 file changed" view), and the diff is bounded to the slice the
+ *  modal can render. */
+const DIFF_MAX = 60000;
 export async function fetchFileDiff(path: string): Promise<CoderDiffResult> {
   try {
     const r = await coderExec(`git --no-pager diff HEAD -- ${shellQuote(path)}`, undefined, 30000);
@@ -53,7 +62,8 @@ export async function fetchFileDiff(path: string): Promise<CoderDiffResult> {
     if (r.exitCode !== 0 && !stdout) {
       return { files: [], diff: '', error: (r.stderr || r.stdout || '').slice(0, 2000) || 'diff failed' };
     }
-    return { files: [{ path }], diff: stdout, truncated: stdout.length > 60000 };
+    if (stdout.trim() === '') return { files: [], diff: '' };
+    return { files: [{ path }], diff: stdout.length > DIFF_MAX ? stdout.slice(0, DIFF_MAX) : stdout, truncated: stdout.length > DIFF_MAX };
   } catch (e) {
     return { files: [], diff: '', error: e instanceof Error ? e.message : String(e) };
   }

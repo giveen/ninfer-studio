@@ -39,6 +39,12 @@ export interface EditorTab {
    *  resolution). The live doc while typing lives in the internal ref map;
    *  this field must NOT be updated per keystroke. */
   doc: string;
+  /** Bumped on every EXTERNAL doc push (load/adopt/save-ack/restore/resolve).
+   *  The pane keys the CodeMirror instance on this: within one mount cycle
+   *  the controlled `value` prop is constant, so a metadata re-render can
+   *  never dispatch the (stale) pushed doc over the live editor content;
+   *  a remount only ever happens with the new external content. */
+  docRev: number;
   /** Last-known disk text. */
   base: string;
   baseBytes: number | null;
@@ -144,7 +150,9 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
    *  (parallel refreshes of different tabs don't invalidate each other). */
   const readSeqRef = useRef(new Map<string, number>());
   const gitSeqRef = useRef(0);
-  const lintSeqRef = useRef(0);
+  /** Per-tab lint seq — saving in another tab must not supersede this tab's
+   *  in-flight lint (a global seq would strand its `linting` spinner). */
+  const lintSeqRef = useRef(new Map<string, number>());
   /** Live docs: tab id → current editor text (updated per keystroke). */
   const docRef = useRef(new Map<string, string>());
   /** Per-workspace snapshots of the open tab set (see the switch effect
@@ -177,6 +185,22 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     [],
   );
 
+  /** Every EXTERNAL doc push bumps docRev (see EditorTab.docRev): the pane
+   *  remounts CodeMirror on it, so `value` only ever changes together with a
+   *  fresh mount — never under a live doc. Only bumps when `doc` actually
+   *  changes (a conflict transition must NOT remount over unsaved edits).
+   *  Kept OUT of per-keystroke paths. */
+  const pushDocTab = useCallback(
+    (id: string, patch: (t: EditorTab) => EditorTab | null) => {
+      patchTab(id, (t) => {
+        const p = patch(t);
+        if (!p) return null;
+        return p.doc !== t.doc ? { ...p, docRev: t.docRev + 1 } : p;
+      });
+    },
+    [patchTab],
+  );
+
   /** Read disk for one tab and apply the compare/adopt/conflict logic
    *  (spec 3.6). `path`/`kind` are passed in (they are stable per tab) because
    *  `tabsRef.current` is only refreshed in a post-render effect — a fresh tab
@@ -188,6 +212,10 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
    *  what drives the notfound / conflict / error paths below. */
   const readDisk = useCallback(
     async (id: string, path: string, kind: FileKind, forceAdopt = false) => {
+      // Defensive sidecar-hold gate: callers are gated too (openFile, restore,
+      // polls), but a relative read must never fly while the sidecar still
+      // points at another workspace — e.g. setActive's activation re-check.
+      if (!ready()) return;
       const gen = genRef.current;
       const seq = (readSeqRef.current.get(id) || 0) + 1;
       readSeqRef.current.set(id, seq);
@@ -198,36 +226,46 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
         if (rErr) throw new Error(rErr);
         const r = rRaw as { content?: string; binary?: boolean; truncated?: boolean };
         if (!stillValid()) return;
-        if (r.binary) {
-          if (kind === 'image') {
-            let img: { dataUrl?: string; size?: number; mime?: string; error?: string };
-            try {
-              const raw: unknown = await coderReadBase64(path);
-              const imgErr = apiErrorBody(raw);
-              if (imgErr) throw new Error(imgErr);
-              img = raw as { dataUrl?: string; size?: number; mime?: string; error?: string };
-              if (!img.dataUrl) throw new Error('image read failed');
-            } catch (e) {
-              if (!stillValid()) return;
-              // e.g. >5 MB image — show the error text in the pane.
-              patchTab(id, (t) => ({ ...t, status: 'error', error: e instanceof Error ? e.message : String(e) }));
-              return;
-            }
+        if (kind === 'image') {
+          // Image tabs ALWAYS take the base64 path — the sidecar marks a file
+          // binary only on a NUL byte, so text-readable formats (SVG) reach
+          // here with r.binary === false and would spin on "Loading image…".
+          let img: { dataUrl?: string; size?: number; mime?: string; error?: string };
+          try {
+            const raw: unknown = await coderReadBase64(path);
+            const imgErr = apiErrorBody(raw);
+            if (imgErr) throw new Error(imgErr);
+            img = raw as { dataUrl?: string; size?: number; mime?: string; error?: string };
+            if (!img.dataUrl) throw new Error('image read failed');
+          } catch (e) {
             if (!stillValid()) return;
-            patchTab(id, (t) => ({ ...t, status: 'ready', image: { dataUrl: img.dataUrl!, size: img.size ?? 0, mime: img.mime ?? '' }, baseBytes: img.size ?? 0 }));
-          } else {
-            patchTab(id, (t) => ({ ...t, status: 'binary' }));
+            // e.g. >5 MB image — show the error text in the pane.
+            patchTab(id, (t) => ({ ...t, status: 'error', error: e instanceof Error ? e.message : String(e) }));
+            return;
           }
+          if (!stillValid()) return;
+          patchTab(id, (t) => ({ ...t, status: 'ready', image: { dataUrl: img.dataUrl!, size: img.size ?? 0, mime: img.mime ?? '' }, baseBytes: img.size ?? 0 }));
+          return;
+        }
+        if (r.binary) {
+          patchTab(id, (t) => ({ ...t, status: 'binary' }));
           return;
         }
         const content = r.content ?? '';
         if (r.truncated) {
-          // Read-only view of the first 256 KB; save is disabled for these.
-          docRef.current.set(id, content);
-          patchTab(id, (t) => ({ ...t, status: 'ready', doc: content, base: content, truncated: true, dirty: false, diskChanged: false, diags: [], linting: false, error: undefined }));
+          // External doc push on the adopt path (read-only view); the
+          // conflict path keeps the live doc and no doc change → no remount.
+          pushDocTab(id, (t) => {
+            // Dirty + disk grew past the cap → conflict: keep the live doc,
+            // never silently discard unsaved edits for a read-only view.
+            if (t.dirty && !forceAdopt && !t.truncated) return { ...t, diskChanged: true, status: 'conflict' };
+            // Read-only view of the first 256 KB; save is disabled for these.
+            docRef.current.set(id, content);
+            return { ...t, status: 'ready', doc: content, base: content, truncated: true, dirty: false, diskChanged: false, diags: [], linting: false, error: undefined };
+          });
           return;
         }
-        patchTab(id, (t) => {
+        pushDocTab(id, (t) => {
           if (t.truncated) {
             // Disk shrank under the cap — re-open as a normal editable tab.
             docRef.current.set(id, content);
@@ -273,7 +311,10 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     genRef.current += 1;
     const prevWs = prevWsRef.current;
     const curTabs = tabsRef.current;
-    if (prevWs && prevWs !== opts.activeWsDir && curTabs.length > 0) {
+    // Snapshot even with ZERO open tabs: otherwise a workspace that was
+    // snapshotted once and then fully closed would restore the STALE tab set
+    // on the next round-trip.
+    if (prevWs && prevWs !== opts.activeWsDir) {
       const docs = new Map<string, string>();
       const snap: EditorTab[] = curTabs.map((t) => {
         const live = docRef.current.get(t.id) ?? t.doc;
@@ -361,7 +402,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       patchTab(id, (t) => ({ ...t, linting: true }));
       try {
         const r = await coderExec(lintCmd, undefined, 120000);
-        if (gen !== genRef.current || seq !== lintSeqRef.current) return;
+        if (gen !== genRef.current || (lintSeqRef.current.get(id) || 0) !== seq) return;
         if (r.exitCode !== 0) {
           const all = parseDiagnostics(lintCmd, r.stderr || r.stdout || '');
           const norm = (s: string) => s.replace(/\\/g, '/');
@@ -376,7 +417,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
           patchTab(id, (t) => ({ ...t, linting: false, diags: [] }));
         }
       } catch {
-        if (gen === genRef.current && seq === lintSeqRef.current) {
+        if (gen === genRef.current && (lintSeqRef.current.get(id) || 0) === seq) {
           patchTab(id, (t) => ({ ...t, linting: false }));
         }
       }
@@ -396,15 +437,34 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
         patchTab(targetId, (x) => ({ ...x, dirty: false }));
         return;
       }
+      // Sidecar-hold gate, same as the read paths: a held A→B switch must not
+      // let a visible B tab write its relative path into A. Stay dirty and
+      // surface why instead of silently firing.
+      if (!ready()) {
+        patchTab(targetId, (x) => ({ ...x, error: 'Save held — the sidecar is still on another workspace (run in flight). Try again once the switch completes.' }));
+        return;
+      }
       const gen = genRef.current;
-      const seq = ++lintSeqRef.current;
+      const seq = (lintSeqRef.current.get(targetId) || 0) + 1;
+      lintSeqRef.current.set(targetId, seq);
       try {
         const wRaw: unknown = await coderWrite(t.path, doc);
         const wErr = apiErrorBody(wRaw);
         if (wErr) throw new Error(wErr);
         if (gen !== genRef.current) return;
         const bytes = new TextEncoder().encode(doc).length;
-        patchTab(targetId, (x) => ({ ...x, dirty: false, base: doc, baseBytes: bytes, diskChanged: false, status: 'ready', diags: [], error: undefined }));
+        // The editor kept taking input while the write was in flight: if the
+        // live doc diverged from the saved one, keep it dirty. `tab.doc`
+        // tracks the LIVE doc either way (so the controlled `value` content
+        // always equals the editor's content and @uiw's replace-dispatch is
+        // a no-op), while `base` tracks the saved-on-disk content the next
+        // save diffs against. Plain patchTab on purpose: no docRev bump, so
+        // the pane never remounts over the live editor content (undo history
+        // survives a save).
+        const live = docRef.current.get(targetId);
+        const diverged = live != null && live !== doc;
+        docRef.current.set(targetId, diverged ? live : doc);
+        patchTab(targetId, (x) => ({ ...x, dirty: diverged, doc: live ?? doc, base: doc, baseBytes: bytes, diskChanged: false, status: 'ready', diags: [], error: undefined }));
         void refreshGitStatus();
         const lintCmd = o.getLintCommand?.();
         if (lintCmd) void runLint(targetId, t.path, lintCmd, gen, seq);
@@ -463,7 +523,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       const tab: EditorTab = {
         id, path,
         kind: fk.kind, lang: fk.lang,
-        doc: '', base: '', baseBytes: null,
+        doc: '', base: '', baseBytes: null, docRev: 0,
         dirty: false, status: 'loading',
         truncated: false, diskChanged: false,
         diags: [], linting: false, image: null,
@@ -536,13 +596,16 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     [patchTab, reloadTab],
   );
 
-  /** Re-fetch disk content for all open code tabs (parallel, per-tab seq).
-   *  Called after every agent mutation (onMutated composite). */
+  /** Re-fetch disk content for all open code tabs AND image tabs (parallel,
+   *  per-tab seq). Called after every agent mutation (onMutated composite)
+   *  and after a held workspace switch's sidecar re-point flushes (CoderScreen
+   *  flush effect) — image tabs need it because the per-workspace snapshot
+   *  drops their payload and a held switch skips the restore re-read. */
   const refreshOpenTabs = useCallback(async () => {
     const o = optsRef.current;
     if (!o.activeWsDir) return;
     if (o.sidecarReady && !o.sidecarReady()) return;
-    const ids = tabsRef.current.filter((t) => t.kind === 'code' && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')).map((t) => t.id);
+    const ids = tabsRef.current.filter((t) => (t.kind === 'code' ? !t.truncated : t.kind === 'image') && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')).map((t) => t.id);
     if (ids.length === 0) return;
     await Promise.all(
       ids.map((id) => {
