@@ -1088,7 +1088,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // sidebar panel can poll + kill them without digging through the transcript).
   const [bgJobs, setBgJobs] = useState<{ id: string; command: string; ws: string }[]>([]);
   /** Live subagent runs (delegate / subagent / scout) for the Jobs panel. */
-  const [activeSubs, setActiveSubs] = useState<{ id: string; label: string; task: string; since: number }[]>([]);
+  const [activeSubs, setActiveSubs] = useState<{ id: string; label: string; task: string; since: number; ws: string }[]>([]);
   const [subTick, setSubTick] = useState(Date.now());
   useEffect(() => {
     if (activeSubs.length === 0) return;
@@ -1138,9 +1138,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [fileDiffPath, setFileDiffPath] = useState<string | null>(null);
   // Commit-approval pending dialog (the agent asked to commit while the gate is ON).
   const [commitReviewOpen, setCommitReviewOpen] = useState(false);
+  /** True when the pending commit-approval request came from a worker
+   *  subagent's own `bash` call, not the supervisor — shown as a note on
+   *  the dialog so the human knows who's asking. */
+  const [commitApprovalFromSubagent, setCommitApprovalFromSubagent] = useState(false);
   const commitResolveRef = useRef<((ok: boolean) => void) | null>(null);
   /** Pause the agent loop and show the diff for human sign-off. Resolves true=approve. */
-  const requestCommitApproval = (): Promise<boolean> => {
+  const requestCommitApproval = (fromSubagent = false): Promise<boolean> => {
+    setCommitApprovalFromSubagent(fromSubagent);
     setCommitReviewOpen(true);
     return new Promise<boolean>((resolve) => {
       commitResolveRef.current = (ok: boolean) => {
@@ -2295,10 +2300,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
 
   // Risky-command HITL dialog: Deny / Approve once / Approve & remember.
-  const [riskyApproval, setRiskyApproval] = useState<{ command: string; reason: string } | null>(null);
+  const [riskyApproval, setRiskyApproval] = useState<{ command: string; reason: string; fromSubagent?: boolean } | null>(null);
   const riskyResolveRef = useRef<((v: 'deny' | 'once' | 'remember') => void) | null>(null);
-  const requestRiskyApproval = (command: string, reason: string): Promise<'deny' | 'once' | 'remember'> => {
-    setRiskyApproval({ command, reason });
+  /** Pause and ask the human before a risky command runs — `fromSubagent`
+   *  marks a request that originated from a worker subagent's own `bash`
+   *  call (rather than the supervisor's), noted on the dialog. */
+  const requestRiskyApproval = (command: string, reason: string, fromSubagent = false): Promise<'deny' | 'once' | 'remember'> => {
+    setRiskyApproval({ command, reason, fromSubagent });
     return new Promise((resolve) => {
       riskyResolveRef.current = (v) => {
         riskyResolveRef.current = null;
@@ -2700,41 +2708,50 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
           const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
           const workerTools = Array.isArray(args.tools) ? args.tools.map(String).filter((t: string) => READONLY_TOOL_NAMES.has(t)) : undefined;
-          let preTree = '';
-          try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
-          let res = { summary: '', diff: '', ok: false };
-          let critique = '';
-          const MAX_WORKER_CRIT = 2;
-          for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
-            const p = attempt === 0
-              ? `TASK (implement now):\n${task}`
-              : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
-            res = await runWorker('subagent', p, wmodel, abortRef.current?.signal ?? new AbortController().signal, 12, workerTools);
-            if (criticMode && res.diff.trim()) {
-              const c = await runCritic(res.diff, task);
-              if (c.learnings.length) {
-                await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
-              }
-              if (!c.approved) {
-                critique = c.issues;
-                addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
-                continue;
-              }
-            }
-            break;
-          }
-          // Net diff across all worker attempts (git write-tree before/after).
-          let diff = res.diff;
+          // Track the run so it shows live in the Jobs panel, same as
+          // delegate/scout (runSubagent) — this was previously invisible
+          // since it calls runWorker directly instead of runSubagent.
+          const subId = `subagent-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+          setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label: 'subagent', task: task.slice(0, 100), since: Date.now(), ws: activeWsDir }]);
           try {
-            const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
-            if (preTree && postTree && preTree !== postTree) {
-              const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
-              diff = (d.stdout || '').slice(0, 60000);
+            let preTree = '';
+            try { preTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim(); } catch { /* no git */ }
+            let res = { summary: '', diff: '', ok: false };
+            let critique = '';
+            const MAX_WORKER_CRIT = 2;
+            for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
+              const p = attempt === 0
+                ? `TASK (implement now):\n${task}`
+                : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
+              res = await runWorker('subagent', p, wmodel, abortRef.current?.signal ?? new AbortController().signal, 12, workerTools);
+              if (criticMode && res.diff.trim()) {
+                const c = await runCritic(res.diff, task);
+                if (c.learnings.length) {
+                  await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
+                }
+                if (!c.approved) {
+                  critique = c.issues;
+                  addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
+                  continue;
+                }
+              }
+              break;
             }
-          } catch { /* keep res.diff */ }
-          mutated = true;
-          result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
-          addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
+            // Net diff across all worker attempts (git write-tree before/after).
+            let diff = res.diff;
+            try {
+              const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
+              if (preTree && postTree && preTree !== postTree) {
+                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
+                diff = (d.stdout || '').slice(0, 60000);
+              }
+            } catch { /* keep res.diff */ }
+            mutated = true;
+            result = JSON.stringify({ summary: res.summary, diff, ok: res.ok });
+            addLog({ type: 'bash', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
+          } finally {
+            setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+          }
         } else if (call.name === 'memory_update') {
           // Agent-proactive learning capture (the critic also writes learnings).
           // Persist outside the repo and refresh local state so the rest of this
@@ -2835,7 +2852,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     // Track the run so it shows live in the Jobs panel.
     const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-    setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), since: Date.now() }]);
+    setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), since: Date.now(), ws: activeWsDir }]);
     try {
       return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
     } finally {
@@ -2896,11 +2913,40 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll));
         case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : []));
         case 'bash': {
+          const command0 = String(args.command || '');
+          // Same risky-command + commit-approval HITL gates the supervisor's
+          // own bash tool goes through (handleToolCalls) — this dispatcher
+          // previously skipped both, so a worker could force-push, publish,
+          // ssh out, or commit with no human in the loop. `fromSubagent: true`
+          // flags the dialog so it's clear a subagent (not the supervisor) is
+          // asking. Truly destructive commands are still hard-blocked
+          // server-side by safe mode regardless of this check.
+          const riskyReason = detectRisky(command0);
+          if (riskyReason && !isApprovedCommand(command0, perms.approvedCommands || [])) {
+            const v = await requestRiskyApproval(command0, riskyReason, true);
+            if (v === 'deny') {
+              return JSON.stringify({ error: `Risky command denied by the user: ${riskyReason}. Use a safer alternative or ask.` });
+            }
+            if (v === 'remember') addApprovedCommand(command0);
+          }
+          if (commitApproval && isGitCommitCommand(command0)) {
+            const ok = await requestCommitApproval(true);
+            if (!ok) {
+              return JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
+            }
+          }
           // Foreground bash runs in a persistent per-workspace shell so cwd AND
           // environment (export / venv / conda activation) survive across calls;
           // background jobs get their own process and stay stateless.
           const sid = !args.background && activeWsDir ? 'sh:' + activeWsDir : (args.background ? activeWsDir : undefined);
-          return JSON.stringify(await coderExec(args.command, undefined, args.timeoutMs, sid, args.background === true));
+          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true);
+          // Register with the Jobs panel — previously a worker's background
+          // job had no panel entry and so no way to see or kill it.
+          if (res.jobId) {
+            const id = res.jobId;
+            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: command0, ws: activeWsDir }]));
+          }
+          return JSON.stringify(res);
         }
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || '')));
         case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000));
@@ -4080,8 +4126,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             </button>
           </div>
           {jobsOpen && (() => {
-            const wsJobs = bgJobs.filter((j) => j.ws === activeWs);
-            const subs = activeSubs;
+            // Both lists are tagged with activeWsDir (the worktree-aware dir a
+            // run actually executes in), not activeWs (the workspace root) —
+            // a worktree conversation's jobs would otherwise never match.
+            const wsJobs = bgJobs.filter((j) => j.ws === activeWsDir);
+            const subs = activeSubs.filter((s) => s.ws === activeWsDir);
             if (wsJobs.length === 0 && subs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
             return (
               <div className="max-h-40 space-y-1 overflow-auto">
@@ -4726,7 +4775,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           tone="warn"
           icon={<Shield size={15} />}
           title="Risky command — approval required"
-          subtitle={<span>This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.</span>}
+          subtitle={
+            <span>
+              {riskyApproval.fromSubagent && <strong className="text-accent">A subagent is requesting permission to run this command. </strong>}
+              This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.
+            </span>
+          }
           footer={
             <>
               <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('deny')}>
@@ -4758,6 +4812,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         open={commitReviewOpen}
         mode="approve"
         title="Approve commit?"
+        banner={commitApprovalFromSubagent ? 'A subagent is requesting permission to commit.' : undefined}
         onClose={() => commitResolveRef.current?.(false)}
         onApprove={() => commitResolveRef.current?.(true)}
         fetchDiff={coderDiff}
