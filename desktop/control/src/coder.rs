@@ -11,7 +11,6 @@ use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::fs;
 use tokio::process::Command;
 use tokio::time::timeout;
 use crate::engine::S;
@@ -867,7 +866,7 @@ pub async fn repo_map(AxumState(state): AxumState<S>) -> Result<Json<Value>, (St
                     let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
                     let mut file_sigs = String::new();
                     for line in content.lines() {
-                        if let Some(caps) = re.captures(line) {
+                        if let Some(_caps) = re.captures(line) {
                             if file_sigs.len() < 1000 {
                                 file_sigs.push_str(&format!("  {}\n", line.trim()));
                             }
