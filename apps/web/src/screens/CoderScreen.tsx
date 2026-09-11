@@ -3051,6 +3051,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // the Log pane (stick-to-bottom, re-engage when they return to the end).
   const transcriptRef = useRef<HTMLDivElement>(null);
   const transcriptStick = useRef(true);
+  // Re-pin on workspace/conversation switch: a newly loaded transcript opens
+  // at its latest message and follows the stream, instead of inheriting the
+  // previous conversation's scrolled-up position (where auto-follow would be
+  // off and the view would sit stale). Runs before the scroll effect below,
+  // which then applies the fresh bottom position.
+  useEffect(() => {
+    transcriptStick.current = true;
+  }, [activeWs, activeConv]);
   useEffect(() => {
     const el = transcriptRef.current;
     if (el && transcriptStick.current) el.scrollTop = el.scrollHeight;
