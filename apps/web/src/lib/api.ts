@@ -31,18 +31,26 @@ import type { ChatAttachment } from './types';
 // control plane by its absolute loopback URL instead.
 const API_BASE = import.meta.env.DEV ? '' : 'http://127.0.0.1:8787';
 
-async function getJSON<T>(path: string, timeoutMs = 4000): Promise<T> {
-  const r = await fetch(API_BASE + path, { signal: AbortSignal.timeout(timeoutMs) });
+/** Combine the per-call timeout with an optional caller-supplied abort
+ *  signal (e.g. a running agent's Stop button) so either one can cut the
+ *  fetch short. */
+function combinedSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
+}
+
+async function getJSON<T>(path: string, timeoutMs = 4000, signal?: AbortSignal): Promise<T> {
+  const r = await fetch(API_BASE + path, { signal: combinedSignal(timeoutMs, signal) });
   if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
   return (await r.json()) as T;
 }
 
-async function postJSON<T>(path: string, body: unknown, timeoutMs = 10_000): Promise<T> {
+async function postJSON<T>(path: string, body: unknown, timeoutMs = 10_000, signal?: AbortSignal): Promise<T> {
   const r = await fetch(API_BASE + path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body ?? {}),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: combinedSignal(timeoutMs, signal),
   });
   const text = await r.text();
   let data: T;
@@ -257,7 +265,12 @@ export function buildChatRequest(
     stream_options: { include_usage: true },
     enable_thinking: enableThinking,
   };
-  if (effort) body.reasoning_effort = effort;
+  // The engine reads this from chat_template_kwargs.reasoning_effort (see
+  // merge_default_request_params in desktop/control/src/lib.rs and the
+  // sidecar's proxyToEngine) — a top-level `reasoning_effort` is not that
+  // key, so it was silently ignored and every request fell back to the
+  // chat template's own default (effectively always max effort for Qwen3).
+  if (effort) body.chat_template_kwargs = { reasoning_effort: effort };
   if (params.preserveThinking !== undefined) body.preserve_thinking = params.preserveThinking;
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
   if (params.greedy) body.temperature = 0;
@@ -578,8 +591,8 @@ export function coderDirs(root: string): Promise<CoderDirs> {
 export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
   return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}`);
 }
-export function coderRead(path: string, offset?: number, limit?: number): Promise<CoderReadResult> {
-  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000);
+export function coderRead(path: string, offset?: number, limit?: number, signal?: AbortSignal): Promise<CoderReadResult> {
+  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000, signal);
 }
 export interface CoderBase64Result {
   path: string;
@@ -590,21 +603,26 @@ export interface CoderBase64Result {
 export function coderReadBase64(path: string): Promise<CoderBase64Result> {
   return postJSON<CoderBase64Result>('/api/coder/fs/b64', { path }, 15_000);
 }
-export function coderWrite(path: string, content: string): Promise<CoderWriteResult> {
-  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000);
+export function coderWrite(path: string, content: string, signal?: AbortSignal): Promise<CoderWriteResult> {
+  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000, signal);
 }
-export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false): Promise<CoderEditResult> {
-  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000);
+export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false, signal?: AbortSignal): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000, signal);
 }
 export interface CoderPatchEdit { old: string; new: string; replaceAll?: boolean; }
-export function coderPatch(path: string, edits: CoderPatchEdit[]): Promise<CoderEditResult> {
-  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000);
+export function coderPatch(path: string, edits: CoderPatchEdit[], signal?: AbortSignal): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000, signal);
 }
-export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean): Promise<CoderExecResult> {
-  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background }, 15_000);
+export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean, signal?: AbortSignal): Promise<CoderExecResult> {
+  // The client-side fetch timeout must be at least as long as the server-side
+  // exec timeout it's requesting (timeoutMs, server default 120s) — it used to
+  // be hardcoded to 15s regardless, so any command running longer than that
+  // threw a spurious client-side timeout while the server kept working.
+  const fetchTimeoutMs = Math.max(15_000, (timeoutMs ?? 120_000) + 5_000);
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background }, fetchTimeoutMs, signal);
 }
-export function coderJob(jobId: string): Promise<CoderJob> {
-  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000);
+export function coderJob(jobId: string, signal?: AbortSignal): Promise<CoderJob> {
+  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000, signal);
 }
 export function coderJobKill(jobId: string): Promise<CoderJob> {
   return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, {}, 15_000);
@@ -616,18 +634,19 @@ export function coderGrep(
   ignoreCase?: boolean,
   offset = 0,
   limit = 200,
+  signal?: AbortSignal,
 ): Promise<CoderGrepResult> {
-  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit }, 15_000);
+  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit }, 15_000, signal);
 }
-export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200): Promise<CoderGlobResult> {
-  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit }, 15_000);
+export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200, signal?: AbortSignal): Promise<CoderGlobResult> {
+  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit }, 15_000, signal);
 }
 export interface CoderSearchResult {
   results: Array<{ file: string; line: number; snippet: string; score: number; kind: string }>;
   truncated: boolean;
 }
-export function coderSearch(query: string, limit = 15): Promise<CoderSearchResult> {
-  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+export function coderSearch(query: string, limit = 15, signal?: AbortSignal): Promise<CoderSearchResult> {
+  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`, 4000, signal);
 }
 export interface CoderDiffResult {
   files: Array<{ path: string; bar?: string }>;
@@ -638,17 +657,26 @@ export interface CoderDiffResult {
 export function coderDiff(): Promise<CoderDiffResult> {
   return getJSON<CoderDiffResult>('/api/coder/diff', 60000);
 }
-export function coderWebFetch(url: string): Promise<CoderWebFetch> {
-  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000);
+export function coderWebFetch(url: string, signal?: AbortSignal): Promise<CoderWebFetch> {
+  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000, signal);
 }
-export function coderWebSearch(query: string): Promise<CoderWebSearch> {
-  return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000);
+export function coderWebSearch(query: string, signal?: AbortSignal): Promise<CoderWebSearch> {
+  return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000, signal);
 }
 export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
 }
 export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
   return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
+}
+/** Mirrors the active workspace's tool permission tiers + denied paths to the
+ *  control plane, so a `deny` tier or denied prefix is enforced at the
+ *  endpoint itself — not only by this client's own dispatcher, which an
+ *  agent could otherwise route around (e.g. `bash` curling straight at an
+ *  endpoint whose tool is denied). `ask` isn't sent — the server has no way
+ *  to pause and prompt a human, so that tier stays client-only. */
+export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }): Promise<unknown> {
+  return postJSON<unknown>('/api/coder/perms', perms, 5000);
 }
 export function coderSandboxGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/sandbox', 5000);
@@ -703,8 +731,8 @@ export function coderMemoryAddLearning(learning: {
   kind: CoderLearningKind;
   provenance?: string;
   task?: string;
-}): Promise<CoderMemory> {
-  return postJSON<CoderMemory>('/api/coder/memory', { learning }, 8000);
+}, signal?: AbortSignal): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { learning }, 8000, signal);
 }
 
 /** Drop a single learning by id and return the updated memory. */

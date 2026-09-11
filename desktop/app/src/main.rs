@@ -48,6 +48,11 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        // Lets the chat UI hand external links (citations, fetched images)
+        // off to the OS default browser — without this, clicking a link in
+        // the webview silently does nothing (see capabilities/default.json
+        // for the matching opener:allow-open-url grant).
+        .plugin(tauri_plugin_opener::init())
         // Close -> hide to tray (keep the engine alive) instead of quitting.
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use base64::Engine as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -140,6 +141,69 @@ pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value
         state.coder_safe_mode.store(enabled, Ordering::SeqCst);
     }
     Json(json!({"enabled": state.coder_safe_mode.load(Ordering::SeqCst)}))
+}
+
+/// Per-tool permission tier — mirrors the web UI's `PermTier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermTier {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// The active workspace's tool permissions, pushed here by the web UI
+/// (`perms_set`) whenever the user edits them or switches workspaces.
+///
+/// The UI is normally what decides whether to call a coder endpoint at all
+/// — but that's a client-side dispatcher the agent can route around (e.g.
+/// its allowed `bash` tool can `curl` straight at an endpoint whose own
+/// tool tier is `deny`). `enforce_perm` re-checks `deny` and `denyPaths`
+/// at the endpoint itself so that bypass doesn't work. `ask` has no
+/// server-side meaning — it means "pause and prompt a human", which only
+/// the client can do — so it stays a client-only tier here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CoderPerms {
+    pub tools: std::collections::HashMap<String, PermTier>,
+    pub deny_paths: Vec<String>,
+}
+
+/// Reject when `tool` is tiered `deny`, or when `rel` (a workspace-relative
+/// path, for tools that take one) sits under a denied prefix. Mirrors the
+/// frontend's `checkPerm`: exact match or `rel` starting with `"<prefix>/"`.
+async fn enforce_perm(state: &S, tool: &str, rel: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+    let perms = state.coder_perms.read().await;
+    if perms.tools.get(tool) == Some(&PermTier::Deny) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": format!("'{tool}' is set to deny by workspace permissions")})),
+        ));
+    }
+    if let Some(rel) = rel {
+        let hit = perms.deny_paths.iter().find(|d| {
+            let clean = d.trim().trim_end_matches('/');
+            !clean.is_empty() && (rel == clean || rel.starts_with(&format!("{clean}/")))
+        });
+        if let Some(hit) = hit {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn perms_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+}
+
+pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
+    if let Ok(parsed) = serde_json::from_value::<CoderPerms>(req) {
+        *state.coder_perms.write().await = parsed;
+    }
+    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
 }
 
 #[derive(Serialize)]
@@ -278,6 +342,7 @@ pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "read", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let buf = tokio::fs::read(&full)
         .await
@@ -316,6 +381,7 @@ pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "write", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let content = match req.get("content").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
@@ -340,6 +406,7 @@ pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "edit", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let (old, new) = match (req.get("old").and_then(|v| v.as_str()), req.get("new").and_then(|v| v.as_str())) {
         (Some(o), Some(n)) => (o.to_string(), n.to_string()),
@@ -463,6 +530,7 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
+    enforce_perm(&state, "apply_patch", Some(rel)).await?;
     let full = within_ws(&ws_root, rel)?;
     let hunks = match req.get("edits").and_then(|v| v.as_array()) {
         Some(h) if !h.is_empty() => h.clone(),
@@ -532,11 +600,18 @@ pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> R
     Ok(Json(json!({"path": rel, "mime": mime, "dataUrl": data_url, "size": buf.len()})))
 }
 
+/// Run a shell command via `bash -lc`. Unlike `fs_*`/`grep`/`glob`, this is
+/// **not** confined to the workspace: `within_ws` only picks the starting
+/// `cwd` (or resumes a session's), and the shell itself is unsandboxed — a
+/// `cd /`, absolute path, or symlink reaches anywhere the OS user can. Safe
+/// mode (default on) blocks a fixed set of destructive patterns before
+/// spawning, but that's a blocklist, not a security boundary. See SECURITY.md.
 pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let command = req.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if command.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "command required"}))));
     }
+    enforce_perm(&state, "bash", None).await?;
     let ws = state.config.read().await.coder_workspace.clone();
     let root = coder_root(&ws)?;
     let rel_cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -900,7 +975,8 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if pattern.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"}))));
     }
-    
+    enforce_perm(&state, "grep", None).await?;
+
     let ignore_case = req.get("ignoreCase").and_then(|v| v.as_bool()).unwrap_or(false);
     
     let regex_pattern = if ignore_case {
@@ -972,6 +1048,7 @@ pub async fn glob(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         Some(p) if !p.is_empty() => p.to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"})))),
     };
+    enforce_perm(&state, "glob", req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty())).await?;
     let ws = state.config.read().await.coder_workspace.clone();
     let ws_root = coder_root(&ws)?;
     let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1047,6 +1124,10 @@ fn truncate_chars(s: &str, max: usize) -> (String, bool) {
 static TEXT_SEL: LazyLock<scraper::Selector> = LazyLock::new(|| {
     scraper::Selector::parse("*:not(script):not(style):not(noscript)").expect("text selector")
 });
+static IMG_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("img[src]").expect("img selector"));
+static LINK_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("a[href]").expect("link selector"));
 static DDG_RESULT: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result").expect("ddg selector"));
 static DDG_LINK: LazyLock<scraper::Selector> =
@@ -1057,10 +1138,16 @@ static COLLAPSE_WS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[ \t\x0b\x0c\r\n]+").expect("html regex"));
 
 /// HTML→text over a real DOM (html5ever via `scraper`): every text node whose
-/// parent isn't `script`/`style`/`noscript`, in document order. Entities come
-/// decoded from the parser; whitespace is collapsed. The sidecar uses
-/// Readability+Turndown (Node-only) — same shape, plain-text content.
-fn html_to_text(html: &str) -> String {
+/// parent isn't `script`/`style`/`noscript`, in document order, followed by
+/// the page's images and links as absolute Markdown `![alt](url)`/`[text](url)`
+/// references (resolved against `base`, the page's own URL — `src`/`href`
+/// are frequently relative). Without these, a model asked to "show a
+/// picture" or cite a source has no real URL to reach for and either
+/// hallucinates one or links to the page itself instead of the image.
+/// Entities come decoded from the parser; whitespace is collapsed. The
+/// sidecar uses Readability+Turndown (Node-only) for the same shape of
+/// output — plain text plus a Markdown-preserved image/link.
+fn html_to_text(html: &str, base: &reqwest::Url) -> String {
     use scraper::node::Node;
     let dom = scraper::Html::parse_document(html);
     let mut out = String::new();
@@ -1074,26 +1161,167 @@ fn html_to_text(html: &str) -> String {
             }
         }
     }
-    COLLAPSE_WS.replace_all(out.trim(), " ").into_owned()
+    let mut out = COLLAPSE_WS.replace_all(out.trim(), " ").into_owned();
+
+    let mut images: Vec<(String, String)> = Vec::new();
+    for el in dom.select(&IMG_SEL) {
+        if images.len() >= 20 {
+            break;
+        }
+        let Some(src) = el.value().attr("src") else { continue };
+        let Ok(abs) = base.join(src) else { continue };
+        let abs = abs.to_string();
+        if !images.iter().any(|(_, u)| u == &abs) {
+            let alt = el.value().attr("alt").unwrap_or("").replace('[', "(").replace(']', ")");
+            images.push((alt, abs));
+        }
+    }
+    if !images.is_empty() {
+        out.push_str("\n\n## Images on this page\n");
+        for (i, (alt, src)) in images.iter().enumerate() {
+            let alt = if alt.is_empty() { format!("image {}", i + 1) } else { alt.clone() };
+            out.push_str(&format!("![{alt}]({src})\n"));
+        }
+    }
+
+    let mut links: Vec<(String, String)> = Vec::new();
+    for el in dom.select(&LINK_SEL) {
+        if links.len() >= 20 {
+            break;
+        }
+        let Some(href) = el.value().attr("href") else { continue };
+        let Ok(abs) = base.join(href) else { continue };
+        let text = COLLAPSE_WS.replace_all(el.text().collect::<String>().trim(), " ").into_owned();
+        let text = if text.is_empty() { abs.to_string() } else { text };
+        let abs = abs.to_string();
+        if !links.iter().any(|(_, u)| u == &abs) {
+            links.push((text, abs));
+        }
+    }
+    if !links.is_empty() {
+        out.push_str("\n\n## Links on this page\n");
+        for (text, href) in &links {
+            out.push_str(&format!("- [{}]({href})\n", text.replace('[', "(").replace(']', ")")));
+        }
+    }
+
+    out
 }
 
-pub async fn web_fetch(AxumState(_state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+/// True when `ip` is a globally-routable address — i.e. not loopback,
+/// private (RFC 1918 / ULA), link-local, CGNAT, multicast, broadcast, or
+/// unspecified. Used to keep `web_fetch` off the loopback control plane and
+/// the local network (SSRF).
+fn is_global_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_global_ipv4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_global_ipv4(&v4),
+            None => is_global_ipv6(v6),
+        },
+    }
+}
+
+fn is_global_ipv4(ip: &Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || o[0] == 0                              // "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64))  // 100.64.0.0/10 CGNAT
+}
+
+fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
+    let seg0 = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (seg0 & 0xfe00) == 0xfc00  // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80) // fe80::/10 link-local
+}
+
+/// Reject `url` unless its scheme is http(s) and its host resolves only to
+/// globally-routable addresses — blocks fetching the loopback control plane
+/// (or any other internal/LAN service) via a tool an agent can call on
+/// untrusted content (fetched pages, files in the workspace).
+async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, Json<Value>)> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "only http/https URLs are allowed"}))));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "url has no host"}))))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_global_ip(&ip) {
+            Ok(())
+        } else {
+            Err((StatusCode::FORBIDDEN, Json(json!({"error": "refusing to fetch a private/loopback/link-local address"}))))
+        };
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("dns lookup failed: {e}")}))))?
+        .peekable();
+    if addrs.peek().is_none() {
+        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "dns lookup returned no addresses"}))));
+    }
+    for addr in addrs {
+        if !is_global_ip(&addr.ip()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")})),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const MAX_REDIRECTS: u8 = 5;
     let raw = match req.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "url required"})))),
     };
-    let url = reqwest::Url::parse(&raw)
+    enforce_perm(&state, "web_fetch", None).await?;
+    let mut url = reqwest::Url::parse(&raw)
         .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid url"}))))?;
     let client = reqwest::Client::builder()
         .user_agent("ninfier-studio/0.1")
         .timeout(Duration::from_secs(25))
+        // Redirects are followed manually below so each hop can be
+        // re-checked against the SSRF guard — otherwise a public URL could
+        // 302 straight into the loopback control plane or the LAN.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("client failed: {e}")}))))?;
-    let resp = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("fetch failed: {e}")}))))?;
+    let mut redirects = 0u8;
+    let resp = loop {
+        ensure_public_http_url(&url).await?;
+        let resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("fetch failed: {e}")}))))?;
+        if resp.status().is_redirection() {
+            let Some(location) = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()) else {
+                break resp;
+            };
+            if redirects >= MAX_REDIRECTS {
+                return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "too many redirects"}))));
+            }
+            redirects += 1;
+            url = url
+                .join(location)
+                .map_err(|_| (StatusCode::BAD_GATEWAY, Json(json!({"error": "invalid redirect location"}))))?;
+            continue;
+        }
+        break resp;
+    };
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -1109,7 +1337,7 @@ pub async fn web_fetch(AxumState(_state): AxumState<S>, Json(req): Json<Value>) 
     bytes.truncate(2 * 1024 * 1024);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (content, ct) = if content_type.contains("html") {
-        (html_to_text(&text), "text/markdown".to_string())
+        (html_to_text(&text, &url), "text/markdown".to_string())
     } else {
         let ct = if content_type.is_empty() { "text/plain".to_string() } else { content_type };
         (text, ct)
@@ -1199,11 +1427,12 @@ fn parse_ddg(html: &str) -> Vec<Value> {
     out
 }
 
-pub async fn web_search(AxumState(_state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn web_search(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let query = match req.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "query required"})))),
     };
+    enforce_perm(&state, "web_search", None).await?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
         .timeout(Duration::from_secs(20))
@@ -1895,6 +2124,47 @@ mod tests {
     }
 
     #[test]
+    fn global_ip_classification_blocks_internal_ranges() {
+        let blocked = [
+            "127.0.0.1", "127.53.0.1", "10.0.0.1", "172.16.5.1", "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0", "255.255.255.255",
+            "::1", "fe80::1", "fc00::1", "fd12::1",
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ];
+        for ip in blocked {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(!is_global_ip(&parsed), "should block {ip}");
+        }
+        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        for ip in allowed {
+            let parsed: IpAddr = ip.parse().unwrap();
+            assert!(is_global_ip(&parsed), "should allow {ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_http_url_rejects_loopback_and_non_http_schemes() {
+        for url in [
+            "http://127.0.0.1/api/coder/workspace",
+            "http://localhost:8787/api/status",
+            "http://[::1]:8787/",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+        ] {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert!(ensure_public_http_url(&parsed).await.is_err(), "should reject {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_public_http_url_allows_public_ip_literal() {
+        let parsed = reqwest::Url::parse("http://93.184.216.34/").unwrap();
+        assert!(ensure_public_http_url(&parsed).await.is_ok());
+    }
+
+    #[test]
     fn glob_translation_matches_sidecar_semantics() {
         let m = glob_matcher("*.ts").unwrap();
         assert!(m.is_match("a.ts"));
@@ -1924,11 +2194,27 @@ mod tests {
 
     #[test]
     fn html_to_text_strips_markup() {
-        let out = html_to_text("<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>");
+        let base = reqwest::Url::parse("https://example.com/page").unwrap();
+        let out = html_to_text("<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>", &base);
         assert!(!out.contains('<'));
         assert!(!out.contains("evil()"));
         assert!(out.contains("Hi & bye"));
         assert!(out.contains('a'));
+    }
+
+    /// A model asked to show a picture or cite a source needs a real,
+    /// absolute URL — not just a page's stripped-down text — so the
+    /// fetched page's images/links are appended as resolved Markdown refs.
+    #[test]
+    fn html_to_text_preserves_image_and_link_urls() {
+        let base = reqwest::Url::parse("https://example.com/blog/post").unwrap();
+        let out = html_to_text(
+            r#"<html><body><p>See <a href="/about">the about page</a>.</p><img src="../cat.png" alt="A cat"><img src="https://cdn.example.com/dog.jpg"></body></html>"#,
+            &base,
+        );
+        assert!(out.contains("![A cat](https://example.com/cat.png)"), "{out}");
+        assert!(out.contains("![image 2](https://cdn.example.com/dog.jpg)"), "{out}");
+        assert!(out.contains("[the about page](https://example.com/about)"), "{out}");
     }
 
     #[test]
@@ -2044,6 +2330,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    /// A `deny`-tiered tool or denied path is rejected at the endpoint
+    /// itself — not only by the client dispatcher that normally decides
+    /// whether to call it (e.g. an agent routing `bash` around a denied
+    /// `write` tool must not be able to reach `fs_write` either).
+    #[tokio::test]
+    async fn perms_are_enforced_server_side() {
+        use axum::extract::State as AxumState;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-perms-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
+        let ws = || AxumState(state.clone());
+
+        // Defaults: nothing denied.
+        let got = perms_get(ws()).await.0;
+        assert_eq!(got.get("tools").and_then(|v| v.as_object()).map(|m| m.len()), Some(0));
+
+        // Push a policy: bash denied outright, anything under "secret" denied by path.
+        perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
+        let got = perms_get(ws()).await.0;
+        assert_eq!(got.get("tools").and_then(|v| v.get("bash")).and_then(|v| v.as_str()), Some("deny"));
+
+        // bash is denied even though safe mode alone would have allowed "echo hi".
+        assert!(exec(ws(), Json(json!({"command": "echo hi"}))).await.is_err());
+
+        // write under the denied prefix is rejected; a sibling path still works.
+        assert!(fs_write(ws(), Json(json!({"path": "secret/x.txt", "content": "no"}))).await.is_err());
+        assert!(fs_write(ws(), Json(json!({"path": "ok/x.txt", "content": "yes"}))).await.is_ok());
+        // exact-match on the denied prefix itself (no trailing content) is also rejected.
+        assert!(fs_read(ws(), Json(json!({"path": "secret"}))).await.is_err());
+        // unrelated read-only tools are unaffected.
+        assert!(grep(ws(), Json(json!({"pattern": "yes"}))).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Background jobs: start → poll to completion → kill a sleeper.
     #[tokio::test]
     async fn bg_job_round_trip() {

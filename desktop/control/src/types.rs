@@ -525,6 +525,12 @@ pub struct State {
     /// Coder "safe mode" (mirrors the sidecar's `coderSafeMode`): when true,
     /// clearly destructive shell commands are refused before they run.
     pub coder_safe_mode: AtomicBool,
+    /// Active workspace's tool permission tiers + denied path prefixes,
+    /// pushed by the web UI (`/api/coder/perms`) whenever the user edits
+    /// them or switches workspaces. Lets `coder::enforce_perm` reject a
+    /// `deny`-tiered tool or path server-side, not only in the client
+    /// dispatcher that normally decides whether to call the endpoint.
+    pub coder_perms: tokio::sync::RwLock<crate::coder::CoderPerms>,
     /// Per-session working directories so the agent's shell behaves like a
     /// stateful terminal (cd persists across calls within a session id).
     pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
@@ -552,6 +558,7 @@ impl State {
             downloads: tokio::sync::Mutex::new(HashMap::new()),
             update_job: tokio::sync::Mutex::new(None),
             coder_safe_mode: AtomicBool::new(true),
+            coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
             event_tx,
             data_dir,

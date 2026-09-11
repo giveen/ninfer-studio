@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { X, RefreshCw, GitCommit, ShieldAlert, FileDiff } from 'lucide-react';
 import { Button, cn } from './ui';
 import { lineClass } from './diffStyle';
@@ -14,9 +14,12 @@ interface DiffReviewModalProps {
   onApprove?: () => void;
   fetchDiff: () => Promise<CoderDiffResult>;
   title?: string;
+  /** Optional note shown under the header, e.g. to flag that the pending
+   *  approval was requested by a worker subagent rather than the supervisor. */
+  banner?: ReactNode;
 }
 
-export function DiffReviewModal({ open, mode, onClose, onApprove, fetchDiff, title }: DiffReviewModalProps) {
+export function DiffReviewModal({ open, mode, onClose, onApprove, fetchDiff, title, banner }: DiffReviewModalProps) {
   const [data, setData] = useState<CoderDiffResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,6 +73,12 @@ export function DiffReviewModal({ open, mode, onClose, onApprove, fetchDiff, tit
             <X size={16} />
           </button>
         </div>
+
+        {banner && (
+          <div className="shrink-0 border-b border-line bg-accent/10 px-3 py-1.5 text-[11.5px] text-accent">
+            {banner}
+          </div>
+        )}
 
         {/* Body */}
         <div className="min-h-0 flex-1 overflow-auto">

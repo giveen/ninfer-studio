@@ -65,6 +65,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/jobs/{id}", get(coder::job_get))
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
         .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
+        .route("/api/coder/perms", get(coder::perms_get).post(coder::perms_set))
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))

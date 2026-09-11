@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
 import { downloadModel, saveConfig } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
+import { openExternalLink } from '../lib/externalLink';
 import type { DownloadRec, StatusPayload } from '../lib/types';
 import { Badge, Button, Field, SectionCard, TextField, cn } from '../components/ui';
 
@@ -123,7 +124,13 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                         <span>{formatBytes(a.size)}</span>
                         <span>{formatTime(a.mtime)}</span>
                         {a.repo && (
-                          <a className="inline-flex items-center gap-1 text-mute hover:text-accent" href={`https://huggingface.co/${a.repo}`} target="_blank" rel="noreferrer">
+                          <a
+                            className="inline-flex items-center gap-1 text-mute hover:text-accent"
+                            href={`https://huggingface.co/${a.repo}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => openExternalLink(e, `https://huggingface.co/${a.repo}`)}
+                          >
                             source <ExternalLink size={10} />
                           </a>
                         )}
@@ -195,7 +202,14 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                               <Download size={12} /> download
                             </Button>
                           )}
-                          <a className="rounded-md p-1.5 text-faint hover:text-ink" title={`open ${c.repo} on Hugging Face`} href={`https://huggingface.co/${c.repo}`} target="_blank" rel="noreferrer">
+                          <a
+                            className="rounded-md p-1.5 text-faint hover:text-ink"
+                            title={`open ${c.repo} on Hugging Face`}
+                            href={`https://huggingface.co/${c.repo}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => openExternalLink(e, `https://huggingface.co/${c.repo}`)}
+                          >
                             <ExternalLink size={13} />
                           </a>
                         </div>
