@@ -21,7 +21,7 @@ export const PRESETS: Preset[] = [
     id: 'long-context-mtp3',
     name: 'Long context MTP3',
     description:
-      '240k context, FP8 KV, 2 lanes, 2 device + 8 host state slots, 8 GiB host KV, MTP3 with optimized head, vision, thinking preserved. The published RTX 5090 profile.',
+      '240k context, FP8 KV, 2 lanes, 2 device + 8 host state slots, 8 GiB host KV, MTP3 with optimized head, vision, thinking preserved. Fits the 3.6-27B (~18.2 GiB loaded) and the pre-repack 3.8 gw-int (19.0 GiB loaded, ~3.3 GiB free — the published RTX 5090 run). Fresh 3.8 gw-int downloads (19.0 GiB file, ~21.3 loaded) overflow at 240k fp8 — use 192k there, or k8v4 to keep 320k.',
     profile: {
       port: 8080,
       maxContext: 240_000,
@@ -127,7 +127,7 @@ export const PRESETS: Preset[] = [
     id: 'ultra-context-k8v4',
     name: 'Ultra context 320k (k8v4)',
     description:
-      'RTX 5090 (32 GB): 320k context on the 17 GiB groupwise-int artifact using k8v4 KV (FP8 keys, NVFP4 values — 1.33× fp8 density). Total ≈ 26.6 GiB, ~4.5 GiB free. MTP3 kept on; watch long-range recall (4-bit V).',
+      'RTX 5090 (32 GB), gw-int artifacts: 320k context via k8v4 KV (FP8 keys, NVFP4 values — 1.33× fp8 density). Local 3.8 gw-int (loads 19.0 GiB) → ~28.7 GiB total, ~2.5 GiB free; 3.6-27B (~18.2 GiB) is comfier. Fresh 3.8 downloads (19.0 GiB file → ~21.3 loaded) should drop to 256k. Watch long-range recall (4-bit V).',
     profile: {
       port: 8080,
       maxContext: 320_000,
@@ -147,7 +147,7 @@ export const PRESETS: Preset[] = [
     id: 'max-fidelity-bf16',
     name: 'Max fidelity 128k (bf16 KV)',
     description:
-      'RTX 5090 (32 GB): 128k context with full-precision bf16 KV on the 17 GiB artifact — best long-range recall. Total ≈ 23.4 GiB, ~7.5 GiB free. MTP3, 2 lanes.',
+      'RTX 5090 (32 GB), gw-int artifacts: 128k context with full-precision bf16 KV — best long-range recall. Local 3.8 gw-int (~19.0 GiB loaded) → ~29.3 GiB total, ~2.4 GiB free; 3.6-27B (~18.2) → ~3.5 free. Fresh 3.8 downloads (~21.3 loaded) must drop to 96k. nvfp4 artifacts do not fit at 128k.',
     profile: {
       port: 8080,
       maxContext: 128_000,
@@ -167,7 +167,7 @@ export const PRESETS: Preset[] = [
     id: 'nvfp4-serving-c4',
     name: 'Multi-client serving C=4 (nvfp4 artifact)',
     description:
-      'RTX 5090 (32 GB): the 20 GiB nvfp4 artifact + fp8 KV at 160k, four concurrent lanes with queued overflow (16 pending, 60 s timeout). Total ≈ 27.6 GiB, ~3.5 GiB free. For 2-4 simultaneous clients.',
+      'RTX 5090 (32 GB): the 3.8 nvfp4 artifact (loads ~20.0 GiB local / ~22.1 fresh) + fp8 KV at 160k, four concurrent lanes with queued overflow (16 pending, 60 s timeout). ~28.5-30.6 GiB total — fresh downloads are at the 1.8 GiB floor; drop to 144k if the capacity line shows under 2 GiB free. For 2-4 simultaneous clients.',
     profile: {
       port: 8080,
       maxContext: 160_000,
@@ -189,7 +189,7 @@ export const PRESETS: Preset[] = [
     id: 'low-latency-c1',
     name: 'Low-latency coding (C=1, 96k)',
     description:
-      'RTX 5090 (32 GB): single lane, 96k fp8 context, MTP3 — minimal footprint (~22 GiB, ~9 GiB free) and fastest first token. 32k default output cap; thinking preserved for agentic work.',
+      'RTX 5090 (32 GB): single lane, 96k fp8 context, MTP3 — fastest first token. Fits EVERY catalog artifact including the 35B-A3B MoE (~27.7 GiB total worst case). 32k default output cap; thinking preserved for agentic work.',
     profile: {
       port: 8080,
       maxContext: 96_000,
@@ -207,10 +207,30 @@ export const PRESETS: Preset[] = [
     },
   },
   {
+    id: 'moe-35b-a3b',
+    name: '35B-A3B MoE (128k, fp8)',
+    description:
+      'RTX 5090 (32 GB): the Qwen3.6-35B-A3B MoE (21.2 GiB file, ~23.8 loaded — only ~3B params active per token, so decode is fast) at 128k fp8 context, 2 lanes, MTP3. ~28.8 GiB total, ~2.4 GiB free. 64k if you want comfortable headroom.',
+    profile: {
+      port: 8080,
+      maxContext: 128_000,
+      kvCapacity: 128_000,
+      maxConcurrency: 2,
+      kvDtype: 'fp8',
+      deviceStateSlots: 2,
+      hostStateSlots: 8,
+      hostKvMib: 8192,
+      spec: 'mtp',
+      draftTokens: 3,
+      lmHeadDraft: true,
+      preserveThinking: true,
+    },
+  },
+  {
     id: 'experimental-nvfp4-kv-480k',
     name: 'Experimental 480k (NVFP4 KV)',
     description:
-      'RTX 5090 (32 GB), single lane: the entire 17 GiB artifact at 480k context via NVFP4 KV (2× fp8 density). Total ≈ 27.8 GiB, ~3.3 GiB free. Experimental: 4-bit K/V costs long-range recall — verify answers on long documents before trusting them.',
+      'RTX 5090 (32 GB), single lane: 480k context via NVFP4 KV (2× fp8 density). Fits the local 3.8 gw-int (19.0 loaded → ~28.6 total) and 3.6-27B (~27.8); fresh 3.8 downloads (~21.3 loaded) must use 384k. Experimental: 4-bit K/V costs long-range recall — verify answers on long documents before trusting them.',
     profile: {
       port: 8080,
       maxContext: 480_000,
