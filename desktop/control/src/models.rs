@@ -5,7 +5,6 @@
 use crate::types::{now_ms, AppEvent, ARTIFACTS, DownloadRec, ModelArtifact, State};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
 
 pub async fn list_models(state: &State) -> Value {
     let dir = state.config.read().await.models_dir.clone();
@@ -121,7 +120,16 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
             let lines = tokio::io::BufReader::new(stdout);
-            pump_lines(st, id2, lines).await;
+            crate::pump_log_lines(lines, |line| {
+                let (st, id) = (st.clone(), id2.clone());
+                async move {
+                    let mut d = st.downloads.lock().await;
+                    if let Some(r) = d.get_mut(&id) {
+                        crate::append_log_line(&mut r.out, &line, crate::LOG_TAIL_LINES);
+                    }
+                }
+            })
+            .await;
         });
     }
     if let Some(stderr) = child.stderr.take() {
@@ -129,7 +137,16 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         let id = id.clone();
         tokio::spawn(async move {
             let lines = tokio::io::BufReader::new(stderr);
-            pump_lines(st, id, lines).await;
+            crate::pump_log_lines(lines, |line| {
+                let (st, id) = (st.clone(), id.clone());
+                async move {
+                    let mut d = st.downloads.lock().await;
+                    if let Some(r) = d.get_mut(&id) {
+                        crate::append_log_line(&mut r.out, &line, crate::LOG_TAIL_LINES);
+                    }
+                }
+            })
+            .await;
         });
     }
 
@@ -193,31 +210,6 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
     });
 
     json!({ "ok": true, "id": id })
-}
-
-async fn pump_lines<S>(st: Arc<State>, id: String, mut lines: S)
-where
-    S: tokio::io::AsyncBufRead + Unpin,
-{
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = match lines.read_line(&mut buf).await {
-            Ok(n) if n > 0 => n,
-            _ => break,
-        };
-        let _ = n;
-        let line: String = buf.chars().take(2000).collect();
-        let mut d = st.downloads.lock().await;
-        if let Some(r) = d.get_mut(&id) {
-            // keep the most recent 2000 lines
-            let mut lines: Vec<&str> = r.out.lines().chain(std::iter::once(line.as_str())).collect();
-            if lines.len() > 2000 {
-                lines = lines.split_off(lines.len() - 2000);
-            }
-            r.out = lines.join("\n");
-        }
-    }
 }
 
 /// Parse a human size string like "20.4G" / "512M" / "1024" into bytes.

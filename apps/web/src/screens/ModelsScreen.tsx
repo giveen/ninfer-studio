@@ -168,7 +168,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
               <tbody>
                 {catalogEntries.length === 0 && artifacts.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="py-4 text-faint">waiting for sidecar status…</td>
+                    <td colSpan={6} className="py-4 text-faint">waiting for control plane status…</td>
                   </tr>
                 )}
                 {(catalogEntries.length ? catalogEntries : []).map((c: any) => {

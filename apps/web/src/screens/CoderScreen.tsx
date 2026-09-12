@@ -17,11 +17,12 @@ import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
-import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
 import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
+import { compactedContext, isCompactedMsg, humanizePassText, runToolLoop, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -730,103 +731,7 @@ function isReadOnlyCommand(cmd: string): boolean {
   return READONLY_BASH.has(first);
 }
 
-/** Recover tool calls a model emitted as text instead of native tool_calls —
- *  small local models commonly paste a tool invocation into content (or
- *  reasoning_content) as JSON rather than using the engine's structured
- *  field. Tries, in priority order: <tool_call> markup (JSON body, or the
- *  <function=name><parameter=k>v</parameter> XML-ish form some models use),
- *  fenced ```json/```tool_call blocks, and — only when the text is
- *  essentially nothing but JSON — a bare leading JSON object/array.
- *  Conservative by design: unrecognized JSON is left alone rather than
- *  guessed at, so a normal prose reply never gets misread. Returns both the
- *  parsed calls and the exact raw substrings consumed, so the caller can
- *  strip only those from the visible reply without touching unrelated code
- *  fences or prose. */
-function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; consumed: string[] } {
-  const calls: AgentToolCall[] = [];
-  const consumed: string[] = [];
 
-  // Trailing commas are a common small-model JSON mistake — strip before parsing.
-  const parseItems = (body: string): unknown[] | null => {
-    const b = body.trim();
-    if (!/^\s*[{[]/.test(b)) return null;
-    try {
-      const j = JSON.parse(b.replace(/,(\s*[}\]])/g, '$1'));
-      return Array.isArray(j) ? j : [j];
-    } catch { return null; }
-  };
-  // Normalize {name,arguments} / {function:{name,arguments}} / {tool,args} shapes.
-  const coerce = (item: unknown): { name: string; args: unknown } | null => {
-    if (!item || typeof item !== 'object') return null;
-    const o = item as Record<string, any>;
-    const name = o.name ?? o.function?.name ?? o.tool;
-    if (typeof name !== 'string' || !name) return null;
-    return { name, args: o.arguments ?? o.function?.arguments ?? o.args ?? o.parameters ?? {} };
-  };
-  const pushAll = (items: unknown[]): boolean => {
-    let any = false;
-    for (const item of items) {
-      const c = coerce(item);
-      if (!c) continue;
-      calls.push({ id: 'markup-' + crypto.randomUUID(), name: c.name, arguments: typeof c.args === 'string' ? c.args : JSON.stringify(c.args) });
-      any = true;
-    }
-    return any;
-  };
-
-  // 1. <tool_call>...</tool_call> — JSON body, or the <function=name> XML-ish form.
-  for (const m of text.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)) {
-    const body = m[1];
-    const items = parseItems(body);
-    let any = items ? pushAll(items) : false;
-    if (!any) {
-      const fn = body.match(/<function=([\w.-]+)>/);
-      if (fn) {
-        const args: Record<string, unknown> = {};
-        for (const p of body.matchAll(/<parameter=([\w.-]+)>([\s\S]*?)<\/parameter>/g)) args[p[1]] = p[2];
-        calls.push({ id: 'markup-' + crypto.randomUUID(), name: fn[1], arguments: JSON.stringify(args) });
-        any = true;
-      }
-    }
-    if (any) consumed.push(m[0]);
-  }
-  if (calls.length > 0) return { calls, consumed };
-
-  // 2. Fenced ```json / ```tool_call blocks (explicitly labeled only — an
-  //    unlabeled ``` fence is more likely a genuine code sample to the
-  //    user). Only tried when the reply is essentially JUST the block(s)
-  //    plus a little surrounding text — the actual failure mode this
-  //    recovers from is an engine emitting the tool call AS a fenced block
-  //    instead of a native call, not a long explanatory answer that happens
-  //    to contain an illustrative JSON example partway through.
-  const FENCED_RE = /```(?:json|tool_?call)\s*\n?([\s\S]*?)\n?```/g;
-  const outsideFences = text.replace(FENCED_RE, '').trim();
-  if (outsideFences.length <= 200) {
-    for (const m of text.matchAll(FENCED_RE)) {
-      const items = parseItems(m[1]);
-      if (items && pushAll(items)) consumed.push(m[0]);
-    }
-  }
-  if (calls.length > 0) return { calls, consumed };
-
-  // 3. Bare JSON — only when the whole text is essentially nothing but JSON.
-  const bare = text.trim().match(/^([{[][\s\S]+[}\]])$/);
-  if (bare) {
-    const items = parseItems(bare[1]);
-    if (items && pushAll(items)) consumed.push(bare[1]);
-  }
-
-  return { calls, consumed };
-}
-
-/** Strip the exact substrings parseMarkupToolCalls recovered calls from, so
- *  the transcript doesn't show raw JSON/markup — without touching any
- *  unrelated code fence or prose that happened to sit alongside it. */
-function stripToolMarkup(text: string, consumed: string[]): string {
-  let out = text;
-  for (const c of consumed) out = out.split(c).join('');
-  return out.trim();
-}
 interface ConvMeta {
   /** Linked worktree path for this conversation, relative to the main workspace. */
   worktree?: string;
@@ -893,19 +798,6 @@ function relTime(ts: number): string {
   if (diff < 30 * DAY) return `${Math.floor(diff / DAY)}d`;
   if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
   return `${Math.floor(diff / (365 * DAY))}y`;
-}
-/** A compaction checkpoint message (the engine-side <compacted-summary> block). */
-function isCompactedMsg(m: ChatMessage): boolean {
-  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
-}
-/** Model context for a loaded transcript: from the most recent compaction
- *  checkpoint onward, so reloading a conversation never re-inflates the full
- *  context. */
-function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (isCompactedMsg(msgs[i])) return msgs.slice(i);
-  }
-  return msgs;
 }
 function stripExtPrefix(p: string): string {
   let rest: string | null = null;
@@ -1116,12 +1008,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
-  // Re-pointed sidecar workspace + flush counter (see the workspace effect below);
+  // Re-pointed control-plane workspace + flush counter (see the workspace effect below);
   // declared early because the panel-reload effects depend on wsFlushed.
   const wsAppliedDirRef = useRef<string | null>(null);
   const [wsFlushed, setWsFlushed] = useState(0);
   // Serialized re-point queue (see the workspace effect below): a run awaits
-  // this before its first sidecar tool call.
+  // this before its first control-plane tool call.
   const wsApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -1234,7 +1126,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return () => { cancelled = true; clearInterval(timer); };
   }, [jobsOpen, bgJobs, activeWs, jobStatus]);
 
-  // Coder "safe mode": the sidecar refuses clearly destructive shell commands
+  // Coder "safe mode": the control plane refuses clearly destructive shell commands
   // (release blocker #2). Surfaced as a toggle + warning banner.
   const [coderSafeMode, setCoderSafeMode] = useState(true);
   const toggleSafeMode = useCallback(async (next: boolean) => {
@@ -1301,14 +1193,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const treeSeqRef = useRef(0);
   const memSeqRef = useRef(0);
 
-  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the sidecar
+  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the control plane
   // under its data dir, so it is never committed by accident. The agent sees it
   // only via system-prompt injection (memoryRef) — it can't read it as a file.
   const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
   const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
   // Memory modal open state.
   const [memOpen, setMemOpen] = useState(false);
-  // Generation counters for the sidecar-relative panel fetches (commits panel —
+  // Generation counters for the control-plane-relative panel fetches (commits panel —
   // the tree/memory seq refs live in the shared block above).
   const commitsSeqRef = useRef(0);
   // Pull the bank + learnings for the active workspace; called on workspace change
@@ -1339,7 +1231,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
       setCommits(commits);
     } catch {
-      // Keep the last good list rather than wiping it on a transient sidecar
+      // Keep the last good list rather than wiping it on a transient backend
       // blip (M2). An empty workspace simply shows no commits.
     } finally {
       if (seq === commitsSeqRef.current) setCommitsLoading(false);
@@ -1363,7 +1255,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [running, activeWs, loadCommits]);
 
   // Refresh the commit history whenever the active workspace changes (or the
-  // sidecar re-point is flushed after a held mid-run switch — wsFlushed).
+  // control-plane re-point is flushed after a held mid-run switch — wsFlushed).
   useEffect(() => {
     if (activeWsDir) loadCommits();
   }, [activeWsDir, wsFlushed, loadCommits]);
@@ -1375,7 +1267,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (activeWsDir) void loadMemory();
   }, [activeWsDir, wsFlushed, loadMemory]);
 
-  // Sync the safe-mode toggle with the sidecar's current state on mount.
+  // Sync the safe-mode toggle with the control plane's current state on mount.
   useEffect(() => {
     coderSafeModeGet()
       .then((r) => setCoderSafeMode(r.enabled))
@@ -1500,9 +1392,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   }, [messages, ledger, todos, todosUpdatedAt, activeWs, activeConv]);
 
-  // Keep the sidecar's coder workspace pointed at the active workspace — but
+  // Keep the control plane's coder workspace pointed at the active workspace — but
   // HOLD the re-point while a run is in flight: every agent tool call resolves
-  // against the sidecar's configured workspace, so re-pointing mid-run would
+  // against the control plane's configured workspace, so re-pointing mid-run would
   // send the running agent's edits/commits to the repo the user just switched
   // to. When the run ends the re-point fires (running flips in the deps) and
   // the panel reloads below pick it up via wsFlushed.
@@ -1511,11 +1403,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // A→B→A switches can't interleave, and only the LATEST request commits
   // wsAppliedDirRef/wsFlushed — a stale response from an older switch can't
   // clobber the applied workspace. runAgent awaits this queue before its
-  // first sidecar tool call, so an in-flight re-point settles before the run
+  // first control-plane tool call, so an in-flight re-point settles before the run
   // starts rather than landing mid-run.
   const wsApplySeqRef = useRef(0);
   const wsApplyPendingRef = useRef(false);
-  /** Enqueue a sidecar re-point (serialized; only the latest request commits
+  /** Enqueue a control-plane re-point (serialized; only the latest request commits
    *  wsAppliedDirRef/wsFlushed). Called by the effect below AND directly by
    *  the ask-resume paths — their setStore-driven effect would otherwise
    *  enqueue the re-point only after runAgent already passed its queue await,
@@ -1528,11 +1420,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const task = wsApplyQueueRef.current
       .catch(() => undefined) // a previous failure must not clog the queue
       .then(() => setCoderWorkspace(dir))
-      .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
+      .catch((e) => console.warn('Failed to set coder workspace on control plane:', e))
       .then(() => {
         // Only the LATEST request may commit — a stale response from an older
         // workspace switch would otherwise leave wsAppliedDirRef pointing at
-        // a workspace the sidecar is no longer on.
+        // a workspace the control plane is no longer on.
         if (seq === wsApplySeqRef.current) {
           wsAppliedDirRef.current = dir;
           setWsFlushed((n) => n + 1);
@@ -1548,11 +1440,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (running) { setWsBusy(false); return; }
     queueWorkspaceApply(activeWsDir);
   }, [activeWsDir, running]);
-  // True while the view is on a different workspace than the one the sidecar
+  // True while the view is on a different workspace than the one the control plane
   // is still pointed at (a re-point held by an in-flight run).
   const wsHeld = running && wsAppliedDirRef.current !== null && wsAppliedDirRef.current !== activeWsDir;
 
-  // Seed the default workspace from the sidecar once its path is known.
+  // Seed the default workspace from the control plane once its path is known.
   const seeded = useRef(false);
   useEffect(() => {
     if (!coderWs || seeded.current) return;
@@ -2139,7 +2031,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWs, activeConv, refreshRepoMap]);
 
   // Load/refresh the tree whenever the active (possibly worktree-bound) directory
-  // changes, or the sidecar re-point is flushed after a held mid-run switch
+  // changes, or the control-plane re-point is flushed after a held mid-run switch
   // (#11's wsFlushed — the merged successor of #8's wsSynced counter).
   useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
@@ -2286,9 +2178,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const tabs = useFileTabs({
     activeWsDir,
     running,
-    // Mid-run sidecar-hold gate: while a run pins the sidecar to another
-    // workspace, every sidecar-touching tab op no-ops (the wsHeld chip explains).
-    sidecarReady: () => wsAppliedDirRef.current === activeWsDir,
+    // Mid-run backend-hold gate: while a run pins the control plane to another
+    // workspace, every backend-touching tab op no-ops (the wsHeld chip explains).
+    backendReady: () => wsAppliedDirRef.current === activeWsDir,
     getLintCommand: () => {
       const c = activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined;
       return c?.lint || c?.build || null;
@@ -2296,13 +2188,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     onUndoEdit: (p) => { void undoFileEdit(p); },
   });
   tabsRefreshRef.current = () => { void tabs.refreshOpenTabs(); void tabs.refreshGitStatus(); };
-  // Refresh git badges once a new workspace's sidecar re-point is flushed.
+  // Refresh git badges once a new workspace's control-plane re-point is flushed.
   useEffect(() => {
     void tabs.refreshGitStatus();
   }, [tabs.refreshGitStatus, wsFlushed, activeWsDir]);
   // Content refresh only when the flush actually lands (wsFlushed bumped):
   // a held mid-run switch — and even a plain switch's in-flight POST — skips
-  // the restore re-reads (sidecarReady is false until the confirmed
+  // the restore re-reads (backendReady is false until the confirmed
   // workspace), so this is the point at which rereading open tabs (code AND
   // image — the snapshot drops image payloads) is guaranteed to hit the
   // right workspace. Gated on the delta so a plain activeWsDir change (no
@@ -3271,35 +3163,37 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search']);
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
-    let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
-    for (let step = 0; step < maxSteps; step++) {
-      if (signal.aborted) return `(subagent ${label} aborted)`;
-      let content = '';
-      let toolCalls: AgentToolCall[] = [];
-      try {
-        await trackedStream(
-          buildChatRequest(model, dynamicSystemRef.current, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams, { tools }, coderParams.promptCache),
-          signal,
-          'subagent ' + label,
-          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; } },
-        );
-      } catch (e) {
-        return `(subagent ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
-      }
-      msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
-      if (toolCalls.length === 0) return content.trim() || '(no findings)';
-      for (const call of toolCalls) {
-        if (call.name === 'delegate') {
-          const args = JSON.parse(call.arguments);
-          const res = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, maxSteps, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
-          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: JSON.stringify({ summary: res }) });
-        } else {
-          const res = await runReadOnlyCall(call, signal, model);
-          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
-        }
-      }
+    // Read-only tools through the shared runner's registry; `delegate`
+    // recurses into runSubagent with a filtered allow-list.
+    const readOnly = (name: string): ToolHandler => (args, sig) =>
+      runReadOnlyCall({ id: crypto.randomUUID(), name, arguments: JSON.stringify(args) }, sig, model);
+    const registry: ToolRegistry = {
+      delegate: (args, sig) => runSubagent(`delegate-${depth}`, `Task: ${String(args.task ?? '')}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, sig, maxSteps, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1).then((r) => JSON.stringify({ summary: r })),
+    };
+    for (const t of TOOLS) {
+      const n = t.function.name;
+      if (n !== 'delegate' && !registry[n]) registry[n] = readOnly(n);
     }
-    return '(subagent step budget reached)';
+    let res;
+    try {
+      res = await runToolLoop({
+        model,
+        system: dynamicSystemRef.current,
+        messages: [{ role: 'user', content: prompt }],
+        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams,
+        tools,
+        registry,
+        maxSteps,
+        signal,
+        stream: (req, sig, cb) => trackedStream(req, sig, 'subagent ' + label, cb),
+      });
+    } catch (e) {
+      return `(subagent ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
+    }
+    if (res.stop === 'aborted' || signal.aborted) return `(subagent ${label} aborted)`;
+    if (res.stop === 'steps') return '(subagent step budget reached)';
+    const last = [...res.messages].reverse().find((m) => m.role === 'assistant');
+    return last?.content.trim() || '(no findings)';
   };
 
   // Dispatch a single tool call for an IMPLEMENTATION worker subagent. This is a
@@ -3461,7 +3355,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let preTree = '';
     try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal)).stdout.trim(); } catch { /* no git */ }
-    let msgs: ChatMessage[] = [{ role: 'user', content: prompt }];
     let summary = '';
     // Set only when the loop runs out of steps without the model finishing —
     // used below so that outcome is reported like every other bounded loop
@@ -3469,37 +3362,38 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // instead of silently returning ok:true with a thin/empty summary.
     let budgetReached = false;
     try {
-      let step = 0;
-      for (; step < maxSteps; step++) {
-        if (signal.aborted) break;
-        let content = '';
-        let toolCalls: AgentToolCall[] = [];
-        let finishReason: string | undefined;
-        await trackedStream(
-          buildChatRequest(model, WORKER_SYSTEM, msgs, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams, { tools }, coderParams.promptCache),
-          signal,
-          'worker',
-          { onContentDelta: (t) => { content += t; }, onToolCalls: (c) => { toolCalls = c; }, onDone: (meta) => { finishReason = meta.finishReason; } },
-        );
-        if (finishReason === 'length' && toolCalls.length === 0) {
-          // Cut off mid-generation with no tool call parsed — the raw text is
-          // likely a half-written code block or mid-sentence. Feeding that
-          // straight back as the "assistant" turn tends to confuse the next
-          // step, so summarize it instead (mirrors GVS5H's cut-off handling).
-          const digest = await summarizeCutoff(content, model, signal);
-          summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
-          msgs = [...msgs, { role: 'assistant', content: `[cut off at the token limit — summary of the partial attempt]\n${digest}` }];
-          continue;
-        }
-        summary = content.trim() || summary;
-        msgs = [...msgs, { role: 'assistant', content, tool_calls: toolCalls.length ? toolCalls : undefined }];
-        if (toolCalls.length === 0) break;
-        for (const call of toolCalls) {
-          const res = await runWorkerCall(call, signal, model, depth);
-          msgs.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: res });
-        }
+      const workerCall = (name: string): ToolHandler => (args, sig) =>
+        runWorkerCall({ id: crypto.randomUUID(), name, arguments: JSON.stringify(args) }, sig, model, depth);
+      const registry: ToolRegistry = {
+        delegate: (args, sig) => runSubagent(`delegate-${depth}`, `Task: ${String(args.task ?? '')}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, sig, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1).then((r) => JSON.stringify({ summary: r })),
+      };
+      for (const t of TOOLS) {
+        const n = t.function.name;
+        if (n !== 'delegate' && !registry[n]) registry[n] = workerCall(n);
       }
-      if (step >= maxSteps) budgetReached = true;
+      const res = await runToolLoop({
+        model,
+        system: WORKER_SYSTEM,
+        messages: [{ role: 'user', content: prompt }],
+        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams,
+        tools,
+        registry,
+        maxSteps,
+        signal,
+        stream: (req, sig, cb) => trackedStream(req, sig, 'worker', cb),
+        onAssistantTurn: async (msg, info) => {
+          if (info.finishReason === 'length' && (msg.tool_calls?.length ?? 0) === 0) {
+            // Cut off mid-generation with no tool call parsed — the raw text is
+            // likely a half-written code block or mid-sentence. Summarize it
+            // instead of feeding it back raw as the assistant turn.
+            const digest = await summarizeCutoff(msg.content, model, signal);
+            summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
+            return { proceed: true, inject: [{ role: 'assistant', content: `[cut off at the token limit — summary of the partial attempt]\n${digest}` }] };
+          }
+          summary = msg.content.trim() || summary;
+        },
+      });
+      budgetReached = res.stop === 'steps';
     } catch (e) {
       summary = `(worker ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
     }
@@ -3676,7 +3570,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setRunning(true);
     // Pin the run's token accounting; the visible meter may follow the view.
     runTokensRef.current = lastPromptTokensRef.current;
-    // Settle any in-flight sidecar re-point BEFORE the first tool call: a
+    // Settle any in-flight control-plane re-point BEFORE the first tool call: a
     // switch POST only ever targets the view the run starts in, so awaiting
     // it makes the early calls hit the right repo instead of the previous
     // workspace, and nothing re-points mid-run (switches now queue behind it).
@@ -3760,7 +3654,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Read the engine's context window so we can auto-compact once usage crosses
     // the configured share of max (coderParams.compactAt, default 80%). Prefer
     // the engine's own /v1/models advertisement, falling back to the
-    // sidecar-reported maxContext.
+    // control-plane-reported maxContext.
     let maxContext = 0;
     try {
       maxContext = (await getEngineContextSize(model)) ?? 0;
@@ -3913,32 +3807,24 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // a compact placeholder for THIS request only — the canonical
         // currentMessages (shown in the UI, fed to compaction) is untouched.
         const wireMessages = await packForRequest(currentMessages);
-        const req = buildChatRequest(model, system, wireMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
+        const turnParams = { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams;
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
-        let streamOk = false;
-        while (!streamOk && attempt < MAX_ATTEMPTS) {
+        let turn: TurnResult | null = null;
+        while (!turn && attempt < MAX_ATTEMPTS) {
           attempt++;
-          content = '';
-          reasoning = '';
-          toolCalls = [];
-          finishReason = undefined;
           try {
-            await trackedStream(req, abortRef.current.signal, 'agent', {
-              onContentDelta: (text) => { content += text; },
-              onReasoningDelta: (text) => { reasoning += text; },
-              onToolCalls: (calls) => { toolCalls = calls; },
-              onDone: (meta) => {
-                // Record the engine's real prompt-token count when present;
-                // otherwise keep the local estimate so accounting stays accurate
-                // across turns even when usage is omitted (M3). Pinned to the
-                // run — the visible meter may follow a different conversation.
-                noteRunTokens(meta?.promptTokens ?? est);
-                finishReason = meta?.finishReason;
-              },
+            turn = await streamTurn({
+              model,
+              system,
+              messages: wireMessages,
+              params: turnParams,
+              tools: activeTools,
+              cacheSystem: coderParams.promptCache,
+              signal: abortRef.current.signal,
+              stream: (r, sig, cb) => trackedStream(r, sig, 'agent', cb),
             });
-            streamOk = true;
           } catch (e) {
             if (abortRef.current?.signal.aborted) throw e;
             const msg = e instanceof Error ? e.message : String(e);
@@ -3950,32 +3836,24 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             await new Promise((r) => setTimeout(r, 800 * attempt));
           }
         }
-        
-        // Engine fallback: when the model dumps a tool call into content (or
-        // reasoning, for engines that split thinking/answer) instead of using
-        // native tool_calls — common with small local models in several
-        // shapes (<tool_call> markup, fenced JSON, bare JSON) — recover it so
-        // the run proceeds instead of dead-airing. Falls back to reasoning
-        // only when content itself is empty. Undeclared tool names are
+        if (!turn) throw new Error('stream produced no turn without throwing');
+        // streamTurn accumulates content/reasoning/tool calls and recovers
+        // text-emitted markup (small local models); undeclared names are
         // dropped with an explanatory note the model sees.
-        if (toolCalls.length === 0 && (content.trim() || reasoning.trim())) {
-          const declared = new Set(activeTools.map((t) => t.function.name));
-          let { calls: recovered, consumed } = parseMarkupToolCalls(content);
-          let fromReasoning = false;
-          if (recovered.length === 0 && !content.trim() && reasoning.trim()) {
-            ({ calls: recovered, consumed } = parseMarkupToolCalls(reasoning));
-            fromReasoning = true;
-          }
-          const usable = recovered.filter((c) => declared.has(c.name));
-          if (usable.length > 0) {
-            if (fromReasoning) reasoning = stripToolMarkup(reasoning, consumed);
-            else content = stripToolMarkup(content, consumed);
-            toolCalls = usable;
-            const dropped = recovered.filter((c) => !declared.has(c.name)).map((c) => c.name);
-            addLog({ type: 'error', label: 'markup', detail: `recovered ${usable.length} tool call(s) from ${fromReasoning ? 'reasoning' : 'text'} markup${dropped.length ? `; dropped undeclared: ${dropped.join(', ')}` : ''}` });
-            if (dropped.length) {
-              content += `\n\n[System: your tool-call markup for ${dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${[...declared].join(', ')}. Use the native tool-call format.]`;
-            }
+        content = turn.content;
+        reasoning = turn.reasoning;
+        toolCalls = turn.toolCalls;
+        finishReason = turn.finishReason;
+        // Record the engine's real prompt-token count when present; otherwise
+        // keep the local estimate so accounting stays accurate across turns
+        // even when usage is omitted (M3). Pinned to the run — the visible
+        // meter may follow a different conversation.
+        noteRunTokens(turn.meta?.promptTokens ?? est);
+        if (turn.recoveredFromMarkup) {
+          const declared = activeTools.map((t) => t.function.name);
+          addLog({ type: 'error', label: 'markup', detail: `recovered ${toolCalls.length} tool call(s) from ${turn.recoveredFromMarkup} markup${turn.dropped.length ? `; dropped undeclared: ${turn.dropped.join(', ')}` : ''}` });
+          if (turn.dropped.length) {
+            content += `\n\n[System: your tool-call markup for ${turn.dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${declared.join(', ')}. Use the native tool-call format.]`;
           }
         }
 
@@ -4003,31 +3881,23 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // deterministic tell-gate and silently re-write the message in place when
         // it trips a high-signal tell. Skipped for tool-call turns.
         if (coderParams.humanize && toolCalls.length === 0 && assistantMsg.content.trim()) {
-          // Best-effort pass: the gate runs outside the rewrite's own try, so
-          // wrap it too — a gate failure must keep the original reply, never
-          // strand the streaming state.
+          // Best-effort pass: a gate/rewrite failure keeps the original reply,
+          // never strands the run.
           try {
-            // Retry up to HUMANIZE_MAX_DEPTH times: a rewrite can itself trip
-            // the gate, so re-check each attempt and feed the best-so-far
-            // text back in rather than accepting the first pass unconditionally.
-            const voice = effectiveVoice({ ...coderParams, humanize: true }, 'technical');
-            let current = assistantMsg.content;
-            let gateRes = evaluate(current, voice, {});
-            for (let attempt = 0; attempt < HUMANIZE_MAX_DEPTH && needsHumanize(gateRes) && !abortRef.current?.signal.aborted; attempt++) {
-              const rewritten = await humanizeRewriteText({
+            const humanized = await humanizePassText(assistantMsg.content, {
+              voice: effectiveVoice({ ...coderParams, humanize: true }, 'technical'),
+              signal: abortRef.current?.signal,
+              rewrite: (current) => humanizeRewriteText({
                 model,
                 baseSystem: dynamicSystemRef.current,
                 priorMessages: currentMessages.slice(0, currentMessages.length - 1),
                 originalText: current,
                 params: { thinking: coderParams.thinking, humanize: true, voiceProfile: coderParams.voiceProfile || 'technical' },
                 signal: abortRef.current?.signal,
-              });
-              if (!rewritten || !rewritten.trim() || rewritten.trim() === current.trim()) break;
-              current = rewritten.trim();
-              gateRes = evaluate(current, voice, {});
-            }
-            if (current.trim() !== assistantMsg.content.trim()) {
-              const updated: ChatMessage = { ...assistantMsg, content: current };
+              }),
+            });
+            if (humanized.trim() !== assistantMsg.content.trim()) {
+              const updated: ChatMessage = { ...assistantMsg, content: humanized };
               currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
               updateRunMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
             }
@@ -4942,9 +4812,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           {wsHeld && (
             <span
               className="shrink-0 text-[10px] text-faint"
-              title="All agent tools run against the sidecar's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
+              title="All agent tools run against the control plane's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
             >
-              sidecar on {baseName(wsAppliedDirRef.current!)} until run ends
+              backend on {baseName(wsAppliedDirRef.current!)} until run ends
             </span>
           )}
           <span

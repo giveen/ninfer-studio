@@ -3,7 +3,8 @@
 //! The Tauri window hosts the same loopback control-plane URL the browser uses
 //! (http://127.0.0.1:8787). The control plane (engine supervision, model
 //! management, GPU stats, SSE-safe engine API proxy, static hosting) runs in
-//! this process's Rust core — no Node sidecar needed at runtime.
+//! this process's Rust core — dev mode runs the same crate as a standalone
+//! binary, so there is exactly one control-plane implementation.
 //!
 //! Tier 3 platform polish:
 //!  * Tray icon + close-to-hide: closing the window hides to the tray (the

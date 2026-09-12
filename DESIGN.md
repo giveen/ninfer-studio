@@ -23,8 +23,8 @@ A from-scratch, Linux-first desktop UI for the **NInfer** C++/CUDA inference eng
           │  loopback
 ┌─────────▼──────────────────────────────────────────────────────────┐
 │  CONTROL PLANE — Rust `ninfier-control` crate (axum + tokio)       │
-│  inside the Tauri 2 desktop app (WebKitGTK window)                 │
-│  (dev-mode equivalent: zero-dep Node 22 sidecar, same API)        │
+│  inside the Tauri 2 desktop app (WebKitGTK window); standalone     │
+│  `ninfier-control` binary in dev mode (Vite HMR against :8787)     │
 │  • engine lifecycle: spawn / poll /health / SIGTERM / adopt        │
 │  • profile → CLI args (build_serve_args, 1:1 with ninfer-serve)    │
 │  • models dir scan, hf download supervisor, nvidia-smi stats       │
@@ -46,14 +46,13 @@ A from-scratch, Linux-first desktop UI for the **NInfer** C++/CUDA inference eng
   CUDA fault in the engine must not take down the control plane. The supervisor is now the
   Rust `ninfier-control` crate running inside the Tauri 2 desktop core: the engine's parent
   process is the app itself, so a native window + a single Rust process supervise everything.
-  The Node sidecar (`apps/sidecar`) implements the identical API contract for browser dev
-  mode with HMR. The UI code is byte-identical in both because it only speaks the loopback
-  HTTP contract.
+  The same binary serves browser dev mode (Vite HMR against :8787). The UI
+  code is identical in both because it only speaks the loopback HTTP contract.
 - The proxy (`/v1/*`, `/health` → engine port) keeps the UI on a single origin (no CORS),
   injects the configured API key, and is SSE-safe (chunks piped as they arrive).
 
 **Key lifecycle behaviors** (all implemented and verified):
-- **adopt-don't-kill**: if the configured port already serves `/health: ok`, the sidecar marks
+- **adopt-don't-kill**: if the configured port already serves `/health: ok`, the control plane marks
   the engine **external** (scans `/proc` for the `ninfer-serve` pid) and never double-spawns.
   The UI shows `external · not spawned by studio` and can still SIGTERM it.
 - **start**: builds args from the profile, spawns with cwd = engine dir, appends
@@ -158,7 +157,7 @@ engine's stderr — the startup sequence (weights → host state/KV pinning → 
 
 Engine paths (`ninfer-serve`, `ninfer` CLI, models dir, `hf`), default port, API key (Studio
 injects it on proxied requests), About (architecture note). Persisted to
-`data/config.json` via the sidecar.
+`data/config.json` via the control plane.
 
 ## 3. Option catalog → control mapping (serve surface)
 

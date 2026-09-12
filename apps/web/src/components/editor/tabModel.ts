@@ -2,7 +2,7 @@
  * useFileTabs — the Coder screen's VS Code-style tab model.
  *
  * UI-free (no JSX): owns the tab list, live docs (ref map — see the doc-churn
- * note below), dirty/conflict tracking, the mid-run sidecar-hold gate, the
+ * note below), dirty/conflict tracking, the mid-run backend-hold gate, the
  * workspace-switch generation guard + per-workspace tab snapshots (open tabs
  * and unsaved docs persist across a workspace round-trip), save-and-lint,
  * and git status badges.
@@ -64,11 +64,11 @@ export interface EditorTab {
 export interface FileTabsOptions {
   activeWsDir: string | null;
   running: boolean;
-  /** Mid-run sidecar-hold gate: CoderScreen passes
+  /** Mid-run backend-hold gate: CoderScreen passes
    *  `() => wsAppliedDirRef.current === activeWsDir`. While false, every
-   *  sidecar-touching op refuses / no-ops (reads would resolve against the
+   *  backend-touching op refuses / no-ops (reads would resolve against the
    *  running workspace). */
-  sidecarReady?: () => boolean;
+  backendReady?: () => boolean;
   getLintCommand?: () => string | null;
   onUndoEdit?: (path: string) => void;
 }
@@ -164,7 +164,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
   const ready = (): boolean => {
     const o = optsRef.current;
     if (!o.activeWsDir) return false;
-    return o.sidecarReady ? o.sidecarReady() : true;
+    return o.backendReady ? o.backendReady() : true;
   };
 
   /** Functional tab patch; null = no change (avoids state churn). */
@@ -212,8 +212,8 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
    *  what drives the notfound / conflict / error paths below. */
   const readDisk = useCallback(
     async (id: string, path: string, kind: FileKind, forceAdopt = false) => {
-      // Defensive sidecar-hold gate: callers are gated too (openFile, restore,
-      // polls), but a relative read must never fly while the sidecar still
+      // Defensive backend-hold gate: callers are gated too (openFile, restore,
+      // polls), but a relative read must never fly while the control plane still
       // points at another workspace — e.g. setActive's activation re-check.
       if (!ready()) return;
       const gen = genRef.current;
@@ -227,7 +227,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
         const r = rRaw as { content?: string; binary?: boolean; truncated?: boolean };
         if (!stillValid()) return;
         if (kind === 'image') {
-          // Image tabs ALWAYS take the base64 path — the sidecar marks a file
+          // Image tabs ALWAYS take the base64 path — the control plane marks a file
           // binary only on a NUL byte, so text-readable formats (SVG) reach
           // here with r.binary === false and would spin on "Loading image…".
           let img: { dataUrl?: string; size?: number; mime?: string; error?: string };
@@ -330,7 +330,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
           // caching the dataUrl in the snapshot is pure memory retention —
           // with 8 ws × several image tabs this is O(hundreds of MB). The
           // pane shows "Loading image…" until the re-read lands (immediately
-          // when the sidecar is ready, next refresh while a run holds it).
+          // when the backend is ready, next refresh while a run holds it).
           image: null,
           // Stale across a round-trip — refreshed by the restore re-read / CoderScreen's git poll.
           linting: false,
@@ -359,7 +359,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     for (const [id, doc] of snap.docs) docRef.current.set(id, doc);
     setTabs(snap.tabs);
     setActiveTabId(snap.activeTabId);
-    // Sidecar-hold gate: while a run pins the sidecar elsewhere, show the
+    // Backend-hold gate: while a run pins the control plane elsewhere, show the
     // snapshot as-is; the next refresh (activation re-check / run poll /
     // wsFlushed git poll) picks up the disk state.
     if (ready()) {
@@ -374,7 +374,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
   const refreshGitStatus = useCallback(async () => {
     const o = optsRef.current;
     if (!o.activeWsDir) return;
-    if (o.sidecarReady && !o.sidecarReady()) return;
+    if (o.backendReady && !o.backendReady()) return;
     const gen = genRef.current;
     const seq = ++gitSeqRef.current;
     try {
@@ -437,11 +437,11 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
         patchTab(targetId, (x) => ({ ...x, dirty: false }));
         return;
       }
-      // Sidecar-hold gate, same as the read paths: a held A→B switch must not
+      // Backend-hold gate, same as the read paths: a held A→B switch must not
       // let a visible B tab write its relative path into A. Stay dirty and
       // surface why instead of silently firing.
       if (!ready()) {
-        patchTab(targetId, (x) => ({ ...x, error: 'Save held — the sidecar is still on another workspace (run in flight). Try again once the switch completes.' }));
+        patchTab(targetId, (x) => ({ ...x, error: 'Save held — the control plane is still on another workspace (run in flight). Try again once the switch completes.' }));
         return;
       }
       const gen = genRef.current;
@@ -487,7 +487,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       // code tab with the same compare/adopt/conflict logic — a `bash` edit to
       // a previously-inactive tab must not survive silently. Image tabs are
       // re-fetched too (they can reach here with `image: null` after a
-      // workspace-restore while the sidecar was held — the snapshot drops
+      // workspace-restore while the backend was held — the snapshot drops
       // dataUrls and the restore re-read was gated off).
       if (t && (t.kind === 'code' || t.kind === 'image') && !t.truncated && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')) {
         void readDisk(t.id, t.path, t.kind);
@@ -501,7 +501,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     (path: string): boolean => {
       const o = optsRef.current;
       if (!o.activeWsDir) return false;
-      if (o.sidecarReady && !o.sidecarReady()) return false; // wsHeld chip explains why
+      if (o.backendReady && !o.backendReady()) return false; // wsHeld chip explains why
       const existing = tabsRef.current.find((t) => t.path === path);
       if (existing) {
         setActive(existing.id);
@@ -598,13 +598,13 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
 
   /** Re-fetch disk content for all open code tabs AND image tabs (parallel,
    *  per-tab seq). Called after every agent mutation (onMutated composite)
-   *  and after a held workspace switch's sidecar re-point flushes (CoderScreen
-   *  flush effect) — image tabs need it because the per-workspace snapshot
-   *  drops their payload and a held switch skips the restore re-read. */
+   *  and after a held workspace switch's control-plane re-point flushes
+   *  (CoderScreen flush effect) — image tabs need it because the per-workspace
+   *  snapshot drops their payload and a held switch skips the restore re-read. */
   const refreshOpenTabs = useCallback(async () => {
     const o = optsRef.current;
     if (!o.activeWsDir) return;
-    if (o.sidecarReady && !o.sidecarReady()) return;
+    if (o.backendReady && !o.backendReady()) return;
     const ids = tabsRef.current.filter((t) => (t.kind === 'code' ? !t.truncated : t.kind === 'image') && (t.status === 'ready' || t.status === 'conflict' || t.status === 'notfound')).map((t) => t.id);
     if (ids.length === 0) return;
     await Promise.all(
@@ -621,7 +621,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
     if (!opts.running) return;
     const timer = setInterval(() => {
       const o = optsRef.current;
-      if (!o.activeWsDir || (o.sidecarReady && !o.sidecarReady())) return;
+      if (!o.activeWsDir || (o.backendReady && !o.backendReady())) return;
       void refreshGitStatus();
       const id = activeTabIdRef.current;
       if (!id) return;

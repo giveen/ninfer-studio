@@ -1,9 +1,9 @@
 name: CI / Rust control
 
 # Tests for the Rust control plane (desktop/control): every /api/* handler,
-# the serve-arg builder parity test (TS fixture shared with CI / Sidecar),
-# and the workspace/memory unit + concurrency suites. Locked mode keeps
-# Cargo.lock from drifting when Cargo.toml changes.
+# the serve-arg builder fixture test, and the workspace/memory unit +
+# concurrency suites. Locked mode keeps Cargo.lock from drifting when
+# Cargo.toml changes.
 
 on:
   pull_request:

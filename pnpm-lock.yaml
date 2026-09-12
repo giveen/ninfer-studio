@@ -12,24 +12,6 @@ importers:
         specifier: ^2
         version: 2.11.4
 
-  apps/sidecar:
-    dependencies:
-      '@mozilla/readability':
-        specifier: ^0.6.0
-        version: 0.6.0
-      crawlee:
-        specifier: ^3.18.1
-        version: 3.18.1(@types/node@22.20.1)(playwright@1.63.0)(supports-color@7.2.0)
-      jsdom:
-        specifier: ^30.0.1
-        version: 30.0.1
-      playwright:
-        specifier: ^1.63.0
-        version: 1.63.0
-      turndown:
-        specifier: ^7.2.4
-        version: 7.2.4
-
   apps/web:
     dependencies:
       '@codemirror/lang-cpp':

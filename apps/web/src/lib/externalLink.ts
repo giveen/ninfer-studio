@@ -4,8 +4,8 @@ import { isTauri } from '@tauri-apps/api/core';
 /** Hand a link off to the OS default browser when running inside the Tauri
  *  desktop shell — a plain `<a target="_blank">` click is otherwise
  *  silently swallowed by the webview (no window ever opens). Outside Tauri
- *  (plain browser / the web sidecar) this is a no-op and the native anchor
- *  behavior handles it. Pass as an `<a>`'s `onClick`. */
+ *  (plain browser against the dev control plane) this is a no-op and the native
+ *  anchor behavior handles it. Pass as an `<a>`'s `onClick`. */
 export function openExternalLink(e: MouseEvent<HTMLAnchorElement>, href: string | undefined) {
   if (!href || !isTauri()) return;
   e.preventDefault();

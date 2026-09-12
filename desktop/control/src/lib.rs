@@ -1,6 +1,6 @@
 //! NInfer Studio control plane — axum HTTP server.
 //!
-//! Mirrors the zero-dependency Node sidecar 1:1 so the web app is unchanged:
+//! The single control-plane implementation (dev standalone and in-process under Tauri):
 //!   /api/*        management endpoints (status, config, engine, logs, models, downloads, gpu)
 //!   /health,/v1/* SSE-safe proxy to the engine port
 //!   /…            static hosting of the built web app (SPA fallback)
@@ -21,7 +21,10 @@ use crate::engine::{
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models, start_download};
 use crate::repo::{start_update, update_public};
-use crate::types::{strip_extended_prefix, AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, ProfileState, SavedProfile, State};
+use crate::types::{
+    args_equal, base_name, build_serve_args, strip_extended_prefix, AppEvent, ARTIFACTS, AppSettings, EngineProfile,
+    LastStart, ProfileState, SavedProfile, State,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use axum::body::Body;
 use axum::extract::{Query, Request, State as AxumState};
@@ -31,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncBufReadExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +49,43 @@ const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// generous enough to contain the requested line count for any log this app
 /// produces.
 const LOG_TAIL_WINDOW_BYTES: usize = 512 * 1024;
+
+/// Rolling-log size for background jobs (model downloads in models.rs, repo
+/// pull/build updates in repo.rs): only the most recent lines matter for
+/// diagnosing a failure, so both pumps cap per-line length and the tail the
+/// same way, via [`append_log_line`].
+pub(crate) const LOG_TAIL_LINES: usize = 2000;
+pub(crate) const LOG_TAIL_LINE_CHARS: usize = 2000;
+
+/// Append `line` to a rolling job log, keeping only the most recent
+/// `max_lines` lines.
+pub(crate) fn append_log_line(out: &mut String, line: &str, max_lines: usize) {
+    let lines: Vec<&str> = out.lines().chain(std::iter::once(line)).collect();
+    let start = lines.len().saturating_sub(max_lines);
+    *out = lines[start..].join("\n");
+}
+
+/// Drain `reader` line by line, truncating each line to
+/// [`LOG_TAIL_LINE_CHARS`] and invoking `on_line` (owned, so the callback can
+/// be an async closure) per line until EOF. Shared by the stdout/stderr pumps
+/// of the model-download and repo-update jobs.
+pub(crate) async fn pump_log_lines<S, F, Fut>(mut reader: S, mut on_line: F)
+where
+    S: tokio::io::AsyncBufRead + Unpin,
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future,
+{
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf).await {
+            Ok(n) if n > 0 => {}
+            _ => break,
+        }
+        let line: String = buf.chars().take(LOG_TAIL_LINE_CHARS).collect();
+        on_line(line).await;
+    }
+}
 
 /// Timeout for the `/v1/*` proxy to the engine — generation requests can run
 /// long (large max_tokens, slow hardware), so this is much longer than a
@@ -70,8 +111,9 @@ pub fn build_router(state: S) -> Router {
         .route("/api/models", get(api_models))
         .route("/api/models/download", post(models_download))
         .route("/api/engine/update", post(engine_update))
+        .route("/api/engine/args", post(engine_args))
         .route("/api/gpu", get(gpu))
-        // Coding harness — control-plane endpoints (mirror apps/sidecar/server.js)
+        // Coding harness — control-plane endpoints
         .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
         .route("/api/coder/tree", get(coder::tree))
         .route("/api/coder/dirs", get(coder::dirs))
@@ -83,6 +125,9 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/jobs/{id}", get(coder::job_get))
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
         .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
+        .route("/api/coder/sandbox", get(coder::sandbox_get).post(coder::sandbox_set))
+        .route("/api/coder/search", get(coder::search))
+        .route("/api/coder/diff", get(coder::diff))
         .route("/api/coder/perms", get(coder::perms_get).post(coder::perms_set))
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
@@ -330,9 +375,8 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
     // Parse `profile` and `artifact` independently. A whole-body deserialization
     // previously fell back to defaults on any profile field error (e.g.
     // `kvCapacity: ""`), which silently dropped `artifact` and made a valid start
-    // return a misleading `no_artifact`. The Node sidecar already threads them
-    // separately; mirror that here so a malformed profile field can never
-    // discard the chosen artifact.
+    // return a misleading `no_artifact`. Threading them separately means a
+    // malformed profile field can never discard the chosen artifact.
     let profile_val = body.get("profile").cloned().unwrap_or(Value::Null);
     // Empty strings ("") are how the UI represents an unset field, but a ''
     // against a typed Option<u64>/Option<f64> field fails the WHOLE profile
@@ -375,6 +419,81 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
         }
     }
     Ok(Json(result))
+}
+
+/// `POST /api/engine/args` — server is the source of truth for the launch
+/// command and the restart-dirty check (P0-2: the web UI previously carried a
+/// third copy of the launch-arg builder plus its own dirty logic; both lived
+/// in EngineScreen.tsx and could drift from the builder that actually spawns
+/// the engine). Response:
+///   args        launch argv for the posted profile, api key masked
+///   dirty       settings differ from the running engine (only computed while
+///               an engine matching the profile's port is up)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineArgsBody {
+    #[serde(default)]
+    profile: Option<Value>,
+    #[serde(default)]
+    artifact: Option<String>,
+}
+
+async fn engine_args(
+    AxumState(state): AxumState<S>,
+    Json(body): Json<EngineArgsBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut sanitized = body.profile.clone().unwrap_or(Value::Null);
+    sanitize_empty_strings(&mut sanitized);
+    let profile: EngineProfile =
+        serde_json::from_value(sanitized).unwrap_or_else(|_| EngineProfile::default());
+    let artifact = body.artifact.clone().unwrap_or_default();
+
+    let (eng, last, cfg) = (state.engine.read().await, state.last_start.read().await, state.config.read().await);
+    let port = profile.port.unwrap_or(cfg.engine_port);
+    let running = eng.state == "running" || eng.state == "external";
+    let port_match = eng.port.map(|p| p == port).unwrap_or(true);
+    let running_args = eng.argv.as_deref().filter(|a| !a.is_empty());
+    let form = build_serve_args(&profile, port);
+
+    // Mirror of the UI's dirty rule: only meaningful for a matching port, and
+    // an unreadable argv (adopted external engine) must never read as "changed".
+    let dirty = if running && port_match {
+        match running_args {
+            Some(ra) => {
+                let running_artifact = ra.iter().find(|x| !x.starts_with('-'));
+                !args_equal(ra, &form)
+                    || base_name(&artifact)
+                        != base_name(running_artifact.map(|s| s.as_str()).unwrap_or(""))
+            }
+            None => match last.as_ref() {
+                // The UI normalizes "" to null for the artifact, so an empty
+                // artifact here means "none" as well.
+                Some(ls) => {
+                    let art_opt = if artifact.is_empty() { None } else { Some(artifact.as_str()) };
+                    ls.artifact.as_deref() != art_opt
+                        || serde_json::to_string(&ls.profile).ok() != serde_json::to_string(&profile).ok()
+                }
+                None => false,
+            },
+        }
+    } else {
+        false
+    };
+
+    // The api key is the caller's own key (posted from their own UI) — mask it
+    // in the response so the displayed command never shows a live credential.
+    let mut args = form;
+    if let Some(i) = args.iter().position(|a| a == "--api-key") {
+        if i + 1 < args.len() && !args[i + 1].is_empty() {
+            args[i + 1] = "••••••••".to_string();
+        }
+    }
+
+    Ok(Json(json!({
+        "args": args,
+        "dirty": dirty,
+        "portMatch": port_match,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -514,6 +633,12 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     }
     if let Some(v) = body.get("coderWorkspace").and_then(|v| v.as_str()) {
         merged.coder_workspace = v.into();
+    }
+    if let Some(v) = body.get("coderSandbox").and_then(|v| v.as_bool()) {
+        merged.coder_sandbox = v;
+    }
+    if let Some(v) = body.get("sandboxBinds").and_then(|v| v.as_array()) {
+        merged.sandbox_binds = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
     }
     let path = state.data_dir.join("config.json");
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
@@ -870,4 +995,39 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
         }
     }
     state
+}
+#[cfg(test)]
+mod log_pump_tests {
+    use super::*;
+
+    #[test]
+    fn append_log_line_keeps_only_the_recent_tail() {
+        let mut out = String::new();
+        for i in 0..(LOG_TAIL_LINES + 5) {
+            append_log_line(&mut out, &format!("line-{i}"), LOG_TAIL_LINES);
+        }
+        let lines = out.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), LOG_TAIL_LINES);
+        // Oldest lines dropped, newest kept, in order.
+        assert_eq!(lines[0], &format!("line-5"));
+        assert_eq!(lines.last().unwrap(), &format!("line-{}", LOG_TAIL_LINES + 4));
+    }
+
+    #[tokio::test]
+    async fn pump_log_lines_truncates_long_lines_and_stops_at_eof() {
+        let input = format!("short\n{}\nend\n", "x".repeat(LOG_TAIL_LINE_CHARS + 100));
+        let mut out = String::new();
+        pump_log_lines(tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes())), |line| {
+            // read_line hands each line WITH its trailing newline; EOF ends
+            // the loop with no extra empty line (3 lines in → 3 invocations).
+            out.push_str(&line);
+            async {}
+        })
+        .await;
+        // Truncating the 2100-char line to 2000 chars chops off its trailing
+        // newline, so the next line concatenates onto it (pre-existing
+        // behavior of the original pumps; only a cosmetic edge case for
+        // abnormally long lines).
+        assert_eq!(out, format!("short\n{}end\n", "x".repeat(LOG_TAIL_LINE_CHARS)));
+    }
 }

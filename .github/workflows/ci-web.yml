@@ -1,13 +1,17 @@
 name: CI / Web
 
-# Type-check + production build of the React app. Runs on pull requests that
-# touch the web app (including forks) and on direct pushes to main, so the
-# lockfile and TS surfaces can't silently drift.
+# Type-check + production build of the React app, plus the API-surface
+# registration gate (every /api/* path the UI calls must be registered by
+# the Rust control plane). Runs on pull requests that touch the web app or
+# the control-plane router (including forks) and on direct pushes to main,
+# so the lockfile and TS surfaces can't silently drift.
 
 on:
   pull_request:
     paths:
       - 'apps/web/**'
+      - 'desktop/control/src/lib.rs'
+      - 'scripts/api-parity.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
       - 'package.json'
@@ -16,6 +20,8 @@ on:
     branches: [main]
     paths:
       - 'apps/web/**'
+      - 'desktop/control/src/lib.rs'
+      - 'scripts/api-parity.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
       - 'package.json'
@@ -45,3 +51,5 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Type-check + build (apps/web)
         run: pnpm --filter @ninfier/web build
+      - name: API surface registration (UI endpoints vs control plane)
+        run: node scripts/api-parity.mjs

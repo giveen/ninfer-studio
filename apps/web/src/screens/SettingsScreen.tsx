@@ -248,12 +248,12 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
               thinking controls, and an agentic Coder mode backed by the same engine.
             </p>
             <p>
-              Architecture: a React 19 + Vite + Tailwind UI. In packaged releases the control plane is a Rust (Tauri/axum) core that
-              supervises the engine, scans models, reports GPU + VRAM state, and proxies the OpenAI/Anthropic HTTP API; in development
-              the same plane runs as a zero-dependency Node sidecar.
+              Architecture: a React 19 + Vite + Tailwind UI backed by a Rust (axum) control plane that
+              supervises the engine, scans models, reports GPU + VRAM state, and proxies the OpenAI/Anthropic HTTP API —
+              the same binary in development and in packaged releases.
             </p>
             <p className="font-mono text-[11.5px] text-faint">
-              engine: C++/CUDA, sm_120a · ui: React 19 + Vite 7 + Tailwind 4 · control plane: Rust axum (packaged) / Node 22 (dev)
+              engine: C++/CUDA, sm_120a · ui: React 19 + Vite 7 + Tailwind 4 · control plane: Rust axum
             </p>
           </div>
         </SectionCard>

@@ -5,7 +5,6 @@
 use crate::types::{AppEvent, State, now_ms};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
 
 pub type S = Arc<State>;
 
@@ -119,14 +118,32 @@ pub async fn start_update(state: &S, action: &str) -> Value {
         let st = state.clone();
         tokio::spawn(async move {
             let lines = tokio::io::BufReader::new(stdout);
-            pump_lines(st, lines).await;
+            crate::pump_log_lines(lines, |line| {
+                let st = st.clone();
+                async move {
+                    let mut j = st.update_job.lock().await;
+                    if let Some(r) = j.as_mut() {
+                        crate::append_log_line(&mut r.out, &line, crate::LOG_TAIL_LINES);
+                    }
+                }
+            })
+            .await;
         });
     }
     if let Some(stderr) = child.stderr.take() {
         let st = state.clone();
         tokio::spawn(async move {
             let lines = tokio::io::BufReader::new(stderr);
-            pump_lines(st, lines).await;
+            crate::pump_log_lines(lines, |line| {
+                let st = st.clone();
+                async move {
+                    let mut j = st.update_job.lock().await;
+                    if let Some(r) = j.as_mut() {
+                        crate::append_log_line(&mut r.out, &line, crate::LOG_TAIL_LINES);
+                    }
+                }
+            })
+            .await;
         });
     }
 
@@ -155,30 +172,6 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     });
 
     json!({ "ok": true, "id": id, "cmd": cmd })
-}
-
-async fn pump_lines<S>(st: Arc<State>, mut lines: S)
-where
-    S: tokio::io::AsyncBufRead + Unpin,
-{
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = match lines.read_line(&mut buf).await {
-            Ok(n) if n > 0 => n,
-            _ => break,
-        };
-        let _ = n;
-        let line: String = buf.chars().take(2000).collect();
-        let mut j = st.update_job.lock().await;
-        if let Some(r) = j.as_mut() {
-            let mut lines: Vec<&str> = r.out.lines().chain(std::iter::once(line.as_str())).collect();
-            if lines.len() > 2000 {
-                lines = lines.split_off(lines.len() - 2000);
-            }
-            r.out = lines.join("\n");
-        }
-    }
 }
 
 /// Serialize the current/last update job (camelCase, for the UI).
