@@ -20,8 +20,9 @@ const appVersion = (() => {
 })();
 
 // Dev: Vite serves the app on :5173 and proxies API + engine traffic to the
-// zero-dependency sidecar on :8787. Production: the sidecar hosts dist/ and
-// serves /api, /v1, /health from one process (single-origin, no proxy needed).
+// Rust control plane on :8787 (`pnpm control:start` or start-stack.sh).
+// Packaged: the control plane hosts dist/ and serves /api, /v1, /health from
+// one process (single-origin, no proxy needed).
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {

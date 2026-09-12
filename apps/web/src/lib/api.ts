@@ -25,10 +25,10 @@ import type {
 } from './types';
 import type { ChatAttachment } from './types';
 
-// In dev (Vite) the web is served on :5173 and /api is proxied to the sidecar on
-// :8787, so relative paths work. In a bundled desktop build the webview is loaded
-// from the Tauri asset origin (tauri://localhost) and must reach the in-process
-// control plane by its absolute loopback URL instead.
+// In dev (Vite) the web is served on :5173 and /api is proxied to the control
+// plane on :8787, so relative paths work. In a bundled desktop build the webview
+// is loaded from the Tauri asset origin (tauri://localhost) and must reach the
+// in-process control plane by its absolute loopback URL instead.
 const API_BASE = import.meta.env.DEV ? '' : 'http://127.0.0.1:8787';
 
 /** Combine the per-call timeout with an optional caller-supplied abort
@@ -71,7 +71,7 @@ export function getConfig(): Promise<AppSettings> {
 
 /** Read the engine's context window (max_model_len) for `model` from its
  *  /v1/models advertisement. Falls back to null so callers can try the
- *  sidecar-reported maxContext instead. */
+ *  control-plane-reported maxContext instead. */
 export async function getEngineContextSize(model = 'qwen-coder'): Promise<number | null> {
   try {
     const data = await getJSON<{ data?: Array<{ id: string; max_model_len?: number }> }>('/v1/models');
@@ -134,9 +134,8 @@ export function startEngine(profile: unknown, artifact: string | null): Promise<
   // Empty strings are how the form represents "unset" for some fields, but the
   // Rust control plane deserializes typed Option<u64>/Option<f64> fields — a ''
   // value fails the whole profile parse there and (with its fallback) silently
-  // drops EVERY setting. Strip '' values here so both the Node sidecar and the
-  // control plane receive a clean profile; `undefined` keys are dropped by
-  // JSON.stringify.
+  // drops EVERY setting. Strip '' values here so the control plane receives a
+  // clean profile; `undefined` keys are dropped by JSON.stringify.
   const clean = JSON.parse(JSON.stringify(profile, (_k, v) => (v === '' ? undefined : v)));
   return postJSON<EngineActionResult>('/api/engine/start', { profile: clean, artifact }, 15_000);
 }
@@ -985,8 +984,8 @@ export interface CoderCommit {
 
 /**
  * List recent commits in the active Coder workspace via `git log`. Runs through
- * `coderExec` (which executes in the workspace root), so no sidecar change is
- * needed. Returns [] when the workspace isn't a git repo or has no commits yet.
+ * `coderExec` (which executes in the workspace root), so no control-plane change
+ * is needed. Returns [] when the workspace isn't a git repo or has no commits yet.
  */
 export async function coderGitLog(limit = 100): Promise<CoderCommit[]> {
   const fmt = '%H%x1f%an%x1f%ar%x1f%ad%x1f%s%x1f%b%x1e';

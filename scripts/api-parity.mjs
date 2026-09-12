@@ -1,19 +1,20 @@
 #!/usr/bin/env node
-// API-surface parity gate.
+// API-surface registration gate.
 //
-// The web app (apps/web/src/lib/api.ts) talks to TWO interchangeable
-// backends: the zero-dependency Node sidecar (dev) and the Rust control
-// plane (AppImage). Any endpoint the UI calls that one backend fails to
-// register 404s silently on that platform (this is how the search/diff/
-// sandbox endpoints drifted: present in the sidecar, absent in Rust).
+// The web app (apps/web/src/lib/api.ts) talks to the Rust control plane
+// (dev standalone, in-process under Tauri when packaged). Any endpoint the
+// UI calls that the control plane fails to register 404s at runtime — this
+// is how the search/diff/sandbox endpoints once drifted under the retired
+// Node sidecar, and the failure mode persists with one backend whenever a
+// UI call is added without its route.
 //
-// This script enumerates every /api/* path the UI calls and asserts both
-// backends register it. Run in CI (CI / Sidecar) and locally:
+// This script enumerates every /api/* path the UI calls and asserts the
+// control plane registers it. Run in CI (CI / Web) and locally:
 //
 //   node scripts/api-parity.mjs
 //
-// Exit 0 = all endpoints registered on both backends; 1 = drift, with the
-// offending endpoints listed per backend.
+// Exit 0 = all endpoints registered; 1 = drift, with the offending
+// endpoints listed.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -47,19 +48,9 @@ function rustRoutes() {
   return [...routes];
 }
 
-function sidecarRoutes() {
-  const src = read('apps/sidecar/server.js');
-  const routes = new Set();
-  for (const m of src.matchAll(/['"]\/api\/[^'"]*['"]/g)) {
-    routes.add(m[0].slice(1, -1));
-  }
-  return [...routes];
-}
 
-// --- Match a UI path against a backend's route list -------------------------
-// Exact match, one-segment wildcard (`*`), or prefix routes (sidecar
-// `startsWith` handlers register a trailing-slash path like
-// `/api/coder/jobs/`).
+// --- Match a UI path against the route list ----------------------------------
+// Exact match, one-segment wildcard (`*`), or prefix routes.
 function registered(uiPath, routes) {
   return routes.some((r) => {
     if (r === uiPath) return true;
@@ -74,26 +65,14 @@ function registered(uiPath, routes) {
 
 const ui = uiEndpoints();
 const rust = rustRoutes();
-const side = sidecarRoutes();
 
-const missingRust = ui.filter((p) => !registered(p, rust));
-const missingSidecar = ui.filter((p) => !registered(p, side));
+const missing = ui.filter((p) => !registered(p, rust));
 
-console.log(`API surface parity — ${ui.length} endpoints called by the web UI`);
-let fail = false;
-for (const [name, missing] of [
-  ['Rust control plane (desktop/control/src/lib.rs)', missingRust],
-  ['Node sidecar (apps/sidecar/server.js)', missingSidecar],
-]) {
-  if (missing.length) {
-    fail = true;
-    console.log(`\nFAIL: ${name} is missing ${missing.length} endpoint(s) the UI calls:`);
-    for (const p of missing) console.log(`  ${p}`);
-  } else {
-    console.log(`ok:  ${name} registers every endpoint the UI calls`);
-  }
-}
-if (fail) {
-  console.log('\nFix: register the missing routes in the lagging backend (mirror the other\nbackend\'s handler), then re-run. Do NOT remove the UI call — the endpoint is real.');
+console.log(`API surface — ${ui.length} endpoints called by the web UI`);
+if (missing.length) {
+  console.log(`\nFAIL: control plane (desktop/control/src/lib.rs) is missing ${missing.length} endpoint(s) the UI calls:`);
+  for (const p of missing) console.log(`  ${p}`);
+  console.log('\nFix: register the missing routes in desktop/control/src/lib.rs, then re-run. Do NOT remove the UI call — the endpoint is real.');
   process.exit(1);
 }
+console.log('ok:  control plane registers every endpoint the UI calls');

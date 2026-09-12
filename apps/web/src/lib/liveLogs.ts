@@ -15,14 +15,14 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight: Promise<void> | null = null;
 
 async function tick() {
-  if (inFlight) return; // never stack polls on a slow sidecar
+  if (inFlight) return; // never stack polls on a slow control plane
   inFlight = (async () => {
     try {
       const r = await getLogs(N);
       lines = r.lines;
       listeners.forEach((l) => l());
     } catch {
-      /* sidecar busy — keep the last good tail */
+    /* control plane busy — keep the last good tail */
     } finally {
       inFlight = null;
     }

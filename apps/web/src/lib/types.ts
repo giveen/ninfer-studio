@@ -1,4 +1,4 @@
-// Shared types mirroring the sidecar's API surface and the NInfer engine's
+// Shared types mirroring the control plane's API surface and the NInfer engine's
 // HTTP contract (docs/serving.md).
 
 export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed' | 'external';
@@ -97,12 +97,6 @@ export interface LastStart {
   at: number;
 }
 
-export interface SidecarStatus {
-  startedAt: number;
-  codeMtime: number | null;
-  stale: boolean;
-}
-
 export interface StatusPayload {
   engine: EngineStatus;
   engines?: EngineStatus[];
@@ -117,7 +111,6 @@ export interface StatusPayload {
   catalog: CatalogEntry[];
   downloads: DownloadRec[];
   update?: UpdateJob | null;
-  sidecar?: SidecarStatus;
 }
 
 export interface DownloadRec {
@@ -368,7 +361,7 @@ export interface CoderTodo {
   activeForm?: string;
 }
 
-// Control-plane response shapes (mirrors apps/sidecar/server.js / Rust coder.rs).
+// Control-plane response shapes (mirrors desktop/control/src/coder/*).
 export interface FileNode {
   name: string;
   path: string;
@@ -408,7 +401,7 @@ export interface CoderExecResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
-  /** True when stdout/stderr exceeded the sidecar's output cap and was truncated. */
+  /** True when stdout/stderr exceeded the control plane's output cap and was truncated. */
   truncated?: boolean;
   /** True when the command was refused by safe mode (see detectDestructive). */
   blocked?: boolean;

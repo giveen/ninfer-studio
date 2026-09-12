@@ -1008,12 +1008,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
-  // Re-pointed sidecar workspace + flush counter (see the workspace effect below);
+  // Re-pointed control-plane workspace + flush counter (see the workspace effect below);
   // declared early because the panel-reload effects depend on wsFlushed.
   const wsAppliedDirRef = useRef<string | null>(null);
   const [wsFlushed, setWsFlushed] = useState(0);
   // Serialized re-point queue (see the workspace effect below): a run awaits
-  // this before its first sidecar tool call.
+  // this before its first control-plane tool call.
   const wsApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -1126,7 +1126,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return () => { cancelled = true; clearInterval(timer); };
   }, [jobsOpen, bgJobs, activeWs, jobStatus]);
 
-  // Coder "safe mode": the sidecar refuses clearly destructive shell commands
+  // Coder "safe mode": the control plane refuses clearly destructive shell commands
   // (release blocker #2). Surfaced as a toggle + warning banner.
   const [coderSafeMode, setCoderSafeMode] = useState(true);
   const toggleSafeMode = useCallback(async (next: boolean) => {
@@ -1193,14 +1193,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const treeSeqRef = useRef(0);
   const memSeqRef = useRef(0);
 
-  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the sidecar
+  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the control plane
   // under its data dir, so it is never committed by accident. The agent sees it
   // only via system-prompt injection (memoryRef) — it can't read it as a file.
   const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
   const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
   // Memory modal open state.
   const [memOpen, setMemOpen] = useState(false);
-  // Generation counters for the sidecar-relative panel fetches (commits panel —
+  // Generation counters for the control-plane-relative panel fetches (commits panel —
   // the tree/memory seq refs live in the shared block above).
   const commitsSeqRef = useRef(0);
   // Pull the bank + learnings for the active workspace; called on workspace change
@@ -1231,7 +1231,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
       setCommits(commits);
     } catch {
-      // Keep the last good list rather than wiping it on a transient sidecar
+      // Keep the last good list rather than wiping it on a transient backend
       // blip (M2). An empty workspace simply shows no commits.
     } finally {
       if (seq === commitsSeqRef.current) setCommitsLoading(false);
@@ -1255,7 +1255,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [running, activeWs, loadCommits]);
 
   // Refresh the commit history whenever the active workspace changes (or the
-  // sidecar re-point is flushed after a held mid-run switch — wsFlushed).
+  // control-plane re-point is flushed after a held mid-run switch — wsFlushed).
   useEffect(() => {
     if (activeWsDir) loadCommits();
   }, [activeWsDir, wsFlushed, loadCommits]);
@@ -1267,7 +1267,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (activeWsDir) void loadMemory();
   }, [activeWsDir, wsFlushed, loadMemory]);
 
-  // Sync the safe-mode toggle with the sidecar's current state on mount.
+  // Sync the safe-mode toggle with the control plane's current state on mount.
   useEffect(() => {
     coderSafeModeGet()
       .then((r) => setCoderSafeMode(r.enabled))
@@ -1392,9 +1392,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   }, [messages, ledger, todos, todosUpdatedAt, activeWs, activeConv]);
 
-  // Keep the sidecar's coder workspace pointed at the active workspace — but
+  // Keep the control plane's coder workspace pointed at the active workspace — but
   // HOLD the re-point while a run is in flight: every agent tool call resolves
-  // against the sidecar's configured workspace, so re-pointing mid-run would
+  // against the control plane's configured workspace, so re-pointing mid-run would
   // send the running agent's edits/commits to the repo the user just switched
   // to. When the run ends the re-point fires (running flips in the deps) and
   // the panel reloads below pick it up via wsFlushed.
@@ -1403,11 +1403,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // A→B→A switches can't interleave, and only the LATEST request commits
   // wsAppliedDirRef/wsFlushed — a stale response from an older switch can't
   // clobber the applied workspace. runAgent awaits this queue before its
-  // first sidecar tool call, so an in-flight re-point settles before the run
+  // first control-plane tool call, so an in-flight re-point settles before the run
   // starts rather than landing mid-run.
   const wsApplySeqRef = useRef(0);
   const wsApplyPendingRef = useRef(false);
-  /** Enqueue a sidecar re-point (serialized; only the latest request commits
+  /** Enqueue a control-plane re-point (serialized; only the latest request commits
    *  wsAppliedDirRef/wsFlushed). Called by the effect below AND directly by
    *  the ask-resume paths — their setStore-driven effect would otherwise
    *  enqueue the re-point only after runAgent already passed its queue await,
@@ -1420,11 +1420,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const task = wsApplyQueueRef.current
       .catch(() => undefined) // a previous failure must not clog the queue
       .then(() => setCoderWorkspace(dir))
-      .catch((e) => console.warn('Failed to set coder workspace on sidecar:', e))
+      .catch((e) => console.warn('Failed to set coder workspace on control plane:', e))
       .then(() => {
         // Only the LATEST request may commit — a stale response from an older
         // workspace switch would otherwise leave wsAppliedDirRef pointing at
-        // a workspace the sidecar is no longer on.
+        // a workspace the control plane is no longer on.
         if (seq === wsApplySeqRef.current) {
           wsAppliedDirRef.current = dir;
           setWsFlushed((n) => n + 1);
@@ -1440,11 +1440,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (running) { setWsBusy(false); return; }
     queueWorkspaceApply(activeWsDir);
   }, [activeWsDir, running]);
-  // True while the view is on a different workspace than the one the sidecar
+  // True while the view is on a different workspace than the one the control plane
   // is still pointed at (a re-point held by an in-flight run).
   const wsHeld = running && wsAppliedDirRef.current !== null && wsAppliedDirRef.current !== activeWsDir;
 
-  // Seed the default workspace from the sidecar once its path is known.
+  // Seed the default workspace from the control plane once its path is known.
   const seeded = useRef(false);
   useEffect(() => {
     if (!coderWs || seeded.current) return;
@@ -2031,7 +2031,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWs, activeConv, refreshRepoMap]);
 
   // Load/refresh the tree whenever the active (possibly worktree-bound) directory
-  // changes, or the sidecar re-point is flushed after a held mid-run switch
+  // changes, or the control-plane re-point is flushed after a held mid-run switch
   // (#11's wsFlushed — the merged successor of #8's wsSynced counter).
   useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
@@ -2178,9 +2178,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const tabs = useFileTabs({
     activeWsDir,
     running,
-    // Mid-run sidecar-hold gate: while a run pins the sidecar to another
-    // workspace, every sidecar-touching tab op no-ops (the wsHeld chip explains).
-    sidecarReady: () => wsAppliedDirRef.current === activeWsDir,
+    // Mid-run backend-hold gate: while a run pins the control plane to another
+    // workspace, every backend-touching tab op no-ops (the wsHeld chip explains).
+    backendReady: () => wsAppliedDirRef.current === activeWsDir,
     getLintCommand: () => {
       const c = activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined;
       return c?.lint || c?.build || null;
@@ -2188,13 +2188,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     onUndoEdit: (p) => { void undoFileEdit(p); },
   });
   tabsRefreshRef.current = () => { void tabs.refreshOpenTabs(); void tabs.refreshGitStatus(); };
-  // Refresh git badges once a new workspace's sidecar re-point is flushed.
+  // Refresh git badges once a new workspace's control-plane re-point is flushed.
   useEffect(() => {
     void tabs.refreshGitStatus();
   }, [tabs.refreshGitStatus, wsFlushed, activeWsDir]);
   // Content refresh only when the flush actually lands (wsFlushed bumped):
   // a held mid-run switch — and even a plain switch's in-flight POST — skips
-  // the restore re-reads (sidecarReady is false until the confirmed
+  // the restore re-reads (backendReady is false until the confirmed
   // workspace), so this is the point at which rereading open tabs (code AND
   // image — the snapshot drops image payloads) is guaranteed to hit the
   // right workspace. Gated on the delta so a plain activeWsDir change (no
@@ -3570,7 +3570,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setRunning(true);
     // Pin the run's token accounting; the visible meter may follow the view.
     runTokensRef.current = lastPromptTokensRef.current;
-    // Settle any in-flight sidecar re-point BEFORE the first tool call: a
+    // Settle any in-flight control-plane re-point BEFORE the first tool call: a
     // switch POST only ever targets the view the run starts in, so awaiting
     // it makes the early calls hit the right repo instead of the previous
     // workspace, and nothing re-points mid-run (switches now queue behind it).
@@ -3654,7 +3654,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Read the engine's context window so we can auto-compact once usage crosses
     // the configured share of max (coderParams.compactAt, default 80%). Prefer
     // the engine's own /v1/models advertisement, falling back to the
-    // sidecar-reported maxContext.
+    // control-plane-reported maxContext.
     let maxContext = 0;
     try {
       maxContext = (await getEngineContextSize(model)) ?? 0;
@@ -4812,9 +4812,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           {wsHeld && (
             <span
               className="shrink-0 text-[10px] text-faint"
-              title="All agent tools run against the sidecar's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
+              title="All agent tools run against the control plane's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
             >
-              sidecar on {baseName(wsAppliedDirRef.current!)} until run ends
+              backend on {baseName(wsAppliedDirRef.current!)} until run ends
             </span>
           )}
           <span

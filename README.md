@@ -95,17 +95,17 @@ desktop/         Rust control plane + Tauri 2 desktop shell
   app/           ninfier-studio: Tauri 2 window hosting the control plane
 apps/web         React 19 + Vite + Tailwind 4 frontend
                  (Chat / Coder / Engine / Models / Settings)
-apps/sidecar     zero-dependency Node 22 dev-mode server implementing the same control-plane API
-start-stack.sh   dev convenience: boot the sidecar, seed config from env vars,
+start-stack.sh   dev convenience: boot the control plane, seed config from env vars,
                  start/adopt the engine
 ~/.config/ninfier-studio/   per-user runtime state (CONFIG_HOME); AppData/Roaming/ninfier-studio
                  on Windows — config.json, profile.json, chats.json, last-start.json,
                  engine-<port>.log. Override location with NINFIER_STUDIO_DATA.
 ```
 
-The **control plane** (`desktop/control`, or `apps/sidecar` in browser dev mode) is the
-only process that touches the engine. In the desktop app it runs inside the Tauri core,
-so the engine's parent is the app itself — a single process supervises the engine.
+The **control plane** (`desktop/control`) is the only process that touches the
+engine. In development it runs standalone (`pnpm control:start`); in the desktop
+app it runs inside the Tauri core, so the engine's parent is the app itself — a
+single process supervises the engine.
 
 | API | Purpose |
 |---|---|
@@ -180,8 +180,8 @@ Produces `.deb` + `.AppImage` in `desktop/target/release/bundle/`.
 **Development modes:**
 
 ```bash
-pnpm dev            # web dev: Vite :5173 (HMR) + Node sidecar :8787 (browser UI)
-pnpm control:run    # headless: Rust control plane only, no window
+pnpm dev            # Rust control plane :8787 + Vite :5173 (HMR browser UI)
+pnpm control:start # headless: Rust control plane only, no window
 pnpm desktop:run    # native window + Rust control plane (dist from apps/web/dist)
 ```
 
@@ -189,7 +189,7 @@ pnpm desktop:run    # native window + Rust control plane (dist from apps/web/dis
 `~/.config/ninfier-studio` on Linux, `AppData/Roaming/ninfier-studio` on Windows) and
 `NINFIER_STUDIO_DIST` (default `apps/web/dist`) overrides the dist location.
 
-`start-stack.sh` (dev) boots the sidecar and optionally seeds config + starts the
+`start-stack.sh` (dev) boots the control plane and optionally seeds config + starts the
 engine, taking all paths from the environment — `NINFER_DIR`, `MODELS_DIR`,
 `CODER_WORKSPACE`, `ARTIFACT`, `ENGINE_PORT`; settings persist in `config.json`
 after the first run.

@@ -1,6 +1,6 @@
 //! NInfer Studio control plane — axum HTTP server.
 //!
-//! Mirrors the zero-dependency Node sidecar 1:1 so the web app is unchanged:
+//! The single control-plane implementation (dev standalone and in-process under Tauri):
 //!   /api/*        management endpoints (status, config, engine, logs, models, downloads, gpu)
 //!   /health,/v1/* SSE-safe proxy to the engine port
 //!   /…            static hosting of the built web app (SPA fallback)
@@ -113,7 +113,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/engine/update", post(engine_update))
         .route("/api/engine/args", post(engine_args))
         .route("/api/gpu", get(gpu))
-        // Coding harness — control-plane endpoints (mirror apps/sidecar/server.js)
+        // Coding harness — control-plane endpoints
         .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
         .route("/api/coder/tree", get(coder::tree))
         .route("/api/coder/dirs", get(coder::dirs))
@@ -375,9 +375,8 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
     // Parse `profile` and `artifact` independently. A whole-body deserialization
     // previously fell back to defaults on any profile field error (e.g.
     // `kvCapacity: ""`), which silently dropped `artifact` and made a valid start
-    // return a misleading `no_artifact`. The Node sidecar already threads them
-    // separately; mirror that here so a malformed profile field can never
-    // discard the chosen artifact.
+    // return a misleading `no_artifact`. Threading them separately means a
+    // malformed profile field can never discard the chosen artifact.
     let profile_val = body.get("profile").cloned().unwrap_or(Value::Null);
     // Empty strings ("") are how the UI represents an unset field, but a ''
     // against a typed Option<u64>/Option<f64> field fails the WHOLE profile

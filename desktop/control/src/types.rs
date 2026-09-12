@@ -764,15 +764,13 @@ mod parity {
     use super::*;
     use std::path::Path;
 
-    /// The Node sidecar's builder (apps/sidecar/serve-args.js) must produce
-    /// byte-identical argv to build_serve_args — dev launches and packaged
-    /// AppImage launches must behave the same. scripts/args-parity.mjs checks
-    /// the TS side against the same fixture; if either test fails, one of the
-    /// two builders drifted. Update the fixture with
-    /// `node scripts/args-parity.mjs --update` only for intentional changes,
-    /// then make the other implementation match.
+    /// build_serve_args is the single engine launch-arg builder (dev and
+    /// packaged launches share it — the former Node sidecar copy is gone).
+    /// This test pins its argv against the fixture in tests/parity; change
+    /// the builder intentionally by updating expected-args.json alongside it
+    /// and reviewing the diff.
     #[test]
-    fn serve_args_match_typescript_fixture() {
+    fn serve_args_match_fixture() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/parity");
         let cases: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("canonical-profile.json"))

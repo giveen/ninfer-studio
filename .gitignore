@@ -7,6 +7,5 @@ data/
 desktop/target/
 *.deb
 
-# Runtime sidecar / local storage (not source)
-storage/
-apps/sidecar/storage/
+  # Runtime local storage (not source)
+  storage/

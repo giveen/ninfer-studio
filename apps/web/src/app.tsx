@@ -140,7 +140,7 @@ export function App() {
             )}
             {error && (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-danger/40 bg-danger/10 px-2.5 py-1 text-danger" title={error}>
-                sidecar unreachable
+                control plane unreachable
               </span>
             )}
           </div>
