@@ -18,17 +18,17 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     // single job at a time
     {
         let job = state.update_job.lock().await;
-        if let Some(j) = job.as_ref() {
-            if !j.done {
-                return json!({
-                    "ok": false,
-                    "message": format!(
-                        "an {} job is already running (pid {:?})",
-                        j.action.as_deref().unwrap_or("?"),
-                        j.pid
-                    )
-                });
-            }
+        if let Some(j) = job.as_ref()
+            && !j.done
+        {
+            return json!({
+                "ok": false,
+                "message": format!(
+                    "an {} job is already running (pid {:?})",
+                    j.action.as_deref().unwrap_or("?"),
+                    j.pid
+                )
+            });
         }
     }
 

@@ -1,4 +1,7 @@
 //! Config / profile-state / conversations route handlers.
+
+// Rust guideline compliant 2026-07-28
+
 use axum::body::Body;
 use axum::extract::{Request, State as AxumState};
 use axum::http::StatusCode;
@@ -39,10 +42,7 @@ pub(crate) fn redact_config(mut v: Value) -> Value {
 
 pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let mut merged: AppSettings = {
-        let c = state.config.read().await.clone();
-        c
-    };
+    let mut merged: AppSettings = state.config.read().await.clone();
     if let Some(v) = body.get("ninferPath").and_then(|v| v.as_str()) {
         merged.ninfer_path = v.into();
     }
@@ -82,8 +82,26 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         merged.sandbox_binds = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
     }
     let path = state.data_dir.join("config.json");
-    let _ = tokio::fs::create_dir_all(&state.data_dir).await;
-    let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
+    if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
+        tracing::event!(
+            name: "config.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            data_dir = ?state.data_dir,
+            "could not create data dir {{data_dir}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+    }
+    if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await {
+        tracing::event!(
+            name: "config.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            path = ?path,
+            "could not write config to {{path}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save config: {e}")));
+    }
     {
         let mut c = state.config.write().await;
         *c = merged.clone();
@@ -119,24 +137,42 @@ pub(crate) async fn profile_state_set(
             Err(_) => ProfileState::default(),
         }
     };
-    if let Some(v) = body.get("profile") {
-        if let Ok(p) = serde_json::from_value::<EngineProfile>(v.clone()) {
-            current.profile = Some(p);
-        }
+    if let Some(v) = body.get("profile")
+        && let Ok(p) = serde_json::from_value::<EngineProfile>(v.clone())
+    {
+        current.profile = Some(p);
     }
-    if let Some(v) = body.get("artifact") {
-        if let Some(s) = v.as_str() {
-            current.artifact = s.to_string();
-        }
+    if let Some(v) = body.get("artifact")
+        && let Some(s) = v.as_str()
+    {
+        current.artifact = s.to_string();
     }
-    if let Some(v) = body.get("saved") {
-        if let Ok(s) = serde_json::from_value::<Vec<SavedProfile>>(v.clone()) {
-            current.saved = s;
-        }
+    if let Some(v) = body.get("saved")
+        && let Ok(s) = serde_json::from_value::<Vec<SavedProfile>>(v.clone())
+    {
+        current.saved = s;
     }
     let p = state.data_dir.join("profile.json");
-    tokio::fs::create_dir_all(&state.data_dir).await.ok();
-    tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await.ok();
+    if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
+        tracing::event!(
+            name: "profile_state.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            data_dir = ?state.data_dir,
+            "could not create data dir {{data_dir}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+    }
+    if let Err(e) = tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
+        tracing::event!(
+            name: "profile_state.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            path = ?p,
+            "could not write profile state to {{path}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save profile state: {e}")));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -168,22 +204,40 @@ pub(crate) async fn conversations_set(
             Err(_) => json!({}),
         }
     };
-    if let Some(v) = body.get("conversations") {
-        if v.is_array() {
-            current["conversations"] = v.clone();
-        }
+    if let Some(v) = body.get("conversations")
+        && v.is_array()
+    {
+        current["conversations"] = v.clone();
     }
     if body.get("params").is_some() {
         current["params"] = body["params"].clone();
     }
-    if let Some(v) = body.get("presets") {
-        if v.is_array() {
-            current["presets"] = v.clone();
-        }
+    if let Some(v) = body.get("presets")
+        && v.is_array()
+    {
+        current["presets"] = v.clone();
     }
     let p = state.data_dir.join("chats.json");
-    tokio::fs::create_dir_all(&state.data_dir).await.ok();
-    tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await.ok();
+    if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
+        tracing::event!(
+            name: "conversations.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            data_dir = ?state.data_dir,
+            "could not create data dir {{data_dir}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+    }
+    if let Err(e) = tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
+        tracing::event!(
+            name: "conversations.persist.failed",
+            tracing::Level::ERROR,
+            error = %e,
+            path = ?p,
+            "could not write conversations to {{path}}: {{error}}",
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save conversations: {e}")));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 

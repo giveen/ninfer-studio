@@ -71,10 +71,10 @@ async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
                 }
                 _ => {}
             }
-            if let Some(stripped) = args[i].strip_prefix("--port=") {
-                if let Ok(p) = stripped.parse::<u16>() {
-                    port = Some(p);
-                }
+            if let Some(stripped) = args[i].strip_prefix("--port=")
+                && let Ok(p) = stripped.parse::<u16>()
+            {
+                port = Some(p);
             }
             if artifact.is_none()
                 && !args[i].starts_with('-')
@@ -159,10 +159,10 @@ fn parse_tasklist_serve_pids(output: &str) -> Vec<u32> {
         let name = it.next().unwrap_or("");
         let _sep = it.next();
         let pid = it.next().and_then(|p| p.parse::<u32>().ok());
-        if name.eq_ignore_ascii_case("ninfer-serve.exe") {
-            if let Some(pid) = pid {
-                pids.push(pid);
-            }
+        if name.eq_ignore_ascii_case("ninfer-serve.exe")
+            && let Some(pid) = pid
+        {
+            pids.push(pid);
         }
     }
     pids

@@ -36,19 +36,18 @@ pub async fn refresh_engine_status(state: &State) {
         eng.mark_exited();
     }
 
-    if eng.state == EngineState::Starting {
-        if let Some(deadline) = eng.deadline {
-            if now_ms() > deadline {
-                eng.mark_failed(start_timeout_message());
-            }
-        }
+    if eng.state == EngineState::Starting
+        && let Some(deadline) = eng.deadline
+        && now_ms() > deadline
+    {
+        eng.mark_failed(start_timeout_message());
     }
 
     if eng.state == EngineState::Stopped {
-        if let Some(port) = eng.port {
-            if engine_health(port).await {
-                adopt_external(&mut eng, state, port).await;
-            }
+        if let Some(port) = eng.port
+            && engine_health(port).await
+        {
+            adopt_external(&mut eng, state, port).await;
         }
     } else if eng.state == EngineState::Failed && !has_child {
         // a failed spawn must not mask a live engine: if the spawn targeted a
@@ -59,29 +58,29 @@ pub async fn refresh_engine_status(state: &State) {
         } else {
             eng.port
         };
-        if let Some(port) = port {
-            if engine_health(port).await {
-                adopt_external(&mut eng, state, port).await;
-            }
+        if let Some(port) = port
+            && engine_health(port).await
+        {
+            adopt_external(&mut eng, state, port).await;
         }
-    } else if eng.state == EngineState::External {
-        if let Some(port) = eng.port {
-            if engine_health(port).await {
-                // keep pid fresh (the external process may restart) — same-port
-                // policy as adoption, never a cross-port pid.
-                let all = discover_engines().await;
-                let cfg_port = state.config.read().await.engine_port;
-                if let Some(p) = resolve_external_pid(&all, Some(port), cfg_port) {
-                    eng.pid = Some(p);
-                }
-                if eng.model_id.is_none() {
-                    let (mid, mctx) = engine_model_info(state, port).await;
-                    eng.assign_model_info(mid, mctx);
-                }
-            } else {
-                eng.reset_stopped();
-                eng.argv = None;
+    } else if eng.state == EngineState::External
+        && let Some(port) = eng.port
+    {
+        if engine_health(port).await {
+            // keep pid fresh (the external process may restart) — same-port
+            // policy as adoption, never a cross-port pid.
+            let all = discover_engines().await;
+            let cfg_port = state.config.read().await.engine_port;
+            if let Some(p) = resolve_external_pid(&all, Some(port), cfg_port) {
+                eng.pid = Some(p);
             }
+            if eng.model_id.is_none() {
+                let (mid, mctx) = engine_model_info(state, port).await;
+                eng.assign_model_info(mid, mctx);
+            }
+        } else {
+            eng.reset_stopped();
+            eng.argv = None;
         }
     }
 

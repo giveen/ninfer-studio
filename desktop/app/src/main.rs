@@ -147,18 +147,18 @@ fn main() {
             // compile-time source path that default_dist_dir() would otherwise
             // resolve to (CARGO_MANIFEST_DIR is frozen at build time and points
             // at the CI runner, not the user's machine).
-            if !cfg!(debug_assertions) {
-                if let Ok(res) = app.path().resource_dir() {
-                    // SAFETY: runs synchronously inside Tauri's `setup()` callback,
-                    // which executes once on the main thread before this process
-                    // spawns any of its own threads — the control-plane tokio
-                    // runtime and the async event pump below are both created
-                    // after this point — and before any webview content has
-                    // loaded. Nothing else in this process reads or writes
-                    // process environment variables concurrently with this call.
-                    unsafe {
-                        std::env::set_var("NINFIER_STUDIO_DIST", res);
-                    }
+            if !cfg!(debug_assertions)
+                && let Ok(res) = app.path().resource_dir()
+            {
+                // SAFETY: runs synchronously inside Tauri's `setup()` callback,
+                // which executes once on the main thread before this process
+                // spawns any of its own threads — the control-plane tokio
+                // runtime and the async event pump below are both created
+                // after this point — and before any webview content has
+                // loaded. Nothing else in this process reads or writes
+                // process environment variables concurrently with this call.
+                unsafe {
+                    std::env::set_var("NINFIER_STUDIO_DIST", res);
                 }
             }
 

@@ -218,23 +218,23 @@ async fn spawn_and_attach(
     // pump stdout+stderr into the log file
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    if let Some(stdout) = stdout {
-        if let Ok(la) = log.try_clone().await {
-            tokio::spawn(async move {
-                let mut la = la;
-                let mut so = stdout;
-                let _ = tokio::io::copy(&mut so, &mut la).await;
-            });
-        }
+    if let Some(stdout) = stdout
+        && let Ok(la) = log.try_clone().await
+    {
+        tokio::spawn(async move {
+            let mut la = la;
+            let mut so = stdout;
+            let _ = tokio::io::copy(&mut so, &mut la).await;
+        });
     }
-    if let Some(stderr) = stderr {
-        if let Ok(lb) = log.try_clone().await {
-            tokio::spawn(async move {
-                let mut lb = lb;
-                let mut se = stderr;
-                let _ = tokio::io::copy(&mut se, &mut lb).await;
-            });
-        }
+    if let Some(stderr) = stderr
+        && let Ok(lb) = log.try_clone().await
+    {
+        tokio::spawn(async move {
+            let mut lb = lb;
+            let mut se = stderr;
+            let _ = tokio::io::copy(&mut se, &mut lb).await;
+        });
     }
 
     {
@@ -300,16 +300,16 @@ fn spawn_health_poller(state: S, port: u16) {
                 return;
             }
             let mut eng = state.engine.write().await;
-            if let Some(deadline) = eng.deadline {
-                if now_ms() > deadline {
-                    eng.mark_failed(start_timeout_message());
-                    drop(eng);
-                    let mut c = state.child.lock().await;
-                    if let Some(c) = c.as_mut() {
-                        let _ = c.start_kill();
-                    }
-                    return;
+            if let Some(deadline) = eng.deadline
+                && now_ms() > deadline
+            {
+                eng.mark_failed(start_timeout_message());
+                drop(eng);
+                let mut c = state.child.lock().await;
+                if let Some(c) = c.as_mut() {
+                    let _ = c.start_kill();
                 }
+                return;
             }
         }
     });

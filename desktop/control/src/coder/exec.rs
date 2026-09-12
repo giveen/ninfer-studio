@@ -161,20 +161,20 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     let timeout_ms = req.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000).clamp(1_000, 600_000);
 
     // Safe-mode gate first: refuse before spawning anything (release #2).
-    if state.coder_safe_mode.load(Ordering::SeqCst) {
-        if let Some(reason) = detect_destructive(&command) {
-            let cwd = if rel_cwd.is_empty() { rel_of(&root, &root) } else { rel_cwd.clone() };
-            return Ok(Json(json!({
-                "stdout": "",
-                "stderr": format!("⛔ Blocked by safe mode: {reason}. Use a scoped, non-destructive alternative or ask the user."),
-                "exitCode": 1,
-                "timedOut": false,
-                "truncated": false,
-                "blocked": true,
-                "cwd": cwd,
-                "error": reason,
-            })));
-        }
+    if state.coder_safe_mode.load(Ordering::SeqCst)
+        && let Some(reason) = detect_destructive(&command)
+    {
+        let cwd = if rel_cwd.is_empty() { rel_of(&root, &root) } else { rel_cwd.clone() };
+        return Ok(Json(json!({
+            "stdout": "",
+            "stderr": format!("⛔ Blocked by safe mode: {reason}. Use a scoped, non-destructive alternative or ask the user."),
+            "exitCode": 1,
+            "timedOut": false,
+            "truncated": false,
+            "blocked": true,
+            "cwd": cwd,
+            "error": reason,
+        })));
     }
 
     // Stateful sessions: run from the session's last cwd and capture the new
@@ -266,10 +266,10 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     // job id immediately. The client polls `job_get`; output is tail-capped.
     if req.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let id = format!("job_{now_ms}_{}", BG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        let id = format!("job_{now_ms}_{}", state.bg_job_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
         let job = std::sync::Arc::new(BgJob::new(id.clone(), command.clone(), result_cwd.clone()));
         {
-            let mut jobs = BG_JOBS.lock().await;
+            let mut jobs = state.bg_jobs.lock().await;
             if jobs.len() >= 32 {
                 if let Some(victim) = jobs.iter().find_map(|(k, j)| j.try_done().then(|| k.clone())) {
                     jobs.remove(&victim);
@@ -336,17 +336,17 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             let mut stdout = String::from_utf8_lossy(&so).into_owned();
             let stderr_raw = String::from_utf8_lossy(&se).into_owned();
             // Pull the session cwd out of the marker and strip it from stdout.
-            if let Some(sid) = &session {
-                if let Some(first) = stdout.find(CWD_MARKER) {
-                    let rest = &stdout[first + CWD_MARKER.len()..];
-                    if let Some(end) = rest.find(CWD_MARKER) {
-                        let new_cwd = rest[..end].trim().to_string();
-                        if !new_cwd.is_empty() {
-                            state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
-                        }
+            if let Some(sid) = &session
+                && let Some(first) = stdout.find(CWD_MARKER)
+            {
+                let rest = &stdout[first + CWD_MARKER.len()..];
+                if let Some(end) = rest.find(CWD_MARKER) {
+                    let new_cwd = rest[..end].trim().to_string();
+                    if !new_cwd.is_empty() {
+                        state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
                     }
-                    stdout = stdout[..first].to_string();
                 }
+                stdout = stdout[..first].to_string();
             }
             let (stdout_capped, t_out) = cap_out(&stdout);
             let (stderr_capped, t_err) = cap_out(&stderr_raw);
@@ -366,6 +366,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
 /// run detached; the client polls `job_get` and stops via `job_kill` (which
 /// sets a flag — the drain task sends SIGKILL via `start_kill`, so no child
 /// handle is ever held across an await).
+#[derive(Debug)]
 struct BgState {
     command: String,
     cwd: String,
@@ -378,7 +379,8 @@ struct BgState {
     stderr: String,
     started_at: u64,
 }
-struct BgJob {
+#[derive(Debug)]
+pub struct BgJob {
     id: String,
     state: tokio::sync::Mutex<BgState>,
 }
@@ -402,9 +404,6 @@ impl BgJob {
         self.state.try_lock().map(|s| !s.done && s.killed).unwrap_or(false)
     }
 }
-static BG_JOBS: LazyLock<tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<BgJob>>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
-static BG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Drain a background child: stream pipes to EOF in the background while a
 /// 1s wait-poll honors kill requests and the deadline, then record capped
 /// output (+ session cwd bookkeeping, like the foreground path).
@@ -450,17 +449,17 @@ async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Chi
     st.timed_out = timed_out;
     let killed = st.killed;
     let mut stdout = String::from_utf8_lossy(&so).into_owned();
-    if let Some(sid) = &session {
-        if let Some(first) = stdout.find(CWD_MARKER) {
-            let rest = &stdout[first + CWD_MARKER.len()..];
-            if let Some(end) = rest.find(CWD_MARKER) {
-                let new_cwd = rest[..end].trim().to_string();
-                if !new_cwd.is_empty() {
-                    state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
-                }
+    if let Some(sid) = &session
+        && let Some(first) = stdout.find(CWD_MARKER)
+    {
+        let rest = &stdout[first + CWD_MARKER.len()..];
+        if let Some(end) = rest.find(CWD_MARKER) {
+            let new_cwd = rest[..end].trim().to_string();
+            if !new_cwd.is_empty() {
+                state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
             }
-            stdout = stdout[..first].to_string();
         }
+        stdout = stdout[..first].to_string();
     }
     let (o, t1) = cap_out(&stdout);
     let (e, t2) = cap_out(&String::from_utf8_lossy(&se));
@@ -476,8 +475,8 @@ fn bg_view(id: &str, s: &BgState) -> Value {
         "startedAt": s.started_at, "cwd": s.cwd, "stdout": s.stdout, "stderr": s.stderr,
     })
 }
-pub async fn job_get(AxumState(_state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let jobs = BG_JOBS.lock().await;
+pub async fn job_get(AxumState(state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let jobs = state.bg_jobs.lock().await;
     match jobs.get(&id) {
         Some(job) => {
             let st = job.state.lock().await;
@@ -486,8 +485,8 @@ pub async fn job_get(AxumState(_state): AxumState<S>, axum::extract::Path(id): a
         None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown job"})))),
     }
 }
-pub async fn job_kill(AxumState(_state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let jobs = BG_JOBS.lock().await;
+pub async fn job_kill(AxumState(state): AxumState<S>, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let jobs = state.bg_jobs.lock().await;
     match jobs.get(&id) {
         Some(job) => {
             let mut st = job.state.lock().await;

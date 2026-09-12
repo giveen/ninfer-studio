@@ -1,4 +1,7 @@
 //! Logs / models / gpu route handlers.
+
+// Rust guideline compliant 2026-07-28
+
 use axum::body::Body;
 use axum::extract::{Query, Request, State as AxumState};
 use axum::http::StatusCode;

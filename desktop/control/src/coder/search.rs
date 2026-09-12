@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
@@ -37,18 +37,19 @@ const SYMBOL_TTL: Duration = Duration::from_secs(15);
 const MAX_SYMBOL_FILES: usize = 20_000;
 const MAX_CONTENT_MATCHES: usize = 20_000;
 
-#[derive(Clone)]
-struct SymHit {
+#[derive(Debug, Clone)]
+pub struct SymHit {
     file: String,
     line: u64,
     name: String,
 }
 
-/// In-memory symbol index for the active workspace, refreshed at most every
-/// 15s so repeated searches in a short window are cheap (the sidecar's
-/// "persistent" repo index, rebuilt on the same TTL).
-static SYMBOL_INDEX: LazyLock<Mutex<Option<(std::time::Instant, Vec<SymHit>)>>> =
-    LazyLock::new(|| Mutex::new(None));
+/// Cache slot type for the in-memory symbol index: build time, the root it
+/// was built from, and the hits. Lives on `state.symbol_index` (see that
+/// field's doc) rather than a module-global static, keyed by root so a
+/// workspace switch within the TTL window can never serve another
+/// workspace's stale index.
+type SymbolIndexCache = Mutex<Option<(std::time::Instant, PathBuf, Vec<SymHit>)>>;
 
 fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
     let mut out = Vec::new();
@@ -90,24 +91,25 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
     out
 }
 
-fn search_symbol_index(root: &Path) -> Vec<SymHit> {
+fn search_symbol_index(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
     let idx = build_symbol_index_blocking(root);
-    *SYMBOL_INDEX.lock().unwrap() = Some((std::time::Instant::now(), idx));
-    SYMBOL_INDEX.lock().unwrap().as_ref().unwrap().1.clone()
+    *cache.lock().unwrap() = Some((std::time::Instant::now(), root.to_path_buf(), idx));
+    cache.lock().unwrap().as_ref().unwrap().2.clone()
 }
 
-fn search_cached_symbols(root: &Path) -> Vec<SymHit> {
+fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
     // Drop the guard before rebuilding: the rebuild locks the same mutex, so
     // holding it across the call would self-deadlock on a cache miss.
     {
-        let guard = SYMBOL_INDEX.lock().unwrap();
-        if let Some((at, idx)) = guard.as_ref() {
-            if at.elapsed() < SYMBOL_TTL {
-                return idx.clone();
-            }
+        let guard = cache.lock().unwrap();
+        if let Some((at, cached_root, idx)) = guard.as_ref()
+            && at.elapsed() < SYMBOL_TTL
+            && cached_root == root
+        {
+            return idx.clone();
         }
     }
-    search_symbol_index(root)
+    search_symbol_index(cache, root)
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,10 +140,11 @@ pub async fn search(
         .map(String::from)
         .collect();
     let root_cloned = root.clone();
+    let state_cloned = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         // Symbol-name matches (cached index, high scores).
-        let idx = search_cached_symbols(&root_cloned);
+        let idx = search_cached_symbols(&state_cloned.symbol_index, &root_cloned);
         for s in &idx {
             let file_low = s.file.to_lowercase();
             let name_low = s.name.to_lowercase();
@@ -200,7 +203,7 @@ pub async fn search(
                 }
             }
         }
-        let mut arr: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
+        let mut arr: Vec<Value> = results.into_values().collect();
         arr.sort_by(|a, b| {
             b["score"].as_u64().unwrap_or(0).cmp(&a["score"].as_u64().unwrap_or(0))
         });
@@ -244,10 +247,10 @@ pub async fn repo_map(AxumState(state): AxumState<S>) -> Result<Json<Value>, (St
                 let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
                 let mut file_sigs = String::new();
                 for line in content.lines() {
-                    if let Some(_caps) = re.captures(line) {
-                        if file_sigs.len() < 1000 {
-                            file_sigs.push_str(&format!("  {}\n", line.trim()));
-                        }
+                    if let Some(_caps) = re.captures(line)
+                        && file_sigs.len() < 1000
+                    {
+                        file_sigs.push_str(&format!("  {}\n", line.trim()));
                     }
                 }
                 if !file_sigs.is_empty() {

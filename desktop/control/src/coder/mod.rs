@@ -1,5 +1,3 @@
-// Rust guideline compliant 2026-07-28
-
 //! Coder harness endpoints, one file per concern:
 //!   exec      — shell execution, safe mode, bwrap sandbox, background jobs
 //!   fs        — workspace tree + file read/write/edit/patch/base64
@@ -13,6 +11,8 @@
 //! Every public handler/type is re-exported here so the router in `lib.rs`
 //! (and `types.rs`'s `coder_perms`) keeps using `coder::…` paths unchanged.
 
+// Rust guideline compliant 2026-07-28
+
 mod common;
 mod exec;
 mod fs;
@@ -24,12 +24,12 @@ mod workspace;
 
 pub use common::{perms_get, perms_set, CoderPerms, PermTier};
 pub use exec::{
-    bwrap_available, exec, job_get, job_kill, safe_mode_get, safe_mode_set, sandbox_get, sandbox_set,
+    bwrap_available, exec, job_get, job_kill, safe_mode_get, safe_mode_set, sandbox_get, sandbox_set, BgJob,
 };
 pub use fs::{fs_b64, fs_edit, fs_patch, fs_read, fs_write, tree};
 pub use grep::{glob, grep};
 pub use memory::{memory_get, memory_set, MemQuery};
-pub use search::{diff, repo_map, search, SearchQuery};
+pub use search::{diff, repo_map, search, SearchQuery, SymHit};
 pub use web::{web_fetch, web_search};
 pub use workspace::{dirs, workspace_get, workspace_set, WorkspaceReq, WorkspaceResp};
 
@@ -109,7 +109,7 @@ mod tests {
         let x = exec(ws(), Json(json!({"command": "echo hi", "sessionId": "t1"}))).await.unwrap().0;
         assert_eq!(x.get("exitCode").and_then(|v| v.as_i64()), Some(0));
         assert!(x.get("stdout").and_then(|v| v.as_str()).unwrap().contains("hi"));
-        exec(ws(), Json(json!({"command": "cd sub", "sessionId": "t1"}))).await.unwrap();
+        let _ = exec(ws(), Json(json!({"command": "cd sub", "sessionId": "t1"}))).await.unwrap();
         let x2 = exec(ws(), Json(json!({"command": "pwd", "sessionId": "t1"}))).await.unwrap().0;
         assert!(x2.get("stdout").and_then(|v| v.as_str()).unwrap().trim().ends_with("sub"));
         // traversal escapes the workspace
@@ -117,9 +117,9 @@ mod tests {
         // safe mode blocks, and can be toggled
         let b = exec(ws(), Json(json!({"command": "rm -rf /"}))).await.unwrap().0;
         assert_eq!(b.get("blocked").and_then(|v| v.as_bool()), Some(true));
-        safe_mode_set(ws(), Json(json!({"enabled": false}))).await;
+        let _ = safe_mode_set(ws(), Json(json!({"enabled": false}))).await;
         assert_eq!(safe_mode_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(false));
-        safe_mode_set(ws(), Json(json!({"enabled": true}))).await;
+        let _ = safe_mode_set(ws(), Json(json!({"enabled": true}))).await;
 
         // b64 + dirs
         let b64 = fs_b64(ws(), Json(json!({"path": "sub/hello.txt"}))).await.unwrap().0;
@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(got.get("tools").and_then(|v| v.as_object()).map(|m| m.len()), Some(0));
 
         // Push a policy: bash denied outright, anything under "secret" denied by path.
-        perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
+        let _ = perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
         let got = perms_get(ws()).await.0;
         assert_eq!(got.get("tools").and_then(|v| v.get("bash")).and_then(|v| v.as_str()), Some("deny"));
 

@@ -15,7 +15,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::LazyLock;
 
 /// `<DATA_DIR>/coder-memory/<slug>`, where `slug` is the workspace path with
 /// every non-`[\w.-]` char mapped to `_`, kept to its last 160 chars — the
@@ -183,12 +182,12 @@ fn mem_rand_suffix() -> String {
 /// Per-store mutation lock: `memory_set` is a read-modify-write (a drop
 /// rewrites the whole JSONL), so concurrent agent/critic/UI writes to the
 /// same store must serialize or a stale rewrite can clobber a newer append.
-/// Keyed by store dir so different workspaces never contend.
-static MEMORY_LOCKS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-fn mem_lock(store: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    let mut map = MEMORY_LOCKS.lock().unwrap();
+/// Keyed by store dir so different workspaces never contend. The lock table
+/// itself lives on `state.memory_locks` rather than a module-global static so
+/// distinct `State` instances (as used throughout the test suite) never
+/// share lock bookkeeping.
+fn mem_lock(state: &S, store: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = state.memory_locks.lock().unwrap();
     map.entry(store.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -262,38 +261,38 @@ pub async fn memory_set(
     // Hold the per-store lock across the whole read-modify-write so a
     // concurrent append can't be lost to a stale drop rewrite.
     let store_key = dir.to_string_lossy().into_owned();
-    let store_lock = mem_lock(&store_key);
+    let store_lock = mem_lock(&state, &store_key);
     let _guard = store_lock.lock().await;
 
     if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
         write_mem_file(&dir, "bank.md", bank).await?;
     }
-    if let Some(learning) = req.get("learning").and_then(|v| v.as_object()) {
-        if let Some(text) = learning.get("text").and_then(|v| v.as_str()) {
-            let (ts, now_ms) = iso_now();
-            let entry = json!({
-                "id": format!("l_{now_ms}_{}", mem_rand_suffix()),
-                "text": text,
-                "kind": learning.get("kind").and_then(|v| v.as_str()).unwrap_or("tip"),
-                "provenance": learning.get("provenance").and_then(|v| v.as_str()).unwrap_or(""),
-                "task": learning.get("task").and_then(|v| v.as_str()).unwrap_or(""),
-                "ts": ts,
-            });
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("mkdir failed: {e}")}))))?;
-            use tokio::io::AsyncWriteExt as _;
-            let mut f = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("learnings.jsonl"))
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
-            let line = format!("{}\n", serde_json::to_string(&entry).unwrap_or_default());
-            f.write_all(line.as_bytes())
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
-        }
+    if let Some(learning) = req.get("learning").and_then(|v| v.as_object())
+        && let Some(text) = learning.get("text").and_then(|v| v.as_str())
+    {
+        let (ts, now_ms) = iso_now();
+        let entry = json!({
+            "id": format!("l_{now_ms}_{}", mem_rand_suffix()),
+            "text": text,
+            "kind": learning.get("kind").and_then(|v| v.as_str()).unwrap_or("tip"),
+            "provenance": learning.get("provenance").and_then(|v| v.as_str()).unwrap_or(""),
+            "task": learning.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+            "ts": ts,
+        });
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("mkdir failed: {e}")}))))?;
+        use tokio::io::AsyncWriteExt as _;
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("learnings.jsonl"))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap_or_default());
+        f.write_all(line.as_bytes())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
     }
     if let Some(drop_id) = req.get("dropLearningId").and_then(|v| v.as_str()) {
         let keep: Vec<Value> = read_learnings(&dir)
@@ -557,14 +556,14 @@ mod tests {
                 .unwrap()
                 .0;
                 // Every response is a consistent full snapshot.
-                assert!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len() >= 1);
+                assert!(!r.get("learnings").and_then(|v| v.as_array()).unwrap().is_empty());
             }));
             if i % 2 == 0 {
                 let s = state.clone();
                 let id = seed_id.clone();
                 handles.push(tokio::spawn(async move {
                     let r = memory_set(AxumState(s), Json(json!({"dropLearningId": id}))).await.unwrap().0;
-                    assert!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len() >= 1);
+                    assert!(!r.get("learnings").and_then(|v| v.as_array()).unwrap().is_empty());
                 }));
             }
         }
