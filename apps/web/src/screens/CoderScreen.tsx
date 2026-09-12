@@ -25,6 +25,7 @@ import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { localDateTimeBlock } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
@@ -763,6 +764,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
   const refreshRepoMap = useCallback(async () => {
     let sys = CODER_SYSTEM;
+    sys += `\n\n${localDateTimeBlock()}`;
     try {
       const rMap = await coderRepoMap();
       if (rMap && rMap.map) {
@@ -900,15 +902,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         sys += `\n\n${blocks.join('\n\n')}\n`;
       }
     } catch { /* memory injection must never break system-prompt assembly */ }
-
-    // Not-Ai humanize: when enabled, append the editorial contract (plus the
-    // chosen voice profile) so the agent's user-facing prose avoids em dashes,
-    // buzzwords, and empty framing. The deterministic gate is applied separately
-    // to content-only assistant replies.
-    if (coderParamsRef.current.humanize) {
-      const voice = voiceSnippet(coderParamsRef.current.voiceProfile || 'technical');
-      sys += `\n\n# Humanize replies (Not-Ai)\n${NOT_AI_CONTRACT}${voice ? `\n\n${voice}` : ''}\n`;
-    }
 
     // Not-Ai humanize: when enabled, append the editorial contract (plus the
     // chosen voice profile) so the agent's user-facing prose avoids em dashes,

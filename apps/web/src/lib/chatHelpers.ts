@@ -63,9 +63,26 @@ const CHAT_CAPABILITIES = [
   '- You cannot generate images yourself. When the user attaches images or video, you can see their contents (vision input).',
   '- web_fetch returns a page as text/Markdown and cannot fetch binary image data itself, but its output includes an "## Images on this page" section listing every image URL found on the page (already resolved to absolute URLs) — copy one of those verbatim into a Markdown image tag to actually display it. Do not invent or guess an image URL; if the page has none listed, say so instead of fabricating one.',
 ].join('\n');
+
+/** Current local date/time, in the user's own timezone (read from the OS via
+ *  `Intl`, same source the UI's own clocks use). Without this the model has
+ *  no notion of "today" beyond its training cutoff and can't reason about
+ *  relative dates ("last week", "is this expired") or the user's local time
+ *  of day. Recomputed on every call — never cache the result — so a
+ *  long-running Chat/Coder session doesn't drift onto a stale date. */
+export function localDateTimeBlock(): string {
+  const now = new Date();
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const formatted = now.toLocaleString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  });
+  return `# Current date and time\n${formatted} (${tz})`;
+}
+
 export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0]): string => {
   const base = effectiveSystemPrompt(params);
-  return base ? `${base}\n\n${CHAT_CAPABILITIES}` : CHAT_CAPABILITIES;
+  return [base, localDateTimeBlock(), CHAT_CAPABILITIES].filter(Boolean).join('\n\n');
 };
 
 export const CHAT_TOOLS = [
