@@ -1,7 +1,7 @@
 [package]
 name = "ninfier-studio"
 version = "0.3.3"
-edition = "2021"
+edition = "2024"
 description = "NInfer Studio — native Linux desktop shell (Tauri 2) hosting the NInfer control plane + web UI."
 
 [build-dependencies]
@@ -20,7 +20,7 @@ tauri = { version = "2", features = ["image-png", "image-ico"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
-ninfier-control = { path = "../control" }
+ninfier-control.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "process", "fs", "io-util"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

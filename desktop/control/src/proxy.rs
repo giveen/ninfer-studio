@@ -1,4 +1,7 @@
 //! Engine API proxy (SSE-safe) + port routing.
+
+// Rust guideline compliant 2026-07-28
+
 use axum::body::Body;
 use axum::extract::{Request, State as AxumState};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -27,10 +30,13 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
     let mut cands: Vec<(u16, Option<String>)> = Vec::new();
     {
         let primary = state.engine.read().await;
-        if let Some(p) = primary.port {
-            if matches!(primary.state, crate::types::EngineState::Running | crate::types::EngineState::External | crate::types::EngineState::Starting) {
-                cands.push((p, primary.model_id.clone()));
-            }
+        if let Some(p) = primary.port
+            && matches!(
+                primary.state,
+                crate::types::EngineState::Running | crate::types::EngineState::External | crate::types::EngineState::Starting
+            )
+        {
+            cands.push((p, primary.model_id.clone()));
         }
     }
     for d in discover_engines().await {
@@ -87,27 +93,24 @@ pub(crate) fn merge_default_request_params(
     let mut body_val: serde_json::Value = serde_json::from_slice(body).ok()?;
 
     // 1. generic top-level defaults (client fields win)
-    if !defaults_trimmed.is_empty() {
-        if let serde_json::Value::Object(defaults_map) =
-            serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
-        {
-            if let serde_json::Value::Object(body_map) = &mut body_val {
-                for (k, v) in defaults_map {
-                    body_map.entry(k).or_insert(v);
-                }
-            }
+    if !defaults_trimmed.is_empty()
+        && let serde_json::Value::Object(defaults_map) = serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
+        && let serde_json::Value::Object(body_map) = &mut body_val
+    {
+        for (k, v) in defaults_map {
+            body_map.entry(k).or_insert(v);
         }
     }
 
     // 2. reasoning effort → top-level reasoning_effort field
     //    (client explicit value wins; the dedicated control beats the generic
     //     default for this one key)
-    if !re_trimmed.is_empty() {
-        if let serde_json::Value::Object(body_map) = &mut body_val {
-            body_map
-                .entry("reasoning_effort")
-                .or_insert_with(|| serde_json::Value::String(reasoning_effort.to_string()));
-        }
+    if !re_trimmed.is_empty()
+        && let serde_json::Value::Object(body_map) = &mut body_val
+    {
+        body_map
+            .entry("reasoning_effort")
+            .or_insert_with(|| serde_json::Value::String(reasoning_effort.to_string()));
     }
 
     serde_json::to_vec(&body_val).ok()
@@ -151,10 +154,10 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     };
 
     let mut rb = client.request(method, &target);
-    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-        if let Ok(v) = ct.to_str() {
-            rb = rb.header(header::CONTENT_TYPE, v);
-        }
+    if let Some(ct) = headers.get(header::CONTENT_TYPE)
+        && let Ok(v) = ct.to_str()
+    {
+        rb = rb.header(header::CONTENT_TYPE, v);
     }
     // inject the configured engine API key when the client sent no auth header
     if !api_key.is_empty()

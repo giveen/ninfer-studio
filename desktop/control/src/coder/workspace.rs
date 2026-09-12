@@ -68,11 +68,11 @@ pub async fn workspace_set(
     state.config.write().await.coder_workspace = ws.clone();
 
     let cfg = state.config.read().await.clone();
-    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        if is_safe_base_dir(&state.data_dir) {
-            let path = state.data_dir.join("config.json");
-            let _ = tokio::fs::write(&path, json).await;
-        }
+    if let Ok(json) = serde_json::to_string_pretty(&cfg)
+        && is_safe_base_dir(&state.data_dir)
+    {
+        let path = state.data_dir.join("config.json");
+        let _ = tokio::fs::write(&path, json).await;
     }
 
     Json(WorkspaceResp { workspace: ws, exists })
@@ -92,10 +92,10 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
             Ok(mut rd) => {
                 let mut dirs = Vec::new();
                 while let Ok(Some(e)) = rd.next_entry().await {
-                    if let Ok(ft) = e.file_type().await {
-                        if ft.is_dir() {
-                            dirs.push(e.file_name().to_string_lossy().into_owned());
-                        }
+                    if let Ok(ft) = e.file_type().await
+                        && ft.is_dir()
+                    {
+                        dirs.push(e.file_name().to_string_lossy().into_owned());
                     }
                 }
                 dirs.sort();

@@ -29,13 +29,18 @@ fn wait_capped(mut child: std::process::Child, deadline: std::time::Instant) -> 
     }
 }
 
+/// A parsed `nvidia-smi --query-gpu` line: name, used/total VRAM (MiB), and
+/// utilization percent. Each numeric field is `None` on a non-numeric cell
+/// (e.g. `[N/A]`) — that alone doesn't fail the parse, see `parse_gpu_csv`.
+type GpuCsvLine = (String, Option<u64>, Option<u64>, Option<u64>);
+
 /// Parse the first line of `--query-gpu=name,memory.used,memory.total,
 /// utilization.gpu --format=csv,noheader,nounits` output (one line per
 /// GPU; only the first is used, as before the refactor). Requires all four
 /// cells to be present — a malformed first line means the whole query is
 /// treated as failed, matching the pre-refactor behavior. Numeric fields
 /// are best-effort (non-numeric cell -> None, not a failure).
-fn parse_gpu_csv(stdout: &str) -> Option<(String, Option<u64>, Option<u64>, Option<u64>)> {
+fn parse_gpu_csv(stdout: &str) -> Option<GpuCsvLine> {
     let line = stdout.lines().next()?;
     let cols = line.split(',').map(|s| s.trim());
     let (name, used, total, util) =

@@ -1,4 +1,7 @@
 //! Engine + status route handlers.
+
+// Rust guideline compliant 2026-07-28
+
 use axum::body::Body;
 use axum::extract::{Request, State as AxumState};
 use axum::http::StatusCode;
@@ -154,10 +157,10 @@ pub(crate) async fn engine_start(AxumState(state): AxumState<S>, req: Request<Bo
             // verbatim, even on a parse failure the typed EngineProfile
             // (whose Debug impl already redacts it) never gets constructed.
             let mut redacted_profile = profile_val.clone();
-            if let Value::Object(map) = &mut redacted_profile {
-                if map.get("apiKey").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-                    map.insert("apiKey".to_string(), Value::String("***".to_string()));
-                }
+            if let Value::Object(map) = &mut redacted_profile
+                && map.get("apiKey").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+            {
+                map.insert("apiKey".to_string(), Value::String("***".to_string()));
             }
             tracing::event!(
                 name: "engine.start.profile_parse_error",
@@ -171,10 +174,10 @@ pub(crate) async fn engine_start(AxumState(state): AxumState<S>, req: Request<Bo
     };
     let artifact = body.get("artifact").and_then(|v| v.as_str()).map(|s| s.to_string());
     let mut result = start_engine(&state, profile, artifact).await;
-    if let Some(err) = profile_parse_error {
-        if let Value::Object(map) = &mut result {
-            map.insert("profileParseError".to_string(), Value::String(err));
-        }
+    if let Some(err) = profile_parse_error
+        && let Value::Object(map) = &mut result
+    {
+        map.insert("profileParseError".to_string(), Value::String(err));
     }
     Ok(Json(result))
 }
@@ -241,10 +244,11 @@ pub(crate) async fn engine_args(
     // The api key is the caller's own key (posted from their own UI) — mask it
     // in the response so the displayed command never shows a live credential.
     let mut args = form;
-    if let Some(i) = args.iter().position(|a| a == "--api-key") {
-        if i + 1 < args.len() && !args[i + 1].is_empty() {
-            args[i + 1] = "••••••••".to_string();
-        }
+    if let Some(i) = args.iter().position(|a| a == "--api-key")
+        && i + 1 < args.len()
+        && !args[i + 1].is_empty()
+    {
+        args[i + 1] = "••••••••".to_string();
     }
 
     Ok(Json(json!({

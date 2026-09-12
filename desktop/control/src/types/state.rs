@@ -1,7 +1,8 @@
 //! Control-plane runtime state + desktop-shell events.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use super::domain::{EngineState, JobRec};
 use super::settings::{AppSettings, EngineProfile};
@@ -152,6 +153,22 @@ pub struct State {
     /// Per-session working directories so the agent's shell behaves like a
     /// stateful terminal (cd persists across calls within a session id).
     pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Registry of detached background shell jobs (`coder::exec`'s
+    /// `background: true` runs) keyed by job id, so `job_get`/`job_kill` can
+    /// find them. Lives on `State` rather than a module-global static so
+    /// distinct `State` instances (as used throughout the test suite) never
+    /// share job bookkeeping.
+    pub bg_jobs: tokio::sync::Mutex<HashMap<String, Arc<crate::coder::BgJob>>>,
+    /// Monotonic counter backing background-job ids (`job_<ms>_<n>`).
+    pub bg_job_counter: AtomicU64,
+    /// Per-memory-store mutation locks (`coder::memory`), keyed by store
+    /// directory so unrelated workspaces never contend. See `bg_jobs` for why
+    /// this lives on `State` instead of a global static.
+    pub memory_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Cached repo symbol index for `coder::search` (TTL'd, keyed by the root
+    /// it was built from so a workspace switch can't serve another
+    /// workspace's stale index). See `bg_jobs` for why this lives on `State`.
+    pub symbol_index: std::sync::Mutex<Option<(std::time::Instant, std::path::PathBuf, Vec<crate::coder::SymHit>)>>,
     /// Optional bridge to the desktop shell. `None` when running headless.
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,
@@ -178,6 +195,10 @@ impl State {
             coder_safe_mode: AtomicBool::new(true),
             coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            bg_jobs: tokio::sync::Mutex::new(HashMap::new()),
+            bg_job_counter: AtomicU64::new(0),
+            memory_locks: std::sync::Mutex::new(HashMap::new()),
+            symbol_index: std::sync::Mutex::new(None),
             event_tx,
             data_dir,
             dist_dir,

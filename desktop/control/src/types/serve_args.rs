@@ -49,12 +49,12 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     kv(&mut a, "--response-store-max-records", &p.response_store_max_records.map(|v| v.to_string()).unwrap_or_default());
     kv(&mut a, "--response-store-max-mib", &p.response_store_max_mib.map(|v| v.to_string()).unwrap_or_default());
     kv(&mut a, "--kv-dtype", &p.kv_dtype.clone().unwrap_or_default());
-    if let Some(spec) = &p.spec {
-        if !spec.is_empty() {
-            a.push("--spec".into());
-            a.push(spec.clone());
-            kv(&mut a, "--draft-tokens", &p.draft_tokens.map(|v| v.to_string()).unwrap_or_default());
-        }
+    if let Some(spec) = &p.spec
+        && !spec.is_empty()
+    {
+        a.push("--spec".into());
+        a.push(spec.clone());
+        kv(&mut a, "--draft-tokens", &p.draft_tokens.map(|v| v.to_string()).unwrap_or_default());
     }
     flag(&mut a, "--lm-head-draft", p.lm_head_draft == Some(true));
     kv(&mut a, "--default-max-tokens", &p.default_max_tokens.map(|v| v.to_string()).unwrap_or_default());

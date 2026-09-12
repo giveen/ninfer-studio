@@ -242,10 +242,10 @@ fn largest_file_size_under(root: &std::path::Path) -> u64 {
                 let p = e.path();
                 if p.is_dir() {
                     walk(&p, max);
-                } else if let Ok(m) = e.metadata() {
-                    if m.len() > *max {
-                        *max = m.len();
-                    }
+                } else if let Ok(m) = e.metadata()
+                    && m.len() > *max
+                {
+                    *max = m.len();
                 }
             }
         }

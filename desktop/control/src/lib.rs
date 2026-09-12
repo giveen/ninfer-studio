@@ -179,11 +179,21 @@ async fn guard_local_host(req: Request<Body>, next: axum::middleware::Next) -> a
     }
 }
 
+/// Bind + serve on `port` (see [`serve_until_ready`] for a variant that
+/// signals once the listener is bound).
+///
+/// # Errors
+/// Returns an error if `port` cannot be bound (already in use, or
+/// insufficient permissions), or if the server's `accept` loop fails.
 pub async fn serve(state: S, port: u16) -> std::io::Result<()> {
     serve_until_ready(state, port, None).await
 }
 
 /// Bind + serve, sending `()` on `ready` once the listener is up (if given).
+///
+/// # Errors
+/// Returns an error if `port` cannot be bound (already in use, or
+/// insufficient permissions), or if the server's `accept` loop fails.
 pub async fn serve_until_ready(
     state: S,
     port: u16,
@@ -274,37 +284,37 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     let state = Arc::new(State::new(data_dir, dist_dir, event_tx));
     // load persisted config
     let p = state.data_dir.join("config.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&p).await {
-        if let Ok(mut cfg) = serde_json::from_str::<AppSettings>(&raw) {
-            let defaults = AppSettings::default();
-            if cfg.models_dir.is_empty() {
-                cfg.models_dir = defaults.models_dir;
-            }
-            if cfg.engine_port == 0 {
-                cfg.engine_port = defaults.engine_port;
-            }
-            if cfg.hf_cli.is_empty() {
-                cfg.hf_cli = defaults.hf_cli;
-            }
-            if cfg.ninfer_path.is_empty() {
-                cfg.ninfer_path = defaults.ninfer_path;
-            }
-            if cfg.build_command.is_empty() {
-                cfg.build_command = defaults.build_command;
-            }
-            // Legacy values may carry the Windows extended-length prefix
-            // (`\\?\`) from an older canonicalize; normalize so the UI
-            // (which keys workspaces by plain paths) matches on restart.
-            cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
-            *state.config.write().await = cfg;
+    if let Ok(raw) = tokio::fs::read_to_string(&p).await
+        && let Ok(mut cfg) = serde_json::from_str::<AppSettings>(&raw)
+    {
+        let defaults = AppSettings::default();
+        if cfg.models_dir.is_empty() {
+            cfg.models_dir = defaults.models_dir;
         }
+        if cfg.engine_port == 0 {
+            cfg.engine_port = defaults.engine_port;
+        }
+        if cfg.hf_cli.is_empty() {
+            cfg.hf_cli = defaults.hf_cli;
+        }
+        if cfg.ninfer_path.is_empty() {
+            cfg.ninfer_path = defaults.ninfer_path;
+        }
+        if cfg.build_command.is_empty() {
+            cfg.build_command = defaults.build_command;
+        }
+        // Legacy values may carry the Windows extended-length prefix
+        // (`\\?\`) from an older canonicalize; normalize so the UI
+        // (which keys workspaces by plain paths) matches on restart.
+        cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
+        *state.config.write().await = cfg;
     }
     // load the last-start record (dirty indicator for the Engine tab)
     let p = state.data_dir.join("last-start.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&p).await {
-        if let Ok(ls) = serde_json::from_str::<LastStart>(&raw) {
-            *state.last_start.write().await = Some(ls);
-        }
+    if let Ok(raw) = tokio::fs::read_to_string(&p).await
+        && let Ok(ls) = serde_json::from_str::<LastStart>(&raw)
+    {
+        *state.last_start.write().await = Some(ls);
     }
     state
 }
@@ -321,7 +331,7 @@ mod log_pump_tests {
         let lines = out.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), LOG_TAIL_LINES);
         // Oldest lines dropped, newest kept, in order.
-        assert_eq!(lines[0], &format!("line-5"));
+        assert_eq!(lines[0], "line-5");
         assert_eq!(lines.last().unwrap(), &format!("line-{}", LOG_TAIL_LINES + 4));
     }
 
