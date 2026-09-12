@@ -582,36 +582,39 @@ pub struct ModelArtifact {
     pub repo: Option<String>,
 }
 
+/// A background job the UI polls for progress: either an HF model download
+/// (`models.rs`) or a `git pull` / build of the ninfer-serve source
+/// (`repo.rs`). One shape serves both — each site still hand-picks and
+/// names its own wire-format keys in `downloads_public` / `update_public`,
+/// so the two API responses keep their existing shape even though the
+/// storage underneath is now a single struct instead of two near-identical
+/// ones. Fields specific to one site are `None` at the other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateJob {
+pub struct JobRec {
     pub id: String,
-    pub action: String, // "pull" | "build"
-    pub cmd: String,
+    /// Update job only: "pull" | "build".
+    pub action: Option<String>,
+    /// Update job only: the shell command run.
+    pub cmd: Option<String>,
+    /// Download job only: the Hugging Face repo id.
+    pub repo: Option<String>,
+    /// Download job only: the file within the repo.
+    pub file: Option<String>,
+    /// Download job only: destination directory.
+    pub local_dir: Option<String>,
     pub pid: Option<u32>,
     pub out: String,
     pub exit_code: Option<i32>,
     pub done: bool,
     pub failed: bool,
-    pub started_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadRec {
-    pub id: String,
-    pub repo: String,
-    pub file: String,
-    pub local_dir: String,
-    pub pid: Option<u32>,
-    pub out: String,
-    pub exit_code: Option<i32>,
-    pub done: bool,
-    pub failed: bool,
-    /// total bytes to download (from `hf download --dry-run --json`), if known
+    /// Download job only: total bytes to download (from
+    /// `hf download --dry-run --json`), if known.
     pub total_bytes: Option<u64>,
-    /// bytes downloaded so far, sampled from the staging blob on disk
-    pub downloaded_bytes: u64,
-    /// current throughput in bytes/sec (0 if unknown)
-    pub speed_bps: f64,
+    /// Download job only: bytes downloaded so far, sampled from the
+    /// staging blob on disk.
+    pub downloaded_bytes: Option<u64>,
+    /// Download job only: current throughput in bytes/sec.
+    pub speed_bps: Option<f64>,
     pub started_at: u64,
 }
 
@@ -714,8 +717,8 @@ pub struct State {
     pub last_start: tokio::sync::RwLock<Option<LastStart>>,
     pub child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     pub log_file: tokio::sync::Mutex<Option<tokio::fs::File>>,
-    pub downloads: tokio::sync::Mutex<HashMap<String, DownloadRec>>,
-    pub update_job: tokio::sync::Mutex<Option<UpdateJob>>,
+    pub downloads: tokio::sync::Mutex<HashMap<String, JobRec>>,
+    pub update_job: tokio::sync::Mutex<Option<JobRec>>,
     /// Coder "safe mode" (mirrors the sidecar's `coderSafeMode`): when true,
     /// clearly destructive shell commands are refused before they run.
     pub coder_safe_mode: AtomicBool,

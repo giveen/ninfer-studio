@@ -22,7 +22,11 @@ pub async fn start_update(state: &S, action: &str) -> Value {
             if !j.done {
                 return json!({
                     "ok": false,
-                    "message": format!("an {} job is already running (pid {:?})", j.action, j.pid)
+                    "message": format!(
+                        "an {} job is already running (pid {:?})",
+                        j.action.as_deref().unwrap_or("?"),
+                        j.pid
+                    )
                 });
             }
         }
@@ -85,15 +89,21 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     }
 
     let id = format!("upd_{:x}_{}", now_ms(), std::process::id());
-    let mut rec = crate::types::UpdateJob {
+    let mut rec = crate::types::JobRec {
         id: id.clone(),
-        action: action.to_string(),
-        cmd: cmd.clone(),
+        action: Some(action.to_string()),
+        cmd: Some(cmd.clone()),
+        repo: None,
+        file: None,
+        local_dir: None,
         pid: None,
         out: stopped_note,
         exit_code: None,
         done: false,
         failed: false,
+        total_bytes: None,
+        downloaded_bytes: None,
+        speed_bps: None,
         started_at: now_ms(),
     };
 
@@ -163,7 +173,7 @@ pub async fn start_update(state: &S, action: &str) -> Value {
                     } else {
                         r.out.push_str(&format!("\n✗ failed (exit {:?})", code));
                     }
-                    (r.action.clone(), !r.failed)
+                    (r.action.clone().unwrap_or_default(), !r.failed)
                 }
                 None => (String::new(), false),
             }

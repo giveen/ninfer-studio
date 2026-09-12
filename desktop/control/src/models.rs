@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-07-28
 
-use crate::types::{now_ms, AppEvent, ARTIFACTS, DownloadRec, ModelArtifact, State};
+use crate::types::{now_ms, AppEvent, ARTIFACTS, JobRec, ModelArtifact, State};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -96,19 +96,21 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         let mut d = state.downloads.lock().await;
         d.insert(
             id.clone(),
-            DownloadRec {
+            JobRec {
                 id: id.clone(),
-                repo: repo.to_string(),
-                file: file.to_string(),
-                local_dir: dir.clone(),
+                action: None,
+                cmd: None,
+                repo: Some(repo.to_string()),
+                file: Some(file.to_string()),
+                local_dir: Some(dir.clone()),
                 pid,
                 out: String::new(),
                 exit_code: None,
                 done: false,
                 failed: false,
                 total_bytes,
-                downloaded_bytes: 0,
-                speed_bps: 0.0,
+                downloaded_bytes: Some(0),
+                speed_bps: Some(0.0),
                 started_at: now_ms(),
             },
         );
@@ -168,9 +170,9 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
                     match d.get_mut(&idm) {
                         Some(r) => {
                             if dt > 0.0 && cur >= last {
-                                r.speed_bps = (cur - last) as f64 / dt;
+                                r.speed_bps = Some((cur - last) as f64 / dt);
                             }
-                            r.downloaded_bytes = cur;
+                            r.downloaded_bytes = Some(cur);
                             r.done
                         }
                         None => true,
@@ -198,10 +200,10 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
                     r.done = true;
                     r.failed = code.map(|c| c != 0).unwrap_or(true);
                     if let Some(t) = r.total_bytes {
-                        r.downloaded_bytes = t;
+                        r.downloaded_bytes = Some(t);
                     }
-                    r.speed_bps = 0.0;
-                    (r.file.clone(), !r.failed)
+                    r.speed_bps = Some(0.0);
+                    (r.file.clone().unwrap_or_default(), !r.failed)
                 }
                 None => (id3.clone(), false),
             }
