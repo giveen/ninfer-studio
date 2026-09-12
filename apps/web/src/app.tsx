@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Activity, Code2, Cpu, MessagesSquare, Settings2, Layers, Terminal } from 'lucide-react';
+import { Activity, Code2, Cpu, MessagesSquare, Moon, Settings2, Layers, Sun, Terminal } from 'lucide-react';
 import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
 import { formatBytes, formatPct } from './lib/format';
+import { applyTheme, getStoredTheme, type ThemeMode } from './lib/theme';
 import { ChatScreen } from './screens/ChatScreen';
 import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
@@ -74,6 +75,7 @@ function GpuChip({ status }: { status: StatusPayload | null }) {
 export function App() {
   const [screen, setScreen] = useState<Screen>('chat');
   const [coderWs, setCoderWs] = useState('');
+  const [theme, setTheme] = useState<ThemeMode>(getStoredTheme);
   const { status, error } = useStatus(2500);
 
   useEffect(() => {
@@ -81,6 +83,10 @@ export function App() {
       .then((w) => setCoderWs(w.workspace))
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -126,6 +132,14 @@ export function App() {
                 sidecar unreachable
               </span>
             )}
+            <button
+              type="button"
+              onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+              title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-panel text-mute transition-colors hover:border-line2 hover:text-ink"
+            >
+              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+            </button>
           </div>
         </header>
 

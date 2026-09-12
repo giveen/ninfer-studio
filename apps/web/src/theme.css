@@ -23,6 +23,35 @@
   --color-warn: #e8b34b;
   --color-danger: #f0625f;
   --color-info: #5cb2f0;
+  /* Brighten-on-hover shade for the lime accent button — a separate token
+   * (not derivable from --color-accent alone) so the light theme can supply
+   * its own hover shade instead of inheriting a lime tuned for a near-black
+   * background. */
+  --color-accent-hover: #c8f75e;
+}
+
+/* Light theme — opt-in via <html data-theme="light"> (see lib/theme.ts).
+ * Soft neutral surfaces, not stark white; the semantic colors are darkened
+ * versions of the dark-theme hues (which are pastel/bright for contrast
+ * against near-black) so they stay legible against a light background. */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --color-bg: #eef0f3;
+  --color-panel: #f8f9fb;
+  --color-panel2: #e7e9ee;
+  --color-inset: #ffffff;
+  --color-line: rgba(15, 23, 42, 0.09);
+  --color-line2: rgba(15, 23, 42, 0.16);
+  --color-ink: #1a2030;
+  --color-mute: #5b6472;
+  --color-faint: #98a1b0;
+  --color-accent: #6a9c1f;
+  --color-accent-deep: #4f7817;
+  --color-accent-hover: #84b930;
+  --color-ok: #1f9d63;
+  --color-warn: #b8790a;
+  --color-danger: #d5433f;
+  --color-info: #1c7ed6;
 }
 
 html,
@@ -41,7 +70,7 @@ body {
 }
 
 ::selection {
-  background: rgba(183, 240, 74, 0.28);
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
 }
 
 /* slim scrollbars */
@@ -59,6 +88,16 @@ body {
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+/* A white-tinted scrollbar reads fine on the dark theme's near-black
+ * surfaces but is nearly invisible on light ones — flip to a dark tint.
+ * Matched against `*` (not :root) so it overrides every element's own
+ * scrollbar-color, not just <html>'s. */
+:root[data-theme='light'] * {
+  scrollbar-color: rgba(15, 23, 42, 0.22) transparent;
+}
+:root[data-theme='light'] *::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.18);
 }
 
 /* numeric inputs: hide spinners, we render our own affordances */
@@ -289,13 +328,19 @@ input[type='number'] {
   color: var(--color-mute);
 }
 .cm-editor .cm-selectionMatch {
-  background: rgba(183, 240, 74, 0.12);
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
 }
 .cm-editor .cm-cursor {
   border-left-color: var(--color-accent);
 }
 .cm-editor ::selection {
-  background: rgba(183, 240, 74, 0.28);
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+:root[data-theme='light'] .cm-editor .cm-activeLine {
+  background: rgba(15, 23, 42, 0.045);
+}
+:root[data-theme='light'] .cm-editor .cm-activeLineGutter {
+  background: rgba(15, 23, 42, 0.07);
 }
 .cm-editor .cm-panels {
   background: var(--color-panel2);

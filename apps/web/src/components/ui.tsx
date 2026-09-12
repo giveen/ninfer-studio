@@ -36,7 +36,7 @@ export function Button({
     lg: 'h-10 px-5 text-sm',
   };
   const variants = {
-    primary: 'bg-accent text-[#101408] hover:bg-[#c8f75e] active:bg-accent-deep',
+    primary: 'bg-accent text-[#101408] hover:bg-[var(--color-accent-hover)] active:bg-accent-deep',
     ghost: 'border border-line bg-transparent text-ink hover:bg-panel2 hover:border-line2',
     subtle: 'bg-panel2 text-ink hover:bg-inset',
     danger: 'border border-danger/40 bg-danger/10 text-danger hover:bg-danger/20',
