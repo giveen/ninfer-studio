@@ -23,13 +23,10 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, suggestFollowUps, summarizeConversation } from '../lib/api';
-import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
+import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
+import { isCompactedMsg, runToolLoop, humanizePassText, type ToolRegistry } from '../lib/agentLoop';
 
-// A legacy compaction checkpoint message (raw <compacted-summary> block).
-function isCompactedMsg(m: ChatMessage): boolean {
-  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
-}
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
@@ -72,6 +69,7 @@ function CompactDivider() {
   );
 }
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
+import type { MessageMeta } from '../lib/types';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
@@ -902,7 +900,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
-    async (convId: string, history: ChatMessage[], depth = 0, placeholderId?: string) => {
+    async (convId: string, history: ChatMessage[], _depth = 0, placeholderId?: string) => {
       if (!engineUp) {
         onNavigate('engine');
         return;
@@ -914,151 +912,108 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const ac = new AbortController();
       abortRef.current = ac;
 
-      // Target the streaming placeholder by stable id when available; fall back to
-      // the last message only when no id was assigned (C2).
-      const isTarget = (m: ChatMessage, i: number, len: number): boolean =>
-        placeholderId ? m.id === placeholderId : i === len - 1;
+      // Live target for streamed deltas: the caller's placeholder for turn 0;
+      // each later tool turn appends its own placeholder (onTurnStart) and
+      // re-points this target. Falls back to the last message only when no id
+      // was assigned (C2).
+      let liveTargetId: string | undefined = placeholderId;
+      const patchTarget = (updater: (m: ChatMessage) => ChatMessage) => {
+        setConvs((cs) =>
+          cs.map((c) =>
+            c.id !== convId ? c : {
+              ...c,
+              messages: c.messages.map((m, i, arr) =>
+                (liveTargetId ? m.id === liveTargetId : i === arr.length - 1) ? updater(m) : m),
+            }),
+        );
+      };
 
-      let capturedToolCalls: import('../lib/types').AgentToolCall[] = [];
-
-      await streamChat(
-        buildChatRequest(useModel, chatSystemWithCapabilities(params), history, params, { tools: CHAT_TOOLS }),
-        ac.signal,
-        {
-          onReasoningDelta: (d) => {
-            setConvs((cs) =>
-              cs.map((c) =>
-                c.id !== convId
-                  ? c
-                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, reasoning: (m.reasoning || '') + d } : m)) },
-              ),
-            );
-          },
-          onContentDelta: (d) => {
-            setConvs((cs) =>
-              cs.map((c) =>
-                c.id !== convId
-                  ? c
-                  : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, content: m.content + d } : m)) },
-              ),
-            );
-          },
-          onUsage: (_u, meta) => {
-            setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
-            );
-            setLatestRequestMetrics(meta, useModel);
-          },
-          onToolCalls: (calls) => {
-            capturedToolCalls = calls;
-            setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, tool_calls: calls } : m)) })),
-            );
-          },
-          onDone: (meta) => {
-            setConvs((cs) =>
-              cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (isTarget(m, i, c.messages.length) ? { ...m, meta } : m)) })),
-            );
-            setLatestRequestMetrics(meta, useModel);
-          },
-          onError: (msg) => {
-            setConvs((cs) =>
-              cs.map((c) =>
-                c.id !== convId
-                  ? c
-                  : {
-                      ...c,
-                      messages: c.messages.map((m, i) =>
-                        isTarget(m, i, c.messages.length) ? { ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } } : m,
-                      ),
-                    },
-              ),
-            );
-          },
+      // Chat tools as a registry for the shared runner: two read-only web
+      // tools under the same ToolRegistry contract the coder loops use.
+      const registry: ToolRegistry = {
+        web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
+        web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
+      };
+      // The runner owns the turn messages; these events mirror each turn into
+      // the conversation store so streaming stays live.
+      let lastTurnMeta: MessageMeta | undefined;
+      const res = await runToolLoop({
+        model: useModel,
+        system: chatSystemWithCapabilities(params),
+        messages: history,
+        params,
+        tools: CHAT_TOOLS,
+        registry,
+        maxSteps: 12,
+        signal: ac.signal,
+        onTurnStart: (turn) => {
+          if (turn === 0 || ac.signal.aborted) return;
+          const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+          liveTargetId = next.id;
+          setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, next] })));
         },
-      );
-
-      // Not-Ai auto-rewrite: when humanize is on and this was a plain content
-      // reply (no tool calls), run the deterministic tell-gate and silently
-      // re-write the reply if it trips a high-signal tell (em dashes, buzzwords,
-      // mechanical transitions, participial openers). The whole pass is
-      // best-effort: any failure must degrade to keeping the original reply,
-      // never skip the setStreaming(false) below (which is what froze the chat
-      // "streaming" with a dead STOP button when the gate once threw).
-      try {
-        if (!ac.signal.aborted && params.humanize && capturedToolCalls.length === 0) {
-        const convNow = convsRef.current.find((c) => c.id === convId);
-        if (convNow) {
-          const msgs = convNow.messages;
-          const idx = placeholderId ? msgs.findIndex((m) => m.id === placeholderId) : msgs.length - 1;
-          const target = msgs[idx];
-          if (target && target.role === 'assistant' && target.content.trim()) {
-            // Retry up to HUMANIZE_MAX_DEPTH times: a rewrite can itself trip
-            // the gate (the model doesn't always follow the rewrite rules),
-            // so re-check each attempt and feed the best-so-far text back in
-            // rather than accepting the first pass unconditionally.
-            let current = target.content;
-            let gateRes = evaluate(current, effectiveVoice(params), {});
-            for (let attempt = 0; attempt < HUMANIZE_MAX_DEPTH && needsHumanize(gateRes) && !ac.signal.aborted; attempt++) {
-              try {
-                const rewritten = await humanizeRewriteText({
-                  model: useModel,
-                  baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
-                  priorMessages: msgs.slice(0, idx),
-                  originalText: current,
-                  params,
-                  signal: ac.signal,
-                });
-                if (!rewritten || !rewritten.trim() || rewritten.trim() === current.trim()) break;
-                current = rewritten.trim();
-                gateRes = evaluate(current, effectiveVoice(params), {});
-              } catch {
-                break; // keep the best rewrite obtained so far (or the original)
-              }
-            }
-            if (!ac.signal.aborted && current.trim() !== target.content.trim()) {
-              setConvs((cs) => cs.map((c) => c.id !== convId ? c : {
-                ...c, messages: c.messages.map((m, i) => (i === idx ? { ...m, content: current } : m)),
-              }));
-            }
+        onDelta: (kind, text) => {
+          if (kind === 'content') patchTarget((m) => ({ ...m, content: m.content + text }));
+          else patchTarget((m) => ({ ...m, reasoning: (m.reasoning || '') + text }));
+        },
+        onStreamError: (msg) => {
+          patchTarget((m) => ({ ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } }));
+        },
+        onAppended: (appended) => {
+          const [first, ...rest] = appended;
+          if (first && first.role === 'assistant') {
+            patchTarget((m) => ({
+              ...m,
+              content: first.content,
+              reasoning: first.reasoning ?? m.reasoning,
+              tool_calls: first.tool_calls,
+              model: useModel,
+              meta: lastTurnMeta ?? m.meta,
+            }));
+          } else if (first) {
+            setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, first] })));
           }
-        }
-      }
-      } catch (humanizeError) {
-        // The gate or rewrite must never take the whole run down — the reply
-        // is already complete and shown; keep it and release the UI.
-        console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
-      }
+          if (rest.length) {
+            setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, ...rest] })));
+          }
+        },
+        onAssistantTurn: async (msg, info) => {
+          lastTurnMeta = info.meta;
+          setLatestRequestMetrics(info.meta, useModel);
+          // Not-Ai auto-rewrite: plain content replies run the deterministic
+          // tell-gate (best-effort — any failure keeps the original reply and
+          // never strands the streaming state).
+          if (ac.signal.aborted || !params.humanize || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
+          try {
+            const humanized = await humanizePassText(msg.content, {
+              voice: effectiveVoice(params),
+              signal: ac.signal,
+              rewrite: (current) => humanizeRewriteText({
+                model: useModel,
+                baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
+                priorMessages: history,
+                originalText: current,
+                params,
+                signal: ac.signal,
+              }),
+            });
+            if (!ac.signal.aborted && humanized.trim() !== msg.content.trim()) return { content: humanized };
+          } catch (humanizeError) {
+            // The gate or rewrite must never take the whole run down — the reply
+            // is already complete and shown; keep it and release the UI.
+            console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
+          }
+        },
+      });
 
-      if (capturedToolCalls.length > 0 && !ac.signal.aborted) {
-         if (depth >= 12) {
-           setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
-           setStreaming(false);
-           setStreamingConvId(null);
-           return;
-         }
-         const toolResults: ChatMessage[] = [];
-         for (const call of capturedToolCalls) {
-             let result = '';
-             try {
-                const args = JSON.parse(call.arguments);
-                if (call.name === 'web_fetch') result = JSON.stringify(await coderWebFetch(args.url));
-                else if (call.name === 'web_search') result = JSON.stringify(await coderWebSearch(args.query));
-                else result = JSON.stringify({ error: `unknown tool: ${call.name}` });
-             } catch(e) {
-                result = JSON.stringify({error: String(e)});
-             }
-             toolResults.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: result });
-         }
-         
-         const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
-         setConvs(cs => cs.map(c => c.id !== convId ? c : { ...c, messages: [...c.messages, ...toolResults, asstMsg] }));
-         const updatedConv = convsRef.current.find(c => c.id === convId);
-         if (updatedConv && !ac.signal.aborted) {
-             const newHistory = [...updatedConv.messages, ...toolResults];
-             await runStream(convId, modelHistory({ ...updatedConv, messages: newHistory }), depth + 1, asstMsg.id);
-         }
-         return;
+      // Tool-step budget: the runner stops after 12 tool cycles without a
+      // final reply, same guard the old depth>=12 recursion carried.
+      if (res.stop === 'steps' && !ac.signal.aborted) {
+        patchTarget((m) => ({
+          ...m,
+          content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
+          error: true,
+        }));
       }
       
       // Auto-compact: once this turn's usage crosses the configured share of
@@ -1076,8 +1031,9 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           const limit = allEngines.find((e) => e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
           const convForCompact = convsRef.current.find((c) => c.id === convId);
           const msgsForCompact = convForCompact?.messages ?? [];
-          const idxForCompact = placeholderId ? msgsForCompact.findIndex((m) => m.id === placeholderId) : msgsForCompact.length - 1;
-          const finalMsg = msgsForCompact[idxForCompact];
+          // The final reply is the last assistant message (past the original
+          // placeholder once tool turns ran), not necessarily the placeholder.
+          const finalMsg = [...msgsForCompact].reverse().find((m) => m.role === 'assistant');
           const usedTok = finalMsg?.meta ? (finalMsg.meta.promptTokens ?? 0) + (finalMsg.meta.completionTokens ?? 0) : 0;
           const thresholdPct = params.compactAt ?? 80;
           if (convForCompact && limit && usedTok > 0 && usedTok >= (thresholdPct / 100) * limit) {
@@ -1110,7 +1066,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         try {
           const convForFollowUps = convsRef.current.find((c) => c.id === convId);
           const msgsForFollowUps = convForFollowUps?.messages ?? [];
-          const idxForFollowUps = placeholderId ? msgsForFollowUps.findIndex((m) => m.id === placeholderId) : msgsForFollowUps.length - 1;
+          let idxForFollowUps = msgsForFollowUps.length - 1;
+          while (idxForFollowUps >= 0 && msgsForFollowUps[idxForFollowUps].role !== 'assistant') idxForFollowUps--;
           const finalMsgForFollowUps = msgsForFollowUps[idxForFollowUps];
           if (
             convForFollowUps &&
