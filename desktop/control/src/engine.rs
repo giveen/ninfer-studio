@@ -2,7 +2,9 @@
 
 // Rust guideline compliant 2026-07-28
 
-use crate::types::{build_serve_args, AppEvent, EngineInner, EngineProfile, EngineState, LastStart, State, now_ms};
+use crate::types::{
+    build_serve_args, AppEvent, AppSettings, EngineInner, EngineProfile, EngineState, LastStart, State, now_ms,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -524,9 +526,11 @@ pub fn fail_and_emit(eng: &mut EngineInner, state: &State, stored: String, shown
     });
 }
 
-pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<String>) -> Value {
-    let cfg = state.config.read().await.clone();
-
+/// Validate engine launch prerequisites: a configured `ninfer_path` that
+/// resolves to an existing `ninfer-serve` binary. On failure, records the
+/// failed engine state via `fail_and_emit` and returns the error response
+/// `start_engine` used to return inline.
+async fn validate_launch(state: &S, cfg: &AppSettings) -> Result<std::path::PathBuf, Value> {
     // Fail fast with a clear message if no engine binary is configured. A
     // distributed build ships an empty default (never the developer's machine
     // path), so a fresh install must point Studio at the user's own
@@ -541,11 +545,11 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             "ninfer path not configured".to_string(),
             reason.clone(),
         );
-        return json!({
+        return Err(json!({
             "ok": false,
             "code": "not_configured",
             "message": reason,
-        });
+        }));
     }
     // Resolve the engine binary from the configured path. Accepts (private
     // Windows support):
@@ -572,16 +576,21 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             format!("engine binary not found: {}", engine_binary.display()),
             reason.clone(),
         );
-        return json!({
+        return Err(json!({
             "ok": false,
             "code": "binary_missing",
             "message": reason,
-        });
+        }));
     }
+    Ok(engine_binary)
+}
 
-    let port = profile.port.unwrap_or(cfg.engine_port);
-    let artifact = artifact.filter(|a| !a.is_empty());
-
+/// Resolve the model artifact to launch and guard against redundant spawns:
+/// adopts an engine already serving `port` (rather than killing it) via the
+/// shared `adopt_external` path, refuses a second concurrent spawn, and
+/// validates the artifact exists. Returns the same early-return response
+/// `start_engine` used to return inline for each guard.
+async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Result<String, Value> {
     // adopt-don't-kill: something already serves this port — same single path
     // as the refresh adopter (same-port pid policy, no cross-port fallback).
     if engine_health(port).await {
@@ -592,72 +601,80 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         if artifact.is_some() {
             eng.artifact = artifact;
         }
-        return json!({
+        return Err(json!({
             "ok": false,
             "code": "already_serving",
             "message": format!("an engine is already serving on port {port} (adopted as external)"),
             "engine": public_engine(&eng),
-        });
+        }));
     }
 
     {
         let child = state.child.lock().await;
         if child.is_some() {
-            return json!({
+            return Err(json!({
                 "ok": false,
                 "code": "already_running",
                 "message": "an engine spawn is already in progress"
-            });
+            }));
         }
     }
 
     let Some(artifact) = artifact else {
-        return json!({
+        return Err(json!({
             "ok": false,
             "code": "no_artifact",
             "message": "select a downloaded .ninfer artifact first"
-        });
+        }));
     };
     if tokio::fs::metadata(&artifact).await.is_err() {
-        return json!({
+        return Err(json!({
             "ok": false,
             "code": "artifact_missing",
             "message": format!("artifact not found: {artifact}")
-        });
+        }));
     }
+    Ok(artifact)
+}
 
-    let args = build_serve_args(&profile, port);
-    // remember what we're about to start (dirty-check source for the UI)
-    {
-        let last_start = LastStart {
-            port,
-            profile: profile.clone(),
-            artifact: Some(artifact.clone()),
-            at: now_ms(),
-        };
-        *state.last_start.write().await = Some(last_start.clone());
-        let path = state.data_dir.join("last-start.json");
-        let _ = std::fs::write(&path, serde_json::to_string(&last_start).unwrap_or_default());
-    }
+/// Open (creating if needed) the per-port engine log file, rotating it first
+/// if it's grown too large. Returns the log path (recorded into engine state
+/// for the UI) and the open file handle for the stdout/stderr pumps.
+async fn open_engine_log(state: &S, port: u16) -> Result<(String, tokio::fs::File), Value> {
     let log_file_path = log_path_for(&state.data_dir, port);
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
     rotate_log_if_large(&log_file_path).await;
-    let Ok(log) = tokio::fs::OpenOptions::new()
+    match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_file_path)
         .await
-    else {
-        return json!({ "ok": false, "message": "could not open engine log file" });
-    };
+    {
+        Ok(log) => Ok((log_file_path, log)),
+        Err(_) => Err(json!({ "ok": false, "message": "could not open engine log file" })),
+    }
+}
 
+/// Spawn the engine child process, pump its stdout/stderr into the already-open
+/// log file, attach the child to shared state, then start the reaper and
+/// health-poller background tasks. Returns the same `{ok: true, engine: ...}`
+/// response `start_engine` used to return inline.
+async fn spawn_and_attach(
+    state: &S,
+    engine_binary: &std::path::Path,
+    artifact: &str,
+    args: &[String],
+    port: u16,
+    log_file_path: String,
+    log: tokio::fs::File,
+) -> Value {
     {
         let mut eng = state.engine.write().await;
         eng.state = EngineState::Starting;
         eng.port = Some(port);
-        eng.artifact = Some(artifact.clone());
+        eng.artifact = Some(artifact.to_string());
         eng.model_id = None;
-        let mut argv = vec![artifact.clone()];
+        let mut argv = vec![artifact.to_string()];
         argv.extend(args.iter().cloned());
         eng.argv = Some(argv);
         eng.started_at = Some(now_ms());
@@ -667,19 +684,15 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
     }
 
-    let mut cmd = tokio::process::Command::new(&engine_binary);
+    let mut cmd = tokio::process::Command::new(engine_binary);
     // Attach the FULL built command line. `args` carries every flag from the
     // user's profile (--port, --max-context, --kv-dtype, …); it was previously
     // only recorded into state.argv for display while the spawned process got
     // the artifact alone — so packaged apps launched engines at pure defaults
     // no matter what the GUI said.
-    cmd.arg(&artifact)
-        .args(&args)
-        .current_dir(
-            engine_binary
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-        )
+    cmd.arg(artifact)
+        .args(args)
+        .current_dir(engine_binary.parent().unwrap_or(std::path::Path::new(".")))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -727,57 +740,63 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.pid = pid;
     }
 
-    // reaper: watch the spawned child and record its exit. The handle stays in
-    // `state.child` (cleared only once the process is actually gone) so the
-    // liveness checks in `refresh_engine_status` and the health poller keep
-    // seeing a *live* child instead of a false "process exited" / "external".
-    {
-        let st = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let exited = {
-                    let mut g = st.child.lock().await;
-                    match g.as_mut() {
-                        Some(c) => c.try_wait().ok().flatten().is_some(),
-                        None => return, // slot cleared (e.g. by stop_engine) — nothing to watch
-                    }
-                };
-                if exited {
-                    let mut eng = st.engine.write().await;
-                    if eng.state == EngineState::Starting || eng.state == EngineState::Running {
-                        eng.mark_exited();
-                    }
-                    *st.child.lock().await = None;
-                    return;
-                }
-            }
-        });
-    }
+    spawn_reaper(state.clone());
+    spawn_health_poller(state.clone(), port);
 
-    // health poller until ready or deadline
-    let st = state.clone();
-    let port2 = port;
+    let eng = state.engine.read().await;
+    json!({ "ok": true, "engine": public_engine(&eng) })
+}
+
+/// Watch the spawned child and record its exit. The handle stays in
+/// `state.child` (cleared only once the process is actually gone) so the
+/// liveness checks in `refresh_engine_status` and the health poller keep
+/// seeing a *live* child instead of a false "process exited" / "external".
+fn spawn_reaper(state: S) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let exited = {
+                let mut g = state.child.lock().await;
+                match g.as_mut() {
+                    Some(c) => c.try_wait().ok().flatten().is_some(),
+                    None => return, // slot cleared (e.g. by stop_engine) — nothing to watch
+                }
+            };
+            if exited {
+                let mut eng = state.engine.write().await;
+                if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+                    eng.mark_exited();
+                }
+                *state.child.lock().await = None;
+                return;
+            }
+        }
+    });
+}
+
+/// Poll engine health until it reports ready or the startup deadline passes,
+/// then mark it failed and kill the child.
+fn spawn_health_poller(state: S, port: u16) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(2000)).await;
-            if engine_health(port2).await {
-                let mut eng = st.engine.write().await;
+            if engine_health(port).await {
+                let mut eng = state.engine.write().await;
                 if eng.state == EngineState::Starting || eng.state == EngineState::Running {
                     eng.state = EngineState::Running;
                     if eng.model_id.is_none() {
-                        let (mid, mctx) = engine_model_info(st.as_ref(), port2).await;
+                        let (mid, mctx) = engine_model_info(state.as_ref(), port).await;
                         eng.assign_model_info(mid, mctx);
                     }
                 }
                 return;
             }
-            let mut eng = st.engine.write().await;
+            let mut eng = state.engine.write().await;
             if let Some(deadline) = eng.deadline {
                 if now_ms() > deadline {
                     eng.mark_failed(start_timeout_message());
                     drop(eng);
-                    let mut c = st.child.lock().await;
+                    let mut c = state.child.lock().await;
                     if let Some(c) = c.as_mut() {
                         let _ = c.start_kill();
                     }
@@ -786,9 +805,44 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             }
         }
     });
+}
 
-    let eng = state.engine.read().await;
-    json!({ "ok": true, "engine": public_engine(&eng) })
+pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<String>) -> Value {
+    let cfg = state.config.read().await.clone();
+
+    let engine_binary = match validate_launch(state, &cfg).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let port = profile.port.unwrap_or(cfg.engine_port);
+    let artifact = artifact.filter(|a| !a.is_empty());
+
+    let artifact = match resolve_artifact(state, port, artifact).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    let args = build_serve_args(&profile, port);
+    // remember what we're about to start (dirty-check source for the UI)
+    {
+        let last_start = LastStart {
+            port,
+            profile: profile.clone(),
+            artifact: Some(artifact.clone()),
+            at: now_ms(),
+        };
+        *state.last_start.write().await = Some(last_start.clone());
+        let path = state.data_dir.join("last-start.json");
+        let _ = std::fs::write(&path, serde_json::to_string(&last_start).unwrap_or_default());
+    }
+
+    let (log_file_path, log) = match open_engine_log(state, port).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    spawn_and_attach(state, &engine_binary, &artifact, &args, port, log_file_path, log).await
 }
 
 pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
