@@ -21,6 +21,7 @@ import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize,
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
+import { packForRequest, readRecallChunk } from '../lib/observationPack';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -275,6 +276,21 @@ const TOOLS = [
           query: { type: "string" }
         },
         required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "obs_recall",
+      description: "Page through the full original content of a large tool result that was replaced with a placeholder to save context (see the placeholder's 'retrieve' line for its id). Call repeatedly with the returned next_offset until eof is true.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Observation id from the placeholder, e.g. obs_ab12cd34ef56..." },
+          offset: { type: "number", description: "Byte offset to resume from — 0 for the first call, then the previous response's next_offset." }
+        },
+        required: ["id", "offset"]
       }
     }
   },
@@ -677,7 +693,7 @@ const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_com
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
-const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search', 'obs_recall']);
 /** Tool names an implementation `subagent` worker may use by default — the
  *  same set `runWorker` falls back to when no allow-list is given. Used to
  *  validate a model-supplied `tools` allow-list for the `subagent` tool
@@ -1801,7 +1817,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
    *  with the cached result instead of re-executing. */
   const toolDedupRef = useRef<Array<{ hash: string; name: string; result: string }>>([]);
   const TOOL_DEDUP_WINDOW = 5;
-  const PURE_DEDUP_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search']);
+  const PURE_DEDUP_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall']);
   /** Consecutive FAILED edit/apply_patch attempts per file path this run —
    *  a patch-spiral signal (the model keeps guessing at an `old` string
    *  that doesn't match). Reset on any successful edit/patch to that path. */
@@ -2701,6 +2717,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } catch (e) {
             result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
           }
+        } else if (call.name === 'obs_recall') {
+          const id = String(args.id || '');
+          const offset = Number(args.offset) || 0;
+          logType = 'read'; logDetail = `recall ${id} @${offset}`;
+          result = JSON.stringify(await readRecallChunk(id, offset));
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;
           const res = await coderRead(args.path, args.offset, args.limit, toolSignal);
@@ -3861,7 +3882,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // Baseline for the stale todo_write guard: this request's system
         // prompt carried the list as of this moment.
         todosRevAtReqStartRef.current = todosRevRef.current;
-        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
+        // ObservationPack: replace old, already-seen large tool results with
+        // a compact placeholder for THIS request only — the canonical
+        // currentMessages (shown in the UI, fed to compaction) is untouched.
+        const wireMessages = await packForRequest(currentMessages);
+        const req = buildChatRequest(model, system, wireMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
