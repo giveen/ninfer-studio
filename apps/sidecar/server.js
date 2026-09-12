@@ -1168,37 +1168,42 @@ function updatePublic() {
 function gpuStats() {
   return new Promise((resolve) => {
     const fallback = () => resolve({ available: false, name: null, memUsedMiB: null, memTotalMiB: null, utilPct: null, apps: [] });
-    execFile(
-      'nvidia-smi',
-      ['--query-gpu=name,memory.used,memory.total,utilization.gpu', '--format=csv,noheader,nounits'],
-      { timeout: 3000 },
-      async (err1, out1) => {
-        if (err1) return fallback();
-        const [name, memUsed, memTotal, util] = out1.trim().split('\n')[0].split(',').map((s) => s.trim());
-        execFile(
-          'nvidia-smi',
-          ['--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader,nounits'],
-          { timeout: 3000 },
-          (err2, out2) => {
-            const apps = [];
-            if (!err2 && out2) {
-              for (const line of out2.trim().split('\n').filter(Boolean)) {
-                const [pid, pname, mem] = line.split(',').map((s) => s.trim());
-                apps.push({ pid: Number(pid), name: pname, memMiB: Number(mem) });
-              }
-            }
-            resolve({
-              available: true,
-              name,
-              memUsedMiB: Number(memUsed),
-              memTotalMiB: Number(memTotal),
-              utilPct: Number(util),
-              apps,
-            });
-          },
-        );
-      },
-    );
+    // nvidia-smi accepts only ONE --query-* switch per invocation, so GPU
+    // metrics and the compute-apps table can't come from a single process.
+    // Issue both queries concurrently (previously the apps query waited on
+    // the GPU query to finish): wall time is one query, not two in series.
+    let gpuOut = null;
+    let appsOut = null;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (gpuOut == null) return fallback();
+      const [name, memUsed, memTotal, util] = gpuOut.trim().split('\n')[0].split(',').map((s) => s.trim());
+      const apps = [];
+      if (appsOut) {
+        for (const line of appsOut.trim().split('\n').filter(Boolean)) {
+          const [pid, pname, mem] = line.split(',').map((s) => s.trim());
+          apps.push({ pid: Number(pid), name: pname, memMiB: Number(mem) });
+        }
+      }
+      resolve({
+        available: true,
+        name,
+        memUsedMiB: Number(memUsed),
+        memTotalMiB: Number(memTotal),
+        utilPct: Number(util),
+        apps,
+      });
+    };
+    execFile('nvidia-smi', ['--query-gpu=name,memory.used,memory.total,utilization.gpu', '--format=csv,noheader,nounits'], { timeout: 3000 }, (err1, out1) => {
+      if (!err1) gpuOut = String(out1);
+      done();
+    });
+    execFile('nvidia-smi', ['--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader,nounits'], { timeout: 3000 }, (err2, out2) => {
+      if (!err2) appsOut = String(out2);
+      done();
+    });
   });
 }
 

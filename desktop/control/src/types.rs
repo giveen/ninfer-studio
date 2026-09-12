@@ -533,6 +533,10 @@ pub struct EngineStatus {
 pub struct GpuApp {
     pub pid: u32,
     pub name: String,
+    /// Explicit rename: serde's `camelCase` yields `memMib`, but the sidecar
+    /// and the web type (types.ts `GpuApp`) both spell it `memMiB` — the API
+    /// must match them, so this field is renamed explicitly.
+    #[serde(rename = "memMiB")]
     pub mem_mib: u64,
 }
 
