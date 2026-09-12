@@ -23,7 +23,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
@@ -48,6 +48,7 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
 # Core Directives
 1. **Research First**: ALWAYS investigate before writing code. 
    - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
+   - For pages that only render via JavaScript, use the built-in \`browser\` tool: \`navigate\` then \`snapshot\` (plus \`click\`/\`fill\`/\`wait_for\`/\`evaluate\` when you must interact). Prefer \`web_fetch\` for static pages. Call the \`close\` action when done so the session is freed.
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
    - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
     - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
@@ -1776,6 +1777,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'web'; logDetail = args.query;
           const res = await coderWebSearch(args.query, toolSignal);
           result = JSON.stringify(res);
+        } else if (call.name === 'browser') {
+          logType = 'web'; logDetail = `browser ${String(args.action ?? '')}${args.url ? ` ${args.url}` : ''}`;
+          const bargs: Record<string, string | number> = {};
+          for (const k of ['url', 'selector', 'value', 'key', 'expression', 'wait_until']) if (typeof args[k] === 'string') bargs[k] = String(args[k]);
+          if (typeof args.timeout === 'number') bargs.timeout = args.timeout;
+          result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), bargs, toolSignal));
         } else if (call.name === 'git_commit') {
           logType = 'bash'; logDetail = `git commit ${args.files}`;
           // Commit-approval gate: when ON, the human must sign off on the
@@ -2077,6 +2084,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
         case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
         case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
+        case 'browser': result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal)); break;
         case 'obs_recall': result = JSON.stringify(await readRecallChunk(String(args.id || ''), Number(args.offset) || 0)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
@@ -2101,7 +2109,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search']);
+    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser']);
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     // Read-only tools through the shared runner's registry; `delegate`
     // recurses into runSubagent with a filtered allow-list.
@@ -2176,6 +2184,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
         case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
         case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
+        case 'browser': return JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal));
         case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, signal));
         case 'write': return JSON.stringify(await coderWrite(args.path, args.content, signal));
         case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll, signal));

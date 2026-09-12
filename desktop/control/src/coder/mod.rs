@@ -4,6 +4,7 @@
 //!   grep      — content grep + glob listing
 //!   search    — ranked repo search (cached symbol index), repo map, git diff
 //!   web       — SSRF-guarded web fetch + DuckDuckGo search
+//!   browser   — built-in headless browser (Obscura engine) for JS-heavy pages
 //!   memory    — per-workspace self-improving memory bank
 //!   workspace — workspace pointer + host directory browsing (UI picker)
 //!   common    — shared path resolution + tool permissions
@@ -13,6 +14,7 @@
 
 // Rust guideline compliant 2026-07-28
 
+mod browser;
 mod common;
 mod exec;
 mod fs;
@@ -22,6 +24,7 @@ mod search;
 mod web;
 mod workspace;
 
+pub use browser::{browser, BrowserSlot};
 pub use common::{perms_get, perms_set, CoderPerms, PermTier};
 pub use exec::{
     bwrap_available, exec, job_get, job_kill, safe_mode_get, safe_mode_set, sandbox_get, sandbox_set, BgJob,

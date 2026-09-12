@@ -21,6 +21,13 @@ base64 = "0.23"
 reqwest = { version = "0.13", features = ["stream", "json", "rustls"], default-features = false }
 ignore = "0.4"
 globset = "0.4"
+# Embedded headless browser for the coder `browser` tool. Pinned to a rev:
+# the `obscura` name on crates.io belongs to an unrelated 0.0.2 raytracer, so
+# this is a git dependency. Re-pin deliberately when upgrading; `render`
+# (screenshots/PDF) is intentionally NOT enabled — it forces workspace-level
+# [patch.crates-io] entries for vendored taffy/cosmic-text that we don't
+# want to mirror, and the agent tool only needs DOM + JS + Markdown.
+obscura-browser = { git = "https://github.com/h4ckf0r0day/obscura", rev = "edb67cd95099ba40bf7b0c3f394e0f8e9e62ddf1" }
 scraper = "0.27"
 regex = "1.10"
 futures-util = "0.3"

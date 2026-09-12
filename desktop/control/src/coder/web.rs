@@ -151,7 +151,7 @@ fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
 /// globally-routable addresses — blocks fetching the loopback control plane
 /// (or any other internal/LAN service) via a tool an agent can call on
 /// untrusted content (fetched pages, files in the workspace).
-async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, Json<Value>)> {
+pub(crate) async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, Json<Value>)> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "only http/https URLs are allowed"}))));
     }

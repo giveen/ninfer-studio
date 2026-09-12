@@ -117,6 +117,21 @@ export function coderWebFetch(url: string, signal?: AbortSignal): Promise<CoderW
 export function coderWebSearch(query: string, signal?: AbortSignal): Promise<CoderWebSearch> {
   return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000, signal);
 }
+export interface CoderBrowserResult {
+  ok?: boolean;
+  url?: string;
+  title?: string;
+  content?: string;
+  truncated?: boolean;
+  result?: unknown;
+  found?: boolean;
+  open?: boolean;
+  idle_seconds?: number;
+  error?: string;
+}
+export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal): Promise<CoderBrowserResult> {
+  return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args }, 45_000, signal);
+}
 export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
 }
