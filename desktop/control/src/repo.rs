@@ -187,17 +187,5 @@ pub async fn start_update(state: &S, action: &str) -> Value {
 /// Serialize the current/last update job (camelCase, for the UI).
 pub async fn update_public(state: &S) -> Option<Value> {
     let j = state.update_job.lock().await;
-    j.as_ref().map(|r| {
-        json!({
-            "id": r.id,
-            "action": r.action,
-            "cmd": r.cmd,
-            "pid": r.pid,
-            "out": r.out,
-            "exitCode": r.exit_code,
-            "done": r.done,
-            "failed": r.failed,
-            "startedAt": r.started_at,
-        })
-    })
+    j.as_ref().and_then(|r| serde_json::to_value(r).ok())
 }

@@ -584,12 +584,16 @@ pub struct ModelArtifact {
 
 /// A background job the UI polls for progress: either an HF model download
 /// (`models.rs`) or a `git pull` / build of the ninfer-serve source
-/// (`repo.rs`). One shape serves both — each site still hand-picks and
-/// names its own wire-format keys in `downloads_public` / `update_public`,
-/// so the two API responses keep their existing shape even though the
-/// storage underneath is now a single struct instead of two near-identical
-/// ones. Fields specific to one site are `None` at the other.
+/// (`repo.rs`). One shape serves both. `downloads_public` / `update_public`
+/// serialize this struct directly (`#[serde(rename_all)]` drives the
+/// camelCase wire keys) instead of hand-building a `json!{}` with its own
+/// key spellings — a manually duplicated key list is exactly the drift
+/// that produced the `memMib`/`memMIB` mismatch bug: a Rust-side rename
+/// silently stops reaching the wire because the hand-built object never
+/// gets touched. Fields specific to one site are `None` at the other and
+/// serialize as `null`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobRec {
     pub id: String,
     /// Update job only: "pull" | "build".
