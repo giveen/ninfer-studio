@@ -100,6 +100,8 @@ export function App() {
             key={n.id}
             onClick={() => setScreen(n.id)}
             title={n.label}
+            aria-label={n.label}
+            aria-current={screen === n.id || undefined}
             className={cn(
               'flex h-10 w-10 flex-col items-center justify-center gap-0.5 rounded-lg text-[10px] font-medium transition-colors',
               screen === n.id ? 'bg-accent/12 text-accent' : 'text-faint hover:bg-panel2 hover:text-ink',
@@ -112,6 +114,7 @@ export function App() {
           type="button"
           onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
           title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
           className="mt-auto flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
         >
           {theme === 'dark' ? <Sun size={18} strokeWidth={1.8} /> : <Moon size={18} strokeWidth={1.8} />}

@@ -245,6 +245,7 @@ function ActionBtn({ title, onClick, disabled, children }: { title: string; onCl
     <button
       type="button"
       title={title}
+      aria-label={title}
       disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
@@ -711,6 +712,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
   const [presets, setPresets] = useState<SavedChatParams[]>([]);
   const [convSearch, setConvSearch] = useState('');
+  const [atBottom, setAtBottom] = useState(true);
+  const [dragOver, setDragOver] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -729,6 +732,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Latest conversations snapshot for use inside stable callbacks (avoids stale closures).
@@ -794,16 +798,29 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
   };
 
-  // Scoped to the active conversation's messages array (a new reference each
-  // time a message is added or a streamed token appends to one) instead of
-  // running after every render — unrelated state changes (composer typing,
-  // params popover, etc.) used to force a scrollHeight read + scrollTop
-  // write here too, which is a synchronous layout cost paid on every
-  // keystroke and every streamed token for no reason.
+  // Driven by a ResizeObserver on the actual content (not a [messages]
+  // dependency) so it re-sticks to the bottom no matter WHY the content grew —
+  // a new token, a message added, or the lazy-loaded Markdown chunk's Suspense
+  // boundary resolving after the initial paint (which changes layout without
+  // ever changing the `messages` array reference, so a dependency-gated effect
+  // would run once too early and never fire again for that growth).
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [active?.messages]);
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, []);
+
+  // Switching conversations always starts scrolled to the bottom of the new
+  // one, regardless of where the user had scrolled in the previous one.
+  useEffect(() => {
+    stick.current = true;
+    setAtBottom(true);
+  }, [activeId]);
 
   const runCompact = useCallback(async () => {
     if (compacting) return;
@@ -1140,6 +1157,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setText('');
     setAttachments([]);
     stick.current = true;
+    setAtBottom(true);
 
     const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
@@ -1166,6 +1184,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
       setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
       stick.current = true;
+    setAtBottom(true);
       const history: ChatMessage[] = modelHistory(base);
       await runStream(conv.id, history, 0, asstMsg.id);
     },
@@ -1383,9 +1402,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     URL.revokeObjectURL(url);
   };
 
-  const onFiles = (files: FileList | null) => {
+  const onFiles = (files: FileList | File[] | null) => {
     if (!files) return;
     for (const f of Array.from(files).slice(0, 4)) {
+      if (!f.type.startsWith('image/') && !f.type.startsWith('video/')) continue;
       if (f.size > 16 * 1024 * 1024) continue;
       const kind: 'image' | 'video' = f.type.startsWith('video') ? 'video' : 'image';
       const reader = new FileReader();
@@ -1452,9 +1472,28 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           {filteredConvs.map((c) => (
             <div
               key={c.id}
+              tabIndex={0}
+              role="button"
+              aria-current={c.id === activeId || undefined}
               onClick={() => renamingId !== c.id && setActiveId(c.id)}
+              onKeyDown={(e) => {
+                // Ignore keydowns bubbling up from the rename input or the
+                // pin/rename/export/delete buttons — only act when the row
+                // itself is the focused element.
+                if (e.target !== e.currentTarget) return;
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setActiveId(c.id);
+                } else if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  (e.currentTarget.nextElementSibling as HTMLElement | null)?.focus();
+                } else if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  (e.currentTarget.previousElementSibling as HTMLElement | null)?.focus();
+                }
+              }}
               className={cn(
-                'group mb-1 cursor-pointer rounded-lg border px-2.5 py-2 transition-colors',
+                'group mb-1 cursor-pointer rounded-lg border px-2.5 py-2 transition-colors focus-visible:outline-2 focus-visible:outline-accent/60',
                 c.id === activeId ? 'border-accent/30 bg-accent/8' : 'border-transparent hover:border-line hover:bg-panel2',
               )}
             >
@@ -1496,6 +1535,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                     c.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
                   )}
                   title={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                  aria-label={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
                 >
                   {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
                 </button>
@@ -1508,6 +1548,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   }}
                   className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
                   title="Rename conversation"
+                  aria-label="Rename conversation"
                 >
                   <Pencil size={12} />
                 </button>
@@ -1519,6 +1560,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   }}
                   className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
                   title="Export conversation (Markdown)"
+                  aria-label="Export conversation as Markdown"
                 >
                   <Download size={12} />
                 </button>
@@ -1530,6 +1572,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   }}
                   className="rounded p-0.5 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
                   title="Delete conversation"
+                  aria-label="Delete conversation"
                 >
                   <Trash2 size={12} />
                 </button>
@@ -1568,14 +1611,18 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           </div>
         )}
 
+        <div className="relative min-h-0 flex-1">
         <div
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
-            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            const s = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            stick.current = s;
+            setAtBottom(s);
           }}
-          className="min-h-0 flex-1 overflow-y-auto px-5 py-4"
+          className="h-full overflow-y-auto px-5 py-4"
         >
+          <div ref={contentRef}>
           {messages.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-accent/30 bg-accent/10">
@@ -1624,6 +1671,24 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </div>
             </Suspense>
           )}
+          </div>
+        </div>
+        {!atBottom && messages.length > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              stick.current = true;
+              setAtBottom(true);
+              const el = scrollRef.current;
+              if (el) el.scrollTop = el.scrollHeight;
+            }}
+            title="Jump to latest"
+            aria-label="Jump to latest message"
+            className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-panel px-3 py-1.5 text-[11.5px] text-mute shadow-lg transition-colors hover:border-accent/40 hover:text-ink"
+          >
+            <ChevronDown size={13} /> jump to latest
+          </button>
+        )}
         </div>
 
         {/* composer */}
@@ -1636,7 +1701,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                     <img src={a.dataUrl} alt="" className="h-7 w-7 rounded border border-line object-cover" />
                   ) : a.kind === 'image' ? '🖼' : '🎞'}
                   <span className="max-w-[140px] truncate">{a.name}</span>
-                  <button type="button" onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))} className="text-faint hover:text-danger">
+                  <button type="button" onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))} aria-label={`Remove attachment ${a.name}`} className="text-faint hover:text-danger">
                     <X size={12} />
                   </button>
                 </span>
@@ -1658,7 +1723,22 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </button>
             </div>
           )}
-          <div className="relative rounded-xl border border-line bg-inset focus-within:border-accent/50">
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              onFiles(e.dataTransfer.files);
+            }}
+            className={cn(
+              'relative rounded-xl border bg-inset transition-colors focus-within:border-accent/50',
+              dragOver ? 'border-accent/60' : 'border-line',
+            )}
+          >
             {text.startsWith('/') &&
               (() => {
                 const token = text.split(/\s/)[0].toLowerCase();
@@ -1697,6 +1777,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   if (!streaming && !compacting) send();
                 }
               }}
+              onPaste={(e) => {
+                const files = Array.from(e.clipboardData?.items || [])
+                  .filter((it) => it.kind === 'file')
+                  .map((it) => it.getAsFile())
+                  .filter((f): f is File => !!f);
+                if (files.length) {
+                  e.preventDefault();
+                  onFiles(files);
+                }
+              }}
               placeholder={engineUp ? `Message ${model || 'engine'}…  (Enter to send, Shift+Enter for newline)` : 'Engine is offline — open the Engine tab to start it'}
               className="max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
             />
@@ -1706,6 +1796,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 type="button"
                 onClick={() => fileRef.current?.click()}
                 title="Attach image or video (vision must be enabled on the engine)"
+                aria-label="Attach image or video"
                 className="rounded-md p-1.5 text-mute hover:bg-panel2 hover:text-ink"
               >
                 <Paperclip size={15} />
