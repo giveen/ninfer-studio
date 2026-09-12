@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookmarkPlus,
   Box,
@@ -15,7 +15,7 @@ import {
   Video,
   Zap,
 } from 'lucide-react';
-import { getConfig, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine } from '../lib/api';
+import { engineArgs, getConfig, getProfileState, saveConfig, saveProfileState, startEngine, stopEngine, type EngineArgsResult } from '../lib/api';
 import { BLANK_PROFILE, KV_DTYPE_OPTIONS, LOG_LEVELS, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
@@ -46,94 +46,11 @@ function jumpTo(id: string) {
   document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-// Mirror of the control plane's arg builder — used for the generated-command
-// display (maskKey=true) and the dirty comparison (maskKey=false).
-function buildArgs(p: EngineProfile, maskKey: boolean): string[] {
-  const args: string[] = [];
-  const kv = (flag: string, v: unknown) => {
-    if (v === undefined || v === null || v === '') return;
-    args.push(flag, String(v));
-  };
-  const flag = (f: string, v: unknown) => {
-    if (v) args.push(f);
-  };
-  kv('--host', p.host);
-  kv('--port', p.port);
-  kv('--api-key', p.apiKey && (maskKey ? '••••••••' : p.apiKey));
-  kv('--model-id', p.modelId);
-  kv('--max-context', p.maxContext);
-  kv('--kv-capacity', p.kvCapacity);
-  kv('--max-concurrency', p.maxConcurrency);
-  kv('--max-pending-requests', p.maxPendingRequests);
-  kv('--pending-timeout-ms', p.pendingTimeoutMs);
-  kv('--prefill-chunk', p.prefillChunk);
-  kv('--log-stats-interval-ms', p.logStatsIntervalMs);
-  kv('--log-level', p.logLevel);
-  kv('--device', p.device);
-  kv('--context-cost-presets', p.contextCostPresets);
-  kv('--max-request-mib', p.maxRequestMib);
-  kv('--media-cache-mib', p.mediaCacheMib);
-  kv('--media-live-mib', p.mediaLiveMib);
-  kv('--media-preprocess-threads', p.mediaPreprocessThreads);
-  kv('--request-log-jsonl', p.requestLogJsonl);
-  kv('--response-store-max-records', p.responseStoreMaxRecords);
-  kv('--response-store-max-mib', p.responseStoreMaxMib);
-  kv('--kv-dtype', p.kvDtype);
-  if (p.spec) {
-    args.push('--spec', String(p.spec));
-    kv('--draft-tokens', p.draftTokens);
-  }
-  flag('--lm-head-draft', p.lmHeadDraft);
-  kv('--default-max-tokens', p.defaultMaxTokens);
-  kv('--default-thinking-budget', p.defaultThinkingBudget);
-  flag('--vision', p.vision);
-  flag('--no-cuda-graph', p.noCudaGraph);
-  flag('--no-prefix-reuse', p.noPrefixReuse);
-  kv('--device-state-slots', p.deviceStateSlots);
-  kv('--host-state-slots', p.hostStateSlots);
-  kv('--host-kv-mib', p.hostKvMib);
-  kv('--max-private-continuations', p.maxPrivateContinuations);
-  kv('--max-shared-prefixes', p.maxSharedPrefixes);
-  kv('--max-long-anchors-per-continuation', p.maxLongAnchorsPerContinuation);
-  flag('--no-thinking', p.noThinking);
-  flag('--preserve-thinking', p.preserveThinking);
-  kv('--temperature', p.temperature);
-  kv('--top-p', p.topP);
-  kv('--top-k', p.topK);
-  kv('--min-p', p.minP);
-  kv('--presence-penalty', p.presencePenalty);
-  kv('--frequency-penalty', p.frequencyPenalty);
-  kv('--seed', p.seed);
-  flag('--greedy', p.greedy);
-  flag('--cors', p.cors);
-  return args;
-}
+// P0-2: the in-UI launch-arg builder (buildArgs) and the restart-dirty logic
+// moved to the control plane (POST /api/engine/args) — the same builder that
+// spawns the engine computes both, so the displayed command and the dirty
+// verdict can no longer drift from what actually runs.
 
-// Order-insensitive flag/value comparison for two argv lists (positional
-// args like the artifact path are ignored — compared separately).
-function argsEqual(a: string[], b: string[]): boolean {
-  const norm = (xs: string[]) => {
-    const m = new Map<string, string>();
-    for (let i = 0; i < xs.length; i++) {
-      const x = xs[i];
-      if (!x.startsWith('-')) continue;
-      if (i + 1 < xs.length && !xs[i + 1].startsWith('-')) {
-        m.set(x, xs[i + 1]);
-        i++;
-      } else {
-        m.set(x, '');
-      }
-    }
-    return m;
-  };
-  const ma = norm(a);
-  const mb = norm(b);
-  if (ma.size !== mb.size) return false;
-  for (const [k, v] of ma) if (mb.get(k) !== v) return false;
-  return true;
-}
-
-const baseName = (p: string | null) => (p ? p.split('/').pop() || p : null);
 
 function MiniStat({ label, value }: { label: string; value: string }) {
   return (
@@ -221,25 +138,28 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const running = engine?.state === 'running' || engine?.state === 'external';
   const starting = engine?.state === 'starting' || engine?.state === 'stopping';
 
-  // dirty = the engine running on the form's port was started with a different
-  // (profile, artifact) than the form holds. The running command is read from
-  // the process list, so this works for external engines too.
-  const lastStart = status?.lastStart ?? null;
-  const portMatch = !engine?.port || engine.port === profile.port;
-  // empty/missing argv = command not readable (e.g. adopted engine without a
-  // --port flag) — never treat that as "different settings"
-  const runningArgs = engine?.argv?.length ? engine.argv : null;
-  const formArgs = buildArgs(profile, false);
-  const runningArtifact = runningArgs?.find((x) => !x.startsWith('-')) ?? null;
-  const dirty =
-    !!engine &&
-    (engine.state === 'running' || engine.state === 'external') &&
-    portMatch &&
-    (runningArgs !== null
-      ? !argsEqual(formArgs, runningArgs) || baseName(artifact) !== baseName(runningArtifact)
-      : !!lastStart &&
-        (lastStart.artifact !== (artifact || null) ||
-          JSON.stringify(lastStart.profile) !== JSON.stringify(profile)));
+  // The restart-dirty verdict is computed by the control plane (single source
+  // of truth; debounced + sequenced so a stale response can't answer a newer
+  // form edit). Until the first response lands, dirty stays false and only
+  // the local port rule is used for the port-mismatch message.
+  const [argsInfo, setArgsInfo] = useState<EngineArgsResult | null>(null);
+  const argsSeq = useRef(0);
+  useEffect(() => {
+    const seq = ++argsSeq.current;
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          const r = await engineArgs(profile, artifact);
+          if (seq === argsSeq.current) setArgsInfo(r);
+        } catch {
+          /* keep the previous verdict; the next profile change re-asks */
+        }
+      })();
+    }, 150);
+    return () => clearTimeout(t);
+  }, [profile, artifact]);
+  const dirty = argsInfo?.dirty ?? false;
+  const portMatch = argsInfo?.portMatch ?? (!engine?.port || engine.port === profile.port);
   const otherEngines = (status?.engines ?? []).filter((e) => e.port !== engine?.port && e.pid !== engine?.pid);
   const set = <K extends keyof EngineProfile>(k: K, v: EngineProfile[K]) => setProfile((p) => ({ ...p, [k]: v }));
   const setU = <K extends keyof EngineProfile>(k: K, v: EngineProfile[K] | undefined) =>
@@ -272,13 +192,15 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   }, [artifact, artifacts.length]);
 
   const generatedCommand = useMemo(() => {
-    const args = buildArgs(profile, true);
+    // Server-built argv (api key masked server-side); empty until the first
+    // response lands (debounced, typically <300ms after the screen opens).
+    const args = argsInfo?.args ?? [];
     const command = [
       `ninfer-serve ${artifact ? artifact.split('/').pop() : '<artifact>.ninfer'}`,
       ...(args.length ? ['  ' + args.join(' \\\n  ')] : []),
     ].join('\n');
     return { command, argCount: args.length };
-  }, [profile, artifact]);
+  }, [argsInfo, artifact]);
 
   const doStart = async () => {
     setBusy('start');
@@ -510,7 +432,7 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
               <p className={cn('text-[11px] leading-tight', dirty ? 'text-warn' : 'text-faint')}>
                 {!portMatch
                   ? `form targets :${profile.port} — engine serves :${engine?.port}`
-                  : runningArgs === null && engine?.adopted
+                  : !engine?.argv?.length && engine?.adopted
                     ? 'external engine — running command not readable'
                     : dirty
                       ? 'settings changed — restart to apply'

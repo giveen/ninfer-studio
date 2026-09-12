@@ -34,6 +34,7 @@ export { buildServeArgs };
 // simply mistaken — cannot wipe the user's machine. Users can disable it for
 // trusted workflows via the Coder UI toggle (persisted only for the session).
 let coderSafeMode = true;
+let coderPerms = { tools: {}, denyPaths: [] };
 // Filesystem sandbox: when enabled, agent shell commands run inside bwrap with the
 // whole host mounted read-only and only the workspace bind-mounted read-write. This
 // is the real safety net behind "Safe mode OFF" — even a jailbroken model can only
@@ -860,6 +861,36 @@ function publicEngine() {
 
 // Last profile/artifact handed to an engine (dirty-check source for the UI).
 let lastStart = null;
+
+// Order-insensitive flag/value comparison for two argv lists (positional args
+// like the artifact path are ignored — compared separately). Must stay
+// byte-for-byte the same rule as the Rust control plane's `args_equal`.
+function argsEqual(a, b) {
+  const norm = (xs) => {
+    const m = new Map();
+    for (let i = 0; i < xs.length; i++) {
+      const x = xs[i];
+      if (!x.startsWith('-')) continue;
+      if (i + 1 < xs.length && !xs[i + 1].startsWith('-')) {
+        m.set(x, xs[i + 1]);
+        i++;
+      } else {
+        m.set(x, '');
+      }
+    }
+    return m;
+  };
+  const ma = norm(a);
+  const mb = norm(b);
+  if (ma.size !== mb.size) return false;
+  for (const [k, v] of ma) if (mb.get(k) !== v) return false;
+  return true;
+}
+
+function baseName(p) {
+  if (!p) return null;
+  return p.split('/').pop() || p;
+}
 
 // Primary engine + every locally-discovered ninfer-serve on other ports.
 async function enginesPublic() {
@@ -1931,6 +1962,23 @@ async function handleCoder(req, res, p, url) {
       if (typeof body?.enabled === 'boolean') coderSafeMode = body.enabled;
       return sendJson(res, 200, { enabled: coderSafeMode });
     }
+    // Per-tool permission tiers + denied path prefixes, pushed by the web UI.
+    // In this sidecar the agent loop runs client-side (the UI enforces the
+    // tiers in its dispatcher), so this store mainly keeps GET/POST behavior
+    // 1:1 with the Rust control plane, which additionally re-checks `deny`
+    // server-side in coder::enforce_perm.
+    if (p === '/api/coder/perms' && req.method === 'GET') {
+      return sendJson(res, 200, coderPerms);
+    }
+    if (p === '/api/coder/perms' && req.method === 'POST') {
+      const body = await readBody(req, 1 << 20);
+      if (body?.tools && typeof body.tools === 'object') {
+        const tools = {};
+        for (const [k, v] of Object.entries(body.tools)) if (['allow', 'ask', 'deny'].includes(v)) tools[k] = v;
+        coderPerms = { tools, denyPaths: Array.isArray(body.denyPaths) ? body.denyPaths.filter((x) => typeof x === 'string') : [] };
+      }
+      return sendJson(res, 200, coderPerms);
+    }
     if (p === '/api/coder/sandbox' && req.method === 'GET') {
       return sendJson(res, 200, { enabled: coderSandbox });
     }
@@ -2609,6 +2657,38 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req, 1 << 20);
       const result = await startUpdate(body?.action);
       return sendJson(res, result.ok ? 200 : 400, result);
+    }
+
+    // `POST /api/engine/args` — server is the source of truth for the launch
+    // command and the restart-dirty check (P0-2: the web UI carried a third
+    // copy of the launch-arg builder plus its own dirty logic). Mirrors the
+    // Rust control plane endpoint 1:1 (see scripts/api-parity.mjs).
+    if (p === '/api/engine/args' && req.method === 'POST') {
+      const body = (await readBody(req, 1 << 20)) || {};
+      const profile = body.profile || {};
+      const artifact = body.artifact || '';
+      const port = Number(profile.port) || config.enginePort;
+      // Same normalization startEngine applies before spawning, so the
+      // displayed/dirty-checked args are what this sidecar would actually run.
+      const args = buildServeArgs({ ...profile, port, host: profile.host || '127.0.0.1' });
+      const running = engine.state === 'running' || engine.state === 'external';
+      const portMatch = !engine.port || engine.port === port;
+      const runningArgs = engine.argv?.length ? engine.argv : null;
+      let dirty = false;
+      if (running && portMatch) {
+        if (runningArgs) {
+          const runningArtifact = runningArgs.find((x) => !x.startsWith('-')) ?? null;
+          dirty = !argsEqual(args, runningArgs) || baseName(artifact) !== baseName(runningArtifact);
+        } else if (lastStart) {
+          // Unreadable argv (adopted engine): fall back to the last profile
+          // this sidecar started, like the UI did before the move.
+          dirty = lastStart.artifact !== (artifact || null) || JSON.stringify(lastStart.profile) !== JSON.stringify(profile);
+        }
+      }
+      for (let i = 0; i < args.length - 1; i++) {
+        if (args[i] === '--api-key' && args[i + 1]) { args[i + 1] = '••••••••'; break; }
+      }
+      return sendJson(res, 200, { args, dirty, portMatch });
     }
 
     if (p === '/api/logs' && req.method === 'GET') {

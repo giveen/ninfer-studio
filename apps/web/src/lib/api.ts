@@ -149,6 +149,27 @@ export function startEngineUpdate(action: 'pull' | 'build'): Promise<EngineActio
   return postJSON('/api/engine/update', { action });
 }
 
+/** Server-computed launch command + restart-dirty verdict (single source of
+ * truth: both backends build argv with the same builder that spawns the
+ * engine, so the UI can no longer drift from what actually runs). */
+export interface EngineArgsResult {
+  /** Launch argv for the posted profile; the api key is masked server-side. */
+  args: string[];
+  /** Form settings differ from the running engine (only true while a matching
+   * engine is up; an unreadable argv on an adopted engine is never dirty). */
+  dirty: boolean;
+  /** The running engine serves the profile's port. */
+  portMatch: boolean;
+}
+
+export function engineArgs(profile: unknown, artifact: string | null): Promise<EngineArgsResult> {
+  // Same ''-stripping as startEngine: the dirty check compares against the
+  // profile the engine was ACTUALLY started with (already cleaned), so the
+  // form must be cleaned identically or empty fields read as "changed".
+  const clean = JSON.parse(JSON.stringify(profile, (_k, v) => (v === '' ? undefined : v)));
+  return postJSON<EngineArgsResult>('/api/engine/args', { profile: clean, artifact }, 8_000);
+}
+
 export function getLogs(n = 400): Promise<{ lines: string[]; size: number }> {
   return getJSON<{ lines: string[]; size: number }>(`/api/logs?n=${n}`, 6000);
 }

@@ -2,25 +2,32 @@ name: CI / Sidecar + args parity
 
 # The sidecar is intentionally zero-dependency (no install step), and its
 # server.js boots a real HTTP listener on import — so it must never be
-# imported by tests. CI therefore (1) syntax-checks both sidecar modules and
+# imported by tests. CI therefore (1) syntax-checks both sidecar modules,
 # (2) enforces TS-side launch-arg parity via scripts/args-parity.mjs against
-# the shared fixture that the Rust side checks under `cargo test` (CI / Rust).
-#
-# The fixture (desktop/control/tests/parity/) is shared by both parity checks,
-# so changes to it run this workflow too.
+# the shared fixture that the Rust side checks under `cargo test` (CI / Rust),
+# and (3) enforces API-surface parity via scripts/api-parity.mjs: every
+# /api/* endpoint the web UI calls must be registered by BOTH backends, so a
+# handler added to one backend and not the other fails CI instead of 404ing
+# silently on one platform.
 
 on:
   pull_request:
     paths:
       - 'apps/sidecar/**'
+      - 'apps/web/src/lib/api.ts'
+      - 'desktop/control/src/lib.rs'
       - 'scripts/args-parity.mjs'
+      - 'scripts/api-parity.mjs'
       - 'desktop/control/tests/parity/**'
       - '.github/workflows/ci-sidecar.yml'
   push:
     branches: [main]
     paths:
       - 'apps/sidecar/**'
+      - 'apps/web/src/lib/api.ts'
+      - 'desktop/control/src/lib.rs'
       - 'scripts/args-parity.mjs'
+      - 'scripts/api-parity.mjs'
       - 'desktop/control/tests/parity/**'
       - '.github/workflows/ci-sidecar.yml'
   workflow_dispatch:
@@ -48,3 +55,5 @@ jobs:
           node --check apps/sidecar/serve-args.js
       - name: Engine launch-arg parity (TS builder vs shared fixture)
         run: node scripts/args-parity.mjs
+      - name: API surface parity (UI endpoints vs both backends)
+        run: node scripts/api-parity.mjs

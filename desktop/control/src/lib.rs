@@ -21,7 +21,10 @@ use crate::engine::{
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models, start_download};
 use crate::repo::{start_update, update_public};
-use crate::types::{strip_extended_prefix, AppEvent, ARTIFACTS, AppSettings, EngineProfile, LastStart, ProfileState, SavedProfile, State};
+use crate::types::{
+    args_equal, base_name, build_serve_args, strip_extended_prefix, AppEvent, ARTIFACTS, AppSettings, EngineProfile,
+    LastStart, ProfileState, SavedProfile, State,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use axum::body::Body;
 use axum::extract::{Query, Request, State as AxumState};
@@ -70,6 +73,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/models", get(api_models))
         .route("/api/models/download", post(models_download))
         .route("/api/engine/update", post(engine_update))
+        .route("/api/engine/args", post(engine_args))
         .route("/api/gpu", get(gpu))
         // Coding harness — control-plane endpoints (mirror apps/sidecar/server.js)
         .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
@@ -83,6 +87,9 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/jobs/{id}", get(coder::job_get))
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
         .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
+        .route("/api/coder/sandbox", get(coder::sandbox_get).post(coder::sandbox_set))
+        .route("/api/coder/search", get(coder::search))
+        .route("/api/coder/diff", get(coder::diff))
         .route("/api/coder/perms", get(coder::perms_get).post(coder::perms_set))
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
@@ -377,6 +384,81 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
     Ok(Json(result))
 }
 
+/// `POST /api/engine/args` — server is the source of truth for the launch
+/// command and the restart-dirty check (P0-2: the web UI previously carried a
+/// third copy of the launch-arg builder plus its own dirty logic; both lived
+/// in EngineScreen.tsx and could drift from the builder that actually spawns
+/// the engine). Response:
+///   args        launch argv for the posted profile, api key masked
+///   dirty       settings differ from the running engine (only computed while
+///               an engine matching the profile's port is up)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EngineArgsBody {
+    #[serde(default)]
+    profile: Option<Value>,
+    #[serde(default)]
+    artifact: Option<String>,
+}
+
+async fn engine_args(
+    AxumState(state): AxumState<S>,
+    Json(body): Json<EngineArgsBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut sanitized = body.profile.clone().unwrap_or(Value::Null);
+    sanitize_empty_strings(&mut sanitized);
+    let profile: EngineProfile =
+        serde_json::from_value(sanitized).unwrap_or_else(|_| EngineProfile::default());
+    let artifact = body.artifact.clone().unwrap_or_default();
+
+    let (eng, last, cfg) = (state.engine.read().await, state.last_start.read().await, state.config.read().await);
+    let port = profile.port.unwrap_or(cfg.engine_port);
+    let running = eng.state == "running" || eng.state == "external";
+    let port_match = eng.port.map(|p| p == port).unwrap_or(true);
+    let running_args = eng.argv.as_deref().filter(|a| !a.is_empty());
+    let form = build_serve_args(&profile, port);
+
+    // Mirror of the UI's dirty rule: only meaningful for a matching port, and
+    // an unreadable argv (adopted external engine) must never read as "changed".
+    let dirty = if running && port_match {
+        match running_args {
+            Some(ra) => {
+                let running_artifact = ra.iter().find(|x| !x.starts_with('-'));
+                !args_equal(ra, &form)
+                    || base_name(&artifact)
+                        != base_name(running_artifact.map(|s| s.as_str()).unwrap_or(""))
+            }
+            None => match last.as_ref() {
+                // The UI normalizes "" to null for the artifact, so an empty
+                // artifact here means "none" as well.
+                Some(ls) => {
+                    let art_opt = if artifact.is_empty() { None } else { Some(artifact.as_str()) };
+                    ls.artifact.as_deref() != art_opt
+                        || serde_json::to_string(&ls.profile).ok() != serde_json::to_string(&profile).ok()
+                }
+                None => false,
+            },
+        }
+    } else {
+        false
+    };
+
+    // The api key is the caller's own key (posted from their own UI) — mask it
+    // in the response so the displayed command never shows a live credential.
+    let mut args = form;
+    if let Some(i) = args.iter().position(|a| a == "--api-key") {
+        if i + 1 < args.len() && !args[i + 1].is_empty() {
+            args[i + 1] = "••••••••".to_string();
+        }
+    }
+
+    Ok(Json(json!({
+        "args": args,
+        "dirty": dirty,
+        "portMatch": port_match,
+    })))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StopBody {
@@ -514,6 +596,12 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     }
     if let Some(v) = body.get("coderWorkspace").and_then(|v| v.as_str()) {
         merged.coder_workspace = v.into();
+    }
+    if let Some(v) = body.get("coderSandbox").and_then(|v| v.as_bool()) {
+        merged.coder_sandbox = v;
+    }
+    if let Some(v) = body.get("sandboxBinds").and_then(|v| v.as_array()) {
+        merged.sandbox_binds = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
     }
     let path = state.data_dir.join("config.json");
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;

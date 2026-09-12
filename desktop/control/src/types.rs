@@ -98,6 +98,15 @@ pub struct AppSettings {
     /// within. Every coder filesystem tool is confined to this root (path traversal
     /// rejected). Empty => no workspace configured. Serializes as `coderWorkspace`.
     pub coder_workspace: String,
+    /// Coding harness: wrap the agent's shell in bubblewrap (bwrap) so it can
+    /// write only inside the workspace (rest of the host read-only). Mirrors the
+    /// sidecar's `coderSandbox`. Ignored when bwrap is not installed (exec then
+    /// runs unsandboxed, like the sidecar). Serializes as `coderSandbox`.
+    pub coder_sandbox: bool,
+    /// Extra read-write bind mounts passed to bwrap alongside the workspace
+    /// (e.g. shared model dirs a build step needs to write to). Serializes as
+    /// `sandboxBinds`.
+    pub sandbox_binds: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -118,6 +127,8 @@ impl Default for AppSettings {
             test_command: String::new(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),
+            coder_sandbox: false,
+            sandbox_binds: Vec::new(),
             coder_workspace: String::new(),
         }
     }
@@ -395,6 +406,42 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     a
 }
 
+/// Order-insensitive flag/value equality for two argv lists (positional args
+/// are ignored — the artifact path is compared separately). Mirrors the web
+/// UI's `argsEqual`, so the server-computed restart-dirty check and the UI
+/// cannot disagree about whether settings changed.
+pub fn args_equal(a: &[String], b: &[String]) -> bool {
+    fn norm(xs: &[String]) -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < xs.len() {
+            if !xs[i].starts_with('-') {
+                i += 1;
+                continue;
+            }
+            if i + 1 < xs.len() && !xs[i + 1].starts_with('-') {
+                m.insert(xs[i].clone(), xs[i + 1].clone());
+                i += 2;
+            } else {
+                m.insert(xs[i].clone(), String::new());
+                i += 1;
+            }
+        }
+        m
+    }
+    let (ma, mb) = (norm(a), norm(b));
+    ma.len() == mb.len() && ma.iter().all(|(k, v)| mb.get(k) == Some(v))
+}
+
+/// Basename of a filesystem-ish path (`/a/b/c` -> `c`); whole string when there
+/// is no separator. Mirrors the UI's `baseName` for artifact comparison.
+pub fn base_name(p: &str) -> &str {
+    match p.rsplit_once('/') {
+        Some((_, rest)) => rest,
+        None => p,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registered artifact catalog (mirrors the NInfer README model table)
 // ---------------------------------------------------------------------------
@@ -668,6 +715,44 @@ pub fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod args_equal_tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn order_insensitive_and_positional_ignored() {
+        let a = v(&["--port", "8080", "--model-id", "x", "artifact.ninfer"]);
+        let b = v(&["--model-id", "x", "other.ninfer", "--port", "8080"]);
+        assert!(args_equal(&a, &b));
+        // A value change is dirty.
+        assert!(!args_equal(&a, &v(&["--port", "9090", "--model-id", "x"])));
+        // A changed flag set is dirty.
+        assert!(!args_equal(&a, &v(&["--port", "8080"])));
+    }
+
+    #[test]
+    fn flag_value_boundary_matches_javascript_semantics() {
+        // `--greedy --port`: a value flag eats the next non-flag token only,
+        // so `--greedy` maps to "" and `--port` stands alone with value 8080.
+        // The JS normalization shares this rule, so both sides agree.
+        let a = v(&["--greedy", "--port", "8080"]);
+        let b = v(&["--port", "8080", "--greedy"]);
+        assert!(args_equal(&a, &b));
+        assert!(!args_equal(&a, &v(&["--port", "8080"])));
+    }
+
+    #[test]
+    fn base_name_handles_plain_names_and_separators() {
+        assert_eq!(base_name("/a/b/model.ninfer"), "model.ninfer");
+        assert_eq!(base_name("model.ninfer"), "model.ninfer");
+        assert_eq!(base_name(""), "");
+    }
 }
 
 #[cfg(test)]
