@@ -29,13 +29,32 @@ function isCompactedMsg(m: ChatMessage): boolean {
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
-// visible history is preserved separately for browsing.
+// visible history is preserved separately for browsing. Also drops empty/
+// incomplete assistant turns (e.g. an aborted placeholder) so every call site
+// gets the same "don't send a blank assistant message" behavior instead of
+// each caller having to remember to filter it out itself.
 function modelHistory(conv: Conversation): ChatMessage[] {
+  const tail = conv.compactedSummary ? conv.messages.slice(conv.compactedCount ?? 0) : conv.messages;
+  const filtered = tail.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
   if (conv.compactedSummary) {
     const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
-    return [prefix, ...conv.messages.slice(conv.compactedCount ?? 0)];
+    return [prefix, ...filtered];
   }
-  return conv.messages;
+  return filtered;
+}
+
+// A compacted conversation's summary is only valid as a prefix for a message
+// array at least as long as compactedCount. Deleting/branching/regenerating/
+// editing/clearing can shorten `messages` back to or past that boundary —
+// keeping the old compaction state then makes modelHistory's slice come back
+// empty, silently dropping every real message from the next request. Use
+// this instead of a raw `{ ...conv, messages }` spread anywhere `messages`
+// is being shortened or replaced.
+function withMessages(conv: Conversation, messages: ChatMessage[]): Conversation {
+  if (conv.compactedSummary && messages.length <= (conv.compactedCount ?? 0)) {
+    return { ...conv, messages, compactedSummary: undefined, compactedCount: undefined };
+  }
+  return { ...conv, messages };
 }
 
 // Subtle divider shown in place of the verbose compaction summary.
@@ -281,10 +300,10 @@ const MessageRow = memo(function MessageRow({
           <Pencil size={13} />
         </ActionBtn>
       )}
-      <ActionBtn title="Branch from here" onClick={() => actions.onBranch(convId, index)}>
+      <ActionBtn title="Branch from here" onClick={() => actions.onBranch(convId, index)} disabled={locked}>
         <GitBranch size={13} />
       </ActionBtn>
-      <ActionBtn title="Delete from here" onClick={() => actions.onDelete(convId, index)}>
+      <ActionBtn title="Delete from here" onClick={() => actions.onDelete(convId, index)} disabled={locked}>
         <Trash2 size={13} />
       </ActionBtn>
     </div>
@@ -692,6 +711,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
+  // Which conversation actually owns the in-flight stream — `streaming` alone
+  // is a global one-at-a-time engine lock (a single AbortController/engine
+  // slot), so viewing a DIFFERENT idle conversation must not render it (or
+  // its composer) as if it were the one generating.
+  const [streamingConvId, setStreamingConvId] = useState<string | null>(null);
   const [paramsOpen, setParamsOpen] = useState(false);
   const [model, setModel] = useState<string>(status?.engine?.modelId || '');
   const abortRef = useRef<AbortController | null>(null);
@@ -829,6 +853,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const useModel = model || runningModel;
       if (!useModel) return;
       setStreaming(true);
+      setStreamingConvId(convId);
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -952,6 +977,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
          if (depth >= 12) {
            setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
            setStreaming(false);
+           setStreamingConvId(null);
            return;
          }
          const toolResults: ChatMessage[] = [];
@@ -1056,6 +1082,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       }
 
       setStreaming(false);
+      setStreamingConvId(null);
       abortRef.current = null;
     },
     [engineUp, model, runningModel, params, onNavigate, status],
@@ -1100,7 +1127,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setAttachments([]);
     stick.current = true;
 
-    const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+    const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
@@ -1125,7 +1152,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
       setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
       stick.current = true;
-      const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+      const history: ChatMessage[] = modelHistory(base);
       await runStream(conv.id, history, 0, asstMsg.id);
     },
     [streaming, compacting, engineUp, model, runningModel, convs, activeId, runStream, onNavigate],
@@ -1139,19 +1166,19 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   // Delete this message and everything after it (a chat is a strict linear context).
   const deleteFrom = useCallback((convId: string, msgIndex: number) => {
-    setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.slice(0, msgIndex) })));
+    setConvs((cs) => cs.map((c) => (c.id !== convId ? c : withMessages(c, c.messages.slice(0, msgIndex)))));
   }, []);
 
   // Fork the conversation up to and including this message into a new chat.
   const branchAt = useCallback((convId: string, msgIndex: number) => {
     const conv = convsRef.current.find((c) => c.id === convId);
     if (!conv) return;
+    const forkMessages = conv.messages.slice(0, msgIndex + 1).map((m) => ({ ...m }));
     const fork: Conversation = {
-      ...conv,
+      ...withMessages(conv, forkMessages),
       id: uid(),
       title: conv.title ? `${conv.title} (branch)` : 'Branch',
       createdAt: Date.now(),
-      messages: conv.messages.slice(0, msgIndex + 1).map((m) => ({ ...m })),
     };
     setConvs((cs) => [fork, ...cs]);
     setActiveId(fork.id);
@@ -1163,9 +1190,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const conv = convsRef.current.find((c) => c.id === convId);
       if (!conv) return;
       const prior = conv.messages.slice(0, msgIndex);
+      const base = withMessages(conv, prior);
       const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
-      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...base, messages: [...prior, asst] })));
+      runStream(convId, modelHistory(base), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
@@ -1179,9 +1207,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const msgs = conv.messages.slice();
       msgs[msgIndex] = { ...msgs[msgIndex], content: newText };
       const prior = msgs.slice(0, msgIndex + 1);
+      const base = withMessages(conv, prior);
       const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
-      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...base, messages: [...prior, asst] })));
+      runStream(convId, modelHistory(base), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
@@ -1197,7 +1226,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       if (!conv) return;
       const target = conv.messages[msgIndex];
       if (!target || target.role !== 'assistant') return;
-      const upTo: Conversation = { ...conv, messages: conv.messages.slice(0, msgIndex + 1) };
+      const upTo = withMessages(conv, conv.messages.slice(0, msgIndex + 1));
       const history: ChatMessage[] = [
         ...modelHistory(upTo),
         { role: 'user', content: 'Continue your previous response exactly where it left off. Do not repeat any text you already wrote, and do not add any preamble or acknowledgement.' },
@@ -1249,7 +1278,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const arg = parts.slice(1).join(' ').trim();
       switch (cmd) {
         case '/clear':
-          if (activeId) setConvs((cs) => cs.map((c) => (c.id === activeId ? { ...c, messages: [] } : c)));
+          if (activeId) setConvs((cs) => cs.map((c) => (c.id === activeId ? withMessages(c, []) : c)));
           else setActiveId(null);
           return true;
         case '/retry': {
@@ -1323,8 +1352,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // a different context size is running. Falls back to the primary engine
   // when the model isn't found among the known engines yet.
   const ctxLimit = allEngines.find((e) => e.modelId === (model || runningModel))?.maxContext ?? status?.engine?.maxContext ?? null;
-  const lastMeta =
-    [...messages].reverse().find((m) => m.role === 'assistant' && m.meta && (m.meta.promptTokens || m.meta.completionTokens))?.meta ?? null;
+  // A backward scan instead of `[...messages].reverse().find(...)` — the
+  // spread+reverse copied the whole conversation's message array on every
+  // single streamed token (onContentDelta re-renders this component per
+  // delta), which gets expensive fast in a long-running conversation.
+  const lastMeta = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === 'assistant' && m.meta && (m.meta.promptTokens || m.meta.completionTokens)) return m.meta;
+    }
+    return null;
+  }, [messages]);
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
@@ -1459,7 +1497,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                       convId={activeId ?? ''}
                       index={i}
                       isLast={i === messages.length - 1}
-                      streaming={streaming && i === messages.length - 1}
+                      streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
                       locked={streaming || compacting}
                       actions={msgActions}
                     />
@@ -1572,7 +1610,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 </button>
               )}
               <span className="ml-auto" />
-              {streaming || compacting ? (
+              {streamingConvId && streamingConvId !== activeId ? (
+                <Button variant="ghost" size="sm" disabled title="The engine is generating a reply in another chat">
+                  <Square size={12} /> busy elsewhere
+                </Button>
+              ) : streaming || compacting ? (
                 <Button variant="danger" size="sm" onClick={stop}>
                   <Square size={12} /> {compacting ? 'stop compact' : 'stop'}
                 </Button>
