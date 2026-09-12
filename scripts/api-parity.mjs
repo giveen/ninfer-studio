@@ -16,7 +16,7 @@
 // Exit 0 = all endpoints registered; 1 = drift, with the offending
 // endpoints listed.
 
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,8 +25,14 @@ const root = join(here, '..');
 const read = (p) => readFileSync(join(root, p), 'utf8');
 
 // --- Collect the endpoint paths the web app actually calls ----------------
+// lib/api.ts is a barrel re-exporting lib/api/*.ts (split by domain: config,
+// engine, models, chat, coder) — scan every file in that directory, not just
+// the barrel, or a route literal moved into a domain module goes invisible
+// to this gate and drift stops being caught.
 function uiEndpoints() {
-  const src = read('apps/web/src/lib/api.ts');
+  const dir = 'apps/web/src/lib/api';
+  const files = readdirSync(join(root, dir)).filter((f) => f.endsWith('.ts'));
+  const src = files.map((f) => read(join(dir, f))).join('\n');
   const paths = new Set();
   const re = /['"`]([^'"`$]*\/api\/[^'"`$?]*)/g;
   for (const m of src.matchAll(re)) {

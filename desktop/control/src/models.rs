@@ -278,22 +278,6 @@ async fn fetch_download_size(cli: &str, repo: &str, file: &str, dir: &str) -> Op
 pub async fn downloads_public(state: &State) -> Vec<Value> {
     let d = state.downloads.lock().await;
     d.values()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "repo": r.repo,
-                "file": r.file,
-                "localDir": r.local_dir,
-                "pid": r.pid,
-                "out": r.out,
-                "exitCode": r.exit_code,
-                "done": r.done,
-                "failed": r.failed,
-                "totalBytes": r.total_bytes,
-                "downloadedBytes": r.downloaded_bytes,
-                "speedBps": r.speed_bps,
-                "startedAt": r.started_at,
-            })
-        })
+        .filter_map(|r| serde_json::to_value(r).ok())
         .collect()
 }
