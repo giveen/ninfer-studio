@@ -81,6 +81,17 @@ const Markdown = lazy(() => import('../components/Markdown'));
 import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
 
 
+// Windowing, not full virtualization: a conversation with hundreds of
+// messages only mounts the most recent ones by default (each MessageRow
+// pulls in markdown parsing, syntax highlighting, etc.) — a "show earlier
+// messages" banner reveals the rest on demand. Deliberately simpler than a
+// virtualized list: it doesn't need to touch find-in-conversation's
+// scrollIntoView, the ResizeObserver-driven stick-to-bottom effect, or the
+// lazy-loaded Markdown Suspense boundary, since it's just a plain array
+// slice — the rendered DOM shrinks, but nothing about how it's measured or
+// scrolled changes.
+const RECENT_MESSAGE_WINDOW = 60;
+
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
   reasoningEffort: '',
@@ -721,6 +732,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showAllMessages, setShowAllMessages] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
@@ -831,6 +843,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setAtBottom(true);
     setFindOpen(false);
     setFindQuery('');
+    setShowAllMessages(false);
   }, [activeId]);
 
   useEffect(() => () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); }, []);
@@ -1487,6 +1500,14 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const messages = active?.messages || [];
   const last = messages[messages.length - 1];
 
+  // Find-in-conversation always sees the full list (a match outside the
+  // rendered window would have no DOM node for scrollIntoView to find), so
+  // opening it bypasses windowing entirely rather than needing special-cased
+  // "expand to reveal this match" logic.
+  const windowingActive = !showAllMessages && !findOpen && messages.length > RECENT_MESSAGE_WINDOW;
+  const visibleStart = windowingActive ? messages.length - RECENT_MESSAGE_WINDOW : 0;
+  const hiddenMessageCount = visibleStart;
+
   // Find-in-conversation: indices of messages whose content matches the
   // query, cycled through by findIndex. Message-level, not sub-string
   // highlighting — injecting <mark> into rendered markdown isn't worth the
@@ -1847,7 +1868,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           ) : (
             <Suspense fallback={null}>
               <div className="mx-auto flex max-w-3xl flex-col gap-5">
-                {messages.map((m, i) => {
+                {hiddenMessageCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllMessages(true)}
+                    className="mx-auto rounded-full border border-line bg-panel px-3 py-1.5 text-[11.5px] text-mute hover:border-accent/40 hover:text-ink"
+                  >
+                    Show {hiddenMessageCount} earlier message{hiddenMessageCount === 1 ? '' : 's'}
+                  </button>
+                )}
+                {messages.slice(visibleStart).map((m, sliceI) => {
+                  const i = visibleStart + sliceI;
                   if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
                   const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
                   return (
