@@ -8,4 +8,4 @@ desktop/target/
 *.deb
 
   # Runtime local storage (not source)
-  storage/
+storage/
