@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
-import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
+import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
@@ -10,13 +10,20 @@ import { DirBrowser } from '../components/DirBrowser';
 // chunk back into the eager bundle for both).
 const Markdown = lazy(() => import('../components/Markdown'));
 import { DiffReviewModal } from '../components/DiffReviewModal';
+import { FilePickerModal } from '../components/coder/FilePickerModal';
+import { useCoderMemory } from '../components/coder/useCoderMemory';
+import { useCoderJobs } from '../components/coder/useCoderJobs';
+import { JobsPanel } from '../components/coder/JobsPanel';
+import { useCoderGit } from '../components/coder/useCoderGit';
+import { CommitsPanel } from '../components/coder/CommitsPanel';
+import { useConversationHandlers } from '../components/coder/useCoderConversations';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
@@ -180,8 +187,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerExpanded, setPickerExpanded] = useState<Record<string, boolean>>({});
   const [pickerSelected, setPickerSelected] = useState<Record<string, boolean>>({});
-  const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
-  const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
+  // Conversation rename/archived-collapse UI state lives in useConversationHandlers.
 
   // File Tree panel — browse the workspace and pin files/folders so the system
   // prompt "follows" them (system-prompt follow binding).
@@ -191,8 +197,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [treeExpanded, setTreeExpanded] = useState<Record<string, boolean>>({});
   const [treeChildren, setTreeChildren] = useState<Record<string, FileNode[]>>({});
 
-  // Commit history of the active workspace (populated from `git log`).
-  const [commits, setCommits] = useState<CoderCommit[]>([]);
+  // Commit history of the active workspace (state + fetch live in useCoderGit).
   // Sampling params for the coder runs (persisted globally, not per workspace).
   interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; compactAt?: number; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
@@ -218,7 +223,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
   }, [llmPhase ? 1 : 0]);
-  const [commitsOpen, setCommitsOpen] = useState(true);
+  // Commit panel collapse state lives in useCoderGit.
   const [permsOpen, setPermsOpen] = useState(true);
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
@@ -250,39 +255,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       throw e;
     }
   };
-  const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
-  const [commitsLoading, setCommitsLoading] = useState(false);
-  // Background shell jobs started by the agent (tracked per workspace so the
-  // sidebar panel can poll + kill them without digging through the transcript).
-  const [bgJobs, setBgJobs] = useState<{ id: string; command: string; ws: string }[]>([]);
-  /** Live subagent runs (delegate / subagent / scout) for the Jobs panel. */
-  const [activeSubs, setActiveSubs] = useState<{ id: string; label: string; task: string; since: number; ws: string }[]>([]);
-  const [subTick, setSubTick] = useState(Date.now());
-  useEffect(() => {
-    if (activeSubs.length === 0) return;
-    const t = setInterval(() => setSubTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [activeSubs.length]);
-  const [jobStatus, setJobStatus] = useState<Record<string, CoderJob>>({});
-  const [jobsOpen, setJobsOpen] = useState(true);
-  /** Poll unfinished jobs while the panel is open (3s cadence, stops when all done). */
-  useEffect(() => {
-    if (!jobsOpen) return;
-    const pending = bgJobs.filter((j) => !(jobStatus[j.id]?.done ?? false));
-    if (pending.length === 0) return;
-    let cancelled = false;
-    const poll = async () => {
-      for (const j of pending) {
-        try {
-          const s = await coderJob(j.id);
-          if (!cancelled) setJobStatus((prev) => ({ ...prev, [j.id]: s }));
-        } catch { /* job expired server-side; leave last status */ }
-      }
-    };
-    poll();
-    const timer = setInterval(poll, 3000);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, [jobsOpen, bgJobs, activeWs, jobStatus]);
+  // Expanded-commit + loading state live in useCoderGit.
+  // Background jobs + live subagents (state + polling live in the hook;
+  // the call sits after addLog, which the kill-error path reports through).
 
   // Coder "safe mode": the control plane refuses clearly destructive shell commands
   // (release blocker #2). Surfaced as a toggle + warning banner.
@@ -340,90 +315,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
   const conventionsRef = useRef<string>('');
 
-  // Workspace-switch synchronization (shared by the Tree panel and the memory
-  // panel): both fetch RELATIVE to the control plane's *configured* workspace,
-  // which setCoderWorkspace() re-points asynchronously. A response that lands
-  // before the switch is confirmed belongs to the PREVIOUS workspace — so each
-  // panel applies a response only if (a) it is the newest fetch (seq refs) and
-  // (b) the control was confirmed at that workspace by then (wsAppliedDirRef.current,
+  // Workspace-switch synchronization for the Tree panel: it fetches RELATIVE
+  // to the control plane's *configured* workspace, which setCoderWorkspace()
+  // re-points asynchronously. A response that lands before the switch is
+  // confirmed belongs to the PREVIOUS workspace — so the tree applies a
+  // response only if (a) it is the newest fetch (treeSeqRef) and (b) the
+  // control was confirmed at that workspace by then (wsAppliedDirRef.current,
   // set in the setCoderWorkspace success handler below, which also bumps
-  // wsFlushed to trigger the confirmed reload).
+  // wsFlushed to trigger the confirmed reload). The memory panel applies the
+  // same guard inside useCoderMemory.
   const treeSeqRef = useRef(0);
-  const memSeqRef = useRef(0);
 
-  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the control plane
-  // under its data dir, so it is never committed by accident. The agent sees it
-  // only via system-prompt injection (memoryRef) — it can't read it as a file.
-  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
-  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
-  // Memory modal open state.
-  const [memOpen, setMemOpen] = useState(false);
-  // Generation counters for the control-plane-relative panel fetches (commits panel —
-  // the tree/memory seq refs live in the shared block above).
-  const commitsSeqRef = useRef(0);
-  // Pull the bank + learnings for the active workspace; called on workspace change
-  // and after the critic / memory_update writes new learnings.
-  const loadMemory = useCallback(async () => {
-    if (!activeWsDir) return;
-    const seq = ++memSeqRef.current;
-    try {
-      const m = await coderMemoryGet();
-      // Same switch race as the tree: only adopt the newest response, and
-      // only once the control is confirmed at this workspace — otherwise a
-      // pre-switch response would land in memoryRef and leak the OTHER
-      // workspace's bank into this workspace's system prompt.
-      if (seq === memSeqRef.current && wsAppliedDirRef.current === activeWsDir) {
-        setMemory(m);
-        memoryRef.current = m;
-      }
-    } catch {
-      // memory is best-effort; keep the last good value rather than wiping UI.
-    }
-  }, [activeWsDir]);
-
-  const loadCommits = useCallback(async () => {
-    const seq = ++commitsSeqRef.current;
-    setCommitsLoading(true);
-    try {
-      const commits = await coderGitLog(100);
-      if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
-      setCommits(commits);
-    } catch {
-      // Keep the last good list rather than wiping it on a transient backend
-      // blip (M2). An empty workspace simply shows no commits.
-    } finally {
-      if (seq === commitsSeqRef.current) setCommitsLoading(false);
-    }
-  }, []);
-  /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
-  const revertCommit = useCallback(async (hash: string) => {
-    if (running || !activeWsDir) return;
-    if (!/^[0-9a-f]{7,40}$/i.test(hash)) return;
-    addLog({ type: 'bash', label: 'revert', detail: hash.slice(0, 7) });
-    try {
-      const r = await coderExec(`git revert --no-edit ${hash}`, undefined, 30000, activeWsDir);
-      if (r.exitCode !== 0) {
-        addLog({ type: 'error', label: 'revert', detail: (r.stderr || r.stdout || 'revert failed').slice(0, 300) });
-      }
-    } catch (e) {
-      addLog({ type: 'error', label: 'revert', detail: e instanceof Error ? e.message : String(e) });
-    } finally {
-      loadCommits();
-    }
-  }, [running, activeWs, loadCommits]);
-
-  // Refresh the commit history whenever the active workspace changes (or the
-  // control-plane re-point is flushed after a held mid-run switch — wsFlushed).
-  useEffect(() => {
-    if (activeWsDir) loadCommits();
-  }, [activeWsDir, wsFlushed, loadCommits]);
+  // Self-improving memory panel (state + guarded fetch live in the hook).
+  const { memory, memoryRef, memOpen, setMemOpen, loadMemory, adoptMemory } = useCoderMemory({
+    activeWsDir,
+    wsFlushed,
+    appliedDirRef: wsAppliedDirRef,
+  });
 
   // Refresh the self-improving memory whenever the active workspace changes —
-  // and again once the control is confirmed at it (wsFlushed), the only point
-  // at which the relative fetch is guaranteed to hit this workspace's store.
-  useEffect(() => {
-    if (activeWsDir) void loadMemory();
-  }, [activeWsDir, wsFlushed, loadMemory]);
+  // and again once the control is confirmed at it (wsFlushed). The effect
+  // lives in useCoderMemory; this call site only needs the loader.
 
   // Sync the safe-mode toggle with the control plane's current state on mount.
   useEffect(() => {
@@ -707,154 +619,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
 
-  const handleSelectConv = (ws: string, convId: string) => {
-    // Switching is a pure view change even mid-run: the in-flight run is pinned
-    // to its own conversation (runConvRef) and keeps persisting there, so the
-    // visible transcript can follow the user without corruption (P0 #2).
-    if (ws === activeWs && convId === activeConv) return;
-    setStore((prev) => ({ ...prev, activeWs: ws, activeConv: convId }));
-    loadConv(ws, convId);
+  // Conversation selection + CRUD (store state stays above; handlers live in
+  // the hook). clearView resets the visible transcript when no conversation
+  // is selected (workspace removed, active conversation archived/deleted).
+  const clearView = () => {
+    setMessages([]);
+    setLedger([]);
+    applyTodos([], null);
+    lastPromptTokensRef.current = 0;
   };
-  const handleSelectWorkspace = (ws: string) => {
-    const wsd = storeRef.current.workspaces[ws];
-    const cid = wsd?.activeConv ?? wsd?.order[0] ?? '';
-    handleSelectConv(ws, cid);
-  };
-  const handleToggleExpand = (ws: string) => {
-    setStore((prev) => {
-      const wsd = prev.workspaces[ws];
-      if (!wsd) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [ws]: { ...wsd, expanded: !wsd.expanded } } };
-    });
-  };
-  const handleAddWorkspace = (path: string) => {
-    const existing = storeRef.current.workspaces[path];
-    setStore((prev) => {
-      if (existing) return { ...prev, activeWs: path, activeConv: existing.activeConv ?? existing.order[0] ?? '' };
-      const id = newConvId();
-      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id };
-      return { ...prev, activeWs: path, activeConv: id, workspaces: { ...prev.workspaces, [path]: ws } };
-    });
-    if (existing) {
-      const cid = existing.activeConv ?? existing.order[0] ?? '';
-      loadConv(path, cid);
-    } else {
-      setMessages([]);
-      setLedger([]);
-      applyTodos([], null);
-      lastPromptTokensRef.current = 0;
-    }
-  };
-  const handleRemoveWorkspace = (path: string) => {
-    // A workspace hosting the in-flight (or paused, ask_user) run's
-    // conversation can't go away while its transcript is being written into it.
-    if ((runConvRef.current ?? askConvRef.current)?.ws === path) return;
-    const workspaces = { ...storeRef.current.workspaces };
-    delete workspaces[path];
-    const keys = Object.keys(workspaces);
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (storeRef.current.activeWs === path) {
-      aWs = keys[0] ?? '';
-      aConv = aWs ? (workspaces[aWs].activeConv ?? workspaces[aWs].order[0] ?? '') : '';
-    }
-    setStore((prev) => ({ ...prev, workspaces, activeWs: aWs, activeConv: aConv }));
-    if (aWs && aConv) loadConv(aWs, aConv);
-    else {
-      setMessages([]);
-      setLedger([]);
-      applyTodos([], null);
-      lastPromptTokensRef.current = 0;
-    }
-  };
-
-  const handleRenameConv = (ws: string, cid: string, title: string) => {
-    const t = title.trim();
-    setEditingConv(null);
-    if (!t) return;
-    setStore((prev) => {
-      const wsd = prev.workspaces[ws];
-      const c = wsd?.conversations[cid];
-      if (!wsd || !c) return prev;
-      return {
-        ...prev,
-        workspaces: { ...prev.workspaces, [ws]: { ...wsd, conversations: { ...wsd.conversations, [cid]: { ...c, title: t } } } },
-      };
-    });
-  };
-
-  const handleArchiveConv = (ws: string, cid: string, archived: boolean) => {
-    // Hiding the conversation an in-flight (or paused, ask_user) run is pinned
-    // to would strand its live transcript; restoring it is always fine.
-    if (archived && (runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return;
-    const wsd = storeRef.current.workspaces[ws];
-    const c = wsd?.conversations[cid];
-    if (!wsd || !c) return;
-    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (archived && isActive) {
-      const other = wsd.order.find((id) => id !== cid && !wsd.conversations[id]?.archived);
-      aConv = other ?? '';
-    }
-    setStore((prev) => {
-      const w = prev.workspaces[ws];
-      if (!w) return prev;
-      const conv = w.conversations[cid];
-      if (!conv) return prev;
-      return {
-        ...prev,
-        activeWs: aWs,
-        activeConv: aConv,
-        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: { ...w.conversations, [cid]: { ...conv, archived } } } },
-      };
-    });
-    if (archived && isActive) {
-      if (aConv) loadConv(aWs, aConv);
-      else {
-        setMessages([]);
-        setLedger([]);
-        applyTodos([], null);
-        lastPromptTokensRef.current = 0;
-      }
-    }
-  };
-
-  const handleDeleteConv = (ws: string, cid: string) => {
-    if ((runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return; // pinned by the in-flight / paused run
-    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
-    const wsd = storeRef.current.workspaces[ws];
-    if (!wsd) return;
-    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (isActive) {
-      const remaining = wsd.order.filter((id) => id !== cid);
-      aConv = remaining.find((id) => !wsd.conversations[id]?.archived) ?? remaining[0] ?? '';
-    }
-    setStore((prev) => {
-      const w = prev.workspaces[ws];
-      if (!w) return prev;
-      const convs = { ...w.conversations };
-      delete convs[cid];
-      const order = w.order.filter((id) => id !== cid);
-      return {
-        ...prev,
-        activeWs: aWs,
-        activeConv: aConv,
-        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: convs, order } },
-      };
-    });
-    if (isActive) {
-      if (aConv) loadConv(aWs, aConv);
-      else {
-        setMessages([]);
-        setLedger([]);
-        applyTodos([], null);
-        lastPromptTokensRef.current = 0;
-      }
-    }
-  };
+  const {
+    editingConv, setEditingConv, archivedOpen, setArchivedOpen,
+    handleSelectConv, handleSelectWorkspace, handleToggleExpand,
+    handleAddWorkspace, handleRemoveWorkspace, handleRenameConv,
+    handleArchiveConv, handleDeleteConv,
+  } = useConversationHandlers({
+    store,
+    setStore,
+    activeWs,
+    activeConv,
+    loadConv,
+    clearView,
+    isPinned: (ws, cid) => (runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid,
+    isWorkspacePinned: (path) => (runConvRef.current ?? askConvRef.current)?.ws === path,
+  });
   const abortRef = useRef<AbortController | null>(null);
   const modelRef = useRef<string>('qwen-coder');
   /** Lint/test/build commands resolved once per run (config, else manifest
@@ -946,6 +734,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
     if (target.ws === storeRef.current.activeWs && target.convId === storeRef.current.activeConv) setLedger((prev) => [...prev.slice(-999), rec]);
   };
+  // Background shell jobs + live subagent runs (Jobs panel).
+  const jobs = useCoderJobs({ activeWs, onError: (detail) => addLog({ type: 'error', label: 'job', detail }) });
+  // Commit history + revert (panel render lives in CommitsPanel).
+  const git = useCoderGit({ activeWsDir, activeWs, wsFlushed, running, onLog: addLog });
 
   // ---- Todos: user actions (the panel is no longer read-only). Edits take
   // effect on the agent's next LLM call via the per-turn system-prompt
@@ -1194,8 +986,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
-    if (running || !activeWsDir || commits.length === 0) return;
-    const top = commits[0];
+    if (running || !activeWsDir || git.commits.length === 0) return;
+    const top = git.commits[0];
     if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
     addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
     try {
@@ -1206,10 +998,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch (e) {
       addLog({ type: 'error', label: 'undo', detail: e instanceof Error ? e.message : String(e) });
     } finally {
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
     }
-  }, [running, activeWsDir, commits, loadCommits, refreshRepoMap]);
+  }, [running, activeWsDir, git, refreshRepoMap]);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
   /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
@@ -1248,7 +1040,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
       }
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
     }
     const keptMessages = messages.slice(0, cp.messages);
@@ -1287,7 +1079,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
     const p = q(path);
     const refresh = async () => {
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
       // Re-fetch open tabs (adopt the new disk content or flag a conflict).
       tabsRefreshRef.current();
@@ -1330,7 +1122,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       addLog({ type: 'bash', label: 'undo-file', detail: `reverted last edit to ${path}` });
     }
     await refresh();
-  }, [running, activeWsDir, loadCommits, refreshRepoMap]);
+  }, [running, activeWsDir, git, refreshRepoMap]);
 
   // ---- File tabs (VS Code-style center column: Chat + open file tabs) ----
   const tabs = useFileTabs({
@@ -1762,7 +1554,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               if (res.jobId) {
                 const id = res.jobId;
                 const cmd = String(args.command || '');
-                setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+                jobs.registerJob(id, cmd, activeWsDir);
               }
             }
           }
@@ -1771,7 +1563,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             const res = await coderJob(String(args.jobId || ''), toolSignal);
             result = JSON.stringify(res);
-            setJobStatus((prev) => ({ ...prev, [res.jobId]: res }));
+            jobs.settleJobStatus(res.jobId, res);
           } catch (e) {
             result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
           }
@@ -2098,7 +1890,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // delegate/scout (runSubagent) — this was previously invisible
           // since it calls runWorker directly instead of runSubagent.
           const subId = `subagent-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-          setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label: 'subagent', task: task.slice(0, 100), since: Date.now(), ws: activeWsDir }]);
+          jobs.registerSub({ id: subId, label: 'subagent', task: task.slice(0, 100), ws: activeWsDir });
           try {
             let preTree = '';
             try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
@@ -2160,7 +1952,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             result = JSON.stringify({ summary: res.summary, diff, ok, criticApproved });
             addLog({ type: ok ? 'bash' : 'error', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
           } finally {
-            setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+            jobs.unregisterSub(subId);
           }
         } else if (call.name === 'memory_update') {
           // Agent-proactive learning capture (the critic also writes learnings).
@@ -2179,11 +1971,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' }, toolSignal);
               // The write landed in the store the control points at *now*;
               // adopt it into the active workspace's state only if that is
-              // still the confirmed workspace.
-              if (wsAppliedDirRef.current === activeWsDir) {
-                setMemory(m);
-                memoryRef.current = m;
-              }
+              // still the confirmed workspace (guard lives in adoptMemory).
+              adoptMemory(m);
               result = JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
             } catch (e) {
               result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
@@ -2310,11 +2099,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     // Track the run so it shows live in the Jobs panel.
     const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-    setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), since: Date.now(), ws: activeWsDir }]);
+    jobs.registerSub({ id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
     try {
       return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
     } finally {
-      setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+      jobs.unregisterSub(subId);
     }
   };
   const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
@@ -2430,7 +2219,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // job had no panel entry and so no way to see or kill it.
           if (res.jobId) {
             const id = res.jobId;
-            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: command0, ws: activeWsDir }]));
+            jobs.registerJob(id, command0, activeWsDir);
           }
           return JSON.stringify(res);
         }
@@ -2648,11 +2437,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
     }
     // Adopt the final write response only if the control is still confirmed
-    // at the active workspace (it re-points async on workspace switches).
-    if (wsAppliedDirRef.current === activeWsDir) {
-      setMemory(m);
-      memoryRef.current = m;
-    }
+    // at the active workspace (guard lives in adoptMemory).
+    adoptMemory(m);
   };
 
   // ---------------------------------------------------------------------------
@@ -3074,7 +2860,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             await tabs.refreshGitStatus();
           });
           // Keep the Commit History panel live as the agent commits changes.
-          loadCommits();
+          git.loadCommits();
           // Append only the new tool results to the visible transcript.
           updateRunMessages((prev) => [...prev, ...currentMessages.slice(before)]);
           // Human-in-the-loop pause: if the agent asked the user a question, stop
@@ -3722,152 +3508,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
         {/* Commit History — git log of the active workspace */}
         <SidebarSection title="Commit History" icon={<GitCommit size={13} />} defaultOpen={false}>
-        <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
-          <div className="mb-2 flex items-center gap-2">
-            <button
-              type="button"
-              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-              title="Refresh"
-              onClick={() => loadCommits()}
-            >
-              <RefreshCw size={12} className={commitsLoading ? 'animate-spin' : ''} />
-            </button>
-            <button
-              type="button"
-              className="rounded p-0.5 text-faint hover:text-ink"
-              title={commitsOpen ? 'Collapse' : 'Expand'}
-              onClick={() => setCommitsOpen((o) => !o)}
-            >
-              {commitsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            </button>
-          </div>
-          {commitsOpen && (
-            <div className="max-h-40 space-y-1 overflow-auto">
-              {commitsLoading ? (
-                <div className="text-faint italic text-[11px]">Loading…</div>
-              ) : commits.length === 0 ? (
-                <div className="text-faint italic text-[11px]">No commits yet.</div>
-              ) : (
-                commits.map((c) => (
-                  <div key={c.hash} className="rounded border border-line">
-                    <div className="flex w-full items-center gap-2 px-2 py-1 hover:bg-panel2">
-                      <button
-                        type="button"
-                        onClick={() => setExpandedCommit(expandedCommit === c.hash ? null : c.hash)}
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                      >
-                        <span className="shrink-0 font-mono text-[10.5px] text-accent">{c.hash.slice(0, 7)}</span>
-                        <span className="min-w-0 flex-1 truncate text-[11px] text-ink">{c.subject}</span>
-                        <span className="shrink-0 text-[10px] text-faint">{c.relDate}</span>
-                      </button>
-                      <button
-                        type="button"
-                        title={`Revert ${c.hash.slice(0, 7)} (creates an undo commit)`}
-                        onClick={() => revertCommit(c.hash)}
-                        className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-warn"
-                      >
-                        <Undo2 size={12} />
-                      </button>
-                    </div>
-                    {expandedCommit === c.hash && (
-                      <div className="whitespace-pre-wrap border-t border-line px-2 py-1.5 text-[10.5px] leading-relaxed text-mute">
-                        <div className="mb-1 text-faint">{c.author} · {c.date}</div>
-                        {c.body || c.subject}
-                      </div>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
+        <CommitsPanel git={git} />
         </SidebarSection>
         {/* Background Jobs — live view of detached shell jobs for this workspace */}
         <SidebarSection title="Jobs" icon={<Terminal size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
-          <div className="mb-1.5 flex items-center">
-            <button
-              type="button"
-              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-              title={jobsOpen ? 'Collapse' : 'Expand'}
-              onClick={() => setJobsOpen((o) => !o)}
-            >
-              {jobsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            </button>
-          </div>
-          {jobsOpen && (() => {
-            // Both lists are tagged with activeWsDir (the worktree-aware dir a
-            // run actually executes in), not activeWs (the workspace root) —
-            // a worktree conversation's jobs would otherwise never match.
-            const wsJobs = bgJobs.filter((j) => j.ws === activeWsDir);
-            const subs = activeSubs.filter((s) => s.ws === activeWsDir);
-            if (wsJobs.length === 0 && subs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
-            return (
-              <div className="max-h-40 space-y-1 overflow-auto">
-                {subs.map((s) => (
-                  <div key={s.id} className="rounded border border-accent/25 bg-accent/8 px-2 py-1" title={s.task}>
-                    <div className="flex items-center gap-2">
-                      <BrainCircuit size={11} className="shrink-0 animate-pulse text-accent" />
-                      <span className="min-w-0 flex-1 truncate text-[10.5px] text-mute">{s.label} — {s.task}</span>
-                      <span className="shrink-0 text-[10px] text-faint">{Math.max(1, Math.round((subTick - s.since) / 1000))}s</span>
-                    </div>
-                  </div>
-                ))}
-                {wsJobs.map((j) => {
-                  const s = jobStatus[j.id];
-                  const done = s?.done ?? false;
-                  const ok = done && (s?.exitCode === 0);
-                  return (
-                    <div key={j.id} className="rounded border border-line px-2 py-1">
-                      <div className="flex items-center gap-2">
-                        <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', !done ? 'animate-pulse bg-accent' : ok ? 'bg-ok' : 'bg-danger')} />
-                        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={j.command}>{j.command || j.id}</span>
-                        <span className="shrink-0 text-[10px] text-faint">{!done ? 'running' : s?.exitCode === null ? (s?.killed ? 'killed' : 'done') : `exit ${s?.exitCode}`}</span>
-                        {!done ? (
-                          <button
-                            type="button"
-                            title="Kill job"
-                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
-                            onClick={async () => {
-                              try {
-                                const k = await coderJobKill(j.id);
-                                setJobStatus((prev) => ({ ...prev, [j.id]: k }));
-                              } catch (e) {
-                                addLog({ type: 'error', label: 'job', detail: e instanceof Error ? e.message : String(e) });
-                              }
-                            }}
-                          >
-                            <Square size={11} />
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            title="Dismiss"
-                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-ink"
-                            onClick={() => {
-                              setBgJobs((prev) => prev.filter((x) => x.id !== j.id));
-                              setJobStatus((prev) => {
-                                const next = { ...prev };
-                                delete next[j.id];
-                                return next;
-                              });
-                            }}
-                          >
-                            <X size={11} />
-                          </button>
-                        )}
-                      </div>
-                      {s && (s.stdout || s.stderr) && (
-                        <div className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all border-t border-line pt-1 font-mono text-[10px] text-mute">
-                          {redactSecrets((s.stdout + (s.stderr ? `\n${s.stderr}` : '')).slice(-2000))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })()}
+          <JobsPanel jobs={jobs} activeWsDir={activeWsDir} />
         </div>
         </SidebarSection>
       </div>
@@ -4076,7 +3722,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             type="button"
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={undoLastCommit}
-            disabled={!activeWs || running || commits.length === 0}
+            disabled={!activeWs || running || git.commits.length === 0}
             title="Undo last commit (changes stay in the worktree)"
           >
             <Undo2 size={13} />
@@ -4543,8 +4189,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         open={memOpen}
         onClose={() => setMemOpen(false)}
         memory={memory}
-        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
-        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
+        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => adoptMemory(m))}
+        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => adoptMemory(m))}
         onChanged={() => loadMemory()}
       />
       {showDir && (
@@ -4570,104 +4216,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         />
       )}
 
-    </div>
-  );
-}
-
-
-// ---------------------------------------------------------------------------
-// Workspace file picker — attach project files to a Coder message.
-// ---------------------------------------------------------------------------
-function FilePickerModal({
-  nodes,
-  loading,
-  expanded,
-  selected,
-  onToggle,
-  onToggleSelect,
-  onAttachSelected,
-  onClose,
-  attached,
-  maxBytes,
-}: {
-  nodes: FileNode[];
-  loading: boolean;
-  expanded: Record<string, boolean>;
-  selected: Record<string, boolean>;
-  onToggle: (path: string) => void;
-  onToggleSelect: (path: string) => void;
-  onAttachSelected: (nodes: FileNode[]) => void;
-  onClose: () => void;
-  attached: ChatAttachment[];
-  maxBytes: number;
-}) {
-  const attachedPaths = new Set(attached.map((a) => a.path));
-  const collectFiles = (list: FileNode[]): FileNode[] => {
-    const out: FileNode[] = [];
-    for (const n of list) {
-      if (n.kind === 'file') out.push(n);
-      if (n.children) out.push(...collectFiles(n.children));
-    }
-    return out;
-  };
-  const allFiles = collectFiles(nodes);
-  const selectedNodes = allFiles.filter((n) => selected[n.path]);
-  const renderNodes = (list: FileNode[], depth: number): React.ReactNode => (
-    <div>
-      {list.map((n) => (
-        <div key={n.path}>
-          <div className="flex items-center gap-1 py-0.5 hover:bg-panel2 rounded px-1" style={{ paddingLeft: depth * 12 }}>
-            {n.kind === 'dir' ? (
-              <button type="button" onClick={() => onToggle(n.path)} className="flex items-center gap-1 text-ink">
-                {expanded[n.path] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                <Folder size={13} className="text-accent" /> {n.name}
-              </button>
-            ) : (
-              <label className={cn('flex items-center gap-1 text-ink', attachedPaths.has(n.path) ? 'opacity-50' : '')}>
-                <input
-                  type="checkbox"
-                  checked={!!selected[n.path]}
-                  disabled={attachedPaths.has(n.path) || (n.size ?? 0) > maxBytes}
-                  onChange={() => onToggleSelect(n.path)}
-                />
-                {isImagePath(n.path) ? <Image size={13} /> : <File size={13} />} {n.name}
-                {n.size != null &&
-                  (n.size > maxBytes ? (
-                    <span className="text-danger text-[10px]">over 50 MB</span>
-                  ) : (
-                    <span className="text-faint text-[10px]">{Math.ceil(n.size / 1024)} KB</span>
-                  ))}
-              </label>
-            )}
-          </div>
-          {n.kind === 'dir' && expanded[n.path] && n.children && renderNodes(n.children, depth + 1)}
-        </div>
-      ))}
-    </div>
-  );
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
-      <div className="w-[520px] max-h-[70vh] flex flex-col rounded-xl border border-line bg-panel shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-line p-3">
-          <div className="text-sm font-semibold flex items-center gap-2"><Paperclip size={14} /> Attach workspace files</div>
-          <button type="button" onClick={onClose} className="text-faint hover:text-ink"><X size={16} /></button>
-        </div>
-        <div className="flex-1 overflow-auto p-2 text-[12.5px]">
-          {loading ? (
-            <div className="p-3 text-faint">Loading tree…</div>
-          ) : nodes.length ? (
-            renderNodes(nodes, 0)
-          ) : (
-            <div className="p-3 text-faint">No files.</div>
-          )}
-        </div>
-        <div className="flex items-center justify-between border-t border-line p-2">
-          <span className="text-[11px] text-faint">Select files (≤50 MB each). Images embed as pictures; others inline as text.</span>
-          <Button variant="primary" size="sm" disabled={selectedNodes.length === 0} onClick={() => onAttachSelected(selectedNodes)}>
-            Attach {selectedNodes.length || ''} selected
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }
