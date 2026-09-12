@@ -4,10 +4,13 @@ import {
   ChevronDown,
   ChevronsRight,
   Copy,
+  Download,
   Gauge,
   GitBranch,
   Paperclip,
   Pencil,
+  Pin,
+  PinOff,
   Play,
   Plus,
   RefreshCw,
@@ -708,6 +711,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
   const [presets, setPresets] = useState<SavedChatParams[]>([]);
   const [convSearch, setConvSearch] = useState('');
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
@@ -1272,10 +1277,12 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   // Sidebar search: match the conversation title or any message's content.
   const filteredConvs = useMemo(() => {
     const q = convSearch.trim().toLowerCase();
-    if (!q) return convs;
-    return convs.filter(
-      (c) => c.title.toLowerCase().includes(q) || c.messages.some((m) => m.content.toLowerCase().includes(q)),
-    );
+    const matched = q
+      ? convs.filter((c) => c.title.toLowerCase().includes(q) || c.messages.some((m) => m.content.toLowerCase().includes(q)))
+      : convs;
+    // Stable sort: pinned conversations rise to the top without disturbing
+    // relative order within each group.
+    return [...matched].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
   }, [convs, convSearch]);
 
   // Slash-command interpreter. Returns true if `raw` was a recognized command
@@ -1326,16 +1333,54 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   const stop = () => abortRef.current?.abort();
 
-  const newChat = () => {
+  const newChat = useCallback(() => {
     setActiveId(null);
     setText('');
     setAttachments([]);
     textareaRef.current?.focus();
-  };
+  }, []);
+
+  // Ctrl/Cmd+K: jump to a fresh chat from anywhere in the screen.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        newChat();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [newChat]);
 
   const deleteConv = (id: string) => {
     setConvs((cs) => cs.filter((c) => c.id !== id));
     if (activeId === id) setActiveId(null);
+  };
+
+  const renameConv = (id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, title: trimmed } : c)));
+  };
+
+  const togglePin = (id: string) => {
+    setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, pinned: !c.pinned } : c)));
+  };
+
+  const exportConv = (conv: Conversation) => {
+    const lines = [`# ${conv.title || 'Untitled'}`, '', `_${conv.model} · ${new Date(conv.createdAt).toLocaleString()}_`];
+    for (const m of conv.messages) {
+      if (isCompactedMsg(m) || (!m.content && !m.reasoning)) continue;
+      if (m.role === 'user') lines.push('', '### You', '', m.content);
+      else if (m.role === 'assistant') lines.push('', '### Ninfer', '', m.content);
+    }
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(conv.title || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const onFiles = (files: FileList | null) => {
@@ -1381,7 +1426,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             {/* conversation rail */}
             <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
         <div className="p-2.5">
-          <Button variant="primary" size="sm" className="w-full" onClick={newChat}>
+          <Button variant="primary" size="sm" className="w-full" onClick={newChat} title="New chat (Ctrl/Cmd+K)">
             <Plus size={14} /> new chat
           </Button>
         </div>
@@ -1407,14 +1452,76 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           {filteredConvs.map((c) => (
             <div
               key={c.id}
-              onClick={() => setActiveId(c.id)}
+              onClick={() => renamingId !== c.id && setActiveId(c.id)}
               className={cn(
                 'group mb-1 cursor-pointer rounded-lg border px-2.5 py-2 transition-colors',
                 c.id === activeId ? 'border-accent/30 bg-accent/8' : 'border-transparent hover:border-line hover:bg-panel2',
               )}
             >
               <div className="flex items-center gap-1.5">
-                <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink">{c.title || 'Untitled'}</span>
+                {renamingId === c.id ? (
+                  <input
+                    autoFocus
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onBlur={() => {
+                      renameConv(c.id, renameDraft);
+                      setRenamingId(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        renameConv(c.id, renameDraft);
+                        setRenamingId(null);
+                      } else if (e.key === 'Escape') {
+                        setRenamingId(null);
+                      }
+                    }}
+                    className="min-w-0 flex-1 rounded border border-accent/40 bg-inset px-1.5 py-0.5 text-[12.5px] font-medium text-ink focus:outline-none"
+                  />
+                ) : (
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink">
+                    {c.pinned && <Pin size={10} className="mr-1 inline text-accent" />}
+                    {c.title || 'Untitled'}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    togglePin(c.id);
+                  }}
+                  className={cn(
+                    'rounded p-0.5 text-faint hover:text-accent',
+                    c.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                  )}
+                  title={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                >
+                  {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setRenameDraft(c.title || '');
+                    setRenamingId(c.id);
+                  }}
+                  className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                  title="Rename conversation"
+                >
+                  <Pencil size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    exportConv(c);
+                  }}
+                  className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                  title="Export conversation (Markdown)"
+                >
+                  <Download size={12} />
+                </button>
                 <button
                   type="button"
                   onClick={(e) => {

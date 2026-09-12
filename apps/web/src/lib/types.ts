@@ -276,6 +276,8 @@ export interface ChatMessage {
 export interface Conversation {
   id: string;
   title: string;
+  /** Pinned conversations sort to the top of the sidebar. */
+  pinned?: boolean;
   /** Structured compaction summary (set by /compact). When present, the model
    * context is rebuilt from this summary + post-compaction messages, while the
    * full message history stays visible in the UI. */
