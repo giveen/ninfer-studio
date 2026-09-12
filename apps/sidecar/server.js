@@ -248,19 +248,28 @@ async function loadConfig() {
   }
 }
 
-// The token shape the UI sees when one is stored; the real token never
-// crosses the API. saveConfig treats the mask as "untouched — keep stored".
-const HF_TOKEN_MASK = '********';
+// The shape a secret field takes in every client-facing response; the real
+// value never crosses the API. saveConfig treats the mask as "untouched —
+// keep stored".
+const SECRET_MASK = '********';
 
 function redactConfig(c) {
-  return { ...c, hfToken: c.hfToken ? HF_TOKEN_MASK : '' };
+  return {
+    ...c,
+    hfToken: c.hfToken ? SECRET_MASK : '',
+    apiKey: c.apiKey ? SECRET_MASK : '',
+  };
 }
 
 async function saveConfig(patch) {
-  if (typeof patch.hfToken === 'string' && patch.hfToken !== HF_TOKEN_MASK) {
+  if (typeof patch.hfToken === 'string' && patch.hfToken !== SECRET_MASK) {
     config = { ...config, hfToken: patch.hfToken };
   }
   delete patch.hfToken;
+  if (typeof patch.apiKey === 'string' && patch.apiKey !== SECRET_MASK) {
+    config = { ...config, apiKey: patch.apiKey };
+  }
+  delete patch.apiKey;
   config = { ...config, ...patch };
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(path.join(DATA_DIR, 'config.json'), JSON.stringify(config, null, 2));

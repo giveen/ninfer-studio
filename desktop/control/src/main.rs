@@ -1,6 +1,8 @@
 //! Standalone control-plane binary: run the full HTTP control plane without
 //! the Tauri window (dev mode, or a lightweight "just the server" mode).
 
+// Rust guideline compliant 2026-07-28
+
 use mimalloc::MiMalloc;
 
 #[global_allocator]

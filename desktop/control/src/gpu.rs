@@ -1,5 +1,7 @@
 //! GPU stats via nvidia-smi.
 
+// Rust guideline compliant 2026-07-28
+
 use crate::types::GpuStats;
 use serde_json::json;
 

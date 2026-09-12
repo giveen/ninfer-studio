@@ -1,5 +1,7 @@
 //! Engine source management: git pull + rebuild of the NInfer engine.
 
+// Rust guideline compliant 2026-07-28
+
 use crate::types::{AppEvent, State, now_ms};
 use serde_json::{json, Value};
 use std::sync::Arc;

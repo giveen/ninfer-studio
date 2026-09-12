@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-07-28
+
 use axum::{
     extract::{Query, State as AxumState},
     http::StatusCode,

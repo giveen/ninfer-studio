@@ -12,6 +12,8 @@
 //!  * Single-instance: a second launch focuses the existing window.
 //!  * Native OS notifications for engine ready/stopped, download & build done.
 
+// Rust guideline compliant 2026-07-28
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 

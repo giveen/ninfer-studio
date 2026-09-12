@@ -1,6 +1,8 @@
 //! Shared types for the NInfer Studio control plane.
 //! Field names mirror the web app's TypeScript types 1:1 (camelCase JSON).
 
+// Rust guideline compliant 2026-07-28
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

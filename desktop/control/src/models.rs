@@ -1,5 +1,7 @@
 //! Models directory scanning + Hugging Face download supervision.
 
+// Rust guideline compliant 2026-07-28
+
 use crate::types::{now_ms, AppEvent, ARTIFACTS, DownloadRec, ModelArtifact, State};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -62,7 +64,7 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         .unwrap_or(cfg.models_dir.clone());
     let cli = cfg.hf_cli.clone();
     let _ = tokio::fs::create_dir_all(&dir).await;
-    let total_bytes = fetch_download_size(&cli, &repo, &file, &dir).await;
+    let total_bytes = fetch_download_size(&cli, repo, file, &dir).await;
 
     let id = format!(
         "dl_{:x}_{:x}",
