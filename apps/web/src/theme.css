@@ -8,10 +8,10 @@
   --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
 
-  --color-bg: #0a0c10;
-  --color-panel: #10141b;
-  --color-panel2: #161b25;
-  --color-inset: #0d1017;
+  --color-bg: #0d1015;
+  --color-panel: #141922;
+  --color-panel2: #1b212c;
+  --color-inset: #10131a;
   --color-line: rgba(255, 255, 255, 0.08);
   --color-line2: rgba(255, 255, 255, 0.14);
   --color-ink: #e9edf5;
