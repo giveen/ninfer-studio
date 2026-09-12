@@ -8,12 +8,23 @@ export type ThemeMode = 'dark' | 'light';
 
 const STORAGE_KEY = 'ninfier-theme';
 
-export function getStoredTheme(): ThemeMode {
+function getSystemTheme(): ThemeMode {
   try {
-    return localStorage.getItem(STORAGE_KEY) === 'light' ? 'light' : 'dark';
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   } catch {
     return 'dark';
   }
+}
+
+export function getStoredTheme(): ThemeMode {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === 'light' || stored === 'dark') return stored;
+  } catch {
+    // fall through to the OS preference
+  }
+  // No explicit choice yet — match the OS instead of always defaulting dark.
+  return getSystemTheme();
 }
 
 export function applyTheme(mode: ThemeMode) {
