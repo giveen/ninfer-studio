@@ -34,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncBufReadExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,43 @@ const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// generous enough to contain the requested line count for any log this app
 /// produces.
 const LOG_TAIL_WINDOW_BYTES: usize = 512 * 1024;
+
+/// Rolling-log size for background jobs (model downloads in models.rs, repo
+/// pull/build updates in repo.rs): only the most recent lines matter for
+/// diagnosing a failure, so both pumps cap per-line length and the tail the
+/// same way, via [`append_log_line`].
+pub(crate) const LOG_TAIL_LINES: usize = 2000;
+pub(crate) const LOG_TAIL_LINE_CHARS: usize = 2000;
+
+/// Append `line` to a rolling job log, keeping only the most recent
+/// `max_lines` lines.
+pub(crate) fn append_log_line(out: &mut String, line: &str, max_lines: usize) {
+    let lines: Vec<&str> = out.lines().chain(std::iter::once(line)).collect();
+    let start = lines.len().saturating_sub(max_lines);
+    *out = lines[start..].join("\n");
+}
+
+/// Drain `reader` line by line, truncating each line to
+/// [`LOG_TAIL_LINE_CHARS`] and invoking `on_line` (owned, so the callback can
+/// be an async closure) per line until EOF. Shared by the stdout/stderr pumps
+/// of the model-download and repo-update jobs.
+pub(crate) async fn pump_log_lines<S, F, Fut>(mut reader: S, mut on_line: F)
+where
+    S: tokio::io::AsyncBufRead + Unpin,
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future,
+{
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf).await {
+            Ok(n) if n > 0 => {}
+            _ => break,
+        }
+        let line: String = buf.chars().take(LOG_TAIL_LINE_CHARS).collect();
+        on_line(line).await;
+    }
+}
 
 /// Timeout for the `/v1/*` proxy to the engine — generation requests can run
 /// long (large max_tokens, slow hardware), so this is much longer than a
@@ -958,4 +996,39 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
         }
     }
     state
+}
+#[cfg(test)]
+mod log_pump_tests {
+    use super::*;
+
+    #[test]
+    fn append_log_line_keeps_only_the_recent_tail() {
+        let mut out = String::new();
+        for i in 0..(LOG_TAIL_LINES + 5) {
+            append_log_line(&mut out, &format!("line-{i}"), LOG_TAIL_LINES);
+        }
+        let lines = out.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), LOG_TAIL_LINES);
+        // Oldest lines dropped, newest kept, in order.
+        assert_eq!(lines[0], &format!("line-5"));
+        assert_eq!(lines.last().unwrap(), &format!("line-{}", LOG_TAIL_LINES + 4));
+    }
+
+    #[tokio::test]
+    async fn pump_log_lines_truncates_long_lines_and_stops_at_eof() {
+        let input = format!("short\n{}\nend\n", "x".repeat(LOG_TAIL_LINE_CHARS + 100));
+        let mut out = String::new();
+        pump_log_lines(tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes())), |line| {
+            // read_line hands each line WITH its trailing newline; EOF ends
+            // the loop with no extra empty line (3 lines in → 3 invocations).
+            out.push_str(&line);
+            async {}
+        })
+        .await;
+        // Truncating the 2100-char line to 2000 chars chops off its trailing
+        // newline, so the next line concatenates onto it (pre-existing
+        // behavior of the original pumps; only a cosmetic edge case for
+        // abnormally long lines).
+        assert_eq!(out, format!("short\n{}end\n", "x".repeat(LOG_TAIL_LINE_CHARS)));
+    }
 }
