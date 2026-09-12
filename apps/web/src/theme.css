@@ -36,12 +36,12 @@
  * against near-black) so they stay legible against a light background. */
 :root[data-theme='light'] {
   color-scheme: light;
-  --color-bg: #eef0f3;
-  --color-panel: #f8f9fb;
-  --color-panel2: #e7e9ee;
-  --color-inset: #ffffff;
-  --color-line: rgba(15, 23, 42, 0.09);
-  --color-line2: rgba(15, 23, 42, 0.16);
+  --color-bg: #dee1e6;
+  --color-panel: #eaecf0;
+  --color-panel2: #d7dae0;
+  --color-inset: #f3f4f6;
+  --color-line: rgba(15, 23, 42, 0.11);
+  --color-line2: rgba(15, 23, 42, 0.19);
   --color-ink: #1a2030;
   --color-mute: #5b6472;
   --color-faint: #98a1b0;
