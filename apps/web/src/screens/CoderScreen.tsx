@@ -16,7 +16,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens } from '../lib/format';
@@ -2404,11 +2404,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!hasStd && !hasContent) return resultStr;
     const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
     if (text.length <= SUMMARY_THRESHOLD) return resultStr;
+    // A bash result's exitCode is a known, authoritative pass/fail signal —
+    // pass it through so the receipt validator can reject a summary that
+    // disagrees with it. File reads have no such signal (undefined).
+    const isError = hasStd && typeof res.exitCode === 'number' ? res.exitCode !== 0 : undefined;
     try {
-      const summary = await summarizeOutput({ model, output: text, signal });
-      if (!summary) return resultStr;
+      const receipt = await summarizeOutputVerified({ model, output: text, isError, signal });
+      // null covers a transport/stream failure AND a rejected (unverifiable
+      // or outcome-mismatched) receipt — either way, fall back untouched.
+      if (!receipt) return resultStr;
       const tail = text.slice(-SUMMARY_TAIL);
-      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity]\n${summary}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
       if (hasStd) {
         res.stdout = wrapped;
         res.stderr = '';
