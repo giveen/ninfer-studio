@@ -14,13 +14,15 @@ import { FilePickerModal } from '../components/coder/FilePickerModal';
 import { useCoderMemory } from '../components/coder/useCoderMemory';
 import { useCoderJobs } from '../components/coder/useCoderJobs';
 import { JobsPanel } from '../components/coder/JobsPanel';
+import { useCoderGit } from '../components/coder/useCoderGit';
+import { CommitsPanel } from '../components/coder/CommitsPanel';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
@@ -195,8 +197,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [treeExpanded, setTreeExpanded] = useState<Record<string, boolean>>({});
   const [treeChildren, setTreeChildren] = useState<Record<string, FileNode[]>>({});
 
-  // Commit history of the active workspace (populated from `git log`).
-  const [commits, setCommits] = useState<CoderCommit[]>([]);
+  // Commit history of the active workspace (state + fetch live in useCoderGit).
   // Sampling params for the coder runs (persisted globally, not per workspace).
   interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; compactAt?: number; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
@@ -222,7 +223,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
   }, [llmPhase ? 1 : 0]);
-  const [commitsOpen, setCommitsOpen] = useState(true);
+  // Commit panel collapse state lives in useCoderGit.
   const [permsOpen, setPermsOpen] = useState(true);
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
@@ -254,8 +255,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       throw e;
     }
   };
-  const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
-  const [commitsLoading, setCommitsLoading] = useState(false);
+  // Expanded-commit + loading state live in useCoderGit.
   // Background jobs + live subagents (state + polling live in the hook;
   // the call sits after addLog, which the kill-error path reports through).
 
@@ -332,44 +332,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     wsFlushed,
     appliedDirRef: wsAppliedDirRef,
   });
-  // Generation counter for the commits panel fetch (same switch-race guard).
-  const commitsSeqRef = useRef(0);
-  const loadCommits = useCallback(async () => {
-    const seq = ++commitsSeqRef.current;
-    setCommitsLoading(true);
-    try {
-      const commits = await coderGitLog(100);
-      if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
-      setCommits(commits);
-    } catch {
-      // Keep the last good list rather than wiping it on a transient backend
-      // blip (M2). An empty workspace simply shows no commits.
-    } finally {
-      if (seq === commitsSeqRef.current) setCommitsLoading(false);
-    }
-  }, []);
-  /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
-  const revertCommit = useCallback(async (hash: string) => {
-    if (running || !activeWsDir) return;
-    if (!/^[0-9a-f]{7,40}$/i.test(hash)) return;
-    addLog({ type: 'bash', label: 'revert', detail: hash.slice(0, 7) });
-    try {
-      const r = await coderExec(`git revert --no-edit ${hash}`, undefined, 30000, activeWsDir);
-      if (r.exitCode !== 0) {
-        addLog({ type: 'error', label: 'revert', detail: (r.stderr || r.stdout || 'revert failed').slice(0, 300) });
-      }
-    } catch (e) {
-      addLog({ type: 'error', label: 'revert', detail: e instanceof Error ? e.message : String(e) });
-    } finally {
-      loadCommits();
-    }
-  }, [running, activeWs, loadCommits]);
-
-  // Refresh the commit history whenever the active workspace changes (or the
-  // control-plane re-point is flushed after a held mid-run switch — wsFlushed).
-  useEffect(() => {
-    if (activeWsDir) loadCommits();
-  }, [activeWsDir, wsFlushed, loadCommits]);
 
   // Refresh the self-improving memory whenever the active workspace changes —
   // and again once the control is confirmed at it (wsFlushed). The effect
@@ -898,6 +860,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   // Background shell jobs + live subagent runs (Jobs panel).
   const jobs = useCoderJobs({ activeWs, onError: (detail) => addLog({ type: 'error', label: 'job', detail }) });
+  // Commit history + revert (panel render lives in CommitsPanel).
+  const git = useCoderGit({ activeWsDir, activeWs, wsFlushed, running, onLog: addLog });
 
   // ---- Todos: user actions (the panel is no longer read-only). Edits take
   // effect on the agent's next LLM call via the per-turn system-prompt
@@ -1146,8 +1110,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
   /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
   const undoLastCommit = useCallback(async () => {
-    if (running || !activeWsDir || commits.length === 0) return;
-    const top = commits[0];
+    if (running || !activeWsDir || git.commits.length === 0) return;
+    const top = git.commits[0];
     if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
     addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
     try {
@@ -1158,10 +1122,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch (e) {
       addLog({ type: 'error', label: 'undo', detail: e instanceof Error ? e.message : String(e) });
     } finally {
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
     }
-  }, [running, activeWsDir, commits, loadCommits, refreshRepoMap]);
+  }, [running, activeWsDir, git, refreshRepoMap]);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
   /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
@@ -1200,7 +1164,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
       }
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
     }
     const keptMessages = messages.slice(0, cp.messages);
@@ -1239,7 +1203,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
     const p = q(path);
     const refresh = async () => {
-      loadCommits();
+      git.loadCommits();
       refreshRepoMap();
       // Re-fetch open tabs (adopt the new disk content or flag a conflict).
       tabsRefreshRef.current();
@@ -1282,7 +1246,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       addLog({ type: 'bash', label: 'undo-file', detail: `reverted last edit to ${path}` });
     }
     await refresh();
-  }, [running, activeWsDir, loadCommits, refreshRepoMap]);
+  }, [running, activeWsDir, git, refreshRepoMap]);
 
   // ---- File tabs (VS Code-style center column: Chat + open file tabs) ----
   const tabs = useFileTabs({
@@ -3020,7 +2984,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             await tabs.refreshGitStatus();
           });
           // Keep the Commit History panel live as the agent commits changes.
-          loadCommits();
+          git.loadCommits();
           // Append only the new tool results to the visible transcript.
           updateRunMessages((prev) => [...prev, ...currentMessages.slice(before)]);
           // Human-in-the-loop pause: if the agent asked the user a question, stop
@@ -3668,65 +3632,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
         {/* Commit History — git log of the active workspace */}
         <SidebarSection title="Commit History" icon={<GitCommit size={13} />} defaultOpen={false}>
-        <div className="max-h-52 shrink-0 overflow-hidden border-t border-line p-2">
-          <div className="mb-2 flex items-center gap-2">
-            <button
-              type="button"
-              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-              title="Refresh"
-              onClick={() => loadCommits()}
-            >
-              <RefreshCw size={12} className={commitsLoading ? 'animate-spin' : ''} />
-            </button>
-            <button
-              type="button"
-              className="rounded p-0.5 text-faint hover:text-ink"
-              title={commitsOpen ? 'Collapse' : 'Expand'}
-              onClick={() => setCommitsOpen((o) => !o)}
-            >
-              {commitsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            </button>
-          </div>
-          {commitsOpen && (
-            <div className="max-h-40 space-y-1 overflow-auto">
-              {commitsLoading ? (
-                <div className="text-faint italic text-[11px]">Loading…</div>
-              ) : commits.length === 0 ? (
-                <div className="text-faint italic text-[11px]">No commits yet.</div>
-              ) : (
-                commits.map((c) => (
-                  <div key={c.hash} className="rounded border border-line">
-                    <div className="flex w-full items-center gap-2 px-2 py-1 hover:bg-panel2">
-                      <button
-                        type="button"
-                        onClick={() => setExpandedCommit(expandedCommit === c.hash ? null : c.hash)}
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                      >
-                        <span className="shrink-0 font-mono text-[10.5px] text-accent">{c.hash.slice(0, 7)}</span>
-                        <span className="min-w-0 flex-1 truncate text-[11px] text-ink">{c.subject}</span>
-                        <span className="shrink-0 text-[10px] text-faint">{c.relDate}</span>
-                      </button>
-                      <button
-                        type="button"
-                        title={`Revert ${c.hash.slice(0, 7)} (creates an undo commit)`}
-                        onClick={() => revertCommit(c.hash)}
-                        className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-warn"
-                      >
-                        <Undo2 size={12} />
-                      </button>
-                    </div>
-                    {expandedCommit === c.hash && (
-                      <div className="whitespace-pre-wrap border-t border-line px-2 py-1.5 text-[10.5px] leading-relaxed text-mute">
-                        <div className="mb-1 text-faint">{c.author} · {c.date}</div>
-                        {c.body || c.subject}
-                      </div>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
+        <CommitsPanel git={git} />
         </SidebarSection>
         {/* Background Jobs — live view of detached shell jobs for this workspace */}
         <SidebarSection title="Jobs" icon={<Terminal size={13} />} defaultOpen={false}>
@@ -3940,7 +3846,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             type="button"
             className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
             onClick={undoLastCommit}
-            disabled={!activeWs || running || commits.length === 0}
+            disabled={!activeWs || running || git.commits.length === 0}
             title="Undo last commit (changes stay in the worktree)"
           >
             <Undo2 size={13} />
