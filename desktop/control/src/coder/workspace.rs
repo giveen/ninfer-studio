@@ -11,7 +11,7 @@ use axum::extract::{Query, State as AxumState};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Serialize)]
 pub struct WorkspaceResp {
@@ -66,13 +66,22 @@ pub async fn workspace_set(
 
     state.config.write().await.coder_workspace = ws.clone();
 
-    let path = state.data_dir.join("config.json");
     let cfg = state.config.read().await.clone();
     if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        let _ = tokio::fs::write(&path, json).await;
+        if is_safe_base_dir(&state.data_dir) {
+            let path = state.data_dir.join("config.json");
+            let _ = tokio::fs::write(&path, json).await;
+        }
     }
 
     Json(WorkspaceResp { workspace: ws, exists })
+}
+
+fn is_safe_base_dir(base: &Path) -> bool {
+    base.is_absolute()
+        && !base
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
 }
 
 /// List subdirectories of a host path so the UI can browse for a workspace
