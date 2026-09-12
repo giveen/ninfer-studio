@@ -45,6 +45,21 @@ function checkBwrap() {
   try { execFileSync('bwrap', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
 
+// A bash command's text comes from the model, which can be steered by
+// untrusted input (a file or web page it read) — this process's own
+// environment must not be handed to it wholesale, or a var like
+// GITHUB_TOKEN already exported in the user's own shell before launch
+// becomes readable/leakable by an agent-run command.
+const SECRET_ENV_PATTERNS = ['KEY', 'SECRET', 'TOKEN', 'PASSWORD'];
+function scrubbedEnv() {
+  const out = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    const upper = k.toUpperCase();
+    if (!SECRET_ENV_PATTERNS.some((p) => upper.includes(p))) out[k] = v;
+  }
+  return out;
+}
+
 // Per-session working directories so the agent's shell calls behave like a
 // stateful terminal (cd / navigation persists across calls). Keyed by an
 // arbitrary session id (the web passes the active workspace). We avoid a
@@ -1578,11 +1593,11 @@ class PersistentShell {
         if (bwrapAvailable === null) bwrapAvailable = checkBwrap();
         if (bwrapAvailable) {
           const { args, cwd: sc } = shellSpawnArgs(cwd);
-          this.proc = spawn('bwrap', args, { cwd: sc, env: { ...process.env } });
+          this.proc = spawn('bwrap', args, { cwd: sc, env: scrubbedEnv() });
         }
       }
       if (!this.proc) {
-        this.proc = spawn('bash', ['--norc', '--noprofile'], { cwd, env: { ...process.env } });
+        this.proc = spawn('bash', ['--norc', '--noprofile'], { cwd, env: scrubbedEnv() });
       }
     } catch (e) {
       this.dead = true;
@@ -1755,9 +1770,9 @@ async function execCommand(command, relCwd, timeoutMs, sessionId, hooks) {
     let proc;
     try {
       if (sandboxOk) {
-        proc = spawn('bwrap', ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '-lc', runCmd, ...sandboxBindArgs], { cwd, env: process.env });
+        proc = spawn('bwrap', ['--ro-bind', '/', '/', '--bind', ws, ws, '--tmpfs', '/tmp', '--proc', '/proc', '--dev', '/dev', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL', 'bash', '-lc', runCmd, ...sandboxBindArgs], { cwd, env: scrubbedEnv() });
       } else {
-        proc = spawn('bash', ['-lc', runCmd], { cwd, env: process.env });
+        proc = spawn('bash', ['-lc', runCmd], { cwd, env: scrubbedEnv() });
       }
       if (hooks?.onSpawn) hooks.onSpawn(proc);
     } catch (err) {

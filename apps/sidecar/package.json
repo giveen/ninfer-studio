@@ -1,6 +1,6 @@
 {
   "name": "@ninfier/sidecar",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "type": "module",
   "description": "Zero-dependency Node 22 management server: engine process control, model directory, downloads, GPU stats, API proxy, and static hosting of the web app.",

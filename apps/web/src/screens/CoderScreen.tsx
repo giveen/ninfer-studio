@@ -16,11 +16,12 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutput, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
-import { formatTokens } from '../lib/format';
+import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
+import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -275,6 +276,21 @@ const TOOLS = [
           query: { type: "string" }
         },
         required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "obs_recall",
+      description: "Page through the full original content of a large tool result that was replaced with a placeholder to save context (see the placeholder's 'retrieve' line for its id). Call repeatedly with the returned next_offset until eof is true.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Observation id from the placeholder, e.g. obs_ab12cd34ef56..." },
+          offset: { type: "number", description: "Byte offset to resume from — 0 for the first call, then the previous response's next_offset." }
+        },
+        required: ["id", "offset"]
       }
     }
   },
@@ -677,7 +693,7 @@ const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_com
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
-const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search']);
+const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search', 'obs_recall']);
 /** Tool names an implementation `subagent` worker may use by default — the
  *  same set `runWorker` falls back to when no allow-list is given. Used to
  *  validate a model-supplied `tools` allow-list for the `subagent` tool
@@ -714,37 +730,102 @@ function isReadOnlyCommand(cmd: string): boolean {
   return READONLY_BASH.has(first);
 }
 
-/** Recover tool calls a model emitted as <tool_call> markup in plain text
- *  (the engine returns markup naming an undeclared tool instead of parsing
- *  it into native tool_calls). Handles both the JSON form and the
- *  <function=name><parameter=k>v</parameter> form. */
-function parseMarkupToolCalls(text: string): AgentToolCall[] {
+/** Recover tool calls a model emitted as text instead of native tool_calls —
+ *  small local models commonly paste a tool invocation into content (or
+ *  reasoning_content) as JSON rather than using the engine's structured
+ *  field. Tries, in priority order: <tool_call> markup (JSON body, or the
+ *  <function=name><parameter=k>v</parameter> XML-ish form some models use),
+ *  fenced ```json/```tool_call blocks, and — only when the text is
+ *  essentially nothing but JSON — a bare leading JSON object/array.
+ *  Conservative by design: unrecognized JSON is left alone rather than
+ *  guessed at, so a normal prose reply never gets misread. Returns both the
+ *  parsed calls and the exact raw substrings consumed, so the caller can
+ *  strip only those from the visible reply without touching unrelated code
+ *  fences or prose. */
+function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; consumed: string[] } {
   const calls: AgentToolCall[] = [];
+  const consumed: string[] = [];
+
+  // Trailing commas are a common small-model JSON mistake — strip before parsing.
+  const parseItems = (body: string): unknown[] | null => {
+    const b = body.trim();
+    if (!/^\s*[{[]/.test(b)) return null;
+    try {
+      const j = JSON.parse(b.replace(/,(\s*[}\]])/g, '$1'));
+      return Array.isArray(j) ? j : [j];
+    } catch { return null; }
+  };
+  // Normalize {name,arguments} / {function:{name,arguments}} / {tool,args} shapes.
+  const coerce = (item: unknown): { name: string; args: unknown } | null => {
+    if (!item || typeof item !== 'object') return null;
+    const o = item as Record<string, any>;
+    const name = o.name ?? o.function?.name ?? o.tool;
+    if (typeof name !== 'string' || !name) return null;
+    return { name, args: o.arguments ?? o.function?.arguments ?? o.args ?? o.parameters ?? {} };
+  };
+  const pushAll = (items: unknown[]): boolean => {
+    let any = false;
+    for (const item of items) {
+      const c = coerce(item);
+      if (!c) continue;
+      calls.push({ id: 'markup-' + crypto.randomUUID(), name: c.name, arguments: typeof c.args === 'string' ? c.args : JSON.stringify(c.args) });
+      any = true;
+    }
+    return any;
+  };
+
+  // 1. <tool_call>...</tool_call> — JSON body, or the <function=name> XML-ish form.
   for (const m of text.matchAll(/<tool_call>([\s\S]*?)<\/tool_call>/g)) {
-    const body = m[1].trim();
-    let name = '';
-    let args: Record<string, unknown> = {};
-    if (/^\s*\{/.test(body)) {
-      try {
-        const j = JSON.parse(body);
-        name = String(j.name ?? '');
-        if (j.arguments && typeof j.arguments === 'object') args = j.arguments;
-      } catch { /* fall through to the XML-ish form */ }
-    }
-    if (!name) {
+    const body = m[1];
+    const items = parseItems(body);
+    let any = items ? pushAll(items) : false;
+    if (!any) {
       const fn = body.match(/<function=([\w.-]+)>/);
-      if (!fn) continue;
-      name = fn[1];
-      for (const p of body.matchAll(/<parameter=([\w.-]+)>([\s\S]*?)<\/parameter>/g)) args[p[1]] = p[2];
+      if (fn) {
+        const args: Record<string, unknown> = {};
+        for (const p of body.matchAll(/<parameter=([\w.-]+)>([\s\S]*?)<\/parameter>/g)) args[p[1]] = p[2];
+        calls.push({ id: 'markup-' + crypto.randomUUID(), name: fn[1], arguments: JSON.stringify(args) });
+        any = true;
+      }
     }
-    if (name) calls.push({ id: 'markup-' + crypto.randomUUID(), name, arguments: JSON.stringify(args) });
+    if (any) consumed.push(m[0]);
   }
-  return calls;
+  if (calls.length > 0) return { calls, consumed };
+
+  // 2. Fenced ```json / ```tool_call blocks (explicitly labeled only — an
+  //    unlabeled ``` fence is more likely a genuine code sample to the
+  //    user). Only tried when the reply is essentially JUST the block(s)
+  //    plus a little surrounding text — the actual failure mode this
+  //    recovers from is an engine emitting the tool call AS a fenced block
+  //    instead of a native call, not a long explanatory answer that happens
+  //    to contain an illustrative JSON example partway through.
+  const FENCED_RE = /```(?:json|tool_?call)\s*\n?([\s\S]*?)\n?```/g;
+  const outsideFences = text.replace(FENCED_RE, '').trim();
+  if (outsideFences.length <= 200) {
+    for (const m of text.matchAll(FENCED_RE)) {
+      const items = parseItems(m[1]);
+      if (items && pushAll(items)) consumed.push(m[0]);
+    }
+  }
+  if (calls.length > 0) return { calls, consumed };
+
+  // 3. Bare JSON — only when the whole text is essentially nothing but JSON.
+  const bare = text.trim().match(/^([{[][\s\S]+[}\]])$/);
+  if (bare) {
+    const items = parseItems(bare[1]);
+    if (items && pushAll(items)) consumed.push(bare[1]);
+  }
+
+  return { calls, consumed };
 }
 
-/** Strip tool-call markup from reply text so it doesn't pollute the transcript. */
-function stripToolMarkup(text: string): string {
-  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+/** Strip the exact substrings parseMarkupToolCalls recovered calls from, so
+ *  the transcript doesn't show raw JSON/markup — without touching any
+ *  unrelated code fence or prose that happened to sit alongside it. */
+function stripToolMarkup(text: string, consumed: string[]): string {
+  let out = text;
+  for (const c of consumed) out = out.split(c).join('');
+  return out.trim();
 }
 interface ConvMeta {
   /** Linked worktree path for this conversation, relative to the main workspace. */
@@ -1732,6 +1813,70 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
    *  relative lint/build command detected in workspace A. */
   const detectedCmdsByWsRef = useRef(new Map<string, { lint?: string; test?: string; build?: string }>());
 
+  // ---- Small-model reliability guards (reset at the start of every run(), see below) ----
+  /** Paths `read` this run, or successfully `edit`/`apply_patch`'d (which
+   *  requires matching real existing content) — read-before-write guard input. */
+  const readPathsRef = useRef(new Set<string>());
+  /** Paths that already got ONE unread-write refusal this run — the second
+   *  attempt is let through (a deliberate blind overwrite), so a stubborn
+   *  model doesn't get stuck retrying the same blocked call forever. */
+  const unreadWriteWarnedRef = useRef(new Set<string>());
+  /** Sliding-window cache of recent PURE (read-only) tool calls this run —
+   *  name+args hash -> raw result. An identical repeat is short-circuited
+   *  with the cached result instead of re-executing. */
+  const toolDedupRef = useRef<Array<{ hash: string; name: string; result: string }>>([]);
+  const TOOL_DEDUP_WINDOW = 5;
+  const PURE_DEDUP_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall']);
+  /** Consecutive FAILED edit/apply_patch attempts per file path this run —
+   *  a patch-spiral signal (the model keeps guessing at an `old` string
+   *  that doesn't match). Reset on any successful edit/patch to that path. */
+  const patchFailuresRef = useRef(new Map<string, number>());
+  /** Consecutive read-only tool calls this run with no other kind of call
+   *  in between — a read-loop signal (the model keeps investigating past
+   *  the point of having enough context). Reset by any non-read-only call. */
+  const readStreakRef = useRef(0);
+  const READ_STREAK_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall']);
+
+  /** Stable hash for a (tool name, raw JSON args string) pair — sorts object
+   *  keys first so argument order never defeats a cache hit. */
+  const hashToolCall = (name: string, argsStr: string): string => {
+    let norm = argsStr;
+    try {
+      const o = JSON.parse(argsStr);
+      if (o && typeof o === 'object') norm = JSON.stringify(o, Object.keys(o).sort());
+    } catch { /* not JSON — hash the raw string */ }
+    return `${name}|${norm}`;
+  };
+  /** True when a tool result string is a `{error: ...}` shape — used to
+   *  avoid caching (dedup) or crediting (read-loop reset) a failed call. */
+  const isErrorResult = (s: string): boolean => {
+    try { const o = JSON.parse(s); return !!(o && typeof o === 'object' && 'error' in o); } catch { return false; }
+  };
+  /** Attach a human-readable system note to a tool result without breaking
+   *  callers that parse it as JSON (same parse/mutate/restringify pattern
+   *  as maybeSummarizeTool's `_summarized` flag). */
+  const withNote = (resultStr: string, note: string): string => {
+    try {
+      const o = JSON.parse(resultStr);
+      if (o && typeof o === 'object') { (o as Record<string, unknown>)._note = note; return JSON.stringify(o); }
+    } catch { /* not JSON */ }
+    return `${resultStr}\n\n[SYSTEM] ${note}`;
+  };
+  /** Track an edit/apply_patch outcome for `path`. Returns a nudge string
+   *  once the same file has failed 4+ times in a row (a patch spiral —
+   *  the model should stop guessing and rewrite instead), then resets so
+   *  it doesn't nag on every subsequent attempt. */
+  const trackPatchSpiral = (path: string, success: boolean): string | null => {
+    if (success) { patchFailuresRef.current.delete(path); return null; }
+    const n = (patchFailuresRef.current.get(path) ?? 0) + 1;
+    patchFailuresRef.current.set(path, n);
+    if (n >= 4) {
+      patchFailuresRef.current.delete(path);
+      return `You have failed to patch ${path} ${n} times in a row. Stop using edit/apply_patch on this file — read it fully, decide what the ENTIRE file should contain, and use \`write\` to rewrite it from scratch instead.`;
+    }
+    return null;
+  };
+
   const addLog = (entry: Omit<LogEntry, 'id' | 'time'>) => {
     const safe = entry.detail ? { ...entry, detail: redactSecrets(entry.detail) } : entry;
     // Run logs belong to the conversation the run is pinned to, not whatever
@@ -1802,6 +1947,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (conventionsRef.current.trim()) {
       sys += `\n\n# Project Conventions (from ${convName || 'workspace memory file'} — follow these)\n${conventionsRef.current}\n`;
     }
+    // Bootstrap: surface the already-detected lint/test/build commands up
+    // front so the model doesn't spend early tool calls discovering them
+    // (they're detected once per run in run(), before this first executes —
+    // see detectedCmdsByWsRef). Looked up via the same run-pinned workspace
+    // key used for boundPaths below, not the possibly-stale `activeWsDir`.
+    try {
+      const pin = runConvRef.current;
+      const tWs = pin?.ws ?? storeRef.current.activeWs;
+      const tConv = pin?.convId ?? storeRef.current.activeConv;
+      const tMeta = storeRef.current.workspaces[tWs]?.conversations[tConv];
+      const tWsDir = tMeta?.worktree ? `${tWs}/${tMeta.worktree}` : tWs;
+      const cmds = detectedCmdsByWsRef.current.get(tWsDir);
+      if (cmds && (cmds.lint || cmds.test || cmds.build)) {
+        const lines = [
+          cmds.build ? `- build: \`${cmds.build}\`` : '',
+          cmds.lint ? `- lint: \`${cmds.lint}\`` : '',
+          cmds.test ? `- test: \`${cmds.test}\`` : '',
+        ].filter(Boolean);
+        sys += `\n\n# Detected project commands\nUse these to build/lint/test — no need to search for them:\n${lines.join('\n')}\n`;
+      }
+    } catch { /* bootstrap injection must never break system-prompt assembly */ }
     // Skills-lite: workspace `skills/*/SKILL.md` index. Only names + first-line
     // descriptions are injected; the model reads a skill file via `read` when
     // relevant. Refreshed each run, capped to bound context usage.
@@ -2248,8 +2414,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     model: string,
     signal?: AbortSignal,
   ): Promise<string> => {
-    // Structured results (grep/glob/repo_search) are already bounded — skip them.
-    if (name === 'grep' || name === 'glob' || name === 'repo_search') return resultStr;
+    // Structured results (grep/glob/repo_search/obs_recall) are already bounded — skip them.
+    if (LARGE_OUTPUT_EXCLUDED_TOOLS.has(name)) return resultStr;
     let res: Record<string, unknown> | null = null;
     try {
       const parsed = JSON.parse(resultStr);
@@ -2258,16 +2424,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return resultStr;
     }
     if (!res) return resultStr;
-    const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
-    const hasContent = typeof res.content === 'string';
-    if (!hasStd && !hasContent) return resultStr;
-    const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+    const extracted = extractToolResultText(res);
+    if (!extracted) return resultStr;
+    const { text, hasStd } = extracted;
     if (text.length <= SUMMARY_THRESHOLD) return resultStr;
+    // A bash result's exitCode is a known, authoritative pass/fail signal —
+    // pass it through so the receipt validator can reject a summary that
+    // disagrees with it. File reads have no such signal (undefined).
+    const isError = hasStd && typeof res.exitCode === 'number' ? res.exitCode !== 0 : undefined;
     try {
-      const summary = await summarizeOutput({ model, output: text, signal });
-      if (!summary) return resultStr;
+      const receipt = await summarizeOutputVerified({ model, output: text, isError, signal });
+      // null covers a transport/stream failure AND a rejected (unverifiable
+      // or outcome-mismatched) receipt — either way, fall back untouched.
+      if (!receipt) return resultStr;
       const tail = text.slice(-SUMMARY_TAIL);
-      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity]\n${summary}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
       if (hasStd) {
         res.stdout = wrapped;
         res.stderr = '';
@@ -2459,7 +2630,26 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const t0 = performance.now();
       let logType: LogEntry['type'] = 'error';
       let logDetail = '';
-      
+
+      // Tool-call dedup: an identical PURE (read-only, no side effects) call
+      // within the recent window is short-circuited with the cached result
+      // instead of re-executing — small models loop, re-reading the same
+      // file or re-running the same grep. Skips the permission gate too:
+      // it was already granted for this exact call moments ago and nothing
+      // about a pure lookup's permission verdict changes between calls.
+      if (PURE_DEDUP_TOOLS.has(call.name)) {
+        const hash = hashToolCall(call.name, call.arguments);
+        const hit = toolDedupRef.current.find((e) => e.hash === hash);
+        if (hit) {
+          logType = 'read';
+          logDetail = `${call.name} (cached — identical call already executed this run)`;
+          const durationMs = Math.round(performance.now() - t0);
+          addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
+          nextMessages.push({ role: 'tool', content: withNote(hit.result, 'cached — identical call already executed this run'), tool_call_id: call.id, name: call.name });
+          continue;
+        }
+      }
+
       try {
         const args = JSON.parse(call.arguments);
         // Permission gate: plan-mode read-only, per-tool tiers, denied paths.
@@ -2535,27 +2725,63 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           } catch (e) {
             result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
           }
+        } else if (call.name === 'obs_recall') {
+          const id = String(args.id || '');
+          const offset = Number(args.offset) || 0;
+          logType = 'read'; logDetail = `recall ${id} @${offset}`;
+          result = JSON.stringify(await readRecallChunk(id, offset));
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;
           const res = await coderRead(args.path, args.offset, args.limit, toolSignal);
           result = JSON.stringify(res);
+          readPathsRef.current.add(String(args.path || ''));
         } else if (call.name === 'write') {
           logType = 'write'; logDetail = args.path;
-          const res = await coderWrite(args.path, args.content, toolSignal);
-          mutated = true;
-          if (commitApproval) {
-            // Gate ON: don't auto-commit; let the human review + approve a real commit.
-            result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
-          } else {
-            const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`, toolSignal);
-            result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
+          const wpath = String(args.path || '');
+          let blockedUnread = false;
+          if (!readPathsRef.current.has(wpath) && !unreadWriteWarnedRef.current.has(wpath)) {
+            // Read-before-write guard: an existing file the model hasn't
+            // looked at this run gets ONE refusal (with a hint to `read`
+            // first) instead of a blind overwrite — small models often
+            // hallucinate content instead of checking what's actually
+            // there. New files, and a second attempt on the same path,
+            // are always allowed through.
+            // Probe existence with a 1-byte read. The backend reports a
+            // missing file as HTTP 404 specifically (coder.rs fs_read) — any
+            // OTHER failure (network hiccup, a timeout on a large file,
+            // which is exactly the case this guard cares about) must not
+            // silently disable the guard by being mistaken for "doesn't
+            // exist"; fail closed (assume it exists) instead.
+            const exists = await coderRead(wpath, 0, 1, toolSignal).then(
+              () => true,
+              (e: unknown) => !(e instanceof Error && /HTTP 404\b/.test(e.message)),
+            );
+            if (exists) {
+              unreadWriteWarnedRef.current.add(wpath);
+              result = JSON.stringify({ error: `${wpath} already exists and hasn't been read this run. Read it first with \`read\` so this write doesn't blindly overwrite content you haven't seen — or call \`write\` again on ${wpath} if you intend a deliberate full overwrite.` });
+              blockedUnread = true;
+            }
+          }
+          if (!blockedUnread) {
+            const res = await coderWrite(args.path, args.content, toolSignal);
+            readPathsRef.current.add(wpath);
+            mutated = true;
+            if (commitApproval) {
+              // Gate ON: don't auto-commit; let the human review + approve a real commit.
+              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
+            } else {
+              const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`, toolSignal);
+              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
+            }
           }
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
+          const epath = String(args.path || '');
           const res = await coderEdit(args.path, args.old, args.new, args.replaceAll, toolSignal);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
+            readPathsRef.current.add(epath);
             if (commitApproval) {
               result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
@@ -2563,12 +2789,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
+          const editSpiralNote = trackPatchSpiral(epath, res.replacements > 0);
+          if (editSpiralNote) result = withNote(result, editSpiralNote);
         } else if (call.name === 'apply_patch') {
           logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
+          const ppath = String(args.path || '');
           const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], toolSignal);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
+            readPathsRef.current.add(ppath);
             if (commitApproval) {
               result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
@@ -2576,6 +2806,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
+          const patchSpiralNote = trackPatchSpiral(ppath, res.replacements > 0);
+          if (patchSpiralNote) result = withNote(result, patchSpiralNote);
         } else if (call.name === 'git_branch') {
           const action = String(args.action || 'list');
           logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
@@ -2918,7 +3150,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // can adapt (retry differently, skip, or report) rather than guess.
         result = JSON.stringify({ error: msg });
       }
-      
+
+      // Read-loop nudge: 8 read-only tool calls in a row (no write/run/plan
+      // call in between) usually means the model has enough context and
+      // just needs to be told to stop investigating and produce output.
+      if (READ_STREAK_TOOLS.has(call.name)) {
+        readStreakRef.current += 1;
+        if (readStreakRef.current === 8) {
+          result = withNote(result, `You have used read-only tools ${readStreakRef.current} times in a row without writing or running anything. If you have enough context, stop investigating and produce your output (edit, write, or a final answer) now.`);
+          readStreakRef.current = 0;
+        }
+      } else {
+        readStreakRef.current = 0;
+      }
+
       const durationMs = Math.round(performance.now() - t0);
       addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
 
@@ -2927,6 +3172,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
       if (maybeSummarized !== result) {
         addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
+      }
+
+      // Record a successful PURE call for the dedup cache above — AFTER
+      // summarization, so a cache hit replays the same (possibly
+      // AI-summarized) content the model actually saw, never the raw
+      // pre-summarization dump. Never cache an error — the model should be
+      // allowed to retry after a real fix.
+      if (PURE_DEDUP_TOOLS.has(call.name) && !isErrorResult(maybeSummarized)) {
+        const hash = hashToolCall(call.name, call.arguments);
+        toolDedupRef.current = toolDedupRef.current.filter((e) => e.hash !== hash);
+        toolDedupRef.current.push({ hash, name: call.name, result: maybeSummarized });
+        if (toolDedupRef.current.length > TOOL_DEDUP_WINDOW) toolDedupRef.current.shift();
       }
 
       nextMessages.push({
@@ -2988,6 +3245,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
         case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
         case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
+        case 'obs_recall': result = JSON.stringify(await readRecallChunk(String(args.id || ''), Number(args.offset) || 0)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
       // Same giant-output protection the supervisor's own loop gets — without
@@ -3430,16 +3688,26 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     let runStartHead = '';
     try { runStartHead = (await coderExec('git rev-parse HEAD', undefined, 10000)).stdout.trim(); } catch { /* not a repo yet */ }
 
-    // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
-    // after file mutations during the run (P1 #6).
-    await refreshRepoMap();
+    // Reset all per-run reliability-guard state (read-before-write tracking,
+    // tool-call dedup cache, patch-spiral counters, read-loop streak) — these
+    // are scoped to a single run, not the workspace or session.
+    readPathsRef.current = new Set();
+    unreadWriteWarnedRef.current = new Set();
+    toolDedupRef.current = [];
+    patchFailuresRef.current = new Map();
+    readStreakRef.current = 0;
+
     // Auto-detect lint/test/build commands once per run (config, else
-    // manifests) — cached under the workspace the run started in.
+    // manifests) — cached under the workspace the run started in. Runs
+    // BEFORE refreshRepoMap so its bootstrap block can inject the result.
     {
       const m = detectedCmdsByWsRef.current;
       if (!m.has(activeWsDir) && m.size >= 8) m.delete(m.keys().next().value!);
       m.set(activeWsDir, await detectCommands());
     }
+    // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
+    // after file mutations during the run (P1 #6).
+    await refreshRepoMap();
 
     abortRef.current = new AbortController();
 
@@ -3537,14 +3805,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       : 8192;
 
     // whose tool results push past the window is caught before we send it (P1 #4).
-    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / 4);
+    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / CHARS_PER_TOKEN);
     const estimateTokens = (msgs: ChatMessage[]): number => {
       let n = sysTokenEstimate;
       for (const m of msgs) {
         n += typeof m.content === 'string' ? m.content.length : 0;
         if (m.tool_calls) n += JSON.stringify(m.tool_calls).length;
       }
-      return Math.ceil(n / 4);
+      return Math.ceil(n / CHARS_PER_TOKEN);
     };
     
     try {
@@ -3581,6 +3849,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // context on the next turn).
             updateRunMessages((prev) => [...prev, ...currentMessages]);
             noteRunTokens(0);
+            // The read-before-write guard's "already read this run" state
+            // is only true while the actual file content is still in the
+            // model's context — compaction just discarded it in favor of a
+            // terse summary, so a path read before this point should no
+            // longer be treated as safely read for a later blind write.
+            readPathsRef.current = new Set();
+            unreadWriteWarnedRef.current = new Set();
             continue;
           } catch (e) {
             // A deliberate Stop mid-compaction throws AbortError (see
@@ -3634,7 +3909,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // Baseline for the stale todo_write guard: this request's system
         // prompt carried the list as of this moment.
         todosRevAtReqStartRef.current = todosRevRef.current;
-        const req = buildChatRequest(model, system, currentMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
+        // ObservationPack: replace old, already-seen large tool results with
+        // a compact placeholder for THIS request only — the canonical
+        // currentMessages (shown in the UI, fed to compaction) is untouched.
+        const wireMessages = await packForRequest(currentMessages);
+        const req = buildChatRequest(model, system, wireMessages, { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams, { tools: activeTools }, coderParams.promptCache);
         // Bounded retry on transient stream failures so a single dropped
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
@@ -3672,21 +3951,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         }
         
-        // Engine fallback: when the model emits tool markup as plain text (the
-        // engine returns markup naming an undeclared tool instead of parsing
-        // it), recover the calls so the run proceeds instead of dead-airing.
-        // Undeclared ones are dropped with an explanatory note the model sees.
-        if (toolCalls.length === 0 && /<tool_call>/.test(content)) {
+        // Engine fallback: when the model dumps a tool call into content (or
+        // reasoning, for engines that split thinking/answer) instead of using
+        // native tool_calls — common with small local models in several
+        // shapes (<tool_call> markup, fenced JSON, bare JSON) — recover it so
+        // the run proceeds instead of dead-airing. Falls back to reasoning
+        // only when content itself is empty. Undeclared tool names are
+        // dropped with an explanatory note the model sees.
+        if (toolCalls.length === 0 && (content.trim() || reasoning.trim())) {
           const declared = new Set(activeTools.map((t) => t.function.name));
-          const recovered = parseMarkupToolCalls(content);
+          let { calls: recovered, consumed } = parseMarkupToolCalls(content);
+          let fromReasoning = false;
+          if (recovered.length === 0 && !content.trim() && reasoning.trim()) {
+            ({ calls: recovered, consumed } = parseMarkupToolCalls(reasoning));
+            fromReasoning = true;
+          }
           const usable = recovered.filter((c) => declared.has(c.name));
           if (usable.length > 0) {
-            content = stripToolMarkup(content);
+            if (fromReasoning) reasoning = stripToolMarkup(reasoning, consumed);
+            else content = stripToolMarkup(content, consumed);
             toolCalls = usable;
             const dropped = recovered.filter((c) => !declared.has(c.name)).map((c) => c.name);
-            addLog({ type: 'error', label: 'markup', detail: `recovered ${usable.length} tool call(s) from text markup${dropped.length ? `; dropped undeclared: ${dropped.join(', ')}` : ''}` });
+            addLog({ type: 'error', label: 'markup', detail: `recovered ${usable.length} tool call(s) from ${fromReasoning ? 'reasoning' : 'text'} markup${dropped.length ? `; dropped undeclared: ${dropped.join(', ')}` : ''}` });
             if (dropped.length) {
-              content += `\n\n[System: your <tool_call> markup for ${dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${[...declared].join(', ')}. Use the native tool-call format.]`;
+              content += `\n\n[System: your tool-call markup for ${dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${[...declared].join(', ')}. Use the native tool-call format.]`;
             }
           }
         }

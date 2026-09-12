@@ -21,6 +21,18 @@ use crate::engine::S;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_READ_BYTES: usize = 256 * 1024;
 const CWD_MARKER: &str = "<ninfx_cwd>";
+/// Case-insensitive substrings marking an environment variable as a
+/// credential. A `bash` command's text comes from the model, which can be
+/// steered by untrusted input (a file or web page it read) — this process's
+/// own environment must not be handed to it wholesale, or a var like
+/// `GITHUB_TOKEN` already exported in the user's own shell before launch
+/// becomes readable/leakable by an agent-run command.
+const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
+
+fn is_secret_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_ENV_PATTERNS.iter().any(|p| upper.contains(p))
+}
 /// Directories never descended into by tree/walk (mirrors the sidecar).
 const CODER_IGNORE: &[&str] = &[
     "node_modules", ".git", "target", "dist", "build", ".next", ".turbo", ".cache", "vendor",
@@ -667,12 +679,18 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         rel_of(&root, &spawn_cwd)
     };
 
-    let mut child = Command::new("bash")
-        .arg("-lc")
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc")
         .arg(&run_cmd)
         .current_dir(&spawn_cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, _) in std::env::vars() {
+        if is_secret_env_var(&k) {
+            cmd.env_remove(k);
+        }
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
     // Background mode: hand the child to a detached drain task and return a
@@ -1805,6 +1823,16 @@ fn expand_home(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_env_var_detection_is_case_insensitive_and_scoped() {
+        for name in ["OPENAI_API_KEY", "github_token", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "hf_token"] {
+            assert!(is_secret_env_var(name), "expected {name} to be flagged as a secret");
+        }
+        for name in ["PATH", "HOME", "LANG", "TERM", "PWD", "SHELL", "USER"] {
+            assert!(!is_secret_env_var(name), "expected {name} to NOT be flagged as a secret");
+        }
+    }
 
     #[test]
     fn strip_extended_prefix_matches_windows_canonicalize_form() {

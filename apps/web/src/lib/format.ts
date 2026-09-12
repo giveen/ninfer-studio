@@ -1,3 +1,8 @@
+/** Rough chars-per-token ratio used wherever a real tokenizer isn't worth
+ *  the cost — good to within ~20%, not exact. Single source so every
+ *  estimate in the app drifts together instead of silently diverging. */
+export const CHARS_PER_TOKEN = 4;
+
 export function formatBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || Number.isNaN(n)) return '—';
   if (n < 1024) return `${n} B`;
