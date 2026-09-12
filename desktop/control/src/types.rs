@@ -1,10 +1,20 @@
 //! Shared types for the NInfer Studio control plane.
 //! Field names mirror the web app's TypeScript types 1:1 (camelCase JSON).
 
+// Rust guideline compliant 2026-07-28
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Renders as `""` when empty, `"***"` otherwise — used by manual `Debug`
+/// impls to redact secrets while still showing whether one is set, without
+/// leaking the value itself into a log line or panic message.
+pub(crate) fn redacted(s: &str) -> &'static str {
+    if s.is_empty() { "" } else { "***" }
+}
 
 /// Event emitted by the control plane for desktop-shell concerns (tray state,
 /// OS notifications). The control crate stays framework-agnostic: the Tauri app
@@ -53,7 +63,7 @@ pub fn strip_extended_prefix(p: &str) -> String {
     p.to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     /// Root of the NInfer checkout/build. The ninfer-serve binary
@@ -113,11 +123,34 @@ impl Default for AppSettings {
     }
 }
 
+impl fmt::Debug for AppSettings {
+    /// Redacts `api_key`/`hf_token` — the API layer already masks both before
+    /// they ever reach a client (see `redact_config` in lib.rs); this impl
+    /// keeps that guarantee even if the struct is ever printed directly (a
+    /// stray log line, a panic message, ...).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppSettings")
+            .field("ninfer_path", &self.ninfer_path)
+            .field("models_dir", &self.models_dir)
+            .field("engine_port", &self.engine_port)
+            .field("api_key", &redacted(&self.api_key))
+            .field("hf_cli", &self.hf_cli)
+            .field("hf_token", &redacted(&self.hf_token))
+            .field("build_command", &self.build_command)
+            .field("lint_command", &self.lint_command)
+            .field("test_command", &self.test_command)
+            .field("default_request_params", &self.default_request_params)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("coder_workspace", &self.coder_workspace)
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engine profile — one optional entry per ninfer-serve option.
 // `None` ⇒ flag omitted ⇒ engine executable default.
 // ---------------------------------------------------------------------------
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EngineProfile {
     pub host: Option<String>,
@@ -183,6 +216,61 @@ pub struct EngineProfile {
     pub context_cost_presets: Option<String>,
     pub cors: Option<bool>,
     pub no_cuda_graph: Option<bool>,
+}
+
+impl fmt::Debug for EngineProfile {
+    /// Redacts `api_key` for the same reason as [`AppSettings`]'s manual impl.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EngineProfile")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("api_key", &self.api_key.as_deref().map(redacted))
+            .field("model_id", &self.model_id)
+            .field("max_context", &self.max_context)
+            .field("kv_capacity", &self.kv_capacity)
+            .field("prefill_chunk", &self.prefill_chunk)
+            .field("default_max_tokens", &self.default_max_tokens)
+            .field("default_thinking_budget", &self.default_thinking_budget)
+            .field("device", &self.device)
+            .field("max_concurrency", &self.max_concurrency)
+            .field("max_pending_requests", &self.max_pending_requests)
+            .field("pending_timeout_ms", &self.pending_timeout_ms)
+            .field("log_stats_interval_ms", &self.log_stats_interval_ms)
+            .field("kv_dtype", &self.kv_dtype)
+            .field("no_prefix_reuse", &self.no_prefix_reuse)
+            .field("device_state_slots", &self.device_state_slots)
+            .field("host_state_slots", &self.host_state_slots)
+            .field("host_kv_mib", &self.host_kv_mib)
+            .field("max_private_continuations", &self.max_private_continuations)
+            .field("max_shared_prefixes", &self.max_shared_prefixes)
+            .field("max_long_anchors_per_continuation", &self.max_long_anchors_per_continuation)
+            .field("spec", &self.spec)
+            .field("draft_tokens", &self.draft_tokens)
+            .field("lm_head_draft", &self.lm_head_draft)
+            .field("vision", &self.vision)
+            .field("media_cache_mib", &self.media_cache_mib)
+            .field("media_live_mib", &self.media_live_mib)
+            .field("media_preprocess_threads", &self.media_preprocess_threads)
+            .field("max_request_mib", &self.max_request_mib)
+            .field("no_thinking", &self.no_thinking)
+            .field("preserve_thinking", &self.preserve_thinking)
+            .field("greedy", &self.greedy)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("min_p", &self.min_p)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field("log_level", &self.log_level)
+            .field("request_log_jsonl", &self.request_log_jsonl)
+            .field("response_store_max_records", &self.response_store_max_records)
+            .field("response_store_max_mib", &self.response_store_max_mib)
+            .field("context_cost_presets", &self.context_cost_presets)
+            .field("cors", &self.cors)
+            .field("no_cuda_graph", &self.no_cuda_graph)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +602,7 @@ pub struct ProfileState {
     pub saved: Vec<SavedProfile>,
 }
 
+#[derive(Debug)]
 pub struct State {
     pub config: tokio::sync::RwLock<AppSettings>,
     pub engine: tokio::sync::RwLock<EngineInner>,
@@ -621,5 +710,48 @@ mod parity {
                 serde_json::from_value(want["args"].clone()).expect("expected args array");
             assert_eq!(got, want, "argv drift for parity case {:?}", case["name"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction {
+    use super::*;
+
+    const SECRET: &str = "sk-super-secret-value-do-not-leak";
+
+    #[test]
+    fn app_settings_debug_omits_api_key_and_hf_token() {
+        let settings = AppSettings {
+            api_key: SECRET.to_string(),
+            hf_token: SECRET.to_string(),
+            ..AppSettings::default()
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains(SECRET), "AppSettings Debug leaked the secret: {rendered}");
+        // The field should still be visible as present, just masked.
+        assert!(rendered.contains("api_key: \"***\""), "expected a masked api_key field: {rendered}");
+        assert!(rendered.contains("hf_token: \"***\""), "expected a masked hf_token field: {rendered}");
+    }
+
+    #[test]
+    fn app_settings_debug_shows_empty_when_unset() {
+        let settings = AppSettings::default();
+        let rendered = format!("{settings:?}");
+        assert!(rendered.contains("api_key: \"\""), "expected an empty api_key field: {rendered}");
+    }
+
+    #[test]
+    fn engine_profile_debug_omits_api_key() {
+        let profile = EngineProfile { api_key: Some(SECRET.to_string()), ..EngineProfile::default() };
+        let rendered = format!("{profile:?}");
+        assert!(!rendered.contains(SECRET), "EngineProfile Debug leaked the secret: {rendered}");
+        assert!(rendered.contains("api_key: Some(\"***\")"), "expected a masked api_key field: {rendered}");
+    }
+
+    #[test]
+    fn engine_profile_debug_shows_none_when_unset() {
+        let profile = EngineProfile::default();
+        let rendered = format!("{profile:?}");
+        assert!(rendered.contains("api_key: None"), "expected api_key: None: {rendered}");
     }
 }

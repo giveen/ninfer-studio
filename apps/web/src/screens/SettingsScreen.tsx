@@ -10,6 +10,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
   const [error, setError] = useState<string | null>(null);
   const [needPath, setNeedPath] = useState(false);
   const [pathInput, setPathInput] = useState('');
+  const [apiKeyDraft, setApiKeyDraft] = useState('');
 
   useEffect(() => {
     if (!form && status?.config) setForm(status.config);
@@ -45,7 +46,9 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
         ninferPath: form.ninferPath ?? '',
         modelsDir: form.modelsDir,
         enginePort: Number(form.enginePort),
-        apiKey: form.apiKey,
+        // Empty draft = untouched, so round-trip the mask the server sent us
+        // rather than clearing a stored key the user never meant to change.
+        apiKey: apiKeyDraft.trim() ? apiKeyDraft.trim() : form.apiKey,
         hfCli: form.hfCli,
         buildCommand: form.buildCommand ?? '',
         lintCommand: form.lintCommand ?? '',
@@ -53,8 +56,20 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
         defaultRequestParams: form.defaultRequestParams ?? '',
       });
       setForm(c);
+      setApiKeyDraft('');
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const clearApiKey = async () => {
+    setError(null);
+    try {
+      const c = await saveConfig({ apiKey: '' });
+      setForm(c);
+      setApiKeyDraft('');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -185,8 +200,29 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
                 <TextField value={String(form.enginePort)} onChange={(v) => set('enginePort', Number(v) || 0)} className="font-mono" />
               </div>
             </Field>
-            <Field label="API key" hint="When set, Studio adds it as Authorization: Bearer on all proxied engine requests. Leave empty for an open local server.">
-              <TextField value={form.apiKey} onChange={(v) => set('apiKey', v)} placeholder="unset" className="font-mono" />
+            <Field
+              label="API key"
+              hint={
+                form.apiKey
+                  ? 'A key is saved — Studio adds it as Authorization: Bearer on all proxied engine requests. Type a new one to replace it, or save settings with this field empty to leave it unchanged.'
+                  : 'When set, Studio adds it as Authorization: Bearer on all proxied engine requests. Leave empty for an open local server.'
+              }
+            >
+              <div className="flex items-center gap-2">
+                <TextField
+                  type="password"
+                  value={apiKeyDraft}
+                  onChange={setApiKeyDraft}
+                  placeholder={form.apiKey ? '******** (saved)' : 'unset'}
+                  className="font-mono"
+                  spellCheck={false}
+                />
+                {form.apiKey && !apiKeyDraft && (
+                  <Button size="sm" variant="ghost" onClick={clearApiKey}>
+                    clear
+                  </Button>
+                )}
+              </div>
             </Field>
             <Field label="Default request params" hint={'JSON object merged into every proxied request as defaults (client fields win). e.g. {"chat_template_kwargs":{"preserve_thinking":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.'}>
               <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />

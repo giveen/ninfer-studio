@@ -5,6 +5,8 @@
 //!   /health,/v1/* SSE-safe proxy to the engine port
 //!   /…            static hosting of the built web app (SPA fallback)
 
+// Rust guideline compliant 2026-07-28
+
 pub mod coder;
 pub mod engine;
 pub mod gpu;
@@ -32,6 +34,22 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Cap on a request body this control plane will buffer in memory — large
+/// enough for chat/coder payloads (file attachments, long conversations)
+/// without letting a client exhaust memory with an unbounded body.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Threshold below which `tail_file` reads the whole file rather than seeking
+/// to a tail window, and the size of that tail window for larger files —
+/// generous enough to contain the requested line count for any log this app
+/// produces.
+const LOG_TAIL_WINDOW_BYTES: usize = 512 * 1024;
+
+/// Timeout for the `/v1/*` proxy to the engine — generation requests can run
+/// long (large max_tokens, slow hardware), so this is much longer than a
+/// typical HTTP timeout rather than a duplicated/undocumented guess.
+const ENGINE_PROXY_TIMEOUT_SECS: u64 = 3600;
 
 // ---------------------------------------------------------------------------
 // App construction
@@ -105,7 +123,6 @@ pub fn build_router(state: S) -> Router {
 /// same-origin requests with the attacker's Host header. Checking Host closes
 /// that vector for every route at once.
 async fn guard_local_host(req: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     // Strip the port ("[::1]:8787" -> "[::1]"); IPv6 literals keep brackets.
     let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
@@ -141,9 +158,12 @@ pub async fn serve_until_ready(
     ready: Option<std::sync::mpsc::Sender<()>>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    eprintln!(
-        "[ninfier-control] listening on http://127.0.0.1:{port} (dist: {:?})",
-        state.dist_dir
+    tracing::event!(
+        name: "control_plane.listen",
+        tracing::Level::INFO,
+        port,
+        dist.dir = ?state.dist_dir,
+        "listening on http://127.0.0.1:{{port}} (dist: {{dist.dir}})",
     );
     if let Some(tx) = ready {
         let _ = tx.send(());
@@ -160,9 +180,19 @@ pub async fn boot_adopt(state: &S) {
     drop(eng);
     if engine_health(port).await {
         refresh_engine_status(state).await;
-        eprintln!("[ninfier-control] engine port {port} — external engine detected");
+        tracing::event!(
+            name: "engine.adopt.found",
+            tracing::Level::INFO,
+            port,
+            "external engine detected on port {{port}}",
+        );
     } else {
-        eprintln!("[ninfier-control] engine port {port} — no engine detected");
+        tracing::event!(
+            name: "engine.adopt.absent",
+            tracing::Level::INFO,
+            port,
+            "no engine detected on port {{port}}",
+        );
     }
 }
 
@@ -170,7 +200,7 @@ pub async fn boot_adopt(state: &S) {
 // Helpers
 // ---------------------------------------------------------------------------
 pub(crate) async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, String)> {
-    let bytes = axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024)
+    let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body too large".to_string()))?;
     if bytes.is_empty() {
@@ -231,7 +261,7 @@ async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
 /// other ports (read-only external entries: pid, port, artifact, model, argv).
 async fn engines_public(state: &S) -> Vec<Value> {
     let primary = state.engine.read().await;
-    let mut out = vec![public_engine(&*primary)];
+    let mut out = vec![public_engine(&primary)];
     let p_port = primary.port;
     let p_pid = primary.pid;
     for d in discover_engines().await {
@@ -318,7 +348,22 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
             let msg = format!(
                 "engine profile could not be read ({e}); the engine will start with defaults — check the settings you changed"
             );
-            eprintln!("[engine_start] {msg} | raw profile: {profile_val}");
+            // The raw (pre-parse) profile can carry `apiKey` — never log it
+            // verbatim, even on a parse failure the typed EngineProfile
+            // (whose Debug impl already redacts it) never gets constructed.
+            let mut redacted_profile = profile_val.clone();
+            if let Value::Object(map) = &mut redacted_profile {
+                if map.get("apiKey").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                    map.insert("apiKey".to_string(), Value::String("***".to_string()));
+                }
+            }
+            tracing::event!(
+                name: "engine.start.profile_parse_error",
+                tracing::Level::WARN,
+                error = %e,
+                profile = %redacted_profile,
+                "{msg}",
+            );
             (EngineProfile::default(), Some(msg))
         }
     };
@@ -366,14 +411,14 @@ async fn tail_file(path: &str, lines: usize) -> (Vec<String>, u64) {
         return (vec![], 0);
     };
     let size = md.len();
-    if size <= 512 * 1024 {
+    if size <= LOG_TAIL_WINDOW_BYTES as u64 {
         let Ok(text) = tokio::fs::read_to_string(path).await else {
             return (vec![], size);
         };
         let lines: Vec<String> = text.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().map(|l| l.to_string()).collect();
         return (lines, size);
     }
-    let mut buf = vec![0u8; 512 * 1024];
+    let mut buf = vec![0u8; LOG_TAIL_WINDOW_BYTES];
     let Ok(mut f) = tokio::fs::File::open(path).await else {
         return (vec![], size);
     };
@@ -408,19 +453,26 @@ async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
     Json(redact_config(serde_json::to_value(&*c).unwrap()))
 }
 
-/// The token shape the UI sees when one is stored. The real token is never
-/// sent back over the API; the UI echoes this mask (or "") for untouched
-/// fields and set_config preserves the stored secret on seeing it.
-const HF_TOKEN_MASK: &str = "********";
+/// The shape a secret field takes in every client-facing response. The real
+/// value is never sent back over the API; the UI echoes this mask (or "")
+/// for untouched fields and set_config preserves the stored secret on seeing
+/// it unchanged.
+const SECRET_MASK: &str = "********";
 
+/// Redact every secret field (`hfToken`, `apiKey`) before a config value
+/// reaches a client — see [`SECRET_MASK`].
 fn redact_config(mut v: Value) -> Value {
-    let set = v
-        .get("hfToken")
-        .and_then(|t| t.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    let is_set = |field: &str| {
+        v.get(field)
+            .and_then(|t| t.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    let hf_set = is_set("hfToken");
+    let api_set = is_set("apiKey");
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("hfToken".into(), json!(if set { HF_TOKEN_MASK } else { "" }));
+        obj.insert("hfToken".into(), json!(if hf_set { SECRET_MASK } else { "" }));
+        obj.insert("apiKey".into(), json!(if api_set { SECRET_MASK } else { "" }));
     }
     v
 }
@@ -441,7 +493,11 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
         merged.engine_port = v as u16;
     }
     if let Some(v) = body.get("apiKey").and_then(|v| v.as_str()) {
-        merged.api_key = v.into();
+        // "********" = untouched field (the UI only ever has the mask) — keep
+        // the stored secret. Any other value, including "", replaces it.
+        if v != SECRET_MASK {
+            merged.api_key = v.into();
+        }
     }
     if let Some(v) = body.get("hfCli").and_then(|v| v.as_str()) {
         merged.hf_cli = v.into();
@@ -449,7 +505,7 @@ async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Resul
     if let Some(v) = body.get("hfToken").and_then(|v| v.as_str()) {
         // "********" = untouched field (the UI only ever has the mask) — keep
         // the stored secret. Any other value, including "", replaces it.
-        if v != HF_TOKEN_MASK {
+        if v != SECRET_MASK {
             merged.hf_token = v.into();
         }
     }
@@ -622,6 +678,7 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
 ///   2. `reasoning_effort` — a dedicated UI control that sets the top-level
 ///      `reasoning_effort` field for every request. It overrides the generic
 ///      default for this single key (it's the explicit control).
+///
 /// Returns the re-serialized body, or `None` if neither source applies / on any
 /// parse error.
 fn merge_default_request_params(
@@ -668,7 +725,7 @@ async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
     };
@@ -693,7 +750,7 @@ async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) -> Response {
     let target = format!("http://127.0.0.1:{port}{}", uri.path());
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3600))
+        .timeout(Duration::from_secs(ENGINE_PROXY_TIMEOUT_SECS))
         .build()
         .ok();
     let Some(client) = client else {

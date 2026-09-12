@@ -1,3 +1,5 @@
+// Rust guideline compliant 2026-07-28
+
 use axum::{
     extract::{Query, State as AxumState},
     http::StatusCode,
@@ -206,7 +208,7 @@ pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
     Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct WorkspaceResp {
     pub workspace: String,
     pub exists: bool,
@@ -222,7 +224,7 @@ pub async fn workspace_get(AxumState(state): AxumState<S>) -> Json<WorkspaceResp
     Json(WorkspaceResp { workspace: ws, exists })
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct WorkspaceReq {
     pub path: Option<String>,
 }
@@ -921,37 +923,35 @@ pub async fn repo_map(AxumState(state): AxumState<S>) -> Result<Json<Value>, (St
         let re = regex::Regex::new(r"^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)").unwrap();
         
         let mut file_count = 0;
-        for result in walker {
-            if let Ok(entry) = result {
-                if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+        for entry in walker.flatten() {
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            // basic extension filter to avoid minified js or assets
+            if let Some(ext) = path.extension() {
+                let ext_str = ext.to_string_lossy();
+                if !["ts", "tsx", "js", "jsx", "rs", "py", "go", "c", "cpp", "h", "java"].contains(&ext_str.as_ref()) {
                     continue;
                 }
-                let path = entry.path();
-                // basic extension filter to avoid minified js or assets
-                if let Some(ext) = path.extension() {
-                    let ext_str = ext.to_string_lossy();
-                    if !["ts", "tsx", "js", "jsx", "rs", "py", "go", "c", "cpp", "h", "java"].contains(&ext_str.as_ref()) {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-                
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
-                    let mut file_sigs = String::new();
-                    for line in content.lines() {
-                        if let Some(_caps) = re.captures(line) {
-                            if file_sigs.len() < 1000 {
-                                file_sigs.push_str(&format!("  {}\n", line.trim()));
-                            }
+            } else {
+                continue;
+            }
+
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
+                let mut file_sigs = String::new();
+                for line in content.lines() {
+                    if let Some(_caps) = re.captures(line) {
+                        if file_sigs.len() < 1000 {
+                            file_sigs.push_str(&format!("  {}\n", line.trim()));
                         }
                     }
-                    if !file_sigs.is_empty() {
-                        map.push_str(&format!("{}\n{}\n", rel_path, file_sigs));
-                        file_count += 1;
-                        if file_count > 200 { break; } // limit to avoid massive payloads
-                    }
+                }
+                if !file_sigs.is_empty() {
+                    map.push_str(&format!("{}\n{}\n", rel_path, file_sigs));
+                    file_count += 1;
+                    if file_count > 200 { break; } // limit to avoid massive payloads
                 }
             }
         }
@@ -1002,10 +1002,10 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             }
             
             if let Ok(entry) = result {
-                if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+                if entry.file_type().is_none_or(|ft| ft.is_dir()) {
                     continue;
                 }
-                
+
                 let path = entry.path();
                 if let Ok(content) = std::fs::read_to_string(path) {
                     let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
@@ -1667,7 +1667,7 @@ fn mem_lock(store: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 /// Optional `?workspace=<path>` override for the memory GET (see
 /// `resolve_mem_dir` — explicit target takes precedence over the global
 /// `coderWorkspace` pointer).
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct MemQuery {
     workspace: Option<String>,
 }

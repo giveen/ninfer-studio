@@ -1,5 +1,7 @@
 //! Engine process supervision: spawn / health-poll / stop / adopt-external.
 
+// Rust guideline compliant 2026-07-28
+
 use crate::types::{build_serve_args, AppEvent, EngineInner, EngineProfile, LastStart, State, now_ms};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -7,9 +9,28 @@ use std::time::Duration;
 
 pub type S = Arc<State>;
 
+/// Startup grace period (ms): how long a freshly spawned engine has to report
+/// healthy before it's marked failed.
+const ENGINE_START_TIMEOUT_MS: u64 = 180_000;
+
+/// HTTP client timeout (ms) for a single health/model-info probe of the
+/// locally spawned engine — short, since a slow local loopback response
+/// means the engine isn't ready rather than that the network is slow.
+const ENGINE_PROBE_TIMEOUT_MS: u64 = 1500;
+
+/// User-facing failure reason when an engine doesn't become healthy within
+/// `ENGINE_START_TIMEOUT_MS` — derived from the constant so the wording can't
+/// drift out of sync with the actual timeout.
+fn start_timeout_message() -> String {
+    format!(
+        "engine did not become healthy within {} minutes",
+        ENGINE_START_TIMEOUT_MS / 60_000
+    )
+}
+
 pub async fn engine_health(port: u16) -> bool {
     let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
+        .timeout(Duration::from_millis(ENGINE_PROBE_TIMEOUT_MS))
         .build()
     else {
         return false;
@@ -27,7 +48,7 @@ pub async fn engine_model_info(state: &State, port: u16) -> (Option<String>, Opt
     let api_key = state.config.read().await.api_key.clone();
     let mut req = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/v1/models"))
-        .timeout(Duration::from_millis(1500));
+        .timeout(Duration::from_millis(ENGINE_PROBE_TIMEOUT_MS));
     if !api_key.is_empty() {
         req = req.bearer_auth(&api_key);
     }
@@ -64,6 +85,7 @@ pub async fn find_external_serve_pids() -> Vec<u32> {
 }
 
 /// A locally-running ninfer-serve process discovered via /proc.
+#[derive(Debug)]
 pub struct DiscoveredEngine {
     pub pid: u32,
     pub port: Option<u16>,
@@ -277,10 +299,8 @@ pub async fn refresh_engine_status(state: &State) {
                         eng.max_context = mctx;
                     }
                 }
-            } else if eng.state == "starting" || eng.state == "running" {
-                if eng.state == "starting" && eng.deadline.is_none() {
-                    eng.deadline = Some(now_ms() + 180_000);
-                }
+            } else if eng.state == "starting" && eng.deadline.is_none() {
+                eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
             }
         }
     } else if eng.state == "starting" || eng.state == "running" {
@@ -293,7 +313,7 @@ pub async fn refresh_engine_status(state: &State) {
             if now_ms() > deadline {
                 eng.state = "failed".into();
                 eng.fail_reason =
-                    Some("engine did not become healthy within 3 minutes".into());
+                    Some(start_timeout_message());
             }
         }
     }
@@ -646,7 +666,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         eng.log_path = Some(log_file_path);
         eng.adopted = false;
         eng.fail_reason = None;
-        eng.deadline = Some(now_ms() + 180_000);
+        eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
     }
 
     let mut cmd = tokio::process::Command::new(&engine_binary);
@@ -710,7 +730,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     }
     {
         let mut eng = state.engine.write().await;
-        eng.pid = pid.map(|p| p as u32);
+        eng.pid = pid;
     }
 
     // reaper: watch the spawned child and record its exit. The handle stays in
@@ -767,7 +787,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
                 if now_ms() > deadline {
                     eng.state = "failed".into();
                     eng.fail_reason =
-                        Some("engine did not become healthy within 3 minutes".into());
+                        Some(start_timeout_message());
                     drop(eng);
                     let mut c = st.child.lock().await;
                     if let Some(c) = c.as_mut() {
