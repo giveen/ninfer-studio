@@ -100,7 +100,7 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
                 repo: repo.to_string(),
                 file: file.to_string(),
                 local_dir: dir.clone(),
-                pid: pid.map(|p| p as u32),
+                pid,
                 out: String::new(),
                 exit_code: None,
                 done: false,

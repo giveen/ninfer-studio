@@ -64,6 +64,7 @@ pub async fn find_external_serve_pids() -> Vec<u32> {
 }
 
 /// A locally-running ninfer-serve process discovered via /proc.
+#[derive(Debug)]
 pub struct DiscoveredEngine {
     pub pid: u32,
     pub port: Option<u16>,
@@ -710,7 +711,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     }
     {
         let mut eng = state.engine.write().await;
-        eng.pid = pid.map(|p| p as u32);
+        eng.pid = pid;
     }
 
     // reaper: watch the spawned child and record its exit. The handle stays in

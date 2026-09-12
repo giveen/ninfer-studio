@@ -105,7 +105,6 @@ pub fn build_router(state: S) -> Router {
 /// same-origin requests with the attacker's Host header. Checking Host closes
 /// that vector for every route at once.
 async fn guard_local_host(req: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     // Strip the port ("[::1]:8787" -> "[::1]"); IPv6 literals keep brackets.
     let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
@@ -141,9 +140,12 @@ pub async fn serve_until_ready(
     ready: Option<std::sync::mpsc::Sender<()>>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    eprintln!(
-        "[ninfier-control] listening on http://127.0.0.1:{port} (dist: {:?})",
-        state.dist_dir
+    tracing::event!(
+        name: "control_plane.listen",
+        tracing::Level::INFO,
+        port,
+        dist.dir = ?state.dist_dir,
+        "listening on http://127.0.0.1:{{port}} (dist: {{dist.dir}})",
     );
     if let Some(tx) = ready {
         let _ = tx.send(());
@@ -160,9 +162,19 @@ pub async fn boot_adopt(state: &S) {
     drop(eng);
     if engine_health(port).await {
         refresh_engine_status(state).await;
-        eprintln!("[ninfier-control] engine port {port} — external engine detected");
+        tracing::event!(
+            name: "engine.adopt.found",
+            tracing::Level::INFO,
+            port,
+            "external engine detected on port {{port}}",
+        );
     } else {
-        eprintln!("[ninfier-control] engine port {port} — no engine detected");
+        tracing::event!(
+            name: "engine.adopt.absent",
+            tracing::Level::INFO,
+            port,
+            "no engine detected on port {{port}}",
+        );
     }
 }
 
@@ -231,7 +243,7 @@ async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
 /// other ports (read-only external entries: pid, port, artifact, model, argv).
 async fn engines_public(state: &S) -> Vec<Value> {
     let primary = state.engine.read().await;
-    let mut out = vec![public_engine(&*primary)];
+    let mut out = vec![public_engine(&primary)];
     let p_port = primary.port;
     let p_pid = primary.pid;
     for d in discover_engines().await {
@@ -318,7 +330,22 @@ async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Res
             let msg = format!(
                 "engine profile could not be read ({e}); the engine will start with defaults — check the settings you changed"
             );
-            eprintln!("[engine_start] {msg} | raw profile: {profile_val}");
+            // The raw (pre-parse) profile can carry `apiKey` — never log it
+            // verbatim, even on a parse failure the typed EngineProfile
+            // (whose Debug impl already redacts it) never gets constructed.
+            let mut redacted_profile = profile_val.clone();
+            if let Value::Object(map) = &mut redacted_profile {
+                if map.get("apiKey").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+                    map.insert("apiKey".to_string(), Value::String("***".to_string()));
+                }
+            }
+            tracing::event!(
+                name: "engine.start.profile_parse_error",
+                tracing::Level::WARN,
+                error = %e,
+                profile = %redacted_profile,
+                "{msg}",
+            );
             (EngineProfile::default(), Some(msg))
         }
     };

@@ -15,7 +15,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use mimalloc::MiMalloc;
 use tauri::{Manager, WindowEvent};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use ninfier_control::types::AppEvent;
 use ninfier_control::{boot_adopt, init_state, serve_until_ready};
@@ -35,6 +39,10 @@ struct EngineRunning(Arc<AtomicBool>);
 struct TrayState(std::sync::Mutex<Option<TrayIcon>>);
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Shared flag (cloned into both the window-event handler and the setup).
     let engine_running = Arc::new(AtomicBool::new(false));
     let engine_running_ev = engine_running.clone();
@@ -138,6 +146,13 @@ fn main() {
             // at the CI runner, not the user's machine).
             if !cfg!(debug_assertions) {
                 if let Ok(res) = app.path().resource_dir() {
+                    // SAFETY: runs synchronously inside Tauri's `setup()` callback,
+                    // which executes once on the main thread before this process
+                    // spawns any of its own threads — the control-plane tokio
+                    // runtime and the async event pump below are both created
+                    // after this point — and before any webview content has
+                    // loaded. Nothing else in this process reads or writes
+                    // process environment variables concurrently with this call.
                     unsafe {
                         std::env::set_var("NINFIER_STUDIO_DIST", res);
                     }
@@ -160,7 +175,7 @@ fn main() {
                     let state = init_state(Some(ev_tx)).await;
                     boot_adopt(&state).await;
                     if let Err(e) = serve_until_ready(state, port, Some(ready_tx)).await {
-                        eprintln!("[ninfier-studio] control plane error: {e}");
+                        tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {{error}}");
                     }
                 });
             });

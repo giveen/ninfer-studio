@@ -106,7 +106,7 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     else {
         return json!({ "ok": false, "message": format!("could not spawn: {cmd}") });
     };
-    rec.pid = child.id().map(|p| p as u32);
+    rec.pid = child.id();
     {
         let mut j = state.update_job.lock().await;
         *j = Some(rec);
