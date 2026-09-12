@@ -116,3 +116,9 @@ export function Markdown({ children }: { children: string }) {
     </ReactMarkdown>
   );
 }
+
+// Default export so callers can `lazy(() => import('./Markdown'))` — this
+// module pulls in react-markdown + remark-gfm + highlight.js's full language
+// grammar table, ~300KB that's otherwise parsed/executed on startup even
+// though nothing needs it until the first completed reply actually renders.
+export default Markdown;

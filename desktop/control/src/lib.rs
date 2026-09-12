@@ -528,9 +528,9 @@ async fn conversations_get(AxumState(state): AxumState<S>) -> Json<Value> {
     match tokio::fs::read_to_string(&p).await {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
             Ok(v) => Json(v),
-            Err(_) => Json(json!({ "conversations": [], "params": null })),
+            Err(_) => Json(json!({ "conversations": [], "params": null, "presets": [] })),
         },
-        Err(_) => Json(json!({ "conversations": [], "params": null })),
+        Err(_) => Json(json!({ "conversations": [], "params": null, "presets": [] })),
     }
 }
 
@@ -553,6 +553,11 @@ async fn conversations_set(
     }
     if body.get("params").is_some() {
         current["params"] = body["params"].clone();
+    }
+    if let Some(v) = body.get("presets") {
+        if v.is_array() {
+            current["presets"] = v.clone();
+        }
     }
     let p = state.data_dir.join("chats.json");
     tokio::fs::create_dir_all(&state.data_dir).await.ok();

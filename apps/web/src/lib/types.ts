@@ -268,11 +268,16 @@ export interface ChatMessage {
   displayName?: string;
   /** Harness-injected reports start collapsed; the user can expand them. */
   collapsed?: boolean;
+  /** Up to 3 model-suggested next questions, generated after this reply
+   *  completes. Only ever rendered for the last message in a conversation. */
+  followUps?: string[];
 }
 
 export interface Conversation {
   id: string;
   title: string;
+  /** Pinned conversations sort to the top of the sidebar. */
+  pinned?: boolean;
   /** Structured compaction summary (set by /compact). When present, the model
    * context is rebuilt from this summary + post-compaction messages, while the
    * full message history stays visible in the UI. */
@@ -307,6 +312,14 @@ export interface ChatParams {
   frequencyPenalty?: number;
   seed?: number;
   greedy?: boolean;
+}
+
+// A named, reusable bundle of chat params (sampling + system prompt + thinking),
+// analogous to LM Studio's Presets — saved once, loaded into any conversation.
+export interface SavedChatParams {
+  id: string;
+  name: string;
+  params: ChatParams;
 }
 
 // ---------------------------------------------------------------------------

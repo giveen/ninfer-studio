@@ -53,13 +53,12 @@ async function postJSON<T>(path: string, body: unknown, timeoutMs = 10_000, sign
     signal: combinedSignal(timeoutMs, signal),
   });
   const text = await r.text();
-  let data: T;
+  if (!r.ok) throw new Error(`${path} → HTTP ${r.status}: ${text.slice(0, 300)}`);
   try {
-    data = JSON.parse(text) as T;
+    return JSON.parse(text) as T;
   } catch {
     throw new Error(`${path} → HTTP ${r.status}: ${text.slice(0, 300)}`);
   }
-  return data;
 }
 
 export function getStatus(): Promise<StatusPayload> {
@@ -109,6 +108,7 @@ export function saveProfileState(
 export interface ConversationsState {
   conversations: import('./types').Conversation[];
   params: ChatParams | null;
+  presets?: import('./types').SavedChatParams[];
 }
 
 export function getConversations(): Promise<ConversationsState> {
@@ -116,7 +116,7 @@ export function getConversations(): Promise<ConversationsState> {
 }
 
 export function saveConversations(
-  patch: Partial<{ conversations: import('./types').Conversation[]; params: ChatParams }>,
+  patch: Partial<{ conversations: import('./types').Conversation[]; params: ChatParams; presets: import('./types').SavedChatParams[] }>,
 ): Promise<unknown> {
   return postJSON('/api/conversations', patch, 20_000);
 }
@@ -229,7 +229,13 @@ export function buildChatRequest(
         else if (a.kind === 'video') content.push({ type: 'video_url', video_url: { url: a.dataUrl! } });
         else if (a.kind === 'file') {
           const p = a.path ?? a.name;
-          content.push({ type: 'text', text: `\n\n[Attached file: ${p}]\n\`\`\`\n${a.content ?? ''}\n\`\`\`\n` });
+          const body = a.content ?? '';
+          // Fence longer than the longest backtick run already in the file,
+          // so content containing its own ``` (e.g. a Markdown file with an
+          // embedded code block) can't prematurely close our fence.
+          const longestRun = (body.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+          const fence = '`'.repeat(Math.max(3, longestRun + 1));
+          content.push({ type: 'text', text: `\n\n[Attached file: ${p}]\n${fence}\n${body}\n${fence}\n` });
         }
       }
       messages.push({ role: 'user', content });
@@ -271,8 +277,10 @@ export function buildChatRequest(
   if (effort) body.reasoning_effort = effort;
   if (params.preserveThinking !== undefined) body.preserve_thinking = params.preserveThinking;
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
-  if (params.greedy) body.temperature = 0;
+  // Order matters: greedy must win over a lingering temperature value, not
+  // the other way round, or "deterministic" silently turns into "sampled".
   if (params.temperature !== undefined) body.temperature = params.temperature;
+  if (params.greedy) body.temperature = 0;
   if (params.topP !== undefined) body.top_p = params.topP;
   if (params.topK !== undefined) body.top_k = params.topK;
   if (params.minP !== undefined) body.min_p = params.minP;
@@ -305,7 +313,7 @@ export async function streamChat(
   // A tag can also split across two chunks, so hold back a short tail
   // (shorter than either tag) until we're sure it isn't a partial match.
   const THINK_CLOSE = '</think>';
-  const TAG_HOLDBACK = '<think>'.length - 1;
+  const TAG_HOLDBACK = THINK_CLOSE.length - 1;
   let contentBuf = '';
   const flushContent = (text: string) => {
     if (!text) return;
@@ -609,6 +617,63 @@ export function summarizeOutput(opts: {
 }
 
 // ---------------------------------------------------------------------------
+// Suggested follow-ups: after a reply completes, ask the engine for 3 short
+// next questions so the user has a one-click way to keep the conversation
+// moving instead of staring at a blank composer.
+// ---------------------------------------------------------------------------
+const FOLLOWUP_INSTRUCTION = [
+  'Suggest exactly 3 short, natural follow-up questions the user might ask next, based on the conversation above.',
+  "Phrase each as something the USER would say to continue the conversation — not a restatement or summary of your own answer.",
+  'Keep each under 12 words.',
+  'Output ONLY a JSON array of exactly 3 strings, e.g. ["...", "...", "..."]. No preamble, no markdown, no other text.',
+].join('\n');
+
+function parseFollowUps(raw: string): string[] {
+  const text = raw.trim();
+  // Also matches an OPENED-but-never-closed fence (maxTokens can cut the
+  // response off mid-block) — `(?:```|$)` accepts end-of-string as the close.
+  const fenced = /```(?:json)?\s*([\s\S]*?)(?:```|$)/.exec(text);
+  const jsonText = (fenced ? fenced[1] : text).trim();
+  try {
+    const arr = JSON.parse(jsonText);
+    if (Array.isArray(arr)) {
+      const strs = arr.filter((x): x is string => typeof x === 'string' && !!x.trim());
+      if (strs.length) return strs.slice(0, 3);
+    }
+  } catch {
+    /* fall through below */
+  }
+  // The array may be truncated/malformed (tight maxTokens) — recover whole
+  // quoted strings directly rather than requiring the full array to parse.
+  const quoted = [...jsonText.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1].trim()).filter(Boolean);
+  if (quoted.length) return quoted.slice(0, 3);
+  // Last resort: the model ignored the JSON instruction and just listed lines.
+  return jsonText
+    .split('\n')
+    .map((l) => l.replace(/^[\s\-*\d.)\]\[`"']+/, '').replace(/["'`]+$/, '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+/** Ask the engine for 3 suggested follow-up questions given `history` (which
+ *  should already end in the assistant's just-completed reply). */
+export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
+  const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
+  const params: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 200 };
+  const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
+  return new Promise<string[]>((resolve, reject) => {
+    let acc = '';
+    streamChat(body, opts.signal ?? AbortSignal.timeout(30_000), {
+      onContentDelta: (d) => {
+        acc += d;
+      },
+      onDone: () => resolve(parseFollowUps(acc)),
+      onError: (m) => reject(new Error(m)),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Coding harness control-plane endpoints (sandboxed to the workspace)
 // ---------------------------------------------------------------------------
 export function getCoderWorkspace(): Promise<CoderWorkspace> {
@@ -859,8 +924,10 @@ export function buildCoderRequest(
     enable_thinking: params.thinking,
   };
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
-  if (params.greedy) body.temperature = 0;
+  // Order matters: greedy must win over a lingering temperature value, not
+  // the other way round, or "deterministic" silently turns into "sampled".
   if (params.temperature !== undefined) body.temperature = params.temperature;
+  if (params.greedy) body.temperature = 0;
   if (params.topP !== undefined) body.top_p = params.topP;
   if (params.topK !== undefined) body.top_k = params.topK;
   if (params.minP !== undefined) body.min_p = params.minP;

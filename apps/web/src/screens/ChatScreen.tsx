@@ -1,22 +1,29 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
+  ChevronsRight,
+  ChevronUp,
   Copy,
+  Download,
   Gauge,
   GitBranch,
   Paperclip,
   Pencil,
+  Pin,
+  PinOff,
   Play,
   Plus,
   RefreshCw,
+  Save,
+  Search,
   Send,
   SlidersHorizontal,
   Square,
   Trash2,
   X,
 } from 'lucide-react';
-import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 
 // A legacy compaction checkpoint message (raw <compacted-summary> block).
@@ -26,13 +33,32 @@ function isCompactedMsg(m: ChatMessage): boolean {
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
-// visible history is preserved separately for browsing.
+// visible history is preserved separately for browsing. Also drops empty/
+// incomplete assistant turns (e.g. an aborted placeholder) so every call site
+// gets the same "don't send a blank assistant message" behavior instead of
+// each caller having to remember to filter it out itself.
 function modelHistory(conv: Conversation): ChatMessage[] {
+  const tail = conv.compactedSummary ? conv.messages.slice(conv.compactedCount ?? 0) : conv.messages;
+  const filtered = tail.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
   if (conv.compactedSummary) {
     const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
-    return [prefix, ...conv.messages.slice(conv.compactedCount ?? 0)];
+    return [prefix, ...filtered];
   }
-  return conv.messages;
+  return filtered;
+}
+
+// A compacted conversation's summary is only valid as a prefix for a message
+// array at least as long as compactedCount. Deleting/branching/regenerating/
+// editing/clearing can shorten `messages` back to or past that boundary —
+// keeping the old compaction state then makes modelHistory's slice come back
+// empty, silently dropping every real message from the next request. Use
+// this instead of a raw `{ ...conv, messages }` spread anywhere `messages`
+// is being shortened or replaced.
+function withMessages(conv: Conversation, messages: ChatMessage[]): Conversation {
+  if (conv.compactedSummary && messages.length <= (conv.compactedCount ?? 0)) {
+    return { ...conv, messages, compactedSummary: undefined, compactedCount: undefined };
+  }
+  return { ...conv, messages };
 }
 
 // Subtle divider shown in place of the verbose compaction summary.
@@ -47,10 +73,24 @@ function CompactDivider() {
 }
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
-import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
-import { Markdown } from '../components/Markdown';
+import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
+// Dynamically imported: react-markdown + remark-gfm + highlight.js is a
+// ~300KB chunk that costs nothing at startup this way, only when the first
+// completed (non-streaming) reply actually needs to render.
+const Markdown = lazy(() => import('../components/Markdown'));
 import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
 
+
+// Windowing, not full virtualization: a conversation with hundreds of
+// messages only mounts the most recent ones by default (each MessageRow
+// pulls in markdown parsing, syntax highlighting, etc.) — a "show earlier
+// messages" banner reveals the rest on demand. Deliberately simpler than a
+// virtualized list: it doesn't need to touch find-in-conversation's
+// scrollIntoView, the ResizeObserver-driven stick-to-bottom effect, or the
+// lazy-loaded Markdown Suspense boundary, since it's just a plain array
+// slice — the rendered DOM shrinks, but nothing about how it's measured or
+// scrolled changes.
+const RECENT_MESSAGE_WINDOW = 60;
 
 const DEFAULT_PARAMS: ChatParams = {
   thinking: true,
@@ -208,6 +248,8 @@ type MsgActions = {
   onEdit: (convId: string, i: number, text: string) => void;
   onDelete: (convId: string, i: number) => void;
   onBranch: (convId: string, i: number) => void;
+  onContinue: (convId: string, i: number) => void;
+  onFollowUp: (text: string) => void;
 };
 
 function ActionBtn({ title, onClick, disabled, children }: { title: string; onClick: () => void; disabled?: boolean; children: ReactNode }) {
@@ -215,6 +257,7 @@ function ActionBtn({ title, onClick, disabled, children }: { title: string; onCl
     <button
       type="button"
       title={title}
+      aria-label={title}
       disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
@@ -233,6 +276,7 @@ const MessageRow = memo(function MessageRow({
   locked,
   convId,
   index,
+  isLast,
   actions,
 }: {
   m: ChatMessage;
@@ -243,6 +287,9 @@ const MessageRow = memo(function MessageRow({
   locked?: boolean;
   convId: string;
   index: number;
+  /** Only the last message in the conversation can offer Continue — extending
+   *  a truncated reply anywhere else would orphan the messages after it. */
+  isLast?: boolean;
   actions: MsgActions;
 }) {
   const [editing, setEditing] = useState(false);
@@ -272,10 +319,10 @@ const MessageRow = memo(function MessageRow({
           <Pencil size={13} />
         </ActionBtn>
       )}
-      <ActionBtn title="Branch from here" onClick={() => actions.onBranch(convId, index)}>
+      <ActionBtn title="Branch from here" onClick={() => actions.onBranch(convId, index)} disabled={locked}>
         <GitBranch size={13} />
       </ActionBtn>
-      <ActionBtn title="Delete from here" onClick={() => actions.onDelete(convId, index)}>
+      <ActionBtn title="Delete from here" onClick={() => actions.onDelete(convId, index)} disabled={locked}>
         <Trash2 size={13} />
       </ActionBtn>
     </div>
@@ -407,6 +454,26 @@ const MessageRow = memo(function MessageRow({
             </div>
           )}
         </div>
+        {isLast && !m.error && !streaming && m.meta?.finishReason === 'length' && (
+          <Button size="sm" variant="subtle" className="mt-1.5" onClick={() => actions.onContinue(convId, index)} disabled={locked}>
+            <ChevronsRight size={12} /> continue
+          </Button>
+        )}
+        {isLast && !streaming && m.followUps && m.followUps.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {m.followUps.map((q, qi) => (
+              <button
+                key={qi}
+                type="button"
+                onClick={() => actions.onFollowUp(q)}
+                disabled={locked}
+                className="rounded-full border border-line bg-panel px-3 py-1.5 text-left text-[12px] text-mute transition-colors hover:border-accent/40 hover:text-ink disabled:pointer-events-none disabled:opacity-40"
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        )}
         <MessageMeta m={m} />
       </div>
     </div>
@@ -422,17 +489,26 @@ function ParamsPopover({
   open,
   setOpen,
   disabled,
+  presets,
+  onSavePreset,
+  onLoadPreset,
+  onDeletePreset,
 }: {
   params: ChatParams;
   setParams: (p: ChatParams) => void;
   open: boolean;
   setOpen: (v: boolean) => void;
   disabled?: boolean;
+  presets: SavedChatParams[];
+  onSavePreset: (name: string) => void;
+  onLoadPreset: (id: string) => void;
+  onDeletePreset: (id: string) => void;
 }) {
   const set = (patch: Partial<ChatParams>) => setParams({ ...params, ...patch });
   const row = 'grid grid-cols-[150px_1fr] items-center gap-3';
   const lab = 'text-[12px] text-mute';
   const num = 'w-24';
+  const [presetName, setPresetName] = useState('');
   return (
     <div className="w-[430px] rounded-xl border border-line bg-panel p-4 shadow-2xl">
       <div className="space-y-3.5">
@@ -540,6 +616,49 @@ function ParamsPopover({
             className="w-full resize-y rounded-lg border border-line bg-inset px-2.5 py-2 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
           />
         </div>
+        <div className="h-px bg-line" />
+        <div className="space-y-2">
+          <span className={lab}>Presets (sampling + system prompt bundle)</span>
+          {presets.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {presets.map((p) => (
+                <span key={p.id} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
+                  <button type="button" title="Load this preset" onClick={() => onLoadPreset(p.id)} className="hover:text-ink">
+                    {p.name}
+                  </button>
+                  <button type="button" title="Delete preset" onClick={() => onDeletePreset(p.id)} className="text-faint hover:text-danger">
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-1.5">
+            <input
+              value={presetName}
+              onChange={(e) => setPresetName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && presetName.trim()) {
+                  onSavePreset(presetName);
+                  setPresetName('');
+                }
+              }}
+              placeholder="preset name"
+              className="min-w-0 flex-1 rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+            />
+            <Button
+              size="sm"
+              variant="subtle"
+              disabled={!presetName.trim()}
+              onClick={() => {
+                onSavePreset(presetName);
+                setPresetName('');
+              }}
+            >
+              <Save size={12} /> save current
+            </Button>
+          </div>
+        </div>
         <div className="flex justify-between">
           <Button size="sm" variant="subtle" onClick={() => set({ ...DEFAULT_PARAMS, maxTokens: undefined })}>
             reset to defaults
@@ -603,17 +722,38 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
+  const [presets, setPresets] = useState<SavedChatParams[]>([]);
+  const [convSearch, setConvSearch] = useState('');
+  const [atBottom, setAtBottom] = useState(true);
+  const [dragOver, setDragOver] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<{ conv: Conversation; index: number }[] | null>(null);
+  const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showAllMessages, setShowAllMessages] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findIndex, setFindIndex] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
+  // Which conversation actually owns the in-flight stream — `streaming` alone
+  // is a global one-at-a-time engine lock (a single AbortController/engine
+  // slot), so viewing a DIFFERENT idle conversation must not render it (or
+  // its composer) as if it were the one generating.
+  const [streamingConvId, setStreamingConvId] = useState<string | null>(null);
   const [paramsOpen, setParamsOpen] = useState(false);
   const [model, setModel] = useState<string>(status?.engine?.modelId || '');
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Latest conversations snapshot for use inside stable callbacks (avoids stale closures).
@@ -639,6 +779,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         setConvs(list);
         setActiveId((cur) => cur ?? list[0]?.id ?? null);
         if (s.params) setParamsState(normalizeParams(s.params));
+        if (Array.isArray(s.presets)) setPresets(s.presets);
         setLoaded(true);
       })
       .catch(() => cancelled || setLoaded(true));
@@ -663,10 +804,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     // entirely when the user navigated away mid-rewrite, so the whole turn was
     // lost on return (hydration restored the pre-turn snapshot).
     const t = setTimeout(() => {
-      saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
+      saveConversations({ conversations: convs.slice(0, 200), params, presets }).catch(() => undefined);
     }, 1500);
     return () => clearTimeout(t);
-  }, [convs, params, loaded]);
+  }, [convs, params, presets, loaded]);
   const setParams = useCallback((p: ChatParams) => setParamsState(p), []);
 
   const active = convs.find((c) => c.id === activeId) || null;
@@ -678,10 +819,34 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
   };
 
+  // Driven by a ResizeObserver on the actual content (not a [messages]
+  // dependency) so it re-sticks to the bottom no matter WHY the content grew —
+  // a new token, a message added, or the lazy-loaded Markdown chunk's Suspense
+  // boundary resolving after the initial paint (which changes layout without
+  // ever changing the `messages` array reference, so a dependency-gated effect
+  // would run once too early and never fire again for that growth).
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  });
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, []);
+
+  // Switching conversations always starts scrolled to the bottom of the new
+  // one, regardless of where the user had scrolled in the previous one.
+  useEffect(() => {
+    stick.current = true;
+    setAtBottom(true);
+    setFindOpen(false);
+    setFindQuery('');
+    setShowAllMessages(false);
+  }, [activeId]);
+
+  useEffect(() => () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); }, []);
 
   const runCompact = useCallback(async () => {
     if (compacting) return;
@@ -745,6 +910,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const useModel = model || runningModel;
       if (!useModel) return;
       setStreaming(true);
+      setStreamingConvId(convId);
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -868,6 +1034,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
          if (depth >= 12) {
            setConvs((cs) => cs.map((c) => c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => isTarget(m, i, c.messages.length) ? { ...m, content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`, error: true } : m) }));
            setStreaming(false);
+           setStreamingConvId(null);
            return;
          }
          const toolResults: ChatMessage[] = [];
@@ -936,7 +1103,43 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         }
       }
 
+      // Suggested follow-ups: a fast, best-effort pass offering 3 one-click
+      // next questions so the user isn't stuck staring at a blank composer.
+      // Skipped on a truncated reply (Continue is the more useful action there).
+      if (!ac.signal.aborted) {
+        try {
+          const convForFollowUps = convsRef.current.find((c) => c.id === convId);
+          const msgsForFollowUps = convForFollowUps?.messages ?? [];
+          const idxForFollowUps = placeholderId ? msgsForFollowUps.findIndex((m) => m.id === placeholderId) : msgsForFollowUps.length - 1;
+          const finalMsgForFollowUps = msgsForFollowUps[idxForFollowUps];
+          if (
+            convForFollowUps &&
+            finalMsgForFollowUps &&
+            !finalMsgForFollowUps.error &&
+            finalMsgForFollowUps.content.trim() &&
+            finalMsgForFollowUps.meta?.finishReason !== 'length'
+          ) {
+            const followUps = await suggestFollowUps({
+              model: useModel,
+              history: modelHistory({ ...convForFollowUps, messages: msgsForFollowUps.slice(0, idxForFollowUps + 1) }),
+              signal: ac.signal,
+            });
+            if (!ac.signal.aborted && followUps.length) {
+              setConvs((cs) =>
+                cs.map((c) =>
+                  c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === idxForFollowUps ? { ...m, followUps } : m)) },
+                ),
+              );
+            }
+          }
+        } catch (followUpError) {
+          // Best-effort like the passes above: never take the turn down over this.
+          console.warn('[chat] follow-up suggestions skipped', followUpError);
+        }
+      }
+
       setStreaming(false);
+      setStreamingConvId(null);
       abortRef.current = null;
     },
     [engineUp, model, runningModel, params, onNavigate, status],
@@ -980,11 +1183,39 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setText('');
     setAttachments([]);
     stick.current = true;
+    setAtBottom(true);
 
-    const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+    const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
+
+  // Send a suggested follow-up question straight away (bypassing the composer) —
+  // always appends to the active conversation, which is the only one a
+  // follow-up chip can ever be shown against.
+  const sendFollowUp = useCallback(
+    async (content: string) => {
+      const trimmed = content.trim();
+      if (!trimmed || streaming || compacting) return;
+      if (!engineUp) {
+        onNavigate('engine');
+        return;
+      }
+      const useModel = model || runningModel;
+      if (!useModel) return;
+      const conv = convs.find((c) => c.id === activeId);
+      if (!conv) return;
+      const userMsg: ChatMessage = { role: 'user', content: trimmed };
+      const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+      const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
+      setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
+      stick.current = true;
+    setAtBottom(true);
+      const history: ChatMessage[] = modelHistory(base);
+      await runStream(conv.id, history, 0, asstMsg.id);
+    },
+    [streaming, compacting, engineUp, model, runningModel, convs, activeId, runStream, onNavigate],
+  );
 
   // --- message-level actions (hover toolbar) ---
   const copyMessage = useCallback((m: ChatMessage) => {
@@ -994,19 +1225,19 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   // Delete this message and everything after it (a chat is a strict linear context).
   const deleteFrom = useCallback((convId: string, msgIndex: number) => {
-    setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: c.messages.slice(0, msgIndex) })));
+    setConvs((cs) => cs.map((c) => (c.id !== convId ? c : withMessages(c, c.messages.slice(0, msgIndex)))));
   }, []);
 
   // Fork the conversation up to and including this message into a new chat.
   const branchAt = useCallback((convId: string, msgIndex: number) => {
     const conv = convsRef.current.find((c) => c.id === convId);
     if (!conv) return;
+    const forkMessages = conv.messages.slice(0, msgIndex + 1).map((m) => ({ ...m }));
     const fork: Conversation = {
-      ...conv,
+      ...withMessages(conv, forkMessages),
       id: uid(),
       title: conv.title ? `${conv.title} (branch)` : 'Branch',
       createdAt: Date.now(),
-      messages: conv.messages.slice(0, msgIndex + 1).map((m) => ({ ...m })),
     };
     setConvs((cs) => [fork, ...cs]);
     setActiveId(fork.id);
@@ -1018,9 +1249,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const conv = convsRef.current.find((c) => c.id === convId);
       if (!conv) return;
       const prior = conv.messages.slice(0, msgIndex);
+      const base = withMessages(conv, prior);
       const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
-      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...base, messages: [...prior, asst] })));
+      runStream(convId, modelHistory(base), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
@@ -1034,18 +1266,69 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const msgs = conv.messages.slice();
       msgs[msgIndex] = { ...msgs[msgIndex], content: newText };
       const prior = msgs.slice(0, msgIndex + 1);
+      const base = withMessages(conv, prior);
       const asst: ChatMessage = { role: 'assistant', content: '', id: uid(), model: model || runningModel, meta: {} };
-      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...prior, asst] })));
-      runStream(convId, modelHistory({ ...conv, messages: prior }), 0, asst.id).catch((e) =>
+      setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...base, messages: [...prior, asst] })));
+      runStream(convId, modelHistory(base), 0, asst.id).catch((e) =>
         console.error('[chat] resend run failed', e));
     },
     [model, runningModel, runStream],
   );
 
-  const msgActions = useMemo(
-    () => ({ onCopy: copyMessage, onRegenerate: regenerate, onEdit: editMessage, onDelete: deleteFrom, onBranch: branchAt }),
-    [copyMessage, regenerate, editMessage, deleteFrom, branchAt],
+  // Extend a reply that hit the token limit: replay the context up to and
+  // including the truncated message, plus a hidden nudge to pick up exactly
+  // where it left off, and stream new deltas into the SAME message (no fresh
+  // placeholder) so the bubble grows in place instead of duplicating.
+  const continueMessage = useCallback(
+    (convId: string, msgIndex: number) => {
+      const conv = convsRef.current.find((c) => c.id === convId);
+      if (!conv) return;
+      const target = conv.messages[msgIndex];
+      if (!target || target.role !== 'assistant') return;
+      const upTo = withMessages(conv, conv.messages.slice(0, msgIndex + 1));
+      const history: ChatMessage[] = [
+        ...modelHistory(upTo),
+        { role: 'user', content: 'Continue your previous response exactly where it left off. Do not repeat any text you already wrote, and do not add any preamble or acknowledgement.' },
+      ];
+      runStream(convId, history, 0, target.id).catch((e) => console.error('[chat] continue run failed', e));
+    },
+    [runStream],
   );
+
+  const msgActions = useMemo(
+    () => ({ onCopy: copyMessage, onRegenerate: regenerate, onEdit: editMessage, onDelete: deleteFrom, onBranch: branchAt, onContinue: continueMessage, onFollowUp: sendFollowUp }),
+    [copyMessage, regenerate, editMessage, deleteFrom, branchAt, continueMessage, sendFollowUp],
+  );
+
+  // Presets: named, reusable bundles of sampling + system prompt + thinking.
+  const savePreset = useCallback((name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setPresets((ps) => [...ps.filter((p) => p.name !== trimmed), { id: uid(), name: trimmed, params }]);
+  }, [params]);
+
+  const loadPreset = useCallback(
+    (id: string) => {
+      const p = presets.find((x) => x.id === id);
+      if (p) setParams({ ...p.params });
+    },
+    [presets, setParams],
+  );
+
+  const deletePreset = useCallback((id: string) => {
+    setPresets((ps) => ps.filter((p) => p.id !== id));
+  }, []);
+
+  // Sidebar search: match the conversation title or any message's content.
+  const filteredConvs = useMemo(() => {
+    const q = convSearch.trim().toLowerCase();
+    const matched = q
+      ? convs.filter((c) => c.title.toLowerCase().includes(q) || c.messages.some((m) => m.content.toLowerCase().includes(q)))
+      : convs;
+    // Stable sort: pinned conversations rise to the top without disturbing
+    // relative order within each group.
+    return [...matched].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
+  }, [convs, convSearch]);
 
   // Slash-command interpreter. Returns true if `raw` was a recognized command
   // (so the caller can skip sending it to the engine as a normal message).
@@ -1056,7 +1339,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
       const arg = parts.slice(1).join(' ').trim();
       switch (cmd) {
         case '/clear':
-          if (activeId) setConvs((cs) => cs.map((c) => (c.id === activeId ? { ...c, messages: [] } : c)));
+          if (activeId) setConvs((cs) => cs.map((c) => (c.id === activeId ? withMessages(c, []) : c)));
           else setActiveId(null);
           return true;
         case '/retry': {
@@ -1095,21 +1378,114 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   const stop = () => abortRef.current?.abort();
 
-  const newChat = () => {
+  const newChat = useCallback(() => {
     setActiveId(null);
     setText('');
     setAttachments([]);
     textareaRef.current?.focus();
+  }, []);
+
+  // Ctrl/Cmd+K: jump to a fresh chat from anywhere in the screen.
+  // Ctrl/Cmd+F: open find-in-conversation instead of the browser's own find.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        newChat();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setFindOpen(true);
+        setFindIndex(0);
+        requestAnimationFrame(() => findInputRef.current?.focus());
+      } else if (e.key === 'Escape' && findOpen) {
+        setFindOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [newChat, findOpen]);
+
+  // Delete is soft for 5s: the conversation(s) leave `convs` immediately (so
+  // the sidebar/persistence reflect it right away) but are held in
+  // `pendingDelete` so a misclick (or a bulk delete) can be undone before
+  // they're really gone.
+  const softDelete = (ids: string[]) => {
+    const idSet = new Set(ids);
+    const removed: { conv: Conversation; index: number }[] = [];
+    convs.forEach((c, i) => {
+      if (idSet.has(c.id)) removed.push({ conv: c, index: i });
+    });
+    if (removed.length === 0) return;
+    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+    setConvs((cs) => cs.filter((c) => !idSet.has(c.id)));
+    if (activeId && idSet.has(activeId)) setActiveId(null);
+    setPendingDelete(removed);
+    deleteTimerRef.current = setTimeout(() => setPendingDelete(null), 5000);
   };
 
-  const deleteConv = (id: string) => {
-    setConvs((cs) => cs.filter((c) => c.id !== id));
-    if (activeId === id) setActiveId(null);
+  const deleteConv = (id: string) => softDelete([id]);
+
+  const undoDelete = () => {
+    if (!pendingDelete) return;
+    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+    setConvs((cs) => {
+      const next = cs.slice();
+      // Ascending original-index order so relative positions stay sane.
+      [...pendingDelete]
+        .sort((a, b) => a.index - b.index)
+        .forEach(({ conv, index }) => next.splice(Math.min(index, next.length), 0, conv));
+      return next;
+    });
+    if (pendingDelete.length === 1) setActiveId(pendingDelete[0].conv.id);
+    setPendingDelete(null);
   };
 
-  const onFiles = (files: FileList | null) => {
+  const renameConv = (id: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, title: trimmed } : c)));
+  };
+
+  const togglePin = (id: string) => {
+    setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, pinned: !c.pinned } : c)));
+  };
+
+  const conversationToMarkdown = (conv: Conversation): string => {
+    const lines = [`# ${conv.title || 'Untitled'}`, '', `_${conv.model} · ${new Date(conv.createdAt).toLocaleString()}_`];
+    for (const m of conv.messages) {
+      if (isCompactedMsg(m) || (!m.content && !m.reasoning)) continue;
+      if (m.role === 'user') lines.push('', '### You', '', m.content);
+      else if (m.role === 'assistant') lines.push('', '### Ninfer', '', m.content);
+    }
+    return lines.join('\n');
+  };
+
+  const downloadText = (filename: string, text: string) => {
+    const blob = new Blob([text + '\n'], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const safeFilename = (title: string) => (title || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60);
+
+  const exportConv = (conv: Conversation) => downloadText(`${safeFilename(conv.title)}.md`, conversationToMarkdown(conv));
+
+  const exportConvs = (ids: string[]) => {
+    const selected = convs.filter((c) => ids.includes(c.id));
+    if (selected.length === 0) return;
+    if (selected.length === 1) return exportConv(selected[0]);
+    const text = selected.map(conversationToMarkdown).join('\n\n---\n\n');
+    downloadText(`chats-export-${selected.length}.md`, text);
+  };
+
+  const onFiles = (files: FileList | File[] | null) => {
     if (!files) return;
     for (const f of Array.from(files).slice(0, 4)) {
+      if (!f.type.startsWith('image/') && !f.type.startsWith('video/')) continue;
       if (f.size > 16 * 1024 * 1024) continue;
       const kind: 'image' | 'video' = f.type.startsWith('video') ? 'video' : 'image';
       const reader = new FileReader();
@@ -1124,14 +1500,61 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const messages = active?.messages || [];
   const last = messages[messages.length - 1];
 
+  // Find-in-conversation always sees the full list (a match outside the
+  // rendered window would have no DOM node for scrollIntoView to find), so
+  // opening it bypasses windowing entirely rather than needing special-cased
+  // "expand to reveal this match" logic.
+  const windowingActive = !showAllMessages && !findOpen && messages.length > RECENT_MESSAGE_WINDOW;
+  const visibleStart = windowingActive ? messages.length - RECENT_MESSAGE_WINDOW : 0;
+  const hiddenMessageCount = visibleStart;
+
+  // Find-in-conversation: indices of messages whose content matches the
+  // query, cycled through by findIndex. Message-level, not sub-string
+  // highlighting — injecting <mark> into rendered markdown isn't worth the
+  // complexity for jumping to the right message in a long conversation.
+  const findMatches = useMemo(() => {
+    const q = findQuery.trim().toLowerCase();
+    if (!q) return [] as number[];
+    const out: number[] = [];
+    messages.forEach((m, i) => {
+      if (m.content.toLowerCase().includes(q)) out.push(i);
+    });
+    return out;
+  }, [messages, findQuery]);
+
+  const jumpToFindMatch = (dir: 1 | -1) => {
+    if (findMatches.length === 0) return;
+    const next = (((findIndex + dir) % findMatches.length) + findMatches.length) % findMatches.length;
+    setFindIndex(next);
+    document.getElementById(`msg-${findMatches[next]}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  // A fresh query always starts back at its first match.
+  useEffect(() => {
+    setFindIndex(0);
+    if (findMatches.length > 0) {
+      document.getElementById(`msg-${findMatches[0]}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findQuery]);
+
   // Context-limit indicator: token usage of the latest completed request vs
   // the --max-context of the engine actually serving this chat's model (not
   // just the first/primary engine) — matters once more than one engine with
   // a different context size is running. Falls back to the primary engine
   // when the model isn't found among the known engines yet.
   const ctxLimit = allEngines.find((e) => e.modelId === (model || runningModel))?.maxContext ?? status?.engine?.maxContext ?? null;
-  const lastMeta =
-    [...messages].reverse().find((m) => m.role === 'assistant' && m.meta && (m.meta.promptTokens || m.meta.completionTokens))?.meta ?? null;
+  // A backward scan instead of `[...messages].reverse().find(...)` — the
+  // spread+reverse copied the whole conversation's message array on every
+  // single streamed token (onContentDelta re-renders this component per
+  // delta), which gets expensive fast in a long-running conversation.
+  const lastMeta = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === 'assistant' && m.meta && (m.meta.promptTokens || m.meta.completionTokens)) return m.meta;
+    }
+    return null;
+  }, [messages]);
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
@@ -1141,34 +1564,194 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             {/* conversation rail */}
             <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
         <div className="p-2.5">
-          <Button variant="primary" size="sm" className="w-full" onClick={newChat}>
+          <Button variant="primary" size="sm" className="w-full" onClick={newChat} title="New chat (Ctrl/Cmd+K)">
             <Plus size={14} /> new chat
           </Button>
         </div>
+        {convs.length > 0 && (
+          <div className="px-2.5 pb-2">
+            <div className="flex items-center gap-1.5">
+              <div className="relative min-w-0 flex-1">
+                <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+                <input
+                  value={convSearch}
+                  onChange={(e) => setConvSearch(e.target.value)}
+                  placeholder="Search chats…"
+                  className="w-full rounded-lg border border-line bg-inset py-1.5 pl-7 pr-2.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectMode((v) => !v);
+                  setSelectedIds(new Set());
+                }}
+                className="shrink-0 rounded-md px-2 py-1.5 text-[11.5px] font-medium text-faint hover:bg-panel2 hover:text-ink"
+              >
+                {selectMode ? 'Cancel' : 'Select'}
+              </button>
+            </div>
+          </div>
+        )}
+        {selectMode && selectedIds.size > 0 && (
+          <div className="mx-2.5 mb-2 flex items-center justify-between gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-1.5 text-[11.5px] text-mute">
+            <span>{selectedIds.size} selected</span>
+            <div className="flex items-center gap-2.5">
+              <button type="button" onClick={() => exportConvs([...selectedIds])} className="font-medium text-ink hover:text-accent">
+                Export
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  softDelete([...selectedIds]);
+                  setSelectedIds(new Set());
+                  setSelectMode(false);
+                }}
+                className="font-medium text-danger hover:underline"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        )}
         <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-          {convs.length === 0 && <p className="px-2 py-3 text-[12px] leading-relaxed text-faint">No conversations yet. Start one below — everything runs locally against the NInfer engine.</p>}
-          {convs.map((c) => (
+          {filteredConvs.length === 0 && (
+            <p className="px-2 py-3 text-[12px] leading-relaxed text-faint">
+              {convs.length === 0 ? 'No conversations yet. Start one below — everything runs locally against the NInfer engine.' : 'No chats match your search.'}
+            </p>
+          )}
+          {filteredConvs.map((c) => (
             <div
               key={c.id}
-              onClick={() => setActiveId(c.id)}
+              tabIndex={0}
+              role="button"
+              aria-current={c.id === activeId || undefined}
+              onClick={() => {
+                if (renamingId === c.id) return;
+                if (selectMode) {
+                  setSelectedIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(c.id)) next.delete(c.id);
+                    else next.add(c.id);
+                    return next;
+                  });
+                } else {
+                  setActiveId(c.id);
+                }
+              }}
+              onKeyDown={(e) => {
+                // Ignore keydowns bubbling up from the rename input or the
+                // pin/rename/export/delete buttons — only act when the row
+                // itself is the focused element.
+                if (e.target !== e.currentTarget) return;
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  e.currentTarget.click();
+                } else if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  (e.currentTarget.nextElementSibling as HTMLElement | null)?.focus();
+                } else if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  (e.currentTarget.previousElementSibling as HTMLElement | null)?.focus();
+                }
+              }}
               className={cn(
-                'group mb-1 cursor-pointer rounded-lg border px-2.5 py-2 transition-colors',
+                'group mb-1 cursor-pointer rounded-lg border px-2.5 py-2 transition-colors focus-visible:outline-2 focus-visible:outline-accent/60',
                 c.id === activeId ? 'border-accent/30 bg-accent/8' : 'border-transparent hover:border-line hover:bg-panel2',
               )}
             >
               <div className="flex items-center gap-1.5">
-                <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink">{c.title || 'Untitled'}</span>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteConv(c.id);
-                  }}
-                  className="rounded p-0.5 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
-                  title="Delete conversation"
-                >
-                  <Trash2 size={12} />
-                </button>
+                {selectMode && (
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => {}}
+                    className="shrink-0 accent-accent"
+                    aria-label={`Select ${c.title || 'Untitled'}`}
+                  />
+                )}
+                {renamingId === c.id ? (
+                  <input
+                    autoFocus
+                    value={renameDraft}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onBlur={() => {
+                      renameConv(c.id, renameDraft);
+                      setRenamingId(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        renameConv(c.id, renameDraft);
+                        setRenamingId(null);
+                      } else if (e.key === 'Escape') {
+                        setRenamingId(null);
+                      }
+                    }}
+                    className="min-w-0 flex-1 rounded border border-accent/40 bg-inset px-1.5 py-0.5 text-[12.5px] font-medium text-ink focus:outline-none"
+                  />
+                ) : (
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink">
+                    {c.pinned && <Pin size={10} className="mr-1 inline text-accent" />}
+                    {c.title || 'Untitled'}
+                  </span>
+                )}
+                {!selectMode && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        togglePin(c.id);
+                      }}
+                      className={cn(
+                        'rounded p-0.5 text-faint hover:text-accent',
+                        c.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                      )}
+                      title={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                      aria-label={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                    >
+                      {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenameDraft(c.title || '');
+                        setRenamingId(c.id);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                      title="Rename conversation"
+                      aria-label="Rename conversation"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        exportConv(c);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                      title="Export conversation (Markdown)"
+                      aria-label="Export conversation as Markdown"
+                    >
+                      <Download size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteConv(c.id);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
+                      title="Delete conversation"
+                      aria-label="Delete conversation"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </>
+                )}
               </div>
               <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-faint">
                 <span>{formatTime(c.createdAt)}</span>
@@ -1180,6 +1763,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           ))}
         </div>
+        {pendingDelete && (
+          <div className="m-2 flex items-center justify-between gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-2 text-[11.5px] text-mute">
+            <span className="truncate">
+              {pendingDelete.length === 1 ? `Deleted "${pendingDelete[0].conv.title || 'Untitled'}"` : `Deleted ${pendingDelete.length} conversations`}
+            </span>
+            <button type="button" onClick={undoDelete} className="shrink-0 font-medium text-accent hover:underline">
+              Undo
+            </button>
+          </div>
+        )}
       </aside>
 
       {/* chat column */}
@@ -1204,14 +1797,50 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
           </div>
         )}
 
+        <div className="relative min-h-0 flex-1">
+        {findOpen && (
+          <div className="absolute right-3 top-3 z-20 flex items-center gap-1.5 rounded-lg border border-line bg-panel px-2 py-1.5 shadow-lg">
+            <Search size={13} className="text-faint" />
+            <input
+              ref={findInputRef}
+              value={findQuery}
+              onChange={(e) => setFindQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  jumpToFindMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === 'Escape') {
+                  setFindOpen(false);
+                }
+              }}
+              placeholder="Find in conversation…"
+              className="w-48 bg-transparent text-[12.5px] text-ink placeholder:text-faint focus:outline-none"
+            />
+            <span className="whitespace-nowrap text-[11px] text-faint">
+              {findQuery.trim() ? (findMatches.length > 0 ? `${findIndex + 1}/${findMatches.length}` : '0/0') : ''}
+            </span>
+            <ActionBtn title="Previous match" onClick={() => jumpToFindMatch(-1)} disabled={findMatches.length === 0}>
+              <ChevronUp size={13} />
+            </ActionBtn>
+            <ActionBtn title="Next match" onClick={() => jumpToFindMatch(1)} disabled={findMatches.length === 0}>
+              <ChevronDown size={13} />
+            </ActionBtn>
+            <ActionBtn title="Close find" onClick={() => setFindOpen(false)}>
+              <X size={13} />
+            </ActionBtn>
+          </div>
+        )}
         <div
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
-            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            const s = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            stick.current = s;
+            setAtBottom(s);
           }}
-          className="min-h-0 flex-1 overflow-y-auto px-5 py-4"
+          className="h-full overflow-y-auto px-5 py-4"
         >
+          <div ref={contentRef}>
           {messages.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-accent/30 bg-accent/10">
@@ -1237,26 +1866,59 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </div>
             </div>
           ) : (
-            <div className="mx-auto flex max-w-3xl flex-col gap-5">
-              {messages.map((m, i) => {
-                if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
-                const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
-                return (
-                  <Fragment key={i}>
-                    {showDivider && <CompactDivider />}
-                    <MessageRow
-                      m={m}
-                      convId={activeId ?? ''}
-                      index={i}
-                      streaming={streaming && i === messages.length - 1}
-                      locked={streaming || compacting}
-                      actions={msgActions}
-                    />
-                  </Fragment>
-                );
-              })}
-            </div>
+            <Suspense fallback={null}>
+              <div className="mx-auto flex max-w-3xl flex-col gap-5">
+                {hiddenMessageCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllMessages(true)}
+                    className="mx-auto rounded-full border border-line bg-panel px-3 py-1.5 text-[11.5px] text-mute hover:border-accent/40 hover:text-ink"
+                  >
+                    Show {hiddenMessageCount} earlier message{hiddenMessageCount === 1 ? '' : 's'}
+                  </button>
+                )}
+                {messages.slice(visibleStart).map((m, sliceI) => {
+                  const i = visibleStart + sliceI;
+                  if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                  const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
+                  return (
+                    <Fragment key={i}>
+                      {showDivider && <CompactDivider />}
+                      <div id={`msg-${i}`}>
+                        <MessageRow
+                          m={m}
+                          convId={activeId ?? ''}
+                          index={i}
+                          isLast={i === messages.length - 1}
+                          streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
+                          locked={streaming || compacting}
+                          actions={msgActions}
+                        />
+                      </div>
+                    </Fragment>
+                  );
+                })}
+              </div>
+            </Suspense>
           )}
+          </div>
+        </div>
+        {!atBottom && messages.length > 0 && (
+          <button
+            type="button"
+            onClick={() => {
+              stick.current = true;
+              setAtBottom(true);
+              const el = scrollRef.current;
+              if (el) el.scrollTop = el.scrollHeight;
+            }}
+            title="Jump to latest"
+            aria-label="Jump to latest message"
+            className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-line bg-panel px-3 py-1.5 text-[11.5px] text-mute shadow-lg transition-colors hover:border-accent/40 hover:text-ink"
+          >
+            <ChevronDown size={13} /> jump to latest
+          </button>
+        )}
         </div>
 
         {/* composer */}
@@ -1269,7 +1931,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                     <img src={a.dataUrl} alt="" className="h-7 w-7 rounded border border-line object-cover" />
                   ) : a.kind === 'image' ? '🖼' : '🎞'}
                   <span className="max-w-[140px] truncate">{a.name}</span>
-                  <button type="button" onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))} className="text-faint hover:text-danger">
+                  <button type="button" onClick={() => setAttachments((x) => x.filter((_, j) => j !== i))} aria-label={`Remove attachment ${a.name}`} className="text-faint hover:text-danger">
                     <X size={12} />
                   </button>
                 </span>
@@ -1291,7 +1953,22 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </button>
             </div>
           )}
-          <div className="relative rounded-xl border border-line bg-inset focus-within:border-accent/50">
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              onFiles(e.dataTransfer.files);
+            }}
+            className={cn(
+              'relative rounded-xl border bg-inset transition-colors focus-within:border-accent/50',
+              dragOver ? 'border-accent/60' : 'border-line',
+            )}
+          >
             {text.startsWith('/') &&
               (() => {
                 const token = text.split(/\s/)[0].toLowerCase();
@@ -1330,6 +2007,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   if (!streaming && !compacting) send();
                 }
               }}
+              onPaste={(e) => {
+                const files = Array.from(e.clipboardData?.items || [])
+                  .filter((it) => it.kind === 'file')
+                  .map((it) => it.getAsFile())
+                  .filter((f): f is File => !!f);
+                if (files.length) {
+                  e.preventDefault();
+                  onFiles(files);
+                }
+              }}
               placeholder={engineUp ? `Message ${model || 'engine'}…  (Enter to send, Shift+Enter for newline)` : 'Engine is offline — open the Engine tab to start it'}
               className="max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
             />
@@ -1339,6 +2026,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 type="button"
                 onClick={() => fileRef.current?.click()}
                 title="Attach image or video (vision must be enabled on the engine)"
+                aria-label="Attach image or video"
                 className="rounded-md p-1.5 text-mute hover:bg-panel2 hover:text-ink"
               >
                 <Paperclip size={15} />
@@ -1361,7 +2049,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 </button>
               )}
               <span className="ml-auto" />
-              {streaming || compacting ? (
+              {streamingConvId && streamingConvId !== activeId ? (
+                <Button variant="ghost" size="sm" disabled title="The engine is generating a reply in another chat">
+                  <Square size={12} /> busy elsewhere
+                </Button>
+              ) : streaming || compacting ? (
                 <Button variant="danger" size="sm" onClick={stop}>
                   <Square size={12} /> {compacting ? 'stop compact' : 'stop'}
                 </Button>
@@ -1373,7 +2065,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
             {paramsOpen && (
               <div className="absolute bottom-full left-2 mb-2 z-30">
-                <ParamsPopover params={params} setParams={setParams} open={paramsOpen} setOpen={setParamsOpen} disabled={streaming} />
+                <ParamsPopover
+                  params={params}
+                  setParams={setParams}
+                  open={paramsOpen}
+                  setOpen={setParamsOpen}
+                  disabled={streaming}
+                  presets={presets}
+                  onSavePreset={savePreset}
+                  onLoadPreset={loadPreset}
+                  onDeletePreset={deletePreset}
+                />
               </div>
             )}
           </div>

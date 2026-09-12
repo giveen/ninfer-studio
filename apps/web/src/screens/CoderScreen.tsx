@@ -3,7 +3,12 @@ import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, Che
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
-import { Markdown } from '../components/Markdown';
+// Dynamically imported: react-markdown + remark-gfm + highlight.js is a
+// ~300KB chunk that costs nothing at startup this way, only when the first
+// completed reply actually needs to render (see ChatScreen.tsx, which shares
+// this same lazy module — both must use dynamic import or Rollup folds the
+// chunk back into the eager bundle for both).
+const Markdown = lazy(() => import('../components/Markdown'));
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
@@ -574,7 +579,9 @@ function ReportBlock({ message }: { message: ChatMessage }) {
       </button>
       {open && message.content && (
         <div className="markdown border-t border-line px-3 py-2 text-[13.5px] leading-relaxed">
-          <Markdown>{message.content}</Markdown>
+          <Suspense fallback={null}>
+            <Markdown>{message.content}</Markdown>
+          </Suspense>
         </div>
       )}
     </div>
@@ -606,7 +613,7 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
               )}
               {m.content && m.role !== 'tool' && (
                 m.role === 'assistant'
-                  ? <div className="markdown text-[12px] leading-relaxed"><Markdown>{m.content}</Markdown></div>
+                  ? <div className="markdown text-[12px] leading-relaxed"><Suspense fallback={null}><Markdown>{m.content}</Markdown></Suspense></div>
                   : <div className="break-words text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (
@@ -3511,6 +3518,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // run back to fix at most MAX_CRITIC times before we give up and finish (M6).
     const MAX_CRITIC = 2;
     let criticBudget = 0;
+    // Bounded auto-continue: a final (non-tool-call) reply that hit the token
+    // cap gets nudged to pick up where it left off, same as a Verify/Critic
+    // bounce — the run is autonomous, so this stays consistent with how every
+    // other "not actually done yet" case here is handled, rather than
+    // stranding a half-finished answer for the user to notice and resume by hand.
+    const MAX_CONTINUE = 4;
+    let continueCount = 0;
     // The original user task — used as the critic's review context.
     const taskText = [...initialMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
     // Derive the response budget from the engine's context window so a small
@@ -3605,7 +3619,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let content = '';
         let reasoning = '';
         let toolCalls: AgentToolCall[] = [];
-        
+        let finishReason: string | undefined;
+
         // Plan mode advertises read-only tools only; the permission gate in
         // handleToolCalls enforces it even if the model tries otherwise.
         // Plan mode keeps read-only tools PLUS bash (enforced to inspection
@@ -3629,6 +3644,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           content = '';
           reasoning = '';
           toolCalls = [];
+          finishReason = undefined;
           try {
             await trackedStream(req, abortRef.current.signal, 'agent', {
               onContentDelta: (text) => { content += text; },
@@ -3640,6 +3656,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 // across turns even when usage is omitted (M3). Pinned to the
                 // run — the visible meter may follow a different conversation.
                 noteRunTokens(meta?.promptTokens ?? est);
+                finishReason = meta?.finishReason;
               },
             });
             streamOk = true;
@@ -3755,6 +3772,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             addLog({ type: 'ask', label: 'ask_user', detail: q });
             return;
           }
+        } else if (finishReason === 'length' && continueCount < MAX_CONTINUE) {
+          // The final reply hit the token cap before finishing — nudge it to
+          // pick up exactly where it left off instead of declaring the run
+          // done on a half-written answer. Skips Verify/Critic this iteration;
+          // they run once a genuinely complete reply lands.
+          continueCount++;
+          addLog({ type: 'error', label: 'continue', detail: `reply hit the token limit — continuing (${continueCount}/${MAX_CONTINUE})` });
+          currentMessages = [...currentMessages, {
+            role: 'user',
+            displayName: 'Continue',
+            collapsed: true,
+            content: 'Continue your previous response exactly where it left off. Do not repeat any text you already wrote, and do not add any preamble or acknowledgement.',
+          }];
+          updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
+          continue;
         } else {
           // Verification gate: before declaring done, confirm lint/test pass. If
           // they fail, send the run back to fix them (bounded by MAX_REPAIR) rather
@@ -4853,7 +4885,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                     ) : null}
                     {g.items[0].content && (
                       g.items[0].role === 'assistant' || g.items[0].displayName
-                        ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
+                        ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown>{g.items[0].content}</Markdown></Suspense></div>
                         : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
                     )}
                   </div>
