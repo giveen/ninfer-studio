@@ -3,6 +3,7 @@ import {
   BrainCircuit,
   ChevronDown,
   ChevronsRight,
+  ChevronUp,
   Copy,
   Download,
   Gauge,
@@ -716,6 +717,14 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [dragOver, setDragOver] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<{ conv: Conversation; index: number }[] | null>(null);
+  const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findIndex, setFindIndex] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
@@ -820,7 +829,11 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   useEffect(() => {
     stick.current = true;
     setAtBottom(true);
+    setFindOpen(false);
+    setFindQuery('');
   }, [activeId]);
+
+  useEffect(() => () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); }, []);
 
   const runCompact = useCallback(async () => {
     if (compacting) return;
@@ -1360,20 +1373,58 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   }, []);
 
   // Ctrl/Cmd+K: jump to a fresh chat from anywhere in the screen.
+  // Ctrl/Cmd+F: open find-in-conversation instead of the browser's own find.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         newChat();
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setFindOpen(true);
+        setFindIndex(0);
+        requestAnimationFrame(() => findInputRef.current?.focus());
+      } else if (e.key === 'Escape' && findOpen) {
+        setFindOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [newChat]);
+  }, [newChat, findOpen]);
 
-  const deleteConv = (id: string) => {
-    setConvs((cs) => cs.filter((c) => c.id !== id));
-    if (activeId === id) setActiveId(null);
+  // Delete is soft for 5s: the conversation(s) leave `convs` immediately (so
+  // the sidebar/persistence reflect it right away) but are held in
+  // `pendingDelete` so a misclick (or a bulk delete) can be undone before
+  // they're really gone.
+  const softDelete = (ids: string[]) => {
+    const idSet = new Set(ids);
+    const removed: { conv: Conversation; index: number }[] = [];
+    convs.forEach((c, i) => {
+      if (idSet.has(c.id)) removed.push({ conv: c, index: i });
+    });
+    if (removed.length === 0) return;
+    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+    setConvs((cs) => cs.filter((c) => !idSet.has(c.id)));
+    if (activeId && idSet.has(activeId)) setActiveId(null);
+    setPendingDelete(removed);
+    deleteTimerRef.current = setTimeout(() => setPendingDelete(null), 5000);
+  };
+
+  const deleteConv = (id: string) => softDelete([id]);
+
+  const undoDelete = () => {
+    if (!pendingDelete) return;
+    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
+    setConvs((cs) => {
+      const next = cs.slice();
+      // Ascending original-index order so relative positions stay sane.
+      [...pendingDelete]
+        .sort((a, b) => a.index - b.index)
+        .forEach(({ conv, index }) => next.splice(Math.min(index, next.length), 0, conv));
+      return next;
+    });
+    if (pendingDelete.length === 1) setActiveId(pendingDelete[0].conv.id);
+    setPendingDelete(null);
   };
 
   const renameConv = (id: string, title: string) => {
@@ -1386,20 +1437,36 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     setConvs((cs) => cs.map((c) => (c.id === id ? { ...c, pinned: !c.pinned } : c)));
   };
 
-  const exportConv = (conv: Conversation) => {
+  const conversationToMarkdown = (conv: Conversation): string => {
     const lines = [`# ${conv.title || 'Untitled'}`, '', `_${conv.model} · ${new Date(conv.createdAt).toLocaleString()}_`];
     for (const m of conv.messages) {
       if (isCompactedMsg(m) || (!m.content && !m.reasoning)) continue;
       if (m.role === 'user') lines.push('', '### You', '', m.content);
       else if (m.role === 'assistant') lines.push('', '### Ninfer', '', m.content);
     }
-    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/markdown' });
+    return lines.join('\n');
+  };
+
+  const downloadText = (filename: string, text: string) => {
+    const blob = new Blob([text + '\n'], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${(conv.title || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60)}.md`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const safeFilename = (title: string) => (title || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60);
+
+  const exportConv = (conv: Conversation) => downloadText(`${safeFilename(conv.title)}.md`, conversationToMarkdown(conv));
+
+  const exportConvs = (ids: string[]) => {
+    const selected = convs.filter((c) => ids.includes(c.id));
+    if (selected.length === 0) return;
+    if (selected.length === 1) return exportConv(selected[0]);
+    const text = selected.map(conversationToMarkdown).join('\n\n---\n\n');
+    downloadText(`chats-export-${selected.length}.md`, text);
   };
 
   const onFiles = (files: FileList | File[] | null) => {
@@ -1419,6 +1486,36 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
 
   const messages = active?.messages || [];
   const last = messages[messages.length - 1];
+
+  // Find-in-conversation: indices of messages whose content matches the
+  // query, cycled through by findIndex. Message-level, not sub-string
+  // highlighting — injecting <mark> into rendered markdown isn't worth the
+  // complexity for jumping to the right message in a long conversation.
+  const findMatches = useMemo(() => {
+    const q = findQuery.trim().toLowerCase();
+    if (!q) return [] as number[];
+    const out: number[] = [];
+    messages.forEach((m, i) => {
+      if (m.content.toLowerCase().includes(q)) out.push(i);
+    });
+    return out;
+  }, [messages, findQuery]);
+
+  const jumpToFindMatch = (dir: 1 | -1) => {
+    if (findMatches.length === 0) return;
+    const next = (((findIndex + dir) % findMatches.length) + findMatches.length) % findMatches.length;
+    setFindIndex(next);
+    document.getElementById(`msg-${findMatches[next]}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  // A fresh query always starts back at its first match.
+  useEffect(() => {
+    setFindIndex(0);
+    if (findMatches.length > 0) {
+      document.getElementById(`msg-${findMatches[0]}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findQuery]);
 
   // Context-limit indicator: token usage of the latest completed request vs
   // the --max-context of the engine actually serving this chat's model (not
@@ -1452,14 +1549,47 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         </div>
         {convs.length > 0 && (
           <div className="px-2.5 pb-2">
-            <div className="relative">
-              <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
-              <input
-                value={convSearch}
-                onChange={(e) => setConvSearch(e.target.value)}
-                placeholder="Search chats…"
-                className="w-full rounded-lg border border-line bg-inset py-1.5 pl-7 pr-2.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-              />
+            <div className="flex items-center gap-1.5">
+              <div className="relative min-w-0 flex-1">
+                <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+                <input
+                  value={convSearch}
+                  onChange={(e) => setConvSearch(e.target.value)}
+                  placeholder="Search chats…"
+                  className="w-full rounded-lg border border-line bg-inset py-1.5 pl-7 pr-2.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectMode((v) => !v);
+                  setSelectedIds(new Set());
+                }}
+                className="shrink-0 rounded-md px-2 py-1.5 text-[11.5px] font-medium text-faint hover:bg-panel2 hover:text-ink"
+              >
+                {selectMode ? 'Cancel' : 'Select'}
+              </button>
+            </div>
+          </div>
+        )}
+        {selectMode && selectedIds.size > 0 && (
+          <div className="mx-2.5 mb-2 flex items-center justify-between gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-1.5 text-[11.5px] text-mute">
+            <span>{selectedIds.size} selected</span>
+            <div className="flex items-center gap-2.5">
+              <button type="button" onClick={() => exportConvs([...selectedIds])} className="font-medium text-ink hover:text-accent">
+                Export
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  softDelete([...selectedIds]);
+                  setSelectedIds(new Set());
+                  setSelectMode(false);
+                }}
+                className="font-medium text-danger hover:underline"
+              >
+                Delete
+              </button>
             </div>
           </div>
         )}
@@ -1475,7 +1605,19 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               tabIndex={0}
               role="button"
               aria-current={c.id === activeId || undefined}
-              onClick={() => renamingId !== c.id && setActiveId(c.id)}
+              onClick={() => {
+                if (renamingId === c.id) return;
+                if (selectMode) {
+                  setSelectedIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(c.id)) next.delete(c.id);
+                    else next.add(c.id);
+                    return next;
+                  });
+                } else {
+                  setActiveId(c.id);
+                }
+              }}
               onKeyDown={(e) => {
                 // Ignore keydowns bubbling up from the rename input or the
                 // pin/rename/export/delete buttons — only act when the row
@@ -1483,7 +1625,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                 if (e.target !== e.currentTarget) return;
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  setActiveId(c.id);
+                  e.currentTarget.click();
                 } else if (e.key === 'ArrowDown') {
                   e.preventDefault();
                   (e.currentTarget.nextElementSibling as HTMLElement | null)?.focus();
@@ -1498,6 +1640,15 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               )}
             >
               <div className="flex items-center gap-1.5">
+                {selectMode && (
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => {}}
+                    className="shrink-0 accent-accent"
+                    aria-label={`Select ${c.title || 'Untitled'}`}
+                  />
+                )}
                 {renamingId === c.id ? (
                   <input
                     autoFocus
@@ -1524,58 +1675,62 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                     {c.title || 'Untitled'}
                   </span>
                 )}
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    togglePin(c.id);
-                  }}
-                  className={cn(
-                    'rounded p-0.5 text-faint hover:text-accent',
-                    c.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
-                  )}
-                  title={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
-                  aria-label={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
-                >
-                  {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setRenameDraft(c.title || '');
-                    setRenamingId(c.id);
-                  }}
-                  className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
-                  title="Rename conversation"
-                  aria-label="Rename conversation"
-                >
-                  <Pencil size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    exportConv(c);
-                  }}
-                  className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
-                  title="Export conversation (Markdown)"
-                  aria-label="Export conversation as Markdown"
-                >
-                  <Download size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteConv(c.id);
-                  }}
-                  className="rounded p-0.5 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
-                  title="Delete conversation"
-                  aria-label="Delete conversation"
-                >
-                  <Trash2 size={12} />
-                </button>
+                {!selectMode && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        togglePin(c.id);
+                      }}
+                      className={cn(
+                        'rounded p-0.5 text-faint hover:text-accent',
+                        c.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
+                      )}
+                      title={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                      aria-label={c.pinned ? 'Unpin conversation' : 'Pin conversation'}
+                    >
+                      {c.pinned ? <PinOff size={12} /> : <Pin size={12} />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenameDraft(c.title || '');
+                        setRenamingId(c.id);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                      title="Rename conversation"
+                      aria-label="Rename conversation"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        exportConv(c);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
+                      title="Export conversation (Markdown)"
+                      aria-label="Export conversation as Markdown"
+                    >
+                      <Download size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteConv(c.id);
+                      }}
+                      className="rounded p-0.5 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
+                      title="Delete conversation"
+                      aria-label="Delete conversation"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </>
+                )}
               </div>
               <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-faint">
                 <span>{formatTime(c.createdAt)}</span>
@@ -1587,6 +1742,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
           ))}
         </div>
+        {pendingDelete && (
+          <div className="m-2 flex items-center justify-between gap-2 rounded-lg border border-line bg-panel2 px-2.5 py-2 text-[11.5px] text-mute">
+            <span className="truncate">
+              {pendingDelete.length === 1 ? `Deleted "${pendingDelete[0].conv.title || 'Untitled'}"` : `Deleted ${pendingDelete.length} conversations`}
+            </span>
+            <button type="button" onClick={undoDelete} className="shrink-0 font-medium text-accent hover:underline">
+              Undo
+            </button>
+          </div>
+        )}
       </aside>
 
       {/* chat column */}
@@ -1612,6 +1777,38 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         )}
 
         <div className="relative min-h-0 flex-1">
+        {findOpen && (
+          <div className="absolute right-3 top-3 z-20 flex items-center gap-1.5 rounded-lg border border-line bg-panel px-2 py-1.5 shadow-lg">
+            <Search size={13} className="text-faint" />
+            <input
+              ref={findInputRef}
+              value={findQuery}
+              onChange={(e) => setFindQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  jumpToFindMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === 'Escape') {
+                  setFindOpen(false);
+                }
+              }}
+              placeholder="Find in conversation…"
+              className="w-48 bg-transparent text-[12.5px] text-ink placeholder:text-faint focus:outline-none"
+            />
+            <span className="whitespace-nowrap text-[11px] text-faint">
+              {findQuery.trim() ? (findMatches.length > 0 ? `${findIndex + 1}/${findMatches.length}` : '0/0') : ''}
+            </span>
+            <ActionBtn title="Previous match" onClick={() => jumpToFindMatch(-1)} disabled={findMatches.length === 0}>
+              <ChevronUp size={13} />
+            </ActionBtn>
+            <ActionBtn title="Next match" onClick={() => jumpToFindMatch(1)} disabled={findMatches.length === 0}>
+              <ChevronDown size={13} />
+            </ActionBtn>
+            <ActionBtn title="Close find" onClick={() => setFindOpen(false)}>
+              <X size={13} />
+            </ActionBtn>
+          </div>
+        )}
         <div
           ref={scrollRef}
           onScroll={(e) => {
@@ -1656,15 +1853,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                   return (
                     <Fragment key={i}>
                       {showDivider && <CompactDivider />}
-                      <MessageRow
-                        m={m}
-                        convId={activeId ?? ''}
-                        index={i}
-                        isLast={i === messages.length - 1}
-                        streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
-                        locked={streaming || compacting}
-                        actions={msgActions}
-                      />
+                      <div id={`msg-${i}`}>
+                        <MessageRow
+                          m={m}
+                          convId={activeId ?? ''}
+                          index={i}
+                          isLast={i === messages.length - 1}
+                          streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
+                          locked={streaming || compacting}
+                          actions={msgActions}
+                        />
+                      </div>
                     </Fragment>
                   );
                 })}
