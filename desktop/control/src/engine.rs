@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-07-28
 
-use crate::types::{build_serve_args, AppEvent, EngineInner, EngineProfile, LastStart, State, now_ms};
+use crate::types::{build_serve_args, AppEvent, EngineInner, EngineProfile, EngineState, LastStart, State, now_ms};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -286,45 +286,41 @@ pub async fn refresh_engine_status(state: &State) {
         Err(_) => true,
     };
     let mut eng = state.engine.write().await;
-    let prev_state = eng.state.clone();
+    let prev_state = eng.state;
 
     if has_child {
         if let Some(port) = eng.port {
             if engine_health(port).await {
-                if eng.state != "running" {
-                    eng.state = "running".into();
+                if eng.state != EngineState::Running {
+                    eng.state = EngineState::Running;
                     if eng.model_id.is_none() {
                         let (mid, mctx) = engine_model_info(state, port).await;
-                        eng.model_id = mid;
-                        eng.max_context = mctx;
+                        eng.assign_model_info(mid, mctx);
                     }
                 }
-            } else if eng.state == "starting" && eng.deadline.is_none() {
+            } else if eng.state == EngineState::Starting && eng.deadline.is_none() {
                 eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
             }
         }
-    } else if eng.state == "starting" || eng.state == "running" {
-        eng.state = "failed".into();
-        eng.fail_reason = Some("engine process exited".into());
+    } else if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+        eng.mark_exited();
     }
 
-    if eng.state == "starting" {
+    if eng.state == EngineState::Starting {
         if let Some(deadline) = eng.deadline {
             if now_ms() > deadline {
-                eng.state = "failed".into();
-                eng.fail_reason =
-                    Some(start_timeout_message());
+                eng.mark_failed(start_timeout_message());
             }
         }
     }
 
-    if eng.state == "stopped" {
+    if eng.state == EngineState::Stopped {
         if let Some(port) = eng.port {
             if engine_health(port).await {
                 adopt_external(&mut eng, state, port).await;
             }
         }
-    } else if eng.state == "failed" && !has_child {
+    } else if eng.state == EngineState::Failed && !has_child {
         // a failed spawn must not mask a live engine: if the spawn targeted a
         // non-configured port and the configured port serves, restore its view
         let cfg_port = state.config.read().await.engine_port;
@@ -338,47 +334,42 @@ pub async fn refresh_engine_status(state: &State) {
                 adopt_external(&mut eng, state, port).await;
             }
         }
-    } else if eng.state == "external" {
+    } else if eng.state == EngineState::External {
         if let Some(port) = eng.port {
             if engine_health(port).await {
-                // keep pid + argv fresh (the external process may restart)
-                let pid = discover_engines()
-                    .await
-                    .into_iter()
-                    .find(|d| d.port == Some(port))
-                    .map(|d| d.pid);
-                if let Some(p) = pid {
+                // keep pid fresh (the external process may restart) — same-port
+                // policy as adoption, never a cross-port pid.
+                let all = discover_engines().await;
+                let cfg_port = state.config.read().await.engine_port;
+                if let Some(p) = resolve_external_pid(&all, Some(port), cfg_port) {
                     eng.pid = Some(p);
                 }
                 if eng.model_id.is_none() {
                     let (mid, mctx) = engine_model_info(state, port).await;
-                        eng.model_id = mid;
-                        eng.max_context = mctx;
+                    eng.assign_model_info(mid, mctx);
                 }
             } else {
-                eng.state = "stopped".into();
-                eng.adopted = false;
-                eng.pid = None;
+                eng.reset_stopped();
                 eng.argv = None;
             }
         }
     }
 
     // Edge-triggered desktop-shell events (tray state + OS notifications).
-    let new_state = eng.state.clone();
+    let new_state = eng.state;
     drop(eng);
     if new_state != prev_state {
-        match new_state.as_str() {
-            "running" => {
+        match new_state {
+            EngineState::Running => {
                 let model = state.engine.read().await.model_id.clone();
                 let port = state.config.read().await.engine_port;
                 state.emit(AppEvent::EngineReady { model, port });
             }
-            "failed" => {
+            EngineState::Failed => {
                 let reason = state.engine.read().await.fail_reason.clone();
                 state.emit(AppEvent::EngineFailed { reason });
             }
-            "stopped" => {
+            EngineState::Stopped => {
                 state.emit(AppEvent::EngineStopped);
             }
             _ => {}
@@ -484,34 +475,53 @@ pub async fn vram_status(data_dir: &std::path::Path, port: u16) -> Option<(f64, 
     .unwrap_or(None)
 }
 
+/// Cross-port fallback policy (ONE place — adopt and stop share it): the pid
+/// recorded/signaled for a port is the process discovered ON that port. The
+/// only fallback is a portless discovery (listener unattributable, e.g.
+/// netstat failed) and only when the port is the configured default — never
+/// a process bound to a *different* port, which would record (and later let
+/// Stop kill) somebody else's engine.
+fn resolve_external_pid(all: &[DiscoveredEngine], port: Option<u16>, cfg_port: u16) -> Option<u32> {
+    all.iter()
+        .find(|d| d.port == port)
+        .map(|d| d.pid)
+        .or_else(|| {
+            if port == Some(cfg_port) {
+                all.iter().find(|d| d.port.is_none()).map(|d| d.pid)
+            } else {
+                None
+            }
+        })
+}
+
+/// The single adopt-external-engine path, used by boot/refresh (stopped or
+/// failed state with a live port) and by start (port already serving).
+/// Records the discovered pid/argv/artifact for `port`, probes model info,
+/// and points the log at the shared per-port file.
 async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
-    // find the discovered process serving this port (pid + full argv).
-    // Never fall back to a process bound to a *different* port — only to
-    // portless ones when adopting the configured default port.
     let all = discover_engines().await;
+    let cfg_port = state.config.read().await.engine_port;
     let disc = all.iter().find(|d| d.port == Some(port));
-    let disc_pid = disc.map(|d| d.pid);
-    let disc_argv = disc.map(|d| d.argv.clone());
-    let disc_artifact = disc.and_then(|d| d.artifact.clone());
-    let is_default_port = port == state.config.read().await.engine_port;
-    let fallback_pid = if is_default_port {
-        all.iter()
-            .find(|d| d.port.is_none())
-            .map(|d| d.pid)
-    } else {
-        None
-    };
-    eng.state = "external".into();
+    eng.state = EngineState::External;
     eng.adopted = true;
     eng.port = Some(port);
-    eng.pid = disc_pid.or(fallback_pid);
-    eng.argv = disc_argv;
-    eng.artifact = eng.artifact.clone().or(disc_artifact);
+    eng.pid = resolve_external_pid(&all, Some(port), cfg_port);
+    eng.argv = disc.map(|d| d.argv.clone());
+    eng.artifact = eng.artifact.clone().or_else(|| disc.and_then(|d| d.artifact.clone()));
     let (mid, mctx) = engine_model_info(state, port).await;
-                        eng.model_id = mid;
-                        eng.max_context = mctx;
+    eng.assign_model_info(mid, mctx);
     eng.fail_reason = None;
     eng.log_path = Some(log_path_for(&state.data_dir, port));
+}
+
+/// Record a pre-spawn failure AND notify the desktop shell with the
+/// user-facing wording. (The stored `fail_reason` is the short internal form;
+/// the event carries the actionable message shown in the UI.)
+pub fn fail_and_emit(eng: &mut EngineInner, state: &State, stored: String, shown: String) {
+    eng.mark_failed(stored);
+    state.emit(AppEvent::EngineFailed {
+        reason: Some(shown),
+    });
 }
 
 pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<String>) -> Value {
@@ -523,13 +533,14 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     // ninfer-serve before the engine can start.
     let ninfer_path = cfg.ninfer_path.trim();
     if ninfer_path.is_empty() {
-        let mut eng = state.engine.write().await;
-        eng.state = "failed".into();
-        eng.fail_reason = Some("ninfer path not configured".into());
         let reason = "Ninfer path not configured — open Settings and set the Ninfer path.".to_string();
-        state.emit(AppEvent::EngineFailed {
-            reason: Some(reason.clone()),
-        });
+        let mut eng = state.engine.write().await;
+        fail_and_emit(
+            &mut eng,
+            state,
+            "ninfer path not configured".to_string(),
+            reason.clone(),
+        );
         return json!({
             "ok": false,
             "code": "not_configured",
@@ -550,16 +561,17 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         configured.join("build").join("apps").join("ninfer-serve")
     };
     if !engine_binary.is_file() {
-        let mut eng = state.engine.write().await;
-        eng.state = "failed".into();
-        eng.fail_reason = Some(format!("engine binary not found: {}", engine_binary.display()));
         let reason = format!(
             "Engine binary not found at {} — point the Ninfer path at ninfer-serve (or its folder) in Settings.",
             engine_binary.display()
         );
-        state.emit(AppEvent::EngineFailed {
-            reason: Some(reason.clone()),
-        });
+        let mut eng = state.engine.write().await;
+        fail_and_emit(
+            &mut eng,
+            state,
+            format!("engine binary not found: {}", engine_binary.display()),
+            reason.clone(),
+        );
         return json!({
             "ok": false,
             "code": "binary_missing",
@@ -570,30 +582,16 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     let port = profile.port.unwrap_or(cfg.engine_port);
     let artifact = artifact.filter(|a| !a.is_empty());
 
-    // adopt-don't-kill: something already serves this port
+    // adopt-don't-kill: something already serves this port — same single path
+    // as the refresh adopter (same-port pid policy, no cross-port fallback).
     if engine_health(port).await {
-        // Adopt the PID that actually owns THIS port. Discovery carries
-        // (pid, port) pairs; a bare first-PID pick with engines on two ports
-        // could record the OTHER engine, and a later Stop would kill it.
-        // Fall back to the first discovered PID when the port can't be
-        // resolved (e.g. netstat couldn't attribute the listener).
-        let discovered = discover_engines().await;
-        let pid = discovered
-            .iter()
-            .find(|d| d.port == Some(port))
-            .map(|d| d.pid)
-            .or_else(|| discovered.first().map(|d| d.pid));
         let mut eng = state.engine.write().await;
-        eng.state = "external".into();
-        eng.adopted = true;
-        eng.port = Some(port);
-        eng.artifact = artifact;
-        eng.pid = pid;
-        let (mid, mctx) = engine_model_info(state, port).await;
-                        eng.model_id = mid;
-                        eng.max_context = mctx;
-        eng.log_path = Some(log_path_for(&state.data_dir, port));
-        eng.fail_reason = None;
+        adopt_external(&mut eng, state, port).await;
+        // Record the artifact the user asked to start (adopt keeps whatever
+        // was already recorded, falling back to the discovered argv).
+        if artifact.is_some() {
+            eng.artifact = artifact;
+        }
         return json!({
             "ok": false,
             "code": "already_serving",
@@ -655,7 +653,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
 
     {
         let mut eng = state.engine.write().await;
-        eng.state = "starting".into();
+        eng.state = EngineState::Starting;
         eng.port = Some(port);
         eng.artifact = Some(artifact.clone());
         eng.model_id = None;
@@ -688,13 +686,9 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let mut eng = state.engine.write().await;
-            eng.state = "failed".into();
             let reason = format!("spawn failed: {e}");
-            eng.fail_reason = Some(reason.clone());
-            state.emit(AppEvent::EngineFailed {
-                reason: Some(reason),
-            });
+            let mut eng = state.engine.write().await;
+            fail_and_emit(&mut eng, state, reason.clone(), reason.clone());
             return json!({ "ok": false, "message": format!("spawn failed: {e}") });
         }
     };
@@ -751,11 +745,8 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
                 };
                 if exited {
                     let mut eng = st.engine.write().await;
-                    if eng.state == "starting" || eng.state == "running" {
-                        eng.state = "failed".into();
-                        eng.fail_reason = Some("engine process exited".into());
-                        eng.pid = None;
-                        eng.adopted = false;
+                    if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+                        eng.mark_exited();
                     }
                     *st.child.lock().await = None;
                     return;
@@ -772,12 +763,11 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             tokio::time::sleep(Duration::from_millis(2000)).await;
             if engine_health(port2).await {
                 let mut eng = st.engine.write().await;
-                if eng.state == "starting" || eng.state == "running" {
-                    eng.state = "running".into();
+                if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+                    eng.state = EngineState::Running;
                     if eng.model_id.is_none() {
                         let (mid, mctx) = engine_model_info(st.as_ref(), port2).await;
-                        eng.model_id = mid;
-                        eng.max_context = mctx;
+                        eng.assign_model_info(mid, mctx);
                     }
                 }
                 return;
@@ -785,9 +775,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
             let mut eng = st.engine.write().await;
             if let Some(deadline) = eng.deadline {
                 if now_ms() > deadline {
-                    eng.state = "failed".into();
-                    eng.fail_reason =
-                        Some(start_timeout_message());
+                    eng.mark_failed(start_timeout_message());
                     drop(eng);
                     let mut c = st.child.lock().await;
                     if let Some(c) = c.as_mut() {
@@ -811,16 +799,14 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
             drop(child);
             {
                 let mut eng = state.engine.write().await;
-                eng.state = "stopping".into();
+                eng.begin_stopping();
             }
             let proc = state.child.lock().await.take();
             if let Some(mut proc) = proc {
                 let _ = proc.start_kill();
                 let _ = tokio::time::timeout(Duration::from_secs(8), proc.wait()).await;
                 let mut eng = state.engine.write().await;
-                eng.state = "stopped".into();
-                eng.adopted = false;
-                eng.pid = None;
+                eng.reset_stopped();
                 return json!({ "ok": true, "message": "engine stopped" });
             }
         }
@@ -834,23 +820,14 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
     let Some(target) = target else {
         let (is_external, port) = {
             let eng = state.engine.read().await;
-            (eng.state == "external", eng.port)
+            (eng.state == EngineState::External, eng.port)
         };
         if is_external {
-            // port-aware: only signal the process actually serving this engine's port
+            // Same pid policy as adoption: only signal the process actually
+            // serving this engine's port (see `resolve_external_pid`).
             let all = discover_engines().await;
-            let is_default = port == Some(state.config.read().await.engine_port);
-            let pid = all
-                .iter()
-                .find(|d| d.port == port)
-                .map(|d| d.pid)
-                .or_else(|| {
-                    if is_default {
-                        all.iter().find(|d| d.port.is_none()).map(|d| d.pid)
-                    } else {
-                        None
-                    }
-                });
+            let cfg_port = state.config.read().await.engine_port;
+            let pid = resolve_external_pid(&all, port, cfg_port);
             match pid {
                 None => {
                     // the port is served (we only get here with the engine already
@@ -866,9 +843,7 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
                     let ok = signal_engine_pid(pid);
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                     let mut eng = state.engine.write().await;
-                    eng.state = "stopped".into();
-                    eng.adopted = false;
-                    eng.pid = None;
+                    eng.reset_stopped();
                     return if ok {
                         json!({ "ok": true, "message": format!("signaled external pid {pid}") })
                     } else {
@@ -882,14 +857,12 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
 
     {
         let mut eng = state.engine.write().await;
-        eng.state = "stopping".into();
+        eng.begin_stopping();
     }
     let ok = signal_engine_pid(target);
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let mut eng = state.engine.write().await;
-    eng.state = "stopped".into();
-    eng.adopted = false;
-    eng.pid = None;
+    eng.reset_stopped();
     if ok {
         json!({ "ok": true, "message": format!("signaled pid {target}") })
     } else {
@@ -1091,5 +1064,53 @@ Active Connections
         assert!(ls.contains(&(8081, 9999)));
         // the ESTABLISHED row and the out-of-range port are excluded
         assert_eq!(ls.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod adopt_policy_tests {
+    use super::{resolve_external_pid, DiscoveredEngine};
+
+    fn disc(pid: u32, port: Option<u16>) -> DiscoveredEngine {
+        DiscoveredEngine { pid, port, argv: vec![], artifact: None }
+    }
+
+    #[test]
+    fn same_port_wins_and_cross_port_is_never_picked() {
+        // Two engines on two ports: adopting/stopping 8080 must resolve 111,
+        // never 222 — the old start_engine copy fell back to first().
+        let all = vec![disc(111, Some(8080)), disc(222, Some(9091))];
+        assert_eq!(resolve_external_pid(&all, Some(8080), 8080), Some(111));
+        assert_eq!(resolve_external_pid(&all, Some(9091), 8080), Some(222));
+        // Unknown port with a foreign engine present: no fallback.
+        assert_eq!(resolve_external_pid(&all, Some(1234), 8080), None);
+    }
+
+    #[test]
+    fn portless_fallback_only_on_the_configured_port() {
+        let all = vec![disc(111, Some(9091)), disc(333, None)];
+        // Default port, listener unattributable: portless pid is usable.
+        assert_eq!(resolve_external_pid(&all, Some(8080), 8080), Some(333));
+        // Non-default port: the portless process must not be claimed.
+        assert_eq!(resolve_external_pid(&all, Some(1234), 8080), None);
+        // Exact match beats the portless fallback even on the default port.
+        let both = vec![disc(111, Some(8080)), disc(333, None)];
+        assert_eq!(resolve_external_pid(&both, Some(8080), 8080), Some(111));
+    }
+
+    #[test]
+    fn engine_state_wire_format_keeps_lowercase_strings() {
+        // P0-3: the enum must serialize to exactly what the web UI matches on.
+        let s = serde_json::to_value(crate::types::EngineState::External).unwrap();
+        assert_eq!(s, serde_json::Value::String("external".into()));
+        for (state, wire) in [
+            (crate::types::EngineState::Stopped, "stopped"),
+            (crate::types::EngineState::Starting, "starting"),
+            (crate::types::EngineState::Running, "running"),
+            (crate::types::EngineState::Stopping, "stopping"),
+            (crate::types::EngineState::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::Value::String(wire.into()));
+        }
     }
 }

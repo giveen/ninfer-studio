@@ -75,7 +75,7 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     if action == "build" {
         let running = {
             let eng = state.engine.read().await;
-            matches!(eng.state.as_str(), "running" | "starting" | "stopping") && eng.pid.is_some()
+            matches!(eng.state, crate::types::EngineState::Running | crate::types::EngineState::Starting | crate::types::EngineState::Stopping) && eng.pid.is_some()
         };
         if running {
             crate::engine::stop_engine(state, None).await;

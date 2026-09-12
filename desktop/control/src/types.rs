@@ -512,11 +512,29 @@ pub const ARTIFACTS: &[CatalogEntry] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Engine lifecycle state — an enum (not String) so a mistyped state is a
+// compile error rather than a silent no-match. Wire format keeps the same
+// lowercase strings the web UI already matches on (`EngineState` in
+// apps/web/src/lib/types.ts), via serde.
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineState {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+    External,
+}
+
+// ---------------------------------------------------------------------------
 // Runtime state shapes (serialized for the UI)
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
-    pub state: String,
+    pub state: EngineState,
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub artifact: Option<String>,
@@ -602,7 +620,7 @@ pub struct DownloadRec {
 // ---------------------------------------------------------------------------
 #[derive(Debug, Default)]
 pub struct EngineInner {
-    pub state: String, // stopped | starting | running | stopping | failed | external
+    pub state: EngineState,
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub artifact: Option<String>,
@@ -617,6 +635,42 @@ pub struct EngineInner {
     pub adopted: bool,
     pub fail_reason: Option<String>,
     pub deadline: Option<u64>, // unix ms
+}
+
+impl EngineInner {
+    /// Common tail of every stop path: no process is running and Studio owns
+    /// nothing. (The external-watch branch additionally clears `argv`, which
+    /// described a foreign process that is now gone.)
+    pub fn reset_stopped(&mut self) {
+        self.state = EngineState::Stopped;
+        self.adopted = false;
+        self.pid = None;
+    }
+
+    /// Record a failure with its reason. Callers that also notify the desktop
+    /// shell use `engine::fail_and_emit` instead.
+    pub fn mark_failed(&mut self, reason: impl Into<String>) {
+        self.state = EngineState::Failed;
+        self.fail_reason = Some(reason.into());
+    }
+
+    /// The reaper's transition: the spawned child exited on its own.
+    pub fn mark_exited(&mut self) {
+        self.mark_failed("engine process exited");
+        self.pid = None;
+        self.adopted = false;
+    }
+
+    /// Record probed model identity (id + context window) together.
+    pub fn assign_model_info(&mut self, model_id: Option<String>, max_context: Option<u64>) {
+        self.model_id = model_id;
+        self.max_context = max_context;
+    }
+
+    /// Begin stopping (a signal is in flight; the stopped reset lands after).
+    pub fn begin_stopping(&mut self) {
+        self.state = EngineState::Stopping;
+    }
 }
 
 /// The (profile, artifact) pair used for the most recent engine start.
@@ -689,7 +743,7 @@ impl State {
         Self {
             config: tokio::sync::RwLock::new(AppSettings::default()),
             engine: tokio::sync::RwLock::new(EngineInner {
-                state: "stopped".into(),
+                state: EngineState::Stopped,
                 ..Default::default()
             }),
             last_start: tokio::sync::RwLock::new(None),

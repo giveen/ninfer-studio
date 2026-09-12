@@ -266,8 +266,8 @@ async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
     refresh_engine_status(&state).await;
     let vram = {
         let eng = state.engine.read().await;
-        match (eng.port, eng.state.as_str()) {
-            (Some(port), s) if s == "running" || s == "starting" => engine::vram_status(&state.data_dir, port)
+        match (eng.port, eng.state) {
+            (Some(port), crate::types::EngineState::Running | crate::types::EngineState::Starting) => engine::vram_status(&state.data_dir, port)
                 .await
                 .map(|(runtime_gib, free_gib)| {
                     json!({
@@ -318,7 +318,7 @@ async fn engines_public(state: &S) -> Vec<Value> {
         }
         let (model, _) = engine_model_info(state, port).await;
         out.push(json!({
-            "state": "external",
+            "state": crate::types::EngineState::External,
             "pid": d.pid,
             "port": port,
             "artifact": d.artifact,
@@ -450,7 +450,7 @@ async fn engine_args(
 
     let (eng, last, cfg) = (state.engine.read().await, state.last_start.read().await, state.config.read().await);
     let port = profile.port.unwrap_or(cfg.engine_port);
-    let running = eng.state == "running" || eng.state == "external";
+    let running = matches!(eng.state, crate::types::EngineState::Running | crate::types::EngineState::External);
     let port_match = eng.port.map(|p| p == port).unwrap_or(true);
     let running_args = eng.argv.as_deref().filter(|a| !a.is_empty());
     let form = build_serve_args(&profile, port);
@@ -759,8 +759,8 @@ async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
     let mut cands: Vec<(u16, Option<String>)> = Vec::new();
     {
         let primary = state.engine.read().await;
-        if let (Some(p), st) = (primary.port, primary.state.as_str()) {
-            if st == "running" || st == "external" || st == "starting" {
+        if let Some(p) = primary.port {
+            if matches!(primary.state, crate::types::EngineState::Running | crate::types::EngineState::External | crate::types::EngineState::Starting) {
                 cands.push((p, primary.model_id.clone()));
             }
         }
