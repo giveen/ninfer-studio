@@ -1966,7 +1966,7 @@ async function handleCoder(req, res, p, url) {
     // In this sidecar the agent loop runs client-side (the UI enforces the
     // tiers in its dispatcher), so this store mainly keeps GET/POST behavior
     // 1:1 with the Rust control plane, which additionally re-checks `deny`
-    // server-side in coder::enforce_perm.
+    // server-side in coder::common::enforce_perm.
     if (p === '/api/coder/perms' && req.method === 'GET') {
       return sendJson(res, 200, coderPerms);
     }
@@ -2718,7 +2718,7 @@ const server = createServer(async (req, res) => {
       // Empty or ~-prefixed roots resolve to the home directory (the picker's
       // natural start point); `root` in the response is always the RESOLVED
       // absolute path so the UI can navigate from it directly. Keep 1:1 with
-      // coder::dirs in desktop/control/src/coder.rs.
+      // coder::dirs in desktop/control/src/coder/workspace.rs.
       const raw = (url.searchParams.get('root') || '~').trim() || '~';
       const home = os.homedir().replace(/\/+$/, '');
       const root = !raw || raw === '~' ? home : raw.startsWith('~/') ? `${home}/${raw.slice(2)}` : raw;
