@@ -1,6 +1,6 @@
 [package]
 name = "ninfier-control"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 description = "NInfer Studio control plane: engine process supervision, model management, GPU stats, SSE-safe engine API proxy, static hosting. Framework-agnostic (no Tauri imports)."
 

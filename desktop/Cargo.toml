@@ -3,7 +3,7 @@ resolver = "2"
 members = ["control", "app"]
 
 [workspace.dependencies]
-ninfier-control = { path = "control", version = "0.3.3" }
+ninfier-control = { path = "control", version = "0.3.4" }
 tokio = { version = "1", default-features = false }
 serde_json = "1"
 tracing = "0.1"
