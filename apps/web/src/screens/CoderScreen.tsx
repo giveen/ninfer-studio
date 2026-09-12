@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
-import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
+import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
@@ -12,13 +12,15 @@ const Markdown = lazy(() => import('../components/Markdown'));
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { FilePickerModal } from '../components/coder/FilePickerModal';
 import { useCoderMemory } from '../components/coder/useCoderMemory';
+import { useCoderJobs } from '../components/coder/useCoderJobs';
+import { JobsPanel } from '../components/coder/JobsPanel';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
@@ -254,37 +256,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const [expandedCommit, setExpandedCommit] = useState<string | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
-  // Background shell jobs started by the agent (tracked per workspace so the
-  // sidebar panel can poll + kill them without digging through the transcript).
-  const [bgJobs, setBgJobs] = useState<{ id: string; command: string; ws: string }[]>([]);
-  /** Live subagent runs (delegate / subagent / scout) for the Jobs panel. */
-  const [activeSubs, setActiveSubs] = useState<{ id: string; label: string; task: string; since: number; ws: string }[]>([]);
-  const [subTick, setSubTick] = useState(Date.now());
-  useEffect(() => {
-    if (activeSubs.length === 0) return;
-    const t = setInterval(() => setSubTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [activeSubs.length]);
-  const [jobStatus, setJobStatus] = useState<Record<string, CoderJob>>({});
-  const [jobsOpen, setJobsOpen] = useState(true);
-  /** Poll unfinished jobs while the panel is open (3s cadence, stops when all done). */
-  useEffect(() => {
-    if (!jobsOpen) return;
-    const pending = bgJobs.filter((j) => !(jobStatus[j.id]?.done ?? false));
-    if (pending.length === 0) return;
-    let cancelled = false;
-    const poll = async () => {
-      for (const j of pending) {
-        try {
-          const s = await coderJob(j.id);
-          if (!cancelled) setJobStatus((prev) => ({ ...prev, [j.id]: s }));
-        } catch { /* job expired server-side; leave last status */ }
-      }
-    };
-    poll();
-    const timer = setInterval(poll, 3000);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, [jobsOpen, bgJobs, activeWs, jobStatus]);
+  // Background jobs + live subagents (state + polling live in the hook;
+  // the call sits after addLog, which the kill-error path reports through).
 
   // Coder "safe mode": the control plane refuses clearly destructive shell commands
   // (release blocker #2). Surfaced as a toggle + warning banner.
@@ -923,6 +896,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
     if (target.ws === storeRef.current.activeWs && target.convId === storeRef.current.activeConv) setLedger((prev) => [...prev.slice(-999), rec]);
   };
+  // Background shell jobs + live subagent runs (Jobs panel).
+  const jobs = useCoderJobs({ activeWs, onError: (detail) => addLog({ type: 'error', label: 'job', detail }) });
 
   // ---- Todos: user actions (the panel is no longer read-only). Edits take
   // effect on the agent's next LLM call via the per-turn system-prompt
@@ -1739,7 +1714,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               if (res.jobId) {
                 const id = res.jobId;
                 const cmd = String(args.command || '');
-                setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: cmd, ws: activeWsDir }]));
+                jobs.registerJob(id, cmd, activeWsDir);
               }
             }
           }
@@ -1748,7 +1723,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           try {
             const res = await coderJob(String(args.jobId || ''), toolSignal);
             result = JSON.stringify(res);
-            setJobStatus((prev) => ({ ...prev, [res.jobId]: res }));
+            jobs.settleJobStatus(res.jobId, res);
           } catch (e) {
             result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
           }
@@ -2075,7 +2050,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // delegate/scout (runSubagent) — this was previously invisible
           // since it calls runWorker directly instead of runSubagent.
           const subId = `subagent-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-          setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label: 'subagent', task: task.slice(0, 100), since: Date.now(), ws: activeWsDir }]);
+          jobs.registerSub({ id: subId, label: 'subagent', task: task.slice(0, 100), ws: activeWsDir });
           try {
             let preTree = '';
             try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
@@ -2137,7 +2112,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             result = JSON.stringify({ summary: res.summary, diff, ok, criticApproved });
             addLog({ type: ok ? 'bash' : 'error', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
           } finally {
-            setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+            jobs.unregisterSub(subId);
           }
         } else if (call.name === 'memory_update') {
           // Agent-proactive learning capture (the critic also writes learnings).
@@ -2284,11 +2259,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     // Track the run so it shows live in the Jobs panel.
     const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-    setActiveSubs((prev) => [...prev.slice(-11), { id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), since: Date.now(), ws: activeWsDir }]);
+    jobs.registerSub({ id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
     try {
       return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
     } finally {
-      setActiveSubs((prev) => prev.filter((s) => s.id !== subId));
+      jobs.unregisterSub(subId);
     }
   };
   const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
@@ -2404,7 +2379,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // job had no panel entry and so no way to see or kill it.
           if (res.jobId) {
             const id = res.jobId;
-            setBgJobs((prev) => (prev.some((j) => j.id === id) ? prev : [...prev.slice(-19), { id, command: command0, ws: activeWsDir }]));
+            jobs.registerJob(id, command0, activeWsDir);
           }
           return JSON.stringify(res);
         }
@@ -3756,89 +3731,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         {/* Background Jobs — live view of detached shell jobs for this workspace */}
         <SidebarSection title="Jobs" icon={<Terminal size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
-          <div className="mb-1.5 flex items-center">
-            <button
-              type="button"
-              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-              title={jobsOpen ? 'Collapse' : 'Expand'}
-              onClick={() => setJobsOpen((o) => !o)}
-            >
-              {jobsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            </button>
-          </div>
-          {jobsOpen && (() => {
-            // Both lists are tagged with activeWsDir (the worktree-aware dir a
-            // run actually executes in), not activeWs (the workspace root) —
-            // a worktree conversation's jobs would otherwise never match.
-            const wsJobs = bgJobs.filter((j) => j.ws === activeWsDir);
-            const subs = activeSubs.filter((s) => s.ws === activeWsDir);
-            if (wsJobs.length === 0 && subs.length === 0) return <div className="text-[10.5px] italic text-faint">No background jobs. Long builds/tests run here via bash with background:true.</div>;
-            return (
-              <div className="max-h-40 space-y-1 overflow-auto">
-                {subs.map((s) => (
-                  <div key={s.id} className="rounded border border-accent/25 bg-accent/8 px-2 py-1" title={s.task}>
-                    <div className="flex items-center gap-2">
-                      <BrainCircuit size={11} className="shrink-0 animate-pulse text-accent" />
-                      <span className="min-w-0 flex-1 truncate text-[10.5px] text-mute">{s.label} — {s.task}</span>
-                      <span className="shrink-0 text-[10px] text-faint">{Math.max(1, Math.round((subTick - s.since) / 1000))}s</span>
-                    </div>
-                  </div>
-                ))}
-                {wsJobs.map((j) => {
-                  const s = jobStatus[j.id];
-                  const done = s?.done ?? false;
-                  const ok = done && (s?.exitCode === 0);
-                  return (
-                    <div key={j.id} className="rounded border border-line px-2 py-1">
-                      <div className="flex items-center gap-2">
-                        <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', !done ? 'animate-pulse bg-accent' : ok ? 'bg-ok' : 'bg-danger')} />
-                        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={j.command}>{j.command || j.id}</span>
-                        <span className="shrink-0 text-[10px] text-faint">{!done ? 'running' : s?.exitCode === null ? (s?.killed ? 'killed' : 'done') : `exit ${s?.exitCode}`}</span>
-                        {!done ? (
-                          <button
-                            type="button"
-                            title="Kill job"
-                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
-                            onClick={async () => {
-                              try {
-                                const k = await coderJobKill(j.id);
-                                setJobStatus((prev) => ({ ...prev, [j.id]: k }));
-                              } catch (e) {
-                                addLog({ type: 'error', label: 'job', detail: e instanceof Error ? e.message : String(e) });
-                              }
-                            }}
-                          >
-                            <Square size={11} />
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            title="Dismiss"
-                            className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-ink"
-                            onClick={() => {
-                              setBgJobs((prev) => prev.filter((x) => x.id !== j.id));
-                              setJobStatus((prev) => {
-                                const next = { ...prev };
-                                delete next[j.id];
-                                return next;
-                              });
-                            }}
-                          >
-                            <X size={11} />
-                          </button>
-                        )}
-                      </div>
-                      {s && (s.stdout || s.stderr) && (
-                        <div className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all border-t border-line pt-1 font-mono text-[10px] text-mute">
-                          {redactSecrets((s.stdout + (s.stderr ? `\n${s.stderr}` : '')).slice(-2000))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })()}
+          <JobsPanel jobs={jobs} activeWsDir={activeWsDir} />
         </div>
         </SidebarSection>
       </div>
