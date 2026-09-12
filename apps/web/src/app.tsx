@@ -108,6 +108,14 @@ export function App() {
             <n.icon size={18} strokeWidth={1.8} />
           </button>
         ))}
+        <button
+          type="button"
+          onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          className="mt-auto flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
+        >
+          {theme === 'dark' ? <Sun size={18} strokeWidth={1.8} /> : <Moon size={18} strokeWidth={1.8} />}
+        </button>
       </nav>
 
       {/* main column */}
@@ -132,14 +140,6 @@ export function App() {
                 sidecar unreachable
               </span>
             )}
-            <button
-              type="button"
-              onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-              title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-              className="flex h-7 w-7 items-center justify-center rounded-full border border-line bg-panel text-mute transition-colors hover:border-line2 hover:text-ink"
-            >
-              {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
-            </button>
           </div>
         </header>
 
