@@ -658,10 +658,16 @@ export function validateOutputReceipt(raw: string, sourceText: string, isError?:
   // A known real failure (e.g. non-zero exit code) must be reported as one —
   // never let a fluent summary launder a real failure into "success".
   if (isError === true && p.status !== 'failure') return null;
-  // An output that reads like a failure (by known exit code, or textually)
-  // must carry cited failure evidence, or this is an unverified/soft-pedaled
-  // summary — reject it rather than risk hiding a real problem.
-  if ((isError === true || FAILURE_SIGNAL_RE.test(sourceText)) && !hasFailureEvidence) return null;
+  // An output that reads like a failure must carry cited failure evidence,
+  // or this is an unverified/soft-pedaled summary — reject it rather than
+  // risk hiding a real problem. The textual heuristic only applies when the
+  // outcome isn't already known for certain (isError === undefined, e.g. a
+  // file read): a known-successful exit code (isError === false) must never
+  // be second-guessed by a loose regex just because the output happens to
+  // contain an ordinary word like "error" or "failed" — real code and logs
+  // say those constantly without meaning anything went wrong.
+  const looksLikeFailure = isError === true || (isError === undefined && FAILURE_SIGNAL_RE.test(sourceText));
+  if (looksLikeFailure && !hasFailureEvidence) return null;
 
   return { status: p.status, uncertain: p.uncertain, evidence };
 }

@@ -13,6 +13,7 @@
 // Inspired by SoL-Pi's ObservationPack (github.com/NVlabs/SoL-Pi).
 
 import type { ChatMessage } from './types';
+import { CHARS_PER_TOKEN } from './format';
 
 const DB_NAME = 'ninfier-observation-pack';
 const STORE_NAME = 'observations';
@@ -29,8 +30,10 @@ const RECALL_MAX_BYTES = 4000;
 const RECALL_MAX_LINES = 200;
 const OBSERVATION_ID_PATTERN = /^obs_[a-f0-9]{24}$/;
 /** Tools whose results are already bounded/paged, or that ARE the recall
- *  path itself — never pack these. */
-const PACK_EXCLUDED_TOOLS = new Set(['grep', 'glob', 'repo_search', 'obs_recall']);
+ *  path itself — never pack (this module) or AI-summarize (maybeSummarizeTool
+ *  in CoderScreen.tsx) these. Shared so the two "large tool output" pipelines
+ *  can't drift on what counts as already-bounded. */
+export const LARGE_OUTPUT_EXCLUDED_TOOLS = new Set(['grep', 'glob', 'repo_search', 'obs_recall']);
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 function getDb(): Promise<IDBDatabase> {
@@ -78,13 +81,12 @@ async function getObservationText(id: string): Promise<string | null> {
 
 function countLines(text: string): number {
   if (text.length === 0) return 0;
-  let lines = text.endsWith('\n') ? 0 : 1;
-  for (const ch of text) if (ch === '\n') lines += 1;
-  return lines;
+  const parts = text.split('\n').length;
+  return text.endsWith('\n') ? parts - 1 : parts;
 }
 
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
 function completeLineExcerpt(text: string, budgetBytes: number, fromEnd: boolean): string {
@@ -158,11 +160,30 @@ export async function readRecallChunk(id: string, offset: number): Promise<Recal
   return { text: text2, nextOffset, eof: nextOffset >= bytes.length };
 }
 
-/** Extract the large-text field from a tool result JSON string, the same
- *  way maybeSummarizeTool in CoderScreen.tsx does — or null if this result
- *  isn't pack-eligible (wrong shape, excluded tool, already compacted). */
-function extractPackableText(toolName: string | undefined, content: unknown): string | null {
-  if (!toolName || PACK_EXCLUDED_TOOLS.has(toolName) || typeof content !== 'string') return null;
+export interface ToolResultText {
+  text: string;
+  hasStd: boolean;
+}
+
+/** Extract the large-text field (and which shape it came from) out of an
+ *  already-JSON-parsed tool result — shared by ObservationPack and
+ *  maybeSummarizeTool in CoderScreen.tsx so the two "large tool output"
+ *  pipelines can't disagree on what counts as a result's text. Returns null
+ *  for a result with neither shape. */
+export function extractToolResultText(res: Record<string, unknown>): ToolResultText | null {
+  const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
+  const hasContent = typeof res.content === 'string';
+  if (!hasStd && !hasContent) return null;
+  const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+  return { text, hasStd };
+}
+
+/** Parse a tool-result message's content and extract its packable text, or
+ *  null if it isn't eligible (wrong shape, excluded tool, already a compact
+ *  receipt). Returns the parsed object too so callers don't have to
+ *  re-parse the same JSON a second time. */
+function extractPackable(toolName: string | undefined, content: unknown): { text: string; res: Record<string, unknown> } | null {
+  if (!toolName || LARGE_OUTPUT_EXCLUDED_TOOLS.has(toolName) || typeof content !== 'string') return null;
   let res: Record<string, unknown>;
   try {
     const parsed = JSON.parse(content);
@@ -172,11 +193,17 @@ function extractPackableText(toolName: string | undefined, content: unknown): st
     return null;
   }
   if (res._summarized === true) return null; // already a compact receipt
-  const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
-  const hasContent = typeof res.content === 'string';
-  if (!hasStd && !hasContent) return null;
-  return hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+  const extracted = extractToolResultText(res);
+  return extracted ? { text: extracted.text, res } : null;
 }
+
+/** Cache of already-packed placeholders, keyed by the exact original raw
+ *  content string. A message's content string is immutable and (history
+ *  being append-only within a run) never recurs with a different meaning,
+ *  so once packed it never needs re-hashing or re-writing to IndexedDB
+ *  again — without this, packForRequest would redo that work for every
+ *  already-packed message on every subsequent turn of a long run. */
+const packedCache = new Map<string, string>();
 
 /** Build the request-only view of `messages`: any tool-result message old
  *  enough (PACK_FULL_SENDS turns behind the newest tool result) and large
@@ -200,26 +227,32 @@ export async function packForRequest(messages: ChatMessage[]): Promise<ChatMessa
     if (laterCount < PACK_FULL_SENDS) continue; // still within its full-send window
     const idx = toolIndices[rank];
     const m = out[idx];
-    const text = extractPackableText(m.name, m.content);
-    if (!text) continue;
+    const originalContent = m.content;
+
+    const cached = packedCache.get(originalContent);
+    if (cached !== undefined) {
+      out[idx] = { ...m, content: cached };
+      changed = true;
+      continue;
+    }
+
+    const packable = extractPackable(m.name, originalContent);
+    if (!packable) continue;
+    const { text, res } = packable;
     if (new TextEncoder().encode(text).length <= PACK_THRESHOLD_BYTES) continue;
 
     const id = `obs_${(await hashText(text)).slice(0, 24)}`;
     await ensureStored(id, text);
     const placeholder = placeholderFor(id, m.name || 'tool', text);
-    let res: Record<string, unknown>;
-    try {
-      res = JSON.parse(m.content as string) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
     if (typeof res.stdout === 'string' || typeof res.stderr === 'string') {
       res.stdout = placeholder;
       res.stderr = '';
     } else {
       res.content = placeholder;
     }
-    out[idx] = { ...m, content: JSON.stringify(res) };
+    const packedContent = JSON.stringify(res);
+    packedCache.set(originalContent, packedContent);
+    out[idx] = { ...m, content: packedContent };
     changed = true;
   }
   return changed ? out : messages;

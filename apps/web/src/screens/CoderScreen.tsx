@@ -19,9 +19,9 @@ import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
-import { formatTokens } from '../lib/format';
+import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
-import { packForRequest, readRecallChunk } from '../lib/observationPack';
+import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -793,10 +793,19 @@ function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; consumed:
   if (calls.length > 0) return { calls, consumed };
 
   // 2. Fenced ```json / ```tool_call blocks (explicitly labeled only — an
-  //    unlabeled ``` fence is more likely a genuine code sample to the user).
-  for (const m of text.matchAll(/```(?:json|tool_?call)\s*\n?([\s\S]*?)\n?```/g)) {
-    const items = parseItems(m[1]);
-    if (items && pushAll(items)) consumed.push(m[0]);
+  //    unlabeled ``` fence is more likely a genuine code sample to the
+  //    user). Only tried when the reply is essentially JUST the block(s)
+  //    plus a little surrounding text — the actual failure mode this
+  //    recovers from is an engine emitting the tool call AS a fenced block
+  //    instead of a native call, not a long explanatory answer that happens
+  //    to contain an illustrative JSON example partway through.
+  const FENCED_RE = /```(?:json|tool_?call)\s*\n?([\s\S]*?)\n?```/g;
+  const outsideFences = text.replace(FENCED_RE, '').trim();
+  if (outsideFences.length <= 200) {
+    for (const m of text.matchAll(FENCED_RE)) {
+      const items = parseItems(m[1]);
+      if (items && pushAll(items)) consumed.push(m[0]);
+    }
   }
   if (calls.length > 0) return { calls, consumed };
 
@@ -1826,7 +1835,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
    *  in between — a read-loop signal (the model keeps investigating past
    *  the point of having enough context). Reset by any non-read-only call. */
   const readStreakRef = useRef(0);
-  const READ_STREAK_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search']);
+  const READ_STREAK_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall']);
 
   /** Stable hash for a (tool name, raw JSON args string) pair — sorts object
    *  keys first so argument order never defeats a cache hit. */
@@ -2405,8 +2414,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     model: string,
     signal?: AbortSignal,
   ): Promise<string> => {
-    // Structured results (grep/glob/repo_search) are already bounded — skip them.
-    if (name === 'grep' || name === 'glob' || name === 'repo_search') return resultStr;
+    // Structured results (grep/glob/repo_search/obs_recall) are already bounded — skip them.
+    if (LARGE_OUTPUT_EXCLUDED_TOOLS.has(name)) return resultStr;
     let res: Record<string, unknown> | null = null;
     try {
       const parsed = JSON.parse(resultStr);
@@ -2415,10 +2424,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return resultStr;
     }
     if (!res) return resultStr;
-    const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
-    const hasContent = typeof res.content === 'string';
-    if (!hasStd && !hasContent) return resultStr;
-    const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+    const extracted = extractToolResultText(res);
+    if (!extracted) return resultStr;
+    const { text, hasStd } = extracted;
     if (text.length <= SUMMARY_THRESHOLD) return resultStr;
     // A bash result's exitCode is a known, authoritative pass/fail signal —
     // pass it through so the receipt validator can reject a summary that
@@ -2738,8 +2746,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // hallucinate content instead of checking what's actually
             // there. New files, and a second attempt on the same path,
             // are always allowed through.
-            let exists = true;
-            try { await coderRead(wpath, 0, 1, toolSignal); } catch { exists = false; }
+            // Probe existence with a 1-byte read. The backend reports a
+            // missing file as HTTP 404 specifically (coder.rs fs_read) — any
+            // OTHER failure (network hiccup, a timeout on a large file,
+            // which is exactly the case this guard cares about) must not
+            // silently disable the guard by being mistaken for "doesn't
+            // exist"; fail closed (assume it exists) instead.
+            const exists = await coderRead(wpath, 0, 1, toolSignal).then(
+              () => true,
+              (e: unknown) => !(e instanceof Error && /HTTP 404\b/.test(e.message)),
+            );
             if (exists) {
               unreadWriteWarnedRef.current.add(wpath);
               result = JSON.stringify({ error: `${wpath} already exists and hasn't been read this run. Read it first with \`read\` so this write doesn't blindly overwrite content you haven't seen — or call \`write\` again on ${wpath} if you intend a deliberate full overwrite.` });
@@ -3135,15 +3151,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         result = JSON.stringify({ error: msg });
       }
 
-      // Record a successful PURE call for the dedup cache above (never cache
-      // an error — the model should be allowed to retry after a real fix).
-      if (PURE_DEDUP_TOOLS.has(call.name) && !isErrorResult(result)) {
-        const hash = hashToolCall(call.name, call.arguments);
-        toolDedupRef.current = toolDedupRef.current.filter((e) => e.hash !== hash);
-        toolDedupRef.current.push({ hash, name: call.name, result });
-        if (toolDedupRef.current.length > TOOL_DEDUP_WINDOW) toolDedupRef.current.shift();
-      }
-
       // Read-loop nudge: 8 read-only tool calls in a row (no write/run/plan
       // call in between) usually means the model has enough context and
       // just needs to be told to stop investigating and produce output.
@@ -3165,6 +3172,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
       if (maybeSummarized !== result) {
         addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
+      }
+
+      // Record a successful PURE call for the dedup cache above — AFTER
+      // summarization, so a cache hit replays the same (possibly
+      // AI-summarized) content the model actually saw, never the raw
+      // pre-summarization dump. Never cache an error — the model should be
+      // allowed to retry after a real fix.
+      if (PURE_DEDUP_TOOLS.has(call.name) && !isErrorResult(maybeSummarized)) {
+        const hash = hashToolCall(call.name, call.arguments);
+        toolDedupRef.current = toolDedupRef.current.filter((e) => e.hash !== hash);
+        toolDedupRef.current.push({ hash, name: call.name, result: maybeSummarized });
+        if (toolDedupRef.current.length > TOOL_DEDUP_WINDOW) toolDedupRef.current.shift();
       }
 
       nextMessages.push({
@@ -3226,6 +3245,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
         case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
         case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
+        case 'obs_recall': result = JSON.stringify(await readRecallChunk(String(args.id || ''), Number(args.offset) || 0)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
       // Same giant-output protection the supervisor's own loop gets — without
@@ -3785,14 +3805,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       : 8192;
 
     // whose tool results push past the window is caught before we send it (P1 #4).
-    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / 4);
+    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / CHARS_PER_TOKEN);
     const estimateTokens = (msgs: ChatMessage[]): number => {
       let n = sysTokenEstimate;
       for (const m of msgs) {
         n += typeof m.content === 'string' ? m.content.length : 0;
         if (m.tool_calls) n += JSON.stringify(m.tool_calls).length;
       }
-      return Math.ceil(n / 4);
+      return Math.ceil(n / CHARS_PER_TOKEN);
     };
     
     try {
@@ -3829,6 +3849,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // context on the next turn).
             updateRunMessages((prev) => [...prev, ...currentMessages]);
             noteRunTokens(0);
+            // The read-before-write guard's "already read this run" state
+            // is only true while the actual file content is still in the
+            // model's context — compaction just discarded it in favor of a
+            // terse summary, so a path read before this point should no
+            // longer be treated as safely read for a later blind write.
+            readPathsRef.current = new Set();
+            unreadWriteWarnedRef.current = new Set();
             continue;
           } catch (e) {
             // A deliberate Stop mid-compaction throws AbortError (see
@@ -3941,7 +3968,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
           const usable = recovered.filter((c) => declared.has(c.name));
           if (usable.length > 0) {
-            if (!fromReasoning) content = stripToolMarkup(content, consumed);
+            if (fromReasoning) reasoning = stripToolMarkup(reasoning, consumed);
+            else content = stripToolMarkup(content, consumed);
             toolCalls = usable;
             const dropped = recovered.filter((c) => !declared.has(c.name)).map((c) => c.name);
             addLog({ type: 'error', label: 'markup', detail: `recovered ${usable.length} tool call(s) from ${fromReasoning ? 'reasoning' : 'text'} markup${dropped.length ? `; dropped undeclared: ${dropped.join(', ')}` : ''}` });
