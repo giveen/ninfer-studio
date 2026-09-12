@@ -69,3 +69,12 @@ This project takes a pragmatic stance on third-party advisories:
   made, so it cannot be used to reach the loopback control plane or other services
   on the local network (SSRF). `web_search` is unaffected since its target host
   (DuckDuckGo) isn't attacker-controlled.
+- **The built-in `browser` tool has the same SSRF posture, enforced at two
+  layers.** `navigate` runs the same URL check as `web_fetch` up front, and the
+  Obscura engine's HTTP client independently refuses loopback/RFC1918/link-local
+  connections, so JS redirects and in-page `fetch()` calls on a loaded page
+  cannot reach internal services either. Note that the browser executes the
+  page's JavaScript in-process (V8 via deno_core, on a per-session driver
+  thread); the threat model is intentionally the same as `exec`, where the
+  agent already has an unsandboxed shell. The page session is torn down
+  automatically after 10 minutes of inactivity.

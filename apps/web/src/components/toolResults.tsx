@@ -149,6 +149,7 @@ export function ToolResultBlock({ name, content }: { name: string, content: stri
       }
       case 'grep':
       case 'glob':
+      case 'browser':
       case 'git_branch':
       case 'bash_poll':
         return <RawJsonResultView data={data} />;

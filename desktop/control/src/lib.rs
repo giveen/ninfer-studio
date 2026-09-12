@@ -122,6 +122,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/memory", get(coder::memory_get).post(coder::memory_set))
         .route("/api/coder/glob", post(coder::glob))
         .route("/api/coder/web/fetch", post(coder::web_fetch))
+        .route("/api/coder/browser", post(coder::browser))
         .route("/api/coder/web/search", post(coder::web_search))
         .route("/health", get(proxy::proxy))
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))

@@ -153,6 +153,9 @@ pub struct State {
     /// Per-session working directories so the agent's shell behaves like a
     /// stateful terminal (cd persists across calls within a session id).
     pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Lazily-created headless browser session for the `browser` tool
+    /// (Obscura engine). See `coder::browser` for lifecycle (idle reap).
+    pub browser: tokio::sync::Mutex<crate::coder::BrowserSlot>,
     /// Registry of detached background shell jobs (`coder::exec`'s
     /// `background: true` runs) keyed by job id, so `job_get`/`job_kill` can
     /// find them. Lives on `State` rather than a module-global static so
@@ -195,6 +198,7 @@ impl State {
             coder_safe_mode: AtomicBool::new(true),
             coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            browser: tokio::sync::Mutex::new(crate::coder::BrowserSlot::new()),
             bg_jobs: tokio::sync::Mutex::new(HashMap::new()),
             bg_job_counter: AtomicU64::new(0),
             memory_locks: std::sync::Mutex::new(HashMap::new()),

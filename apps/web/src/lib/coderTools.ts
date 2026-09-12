@@ -212,6 +212,27 @@ export const TOOLS = [
   {
     type: "function",
     function: {
+      name: "browser",
+      description: "Built-in headless web browser (runs page JavaScript, unlike web_fetch). Use for JS-rendered pages. Actions: navigate (url), snapshot (page URL/title/Markdown), click (selector), fill (selector, value), press_key (key, optional selector), select_option (selector, value), evaluate (expression), wait_for (selector, optional timeout), close, status. Prefer web_fetch for simple static pages; use the browser when the content only renders via JavaScript.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["navigate", "snapshot", "click", "fill", "press_key", "select_option", "evaluate", "wait_for", "close", "status"] },
+          url: { type: "string", description: "For navigate." },
+          wait_until: { type: "string", enum: ["domcontentloaded", "load"], description: "navigate only, default domcontentloaded." },
+          selector: { type: "string", description: "CSS selector for click/fill/press_key/select_option/wait_for." },
+          value: { type: "string", description: "For fill / select_option." },
+          key: { type: "string", description: "press_key: key name, e.g. \"Enter\"." },
+          expression: { type: "string", description: "evaluate: JavaScript expression to run in the page." },
+          timeout: { type: "number", description: "wait_for: seconds to poll (default 5, max 15)." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "obs_recall",
       description: "Page through the full original content of a large tool result that was replaced with a placeholder to save context (see the placeholder's 'retrieve' line for its id). Call repeatedly with the returned next_offset until eof is true.",
       parameters: {
@@ -393,7 +414,7 @@ export const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob'
  *  (unlike `delegate`, which is read-only-only, `subagent`'s whole point is
  *  writing/running things, so it must NOT be filtered against
  *  READONLY_TOOL_NAMES — that would silently strip write/edit/bash). */
-export const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+export const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
 
 /** Filter a model-supplied tool allow-list against `allowed`, falling back to
  *  `undefined` (caller's default set) when nothing survives the filter — an
