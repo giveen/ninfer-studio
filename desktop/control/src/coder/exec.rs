@@ -4,7 +4,7 @@
 //! blocklist, optional bubblewrap sandbox, secret-env scrubbing, and the
 //! background-job registry the client polls.
 
-use super::common::{coder_root, enforce_perm, rel_of, within_ws};
+use super::common::{coder_root, enforce_perm, is_safe_base_dir, rel_of, within_ws};
 use crate::engine::S;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
@@ -131,16 +131,11 @@ pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>)
             merged.sandbox_binds = binds.iter().filter_map(|v| v.as_str().map(String::from)).collect();
         }
 
-        let base_dir = coder_root(&state);
-        let safe_base = std::fs::canonicalize(&base_dir).unwrap_or(base_dir.clone());
-        let safe_data_dir = std::fs::canonicalize(&state.data_dir).unwrap_or(state.data_dir.clone());
-        if !safe_data_dir.starts_with(&safe_base) {
-            return Json(json!({"ok": false, "error": "invalid data directory"}));
+        if is_safe_base_dir(&state.data_dir) {
+            let path = state.data_dir.join("config.json");
+            let _ = tokio::fs::create_dir_all(&state.data_dir).await;
+            let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
         }
-
-        let path = safe_data_dir.join("config.json");
-        let _ = tokio::fs::create_dir_all(&safe_data_dir).await;
-        let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
         *state.config.write().await = merged;
     }
     let c = state.config.read().await;

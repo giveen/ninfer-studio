@@ -17,6 +17,15 @@ pub(crate) const CODER_IGNORE: &[&str] = &[
     "__pycache__", ".venv", "venv",
 ];
 
+/// Whether `base` is safe to use as a config-write directory: absolute and
+/// free of `..` components. Guards writes to `State::data_dir`, which is
+/// process config (env var or default), not per-request input, but CodeQL
+/// flags it as tainted since it can be set outside the app.
+pub(crate) fn is_safe_base_dir(base: &Path) -> bool {
+    use std::path::Component;
+    base.is_absolute() && !base.components().any(|c| matches!(c, Component::ParentDir))
+}
+
 /// Canonical workspace root, or a 400 when none is configured.
 pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     if ws.is_empty() {
