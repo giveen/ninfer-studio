@@ -109,6 +109,7 @@ export function saveProfileState(
 export interface ConversationsState {
   conversations: import('./types').Conversation[];
   params: ChatParams | null;
+  presets?: import('./types').SavedChatParams[];
 }
 
 export function getConversations(): Promise<ConversationsState> {
@@ -116,7 +117,7 @@ export function getConversations(): Promise<ConversationsState> {
 }
 
 export function saveConversations(
-  patch: Partial<{ conversations: import('./types').Conversation[]; params: ChatParams }>,
+  patch: Partial<{ conversations: import('./types').Conversation[]; params: ChatParams; presets: import('./types').SavedChatParams[] }>,
 ): Promise<unknown> {
   return postJSON('/api/conversations', patch, 20_000);
 }
@@ -603,6 +604,57 @@ export function summarizeOutput(opts: {
         acc += d;
       },
       onDone: () => resolve(acc.trim()),
+      onError: (m) => reject(new Error(m)),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Suggested follow-ups: after a reply completes, ask the engine for 3 short
+// next questions so the user has a one-click way to keep the conversation
+// moving instead of staring at a blank composer.
+// ---------------------------------------------------------------------------
+const FOLLOWUP_INSTRUCTION = [
+  'Suggest exactly 3 short, natural follow-up questions the user might ask next, based on the conversation above.',
+  "Phrase each as something the USER would say to continue the conversation — not a restatement or summary of your own answer.",
+  'Keep each under 12 words.',
+  'Output ONLY a JSON array of exactly 3 strings, e.g. ["...", "...", "..."]. No preamble, no markdown, no other text.',
+].join('\n');
+
+function parseFollowUps(raw: string): string[] {
+  const text = raw.trim();
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text);
+  const jsonText = fenced ? fenced[1].trim() : text;
+  try {
+    const arr = JSON.parse(jsonText);
+    if (Array.isArray(arr)) {
+      const strs = arr.filter((x): x is string => typeof x === 'string' && !!x.trim());
+      if (strs.length) return strs.slice(0, 3);
+    }
+  } catch {
+    /* fall through to line-based fallback below */
+  }
+  // Fallback: the model ignored the JSON instruction and just listed lines.
+  return text
+    .split('\n')
+    .map((l) => l.replace(/^[\s\-*\d.)\]"']+/, '').replace(/["']+$/, '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+}
+
+/** Ask the engine for 3 suggested follow-up questions given `history` (which
+ *  should already end in the assistant's just-completed reply). */
+export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
+  const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
+  const params: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 200 };
+  const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
+  return new Promise<string[]>((resolve, reject) => {
+    let acc = '';
+    streamChat(body, opts.signal ?? AbortSignal.timeout(30_000), {
+      onContentDelta: (d) => {
+        acc += d;
+      },
+      onDone: () => resolve(parseFollowUps(acc)),
       onError: (m) => reject(new Error(m)),
     });
   });

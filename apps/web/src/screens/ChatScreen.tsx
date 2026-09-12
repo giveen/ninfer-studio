@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, Fragment, type
 import {
   BrainCircuit,
   ChevronDown,
+  ChevronsRight,
   Copy,
   Gauge,
   GitBranch,
@@ -10,13 +11,15 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Save,
+  Search,
   Send,
   SlidersHorizontal,
   Square,
   Trash2,
   X,
 } from 'lucide-react';
-import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, summarizeConversation } from '../lib/api';
+import { coderWebFetch, coderWebSearch, buildChatRequest, frameCompactedSummary, getConversations, saveConversations, streamChat, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { effectiveSystemPrompt, effectiveVoice, evaluate, needsHumanize, humanizeRewriteText, HUMANIZE_MAX_DEPTH, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 
 // A legacy compaction checkpoint message (raw <compacted-summary> block).
@@ -47,7 +50,7 @@ function CompactDivider() {
 }
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
-import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, StatusPayload } from '../lib/types';
+import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
 import { Markdown } from '../components/Markdown';
 import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
 
@@ -208,6 +211,8 @@ type MsgActions = {
   onEdit: (convId: string, i: number, text: string) => void;
   onDelete: (convId: string, i: number) => void;
   onBranch: (convId: string, i: number) => void;
+  onContinue: (convId: string, i: number) => void;
+  onFollowUp: (text: string) => void;
 };
 
 function ActionBtn({ title, onClick, disabled, children }: { title: string; onClick: () => void; disabled?: boolean; children: ReactNode }) {
@@ -233,6 +238,7 @@ const MessageRow = memo(function MessageRow({
   locked,
   convId,
   index,
+  isLast,
   actions,
 }: {
   m: ChatMessage;
@@ -243,6 +249,9 @@ const MessageRow = memo(function MessageRow({
   locked?: boolean;
   convId: string;
   index: number;
+  /** Only the last message in the conversation can offer Continue — extending
+   *  a truncated reply anywhere else would orphan the messages after it. */
+  isLast?: boolean;
   actions: MsgActions;
 }) {
   const [editing, setEditing] = useState(false);
@@ -407,6 +416,26 @@ const MessageRow = memo(function MessageRow({
             </div>
           )}
         </div>
+        {isLast && !m.error && !streaming && m.meta?.finishReason === 'length' && (
+          <Button size="sm" variant="subtle" className="mt-1.5" onClick={() => actions.onContinue(convId, index)} disabled={locked}>
+            <ChevronsRight size={12} /> continue
+          </Button>
+        )}
+        {isLast && !streaming && m.followUps && m.followUps.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {m.followUps.map((q, qi) => (
+              <button
+                key={qi}
+                type="button"
+                onClick={() => actions.onFollowUp(q)}
+                disabled={locked}
+                className="rounded-full border border-line bg-panel px-3 py-1.5 text-left text-[12px] text-mute transition-colors hover:border-accent/40 hover:text-ink disabled:pointer-events-none disabled:opacity-40"
+              >
+                {q}
+              </button>
+            ))}
+          </div>
+        )}
         <MessageMeta m={m} />
       </div>
     </div>
@@ -422,17 +451,26 @@ function ParamsPopover({
   open,
   setOpen,
   disabled,
+  presets,
+  onSavePreset,
+  onLoadPreset,
+  onDeletePreset,
 }: {
   params: ChatParams;
   setParams: (p: ChatParams) => void;
   open: boolean;
   setOpen: (v: boolean) => void;
   disabled?: boolean;
+  presets: SavedChatParams[];
+  onSavePreset: (name: string) => void;
+  onLoadPreset: (id: string) => void;
+  onDeletePreset: (id: string) => void;
 }) {
   const set = (patch: Partial<ChatParams>) => setParams({ ...params, ...patch });
   const row = 'grid grid-cols-[150px_1fr] items-center gap-3';
   const lab = 'text-[12px] text-mute';
   const num = 'w-24';
+  const [presetName, setPresetName] = useState('');
   return (
     <div className="w-[430px] rounded-xl border border-line bg-panel p-4 shadow-2xl">
       <div className="space-y-3.5">
@@ -540,6 +578,49 @@ function ParamsPopover({
             className="w-full resize-y rounded-lg border border-line bg-inset px-2.5 py-2 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
           />
         </div>
+        <div className="h-px bg-line" />
+        <div className="space-y-2">
+          <span className={lab}>Presets (sampling + system prompt bundle)</span>
+          {presets.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {presets.map((p) => (
+                <span key={p.id} className="inline-flex items-center gap-1 rounded-md border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
+                  <button type="button" title="Load this preset" onClick={() => onLoadPreset(p.id)} className="hover:text-ink">
+                    {p.name}
+                  </button>
+                  <button type="button" title="Delete preset" onClick={() => onDeletePreset(p.id)} className="text-faint hover:text-danger">
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-1.5">
+            <input
+              value={presetName}
+              onChange={(e) => setPresetName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && presetName.trim()) {
+                  onSavePreset(presetName);
+                  setPresetName('');
+                }
+              }}
+              placeholder="preset name"
+              className="min-w-0 flex-1 rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+            />
+            <Button
+              size="sm"
+              variant="subtle"
+              disabled={!presetName.trim()}
+              onClick={() => {
+                onSavePreset(presetName);
+                setPresetName('');
+              }}
+            >
+              <Save size={12} /> save current
+            </Button>
+          </div>
+        </div>
         <div className="flex justify-between">
           <Button size="sm" variant="subtle" onClick={() => set({ ...DEFAULT_PARAMS, maxTokens: undefined })}>
             reset to defaults
@@ -603,6 +684,8 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
+  const [presets, setPresets] = useState<SavedChatParams[]>([]);
+  const [convSearch, setConvSearch] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
@@ -639,6 +722,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         setConvs(list);
         setActiveId((cur) => cur ?? list[0]?.id ?? null);
         if (s.params) setParamsState(normalizeParams(s.params));
+        if (Array.isArray(s.presets)) setPresets(s.presets);
         setLoaded(true);
       })
       .catch(() => cancelled || setLoaded(true));
@@ -663,10 +747,10 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     // entirely when the user navigated away mid-rewrite, so the whole turn was
     // lost on return (hydration restored the pre-turn snapshot).
     const t = setTimeout(() => {
-      saveConversations({ conversations: convs.slice(0, 200), params }).catch(() => undefined);
+      saveConversations({ conversations: convs.slice(0, 200), params, presets }).catch(() => undefined);
     }, 1500);
     return () => clearTimeout(t);
-  }, [convs, params, loaded]);
+  }, [convs, params, presets, loaded]);
   const setParams = useCallback((p: ChatParams) => setParamsState(p), []);
 
   const active = convs.find((c) => c.id === activeId) || null;
@@ -936,6 +1020,41 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
         }
       }
 
+      // Suggested follow-ups: a fast, best-effort pass offering 3 one-click
+      // next questions so the user isn't stuck staring at a blank composer.
+      // Skipped on a truncated reply (Continue is the more useful action there).
+      if (!ac.signal.aborted) {
+        try {
+          const convForFollowUps = convsRef.current.find((c) => c.id === convId);
+          const msgsForFollowUps = convForFollowUps?.messages ?? [];
+          const idxForFollowUps = placeholderId ? msgsForFollowUps.findIndex((m) => m.id === placeholderId) : msgsForFollowUps.length - 1;
+          const finalMsgForFollowUps = msgsForFollowUps[idxForFollowUps];
+          if (
+            convForFollowUps &&
+            finalMsgForFollowUps &&
+            !finalMsgForFollowUps.error &&
+            finalMsgForFollowUps.content.trim() &&
+            finalMsgForFollowUps.meta?.finishReason !== 'length'
+          ) {
+            const followUps = await suggestFollowUps({
+              model: useModel,
+              history: modelHistory({ ...convForFollowUps, messages: msgsForFollowUps.slice(0, idxForFollowUps + 1) }),
+              signal: ac.signal,
+            });
+            if (!ac.signal.aborted && followUps.length) {
+              setConvs((cs) =>
+                cs.map((c) =>
+                  c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === idxForFollowUps ? { ...m, followUps } : m)) },
+                ),
+              );
+            }
+          }
+        } catch (followUpError) {
+          // Best-effort like the passes above: never take the turn down over this.
+          console.warn('[chat] follow-up suggestions skipped', followUpError);
+        }
+      }
+
       setStreaming(false);
       abortRef.current = null;
     },
@@ -985,6 +1104,32 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
+
+  // Send a suggested follow-up question straight away (bypassing the composer) —
+  // always appends to the active conversation, which is the only one a
+  // follow-up chip can ever be shown against.
+  const sendFollowUp = useCallback(
+    async (content: string) => {
+      const trimmed = content.trim();
+      if (!trimmed || streaming || compacting) return;
+      if (!engineUp) {
+        onNavigate('engine');
+        return;
+      }
+      const useModel = model || runningModel;
+      if (!useModel) return;
+      const conv = convs.find((c) => c.id === activeId);
+      if (!conv) return;
+      const userMsg: ChatMessage = { role: 'user', content: trimmed };
+      const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+      const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
+      setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
+      stick.current = true;
+      const history: ChatMessage[] = modelHistory(base).filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
+      await runStream(conv.id, history, 0, asstMsg.id);
+    },
+    [streaming, compacting, engineUp, model, runningModel, convs, activeId, runStream, onNavigate],
+  );
 
   // --- message-level actions (hover toolbar) ---
   const copyMessage = useCallback((m: ChatMessage) => {
@@ -1042,10 +1187,58 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     [model, runningModel, runStream],
   );
 
-  const msgActions = useMemo(
-    () => ({ onCopy: copyMessage, onRegenerate: regenerate, onEdit: editMessage, onDelete: deleteFrom, onBranch: branchAt }),
-    [copyMessage, regenerate, editMessage, deleteFrom, branchAt],
+  // Extend a reply that hit the token limit: replay the context up to and
+  // including the truncated message, plus a hidden nudge to pick up exactly
+  // where it left off, and stream new deltas into the SAME message (no fresh
+  // placeholder) so the bubble grows in place instead of duplicating.
+  const continueMessage = useCallback(
+    (convId: string, msgIndex: number) => {
+      const conv = convsRef.current.find((c) => c.id === convId);
+      if (!conv) return;
+      const target = conv.messages[msgIndex];
+      if (!target || target.role !== 'assistant') return;
+      const upTo: Conversation = { ...conv, messages: conv.messages.slice(0, msgIndex + 1) };
+      const history: ChatMessage[] = [
+        ...modelHistory(upTo),
+        { role: 'user', content: 'Continue your previous response exactly where it left off. Do not repeat any text you already wrote, and do not add any preamble or acknowledgement.' },
+      ];
+      runStream(convId, history, 0, target.id).catch((e) => console.error('[chat] continue run failed', e));
+    },
+    [runStream],
   );
+
+  const msgActions = useMemo(
+    () => ({ onCopy: copyMessage, onRegenerate: regenerate, onEdit: editMessage, onDelete: deleteFrom, onBranch: branchAt, onContinue: continueMessage, onFollowUp: sendFollowUp }),
+    [copyMessage, regenerate, editMessage, deleteFrom, branchAt, continueMessage, sendFollowUp],
+  );
+
+  // Presets: named, reusable bundles of sampling + system prompt + thinking.
+  const savePreset = useCallback((name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setPresets((ps) => [...ps.filter((p) => p.name !== trimmed), { id: uid(), name: trimmed, params }]);
+  }, [params]);
+
+  const loadPreset = useCallback(
+    (id: string) => {
+      const p = presets.find((x) => x.id === id);
+      if (p) setParams({ ...p.params });
+    },
+    [presets, setParams],
+  );
+
+  const deletePreset = useCallback((id: string) => {
+    setPresets((ps) => ps.filter((p) => p.id !== id));
+  }, []);
+
+  // Sidebar search: match the conversation title or any message's content.
+  const filteredConvs = useMemo(() => {
+    const q = convSearch.trim().toLowerCase();
+    if (!q) return convs;
+    return convs.filter(
+      (c) => c.title.toLowerCase().includes(q) || c.messages.some((m) => m.content.toLowerCase().includes(q)),
+    );
+  }, [convs, convSearch]);
 
   // Slash-command interpreter. Returns true if `raw` was a recognized command
   // (so the caller can skip sending it to the engine as a normal message).
@@ -1145,9 +1338,26 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             <Plus size={14} /> new chat
           </Button>
         </div>
+        {convs.length > 0 && (
+          <div className="px-2.5 pb-2">
+            <div className="relative">
+              <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+              <input
+                value={convSearch}
+                onChange={(e) => setConvSearch(e.target.value)}
+                placeholder="Search chats…"
+                className="w-full rounded-lg border border-line bg-inset py-1.5 pl-7 pr-2.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+              />
+            </div>
+          </div>
+        )}
         <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-          {convs.length === 0 && <p className="px-2 py-3 text-[12px] leading-relaxed text-faint">No conversations yet. Start one below — everything runs locally against the NInfer engine.</p>}
-          {convs.map((c) => (
+          {filteredConvs.length === 0 && (
+            <p className="px-2 py-3 text-[12px] leading-relaxed text-faint">
+              {convs.length === 0 ? 'No conversations yet. Start one below — everything runs locally against the NInfer engine.' : 'No chats match your search.'}
+            </p>
+          )}
+          {filteredConvs.map((c) => (
             <div
               key={c.id}
               onClick={() => setActiveId(c.id)}
@@ -1248,6 +1458,7 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
                       m={m}
                       convId={activeId ?? ''}
                       index={i}
+                      isLast={i === messages.length - 1}
                       streaming={streaming && i === messages.length - 1}
                       locked={streaming || compacting}
                       actions={msgActions}
@@ -1373,7 +1584,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
             </div>
             {paramsOpen && (
               <div className="absolute bottom-full left-2 mb-2 z-30">
-                <ParamsPopover params={params} setParams={setParams} open={paramsOpen} setOpen={setParamsOpen} disabled={streaming} />
+                <ParamsPopover
+                  params={params}
+                  setParams={setParams}
+                  open={paramsOpen}
+                  setOpen={setParamsOpen}
+                  disabled={streaming}
+                  presets={presets}
+                  onSavePreset={savePreset}
+                  onLoadPreset={loadPreset}
+                  onDeletePreset={deletePreset}
+                />
               </div>
             )}
           </div>

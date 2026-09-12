@@ -331,7 +331,7 @@ async function saveProfileState(patch) {
 // which is tied to the webview origin and lost across installs).
 // ---------------------------------------------------------------------------
 const CHATS_PATH = path.join(DATA_DIR, 'chats.json');
-let chatsState = { conversations: [], params: null };
+let chatsState = { conversations: [], params: null, presets: [] };
 
 async function loadChats() {
   try {
@@ -340,9 +340,10 @@ async function loadChats() {
     chatsState = {
       conversations: Array.isArray(c.conversations) ? c.conversations : [],
       params: c.params ?? null,
+      presets: Array.isArray(c.presets) ? c.presets : [],
     };
   } catch {
-    chatsState = { conversations: [], params: null };
+    chatsState = { conversations: [], params: null, presets: [] };
   }
   return chatsState;
 }
@@ -350,6 +351,7 @@ async function loadChats() {
 async function saveChats(patch) {
   const next = { ...chatsState, ...patch };
   next.conversations = Array.isArray(next.conversations) ? next.conversations : [];
+  next.presets = Array.isArray(next.presets) ? next.presets : [];
   chatsState = next;
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.writeFile(CHATS_PATH, JSON.stringify(next, null, 2));
