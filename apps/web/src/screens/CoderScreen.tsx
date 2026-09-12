@@ -16,6 +16,7 @@ import { useCoderJobs } from '../components/coder/useCoderJobs';
 import { JobsPanel } from '../components/coder/JobsPanel';
 import { useCoderGit } from '../components/coder/useCoderGit';
 import { CommitsPanel } from '../components/coder/CommitsPanel';
+import { useConversationHandlers } from '../components/coder/useCoderConversations';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
@@ -186,8 +187,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [pickerLoading, setPickerLoading] = useState(false);
   const [pickerExpanded, setPickerExpanded] = useState<Record<string, boolean>>({});
   const [pickerSelected, setPickerSelected] = useState<Record<string, boolean>>({});
-  const [editingConv, setEditingConv] = useState<{ ws: string; cid: string } | null>(null);
-  const [archivedOpen, setArchivedOpen] = useState<Record<string, boolean>>({});
+  // Conversation rename/archived-collapse UI state lives in useConversationHandlers.
 
   // File Tree panel — browse the workspace and pin files/folders so the system
   // prompt "follows" them (system-prompt follow binding).
@@ -619,154 +619,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
 
-  const handleSelectConv = (ws: string, convId: string) => {
-    // Switching is a pure view change even mid-run: the in-flight run is pinned
-    // to its own conversation (runConvRef) and keeps persisting there, so the
-    // visible transcript can follow the user without corruption (P0 #2).
-    if (ws === activeWs && convId === activeConv) return;
-    setStore((prev) => ({ ...prev, activeWs: ws, activeConv: convId }));
-    loadConv(ws, convId);
+  // Conversation selection + CRUD (store state stays above; handlers live in
+  // the hook). clearView resets the visible transcript when no conversation
+  // is selected (workspace removed, active conversation archived/deleted).
+  const clearView = () => {
+    setMessages([]);
+    setLedger([]);
+    applyTodos([], null);
+    lastPromptTokensRef.current = 0;
   };
-  const handleSelectWorkspace = (ws: string) => {
-    const wsd = storeRef.current.workspaces[ws];
-    const cid = wsd?.activeConv ?? wsd?.order[0] ?? '';
-    handleSelectConv(ws, cid);
-  };
-  const handleToggleExpand = (ws: string) => {
-    setStore((prev) => {
-      const wsd = prev.workspaces[ws];
-      if (!wsd) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [ws]: { ...wsd, expanded: !wsd.expanded } } };
-    });
-  };
-  const handleAddWorkspace = (path: string) => {
-    const existing = storeRef.current.workspaces[path];
-    setStore((prev) => {
-      if (existing) return { ...prev, activeWs: path, activeConv: existing.activeConv ?? existing.order[0] ?? '' };
-      const id = newConvId();
-      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id };
-      return { ...prev, activeWs: path, activeConv: id, workspaces: { ...prev.workspaces, [path]: ws } };
-    });
-    if (existing) {
-      const cid = existing.activeConv ?? existing.order[0] ?? '';
-      loadConv(path, cid);
-    } else {
-      setMessages([]);
-      setLedger([]);
-      applyTodos([], null);
-      lastPromptTokensRef.current = 0;
-    }
-  };
-  const handleRemoveWorkspace = (path: string) => {
-    // A workspace hosting the in-flight (or paused, ask_user) run's
-    // conversation can't go away while its transcript is being written into it.
-    if ((runConvRef.current ?? askConvRef.current)?.ws === path) return;
-    const workspaces = { ...storeRef.current.workspaces };
-    delete workspaces[path];
-    const keys = Object.keys(workspaces);
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (storeRef.current.activeWs === path) {
-      aWs = keys[0] ?? '';
-      aConv = aWs ? (workspaces[aWs].activeConv ?? workspaces[aWs].order[0] ?? '') : '';
-    }
-    setStore((prev) => ({ ...prev, workspaces, activeWs: aWs, activeConv: aConv }));
-    if (aWs && aConv) loadConv(aWs, aConv);
-    else {
-      setMessages([]);
-      setLedger([]);
-      applyTodos([], null);
-      lastPromptTokensRef.current = 0;
-    }
-  };
-
-  const handleRenameConv = (ws: string, cid: string, title: string) => {
-    const t = title.trim();
-    setEditingConv(null);
-    if (!t) return;
-    setStore((prev) => {
-      const wsd = prev.workspaces[ws];
-      const c = wsd?.conversations[cid];
-      if (!wsd || !c) return prev;
-      return {
-        ...prev,
-        workspaces: { ...prev.workspaces, [ws]: { ...wsd, conversations: { ...wsd.conversations, [cid]: { ...c, title: t } } } },
-      };
-    });
-  };
-
-  const handleArchiveConv = (ws: string, cid: string, archived: boolean) => {
-    // Hiding the conversation an in-flight (or paused, ask_user) run is pinned
-    // to would strand its live transcript; restoring it is always fine.
-    if (archived && (runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return;
-    const wsd = storeRef.current.workspaces[ws];
-    const c = wsd?.conversations[cid];
-    if (!wsd || !c) return;
-    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (archived && isActive) {
-      const other = wsd.order.find((id) => id !== cid && !wsd.conversations[id]?.archived);
-      aConv = other ?? '';
-    }
-    setStore((prev) => {
-      const w = prev.workspaces[ws];
-      if (!w) return prev;
-      const conv = w.conversations[cid];
-      if (!conv) return prev;
-      return {
-        ...prev,
-        activeWs: aWs,
-        activeConv: aConv,
-        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: { ...w.conversations, [cid]: { ...conv, archived } } } },
-      };
-    });
-    if (archived && isActive) {
-      if (aConv) loadConv(aWs, aConv);
-      else {
-        setMessages([]);
-        setLedger([]);
-        applyTodos([], null);
-        lastPromptTokensRef.current = 0;
-      }
-    }
-  };
-
-  const handleDeleteConv = (ws: string, cid: string) => {
-    if ((runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid) return; // pinned by the in-flight / paused run
-    if (!window.confirm('Delete this conversation? This cannot be undone.')) return;
-    const wsd = storeRef.current.workspaces[ws];
-    if (!wsd) return;
-    const isActive = storeRef.current.activeWs === ws && storeRef.current.activeConv === cid;
-    let aWs = storeRef.current.activeWs;
-    let aConv = storeRef.current.activeConv;
-    if (isActive) {
-      const remaining = wsd.order.filter((id) => id !== cid);
-      aConv = remaining.find((id) => !wsd.conversations[id]?.archived) ?? remaining[0] ?? '';
-    }
-    setStore((prev) => {
-      const w = prev.workspaces[ws];
-      if (!w) return prev;
-      const convs = { ...w.conversations };
-      delete convs[cid];
-      const order = w.order.filter((id) => id !== cid);
-      return {
-        ...prev,
-        activeWs: aWs,
-        activeConv: aConv,
-        workspaces: { ...prev.workspaces, [ws]: { ...w, activeConv: aConv, conversations: convs, order } },
-      };
-    });
-    if (isActive) {
-      if (aConv) loadConv(aWs, aConv);
-      else {
-        setMessages([]);
-        setLedger([]);
-        applyTodos([], null);
-        lastPromptTokensRef.current = 0;
-      }
-    }
-  };
+  const {
+    editingConv, setEditingConv, archivedOpen, setArchivedOpen,
+    handleSelectConv, handleSelectWorkspace, handleToggleExpand,
+    handleAddWorkspace, handleRemoveWorkspace, handleRenameConv,
+    handleArchiveConv, handleDeleteConv,
+  } = useConversationHandlers({
+    store,
+    setStore,
+    activeWs,
+    activeConv,
+    loadConv,
+    clearView,
+    isPinned: (ws, cid) => (runConvRef.current ?? askConvRef.current)?.ws === ws && (runConvRef.current ?? askConvRef.current)?.convId === cid,
+    isWorkspacePinned: (path) => (runConvRef.current ?? askConvRef.current)?.ws === path,
+  });
   const abortRef = useRef<AbortController | null>(null);
   const modelRef = useRef<string>('qwen-coder');
   /** Lint/test/build commands resolved once per run (config, else manifest
