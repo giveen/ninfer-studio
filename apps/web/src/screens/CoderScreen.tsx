@@ -11,13 +11,14 @@ import { DirBrowser } from '../components/DirBrowser';
 const Markdown = lazy(() => import('../components/Markdown'));
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { FilePickerModal } from '../components/coder/FilePickerModal';
+import { useCoderMemory } from '../components/coder/useCoderMemory';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemoryGet, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderMemory, type CoderLearning, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderJobKill, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderGitLog, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderCommit, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
@@ -341,47 +342,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Cached AGENTS.md conventions for the active workspace (refreshed by refreshRepoMap).
   const conventionsRef = useRef<string>('');
 
-  // Workspace-switch synchronization (shared by the Tree panel and the memory
-  // panel): both fetch RELATIVE to the control plane's *configured* workspace,
-  // which setCoderWorkspace() re-points asynchronously. A response that lands
-  // before the switch is confirmed belongs to the PREVIOUS workspace — so each
-  // panel applies a response only if (a) it is the newest fetch (seq refs) and
-  // (b) the control was confirmed at that workspace by then (wsAppliedDirRef.current,
+  // Workspace-switch synchronization for the Tree panel: it fetches RELATIVE
+  // to the control plane's *configured* workspace, which setCoderWorkspace()
+  // re-points asynchronously. A response that lands before the switch is
+  // confirmed belongs to the PREVIOUS workspace — so the tree applies a
+  // response only if (a) it is the newest fetch (treeSeqRef) and (b) the
+  // control was confirmed at that workspace by then (wsAppliedDirRef.current,
   // set in the setCoderWorkspace success handler below, which also bumps
-  // wsFlushed to trigger the confirmed reload).
+  // wsFlushed to trigger the confirmed reload). The memory panel applies the
+  // same guard inside useCoderMemory.
   const treeSeqRef = useRef(0);
-  const memSeqRef = useRef(0);
 
-  // Self-improving memory (Hybrid A+B). Persisted OUTSIDE the repo by the control plane
-  // under its data dir, so it is never committed by accident. The agent sees it
-  // only via system-prompt injection (memoryRef) — it can't read it as a file.
-  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
-  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
-  // Memory modal open state.
-  const [memOpen, setMemOpen] = useState(false);
-  // Generation counters for the control-plane-relative panel fetches (commits panel —
-  // the tree/memory seq refs live in the shared block above).
+  // Self-improving memory panel (state + guarded fetch live in the hook).
+  const { memory, memoryRef, memOpen, setMemOpen, loadMemory, adoptMemory } = useCoderMemory({
+    activeWsDir,
+    wsFlushed,
+    appliedDirRef: wsAppliedDirRef,
+  });
+  // Generation counter for the commits panel fetch (same switch-race guard).
   const commitsSeqRef = useRef(0);
-  // Pull the bank + learnings for the active workspace; called on workspace change
-  // and after the critic / memory_update writes new learnings.
-  const loadMemory = useCallback(async () => {
-    if (!activeWsDir) return;
-    const seq = ++memSeqRef.current;
-    try {
-      const m = await coderMemoryGet();
-      // Same switch race as the tree: only adopt the newest response, and
-      // only once the control is confirmed at this workspace — otherwise a
-      // pre-switch response would land in memoryRef and leak the OTHER
-      // workspace's bank into this workspace's system prompt.
-      if (seq === memSeqRef.current && wsAppliedDirRef.current === activeWsDir) {
-        setMemory(m);
-        memoryRef.current = m;
-      }
-    } catch {
-      // memory is best-effort; keep the last good value rather than wiping UI.
-    }
-  }, [activeWsDir]);
-
   const loadCommits = useCallback(async () => {
     const seq = ++commitsSeqRef.current;
     setCommitsLoading(true);
@@ -420,11 +399,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [activeWsDir, wsFlushed, loadCommits]);
 
   // Refresh the self-improving memory whenever the active workspace changes —
-  // and again once the control is confirmed at it (wsFlushed), the only point
-  // at which the relative fetch is guaranteed to hit this workspace's store.
-  useEffect(() => {
-    if (activeWsDir) void loadMemory();
-  }, [activeWsDir, wsFlushed, loadMemory]);
+  // and again once the control is confirmed at it (wsFlushed). The effect
+  // lives in useCoderMemory; this call site only needs the loader.
 
   // Sync the safe-mode toggle with the control plane's current state on mount.
   useEffect(() => {
@@ -2180,11 +2156,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' }, toolSignal);
               // The write landed in the store the control points at *now*;
               // adopt it into the active workspace's state only if that is
-              // still the confirmed workspace.
-              if (wsAppliedDirRef.current === activeWsDir) {
-                setMemory(m);
-                memoryRef.current = m;
-              }
+              // still the confirmed workspace (guard lives in adoptMemory).
+              adoptMemory(m);
               result = JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
             } catch (e) {
               result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
@@ -2649,11 +2622,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
     }
     // Adopt the final write response only if the control is still confirmed
-    // at the active workspace (it re-points async on workspace switches).
-    if (wsAppliedDirRef.current === activeWsDir) {
-      setMemory(m);
-      memoryRef.current = m;
-    }
+    // at the active workspace (guard lives in adoptMemory).
+    adoptMemory(m);
   };
 
   // ---------------------------------------------------------------------------
@@ -4544,8 +4514,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         open={memOpen}
         onClose={() => setMemOpen(false)}
         memory={memory}
-        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
-        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => { if (wsAppliedDirRef.current === activeWsDir) { setMemory(m); memoryRef.current = m; } })}
+        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => adoptMemory(m))}
+        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => adoptMemory(m))}
         onChanged={() => loadMemory()}
       />
       {showDir && (
