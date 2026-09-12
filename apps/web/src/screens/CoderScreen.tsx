@@ -3,7 +3,12 @@ import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, Che
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode, CoderJob } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
-import { Markdown } from '../components/Markdown';
+// Dynamically imported: react-markdown + remark-gfm + highlight.js is a
+// ~300KB chunk that costs nothing at startup this way, only when the first
+// completed reply actually needs to render (see ChatScreen.tsx, which shares
+// this same lazy module — both must use dynamic import or Rollup folds the
+// chunk back into the eager bundle for both).
+const Markdown = lazy(() => import('../components/Markdown'));
 import { DiffReviewModal } from '../components/DiffReviewModal';
 import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
@@ -574,7 +579,9 @@ function ReportBlock({ message }: { message: ChatMessage }) {
       </button>
       {open && message.content && (
         <div className="markdown border-t border-line px-3 py-2 text-[13.5px] leading-relaxed">
-          <Markdown>{message.content}</Markdown>
+          <Suspense fallback={null}>
+            <Markdown>{message.content}</Markdown>
+          </Suspense>
         </div>
       )}
     </div>
@@ -606,7 +613,7 @@ function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
               )}
               {m.content && m.role !== 'tool' && (
                 m.role === 'assistant'
-                  ? <div className="markdown text-[12px] leading-relaxed"><Markdown>{m.content}</Markdown></div>
+                  ? <div className="markdown text-[12px] leading-relaxed"><Suspense fallback={null}><Markdown>{m.content}</Markdown></Suspense></div>
                   : <div className="break-words text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (
@@ -4853,7 +4860,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                     ) : null}
                     {g.items[0].content && (
                       g.items[0].role === 'assistant' || g.items[0].displayName
-                        ? <div className="markdown text-[13.5px] leading-relaxed"><Markdown>{g.items[0].content}</Markdown></div>
+                        ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown>{g.items[0].content}</Markdown></Suspense></div>
                         : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
                     )}
                   </div>

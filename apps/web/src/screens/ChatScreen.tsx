@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, Fragment, type ReactNode } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
@@ -70,7 +70,10 @@ function CompactDivider() {
 import { formatBytes, formatMs, formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
 import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
-import { Markdown } from '../components/Markdown';
+// Dynamically imported: react-markdown + remark-gfm + highlight.js is a
+// ~300KB chunk that costs nothing at startup this way, only when the first
+// completed (non-streaming) reply actually needs to render.
+const Markdown = lazy(() => import('../components/Markdown'));
 import { Badge, Button, cn, NumberField, Segmented, SelectField, Toggle } from '../components/ui';
 
 
@@ -1491,26 +1494,28 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
               </div>
             </div>
           ) : (
-            <div className="mx-auto flex max-w-3xl flex-col gap-5">
-              {messages.map((m, i) => {
-                if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
-                const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
-                return (
-                  <Fragment key={i}>
-                    {showDivider && <CompactDivider />}
-                    <MessageRow
-                      m={m}
-                      convId={activeId ?? ''}
-                      index={i}
-                      isLast={i === messages.length - 1}
-                      streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
-                      locked={streaming || compacting}
-                      actions={msgActions}
-                    />
-                  </Fragment>
-                );
-              })}
-            </div>
+            <Suspense fallback={null}>
+              <div className="mx-auto flex max-w-3xl flex-col gap-5">
+                {messages.map((m, i) => {
+                  if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                  const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
+                  return (
+                    <Fragment key={i}>
+                      {showDivider && <CompactDivider />}
+                      <MessageRow
+                        m={m}
+                        convId={activeId ?? ''}
+                        index={i}
+                        isLast={i === messages.length - 1}
+                        streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
+                        locked={streaming || compacting}
+                        actions={msgActions}
+                      />
+                    </Fragment>
+                  );
+                })}
+              </div>
+            </Suspense>
           )}
         </div>
 
