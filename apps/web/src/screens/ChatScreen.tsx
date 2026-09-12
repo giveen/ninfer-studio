@@ -786,10 +786,16 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
   };
 
+  // Scoped to the active conversation's messages array (a new reference each
+  // time a message is added or a streamed token appends to one) instead of
+  // running after every render — unrelated state changes (composer typing,
+  // params popover, etc.) used to force a scrollHeight read + scrollTop
+  // write here too, which is a synchronous layout cost paid on every
+  // keystroke and every streamed token for no reason.
   useEffect(() => {
     const el = scrollRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  });
+  }, [active?.messages]);
 
   const runCompact = useCallback(async () => {
     if (compacting) return;
