@@ -28,6 +28,7 @@ import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 
 // ---------------------------------------------------------------------------
 // Screen
@@ -124,6 +125,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     // a stale catalog fallback (e.g. "qwen3.8-27b") selected, which 404s.
     if (runningModel && !model) setModel(runningModel);
   }, [runningModel, model]);
+
+  // Probe once per engine readiness change whether /v1/responses is
+  // implemented (community forks may not have it) — cached, so `send` can
+  // check it synchronously per turn without blocking on a fresh request.
+  useEffect(() => {
+    if (engineUp) void probeResponsesSupport();
+  }, [engineUp]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -278,6 +286,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         registry,
         maxSteps: 12,
         signal: ac.signal,
+        // Route through the engine's /v1/responses transport when it's
+        // available AND this turn's sampling params are fully expressible
+        // there (see responses.ts) — never silently drop a knob the user
+        // set (top_k/min_p/penalties/seed aren't accepted on that endpoint
+        // on this engine build). Falls back to the proven Chat Completions
+        // path (streamTurn's own default) otherwise.
+        stream: knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : undefined,
         onTurnStart: (turn) => {
           if (turn === 0 || ac.signal.aborted) return;
           const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
