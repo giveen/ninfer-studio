@@ -12,7 +12,6 @@ use axum::Json;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::process::Command;
@@ -91,26 +90,42 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Persist a single boolean `AppSettings` field to `config.json`, mirroring
+/// `sandbox_set`'s exact read-merge-write shape (a full save-config round
+/// trip would also work, but every coder toggle already updates its own
+/// field in isolation this way to avoid clobbering a concurrent edit to an
+/// unrelated field).
+async fn persist_bool_setting(state: &S, set: impl FnOnce(&mut crate::types::AppSettings, bool), enabled: bool) {
+    let mut merged = state.config.read().await.clone();
+    set(&mut merged, enabled);
+    if is_safe_base_dir(&state.data_dir) {
+        let path = state.data_dir.join("config.json");
+        let _ = tokio::fs::create_dir_all(&state.data_dir).await;
+        let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
+    }
+    *state.config.write().await = merged;
+}
+
 pub async fn safe_mode_get(AxumState(state): AxumState<S>) -> Json<Value> {
-    Json(json!({"enabled": state.coder_safe_mode.load(Ordering::SeqCst)}))
+    Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
 }
 
 pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
     if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        state.coder_safe_mode.store(enabled, Ordering::SeqCst);
+        persist_bool_setting(&state, |c, v| c.coder_safe_mode = v, enabled).await;
     }
-    Json(json!({"enabled": state.coder_safe_mode.load(Ordering::SeqCst)}))
+    Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
 }
 
 pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> {
-    Json(json!({"enabled": state.coder_commit_approval.load(Ordering::SeqCst)}))
+    Json(json!({"enabled": state.config.read().await.coder_commit_approval}))
 }
 
 pub async fn commit_approval_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
     if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        state.coder_commit_approval.store(enabled, Ordering::SeqCst);
+        persist_bool_setting(&state, |c, v| c.coder_commit_approval = v, enabled).await;
     }
-    Json(json!({"enabled": state.coder_commit_approval.load(Ordering::SeqCst)}))
+    Json(json!({"enabled": state.config.read().await.coder_commit_approval}))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +186,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     let timeout_ms = req.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000).clamp(1_000, 600_000);
 
     // Safe-mode gate first: refuse before spawning anything (release #2).
-    if state.coder_safe_mode.load(Ordering::SeqCst)
+    if state.config.read().await.coder_safe_mode
         && let Some(reason) = detect_destructive(&command)
     {
         let cwd = if rel_cwd.is_empty() { rel_of(&root, &root) } else { rel_cwd.clone() };
@@ -630,6 +645,28 @@ mod tests {
         // Toggle back off (the UI's kill switch must be one POST away).
         let r = sandbox_set(w(), Json(json!({"enabled": false}))).await;
         assert_eq!(r["enabled"], false);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn safe_mode_and_commit_approval_persist_to_config() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-safemodetest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let w = || AxumState(state.clone());
+
+        assert_eq!(safe_mode_get(w()).await["enabled"], true);
+        assert_eq!(safe_mode_set(w(), Json(json!({"enabled": false}))).await["enabled"], false);
+        assert_eq!(commit_approval_get(w()).await["enabled"], false);
+        assert_eq!(commit_approval_set(w(), Json(json!({"enabled": true}))).await["enabled"], true);
+
+        // A fresh process reading config.json off disk sees the same values —
+        // not just the in-memory copy — since both now persist like sandbox.
+        let cfg = serde_json::from_str::<Value>(&std::fs::read_to_string(tmp.join("config.json")).unwrap()).unwrap();
+        assert_eq!(cfg.get("coderSafeMode"), Some(&json!(false)));
+        assert_eq!(cfg.get("coderCommitApproval"), Some(&json!(true)));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
