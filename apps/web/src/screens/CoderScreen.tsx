@@ -273,6 +273,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           setLlmPhase(null);
           cb.onDone?.(m);
         },
+        // A request-level failure (e.g. the engine 400s a param it doesn't
+        // support) resolves streamChat via this callback, not onDone or a
+        // throw — without clearing the phase here too, the "reading context"
+        // banner is left stuck ticking forever even though the turn is
+        // already over (the run itself does stop; only this indicator doesn't).
+        onError: (msg) => {
+          setLlmPhase(null);
+          cb.onError?.(msg);
+        },
       });
     } catch (e) {
       setLlmPhase(null);
@@ -2862,6 +2871,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // connection doesn't kill a long agent run (P2 #9).
         let attempt = 0;
         let turn: TurnResult | null = null;
+        // A request-level rejection (bad params, unsupported field — see
+        // streamChat's !r.ok path) resolves streamTurn with an empty,
+        // content-less result rather than throwing, so the retry loop above
+        // never sees it and the isEmptyResponse log below would otherwise
+        // just say "empty response" with no clue why. Capture the real
+        // message here so that log can quote it instead.
+        let streamErrorMsg: string | null = null;
         while (!turn && attempt < MAX_ATTEMPTS) {
           attempt++;
           try {
@@ -2874,6 +2890,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               cacheSystem: coderParams.promptCache,
               signal: abortRef.current.signal,
               stream: (r, sig, cb) => trackedStream(r, sig, 'agent', cb),
+              onStreamError: (msg) => { streamErrorMsg = msg; },
             });
           } catch (e) {
             if (abortRef.current?.signal.aborted) throw e;
@@ -2913,7 +2930,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // stop the turn cleanly so the user can retry (H1).
         const isEmptyResponse = !content.trim() && toolCalls.length === 0;
         if (isEmptyResponse) {
-          addLog({ type: 'error', label: 'empty', detail: 'Model returned an empty response (no content or tool calls) — stopping the turn.' });
+          addLog({
+            type: 'error',
+            label: 'empty',
+            detail: streamErrorMsg
+              ? `${streamErrorMsg} — stopping the turn.`
+              : 'Model returned an empty response (no content or tool calls) — stopping the turn.',
+          });
           break;
         }
 
