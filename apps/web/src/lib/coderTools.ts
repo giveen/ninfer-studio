@@ -396,6 +396,22 @@ export const TOOLS = [
         required: ["text", "kind"]
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_recall",
+      description: "Search this repo's FULL learning history for a keyword or phrase — not just the most recent 15 learnings injected into your system prompt. Use it when you suspect a past run already hit this problem but its learning aged out of the injected window.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keyword(s) or phrase to search for, matched case-insensitively against learning text and task." },
+          kind: { type: "string", enum: ["success", "tip", "avoid"], description: "Optional filter to a single learning kind." },
+          limit: { type: "number", description: "Max matches to return, most recent first (default 10, max 30)." }
+        },
+        required: ["query"]
+      }
+    }
   }
 ];
 
@@ -407,7 +423,7 @@ export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', '
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 export const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
-export const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search', 'obs_recall']);
+export const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'git_diff', 'ask_user', 'bash_poll', 'delegate', 'repo_search', 'obs_recall', 'memory_recall']);
 /** Tool names an implementation `subagent` worker may use by default — the
  *  same set `runWorker` falls back to when no allow-list is given. Used to
  *  validate a model-supplied `tools` allow-list for the `subagent` tool
