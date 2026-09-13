@@ -129,6 +129,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/search", get(coder::search))
         .route("/api/coder/diff", get(coder::diff))
         .route("/api/coder/perms", get(coder::perms_get).post(coder::perms_set))
+        .route("/api/coder/perms/approve", post(coder::perms_approve))
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))

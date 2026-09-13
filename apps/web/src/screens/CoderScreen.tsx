@@ -23,7 +23,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderPermsApprove, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
@@ -184,6 +184,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const wsApplyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [showDir, setShowDir] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  /** Messages typed while a run is in flight, per conversation (keyed by
+   *  convId) — in-memory only, like the composer draft itself, not persisted
+   *  into the conversation's stored messages. Auto-sent one at a time as soon
+   *  as that conversation's run finishes; a manual Stop does NOT auto-drain
+   *  (see `stoppedRef`), so an interrupted run doesn't immediately fire the
+   *  next queued prompt behind the user's back.
+   *  Ref-mirrored (like runConv/runConvRef) so runAgent's finally block —
+   *  running inside a closure captured when the run STARTED — sees items
+   *  queued after that, not a stale empty snapshot. */
+  type QueuedItem = { text: string; attachments: ChatAttachment[] };
+  const queuedRef = useRef<Record<string, QueuedItem[]>>({});
+  const [queued, setQueuedState] = useState<Record<string, QueuedItem[]>>({});
+  const setQueued = (updater: Record<string, QueuedItem[]> | ((prev: Record<string, QueuedItem[]>) => Record<string, QueuedItem[]>)) => {
+    setQueuedState((prev) => {
+      const next = typeof updater === 'function' ? (updater as (p: Record<string, QueuedItem[]>) => Record<string, QueuedItem[]>)(prev) : updater;
+      queuedRef.current = next;
+      return next;
+    });
+  };
+  /** Set by `stop()`, read (and reset) once the aborted run's `finally` runs. */
+  const stoppedRef = useRef(false);
   const [showPicker, setShowPicker] = useState(false);
   const [pickerNodes, setPickerNodes] = useState<FileNode[]>([]);
   const [pickerLoading, setPickerLoading] = useState(false);
@@ -268,10 +289,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setCoderSafeMode(next);
     try { await coderSafeModeSet(next); } catch { /* keep UI state as-is */ }
   }, []);
-  const [coderSandbox, setCoderSandbox] = useState(false);
+  const [coderSandbox, setCoderSandbox] = useState(true);
+  // Whether `bwrap` is actually installed on this host — the toggle can be ON
+  // while this is false, in which case the shell silently runs unsandboxed
+  // (exec.rs's gate no-ops). Surfaced so the label never claims protection it
+  // isn't actually providing.
+  const [bwrapAvailable, setBwrapAvailable] = useState(true);
   const toggleSandbox = useCallback(async (next: boolean) => {
     setCoderSandbox(next);
-    try { await coderSandboxSet(next); } catch { /* keep UI state as-is */ }
+    try {
+      const r = await coderSandboxSet(next);
+      setBwrapAvailable(r.bwrapAvailable);
+    } catch { /* keep UI state as-is */ }
   }, []);
   // Commit approval gate: when ON, the agent may not commit without an explicit
   // human sign-off on the working-tree-vs-HEAD diff. Auto-commits on write/edit
@@ -344,6 +373,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     coderSafeModeGet()
       .then((r) => setCoderSafeMode(r.enabled))
       .catch(() => { /* leave default true */ });
+  }, []);
+
+  // Sync the sandbox toggle + bwrap-availability with the control plane on
+  // mount — without this the toggle always started at its React default
+  // regardless of what was actually persisted/running server-side.
+  useEffect(() => {
+    coderSandboxGet()
+      .then((r) => { setCoderSandbox(r.enabled); setBwrapAvailable(r.bwrapAvailable); })
+      .catch(() => { /* leave defaults */ });
   }, []);
 
   // The conversation an in-flight run is pinned to. Set at run start so that
@@ -985,7 +1023,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
     addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
     try {
-      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWsDir);
+      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWsDir, false, undefined, activeWsDir);
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'undo', detail: (r.stderr || r.stdout || 'undo failed').slice(0, 300) });
       }
@@ -1000,28 +1038,42 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const branchMenuRef = useRef<HTMLDivElement>(null);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
-  /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
-  const createCheckpoint = async () => {
+  /** Most auto-checkpoints a conversation keeps at once — old ones are dropped
+   *  as new ones are taken; manual checkpoints are never touched by this cap. */
+  const MAX_AUTO_CHECKPOINTS = 5;
+  /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git).
+   *  `auto: true` is used for the once-per-turn safety snapshot taken right before the
+   *  first mutating tool call — silent (doesn't pop the panel open) and capped. */
+  const createCheckpoint = async (opts?: { auto?: boolean }) => {
     if (!activeWs || !activeConv) return;
     let commit = '';
     try {
-      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWsDir);
+      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWsDir, false, undefined, activeWsDir);
       if (r.exitCode === 0 && /^[0-9a-f]{5,40}$/i.test((r.stdout || '').trim())) commit = (r.stdout || '').trim();
     } catch { /* not a git repo — transcript-only checkpoint */ }
+    const auto = opts?.auto ?? false;
     const cp: Checkpoint = {
       id: 'cp-' + crypto.randomUUID(),
       time: Date.now(), label: commit ? commit.slice(0, 7) : 'transcript',
-      commit, messages: messages.length, ledger: ledger.length, todos,
+      commit, messages: messages.length, ledger: ledger.length, todos, auto,
     };
     setStore((prev) => {
       const wsd = prev.workspaces[activeWs];
       const meta = wsd?.conversations[activeConv];
       if (!wsd || !meta) return prev;
-      const next = { ...meta, checkpoints: [...(meta.checkpoints ?? []), cp] };
+      let list = [...(meta.checkpoints ?? []), cp];
+      if (auto) {
+        const autoIds = list.filter((c) => c.auto).map((c) => c.id);
+        if (autoIds.length > MAX_AUTO_CHECKPOINTS) {
+          const drop = new Set(autoIds.slice(0, autoIds.length - MAX_AUTO_CHECKPOINTS));
+          list = list.filter((c) => !drop.has(c.id));
+        }
+      }
+      const next = { ...meta, checkpoints: list };
       return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: next } } } };
     });
-    addLog({ type: 'compact', label: 'checkpoint', detail: `saved (${cp.messages} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})` });
-    setShowCheckpoints(true);
+    addLog({ type: 'compact', label: auto ? 'checkpoint (auto)' : 'checkpoint', detail: `saved (${cp.messages} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})` });
+    if (!auto) setShowCheckpoints(true);
   };
   /** Restore a checkpoint: hard-reset the workspace, then truncate transcript + todos. */
   const restoreCheckpoint = async (cp: Checkpoint) => {
@@ -1032,7 +1084,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!window.confirm(`Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${cp.messages} messages.`)) return;
     if (cp.commit) {
       if (!/^[0-9a-f]{5,40}$/i.test(cp.commit)) return;
-      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWsDir);
+      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWsDir, false, undefined, activeWsDir);
       if (r.exitCode !== 0) {
         addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
       }
@@ -1083,11 +1135,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!window.confirm(`Undo the last edit to ${path}?\n\nReverts this file to its previous committed state (a new undo commit is created).`)) return;
     addLog({ type: 'bash', label: 'undo-file', detail: path });
     // Find the most recent commit that touched this file.
-    const last = await coderExec(`git log -1 --format=%H -- ${p}`, undefined, 15000, activeWsDir);
+    const last = await coderExec(`git log -1 --format=%H -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
     const hash = (last.stdout || '').trim();
     if (!hash) {
       // No commit touched it — discard uncommitted working changes (if any).
-      const dis = await coderExec(`git checkout -- ${p}`, undefined, 15000, activeWsDir);
+      const dis = await coderExec(`git checkout -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
       if (dis.exitCode !== 0) {
         addLog({ type: 'error', label: 'undo-file', detail: `no commit and cannot discard changes for ${path}` });
         return;
@@ -1097,21 +1149,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       return;
     }
     // Root commit has no parent → no prior version to revert to.
-    const parentOk = await coderExec(`git rev-parse ${hash}^`, undefined, 15000, activeWsDir);
+    const parentOk = await coderExec(`git rev-parse ${hash}^`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
     if (parentOk.exitCode !== 0) {
       addLog({ type: 'error', label: 'undo-file', detail: `cannot undo root-commit change to ${path} (no prior version)` });
       return;
     }
     // Did the file exist before this commit? If not, it was created here → delete it.
-    const existed = await coderExec(`git cat-file -e ${hash}^:${p}`, undefined, 15000, activeWsDir);
+    const existed = await coderExec(`git cat-file -e ${hash}^:${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
     const res = existed.exitCode === 0
-      ? await coderExec(`git checkout ${hash}^ -- ${p}`, undefined, 15000, activeWsDir)
-      : await coderExec(`git rm -f -- ${p}`, undefined, 15000, activeWsDir);
+      ? await coderExec(`git checkout ${hash}^ -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir)
+      : await coderExec(`git rm -f -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
     if (res.exitCode !== 0) {
       addLog({ type: 'error', label: 'undo-file', detail: (res.stderr || res.stdout || 'undo failed').slice(0, 300) });
       return;
     }
-    const c = await coderExec(`git add -A -- ${p} && git commit -m ${q(`undo: revert ${path}`)}`, undefined, 30000, activeWsDir);
+    const c = await coderExec(`git add -A -- ${p} && git commit -m ${q(`undo: revert ${path}`)}`, undefined, 30000, activeWsDir, false, undefined, activeWsDir);
     if (c.exitCode !== 0) {
       addLog({ type: 'error', label: 'undo-file', detail: (c.stderr || c.stdout || 'commit failed').slice(0, 300) });
     } else {
@@ -1398,9 +1450,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   /** Stage + auto-commit one file, returning a bounded unified-diff preview. */
   const commitFile = async (path: string, message: string, signal?: AbortSignal): Promise<{ ok: boolean; preview: string }> => {
     const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000, undefined, false, signal);
+    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000, undefined, false, signal, activeWsDir);
     if (c.exitCode !== 0) return { ok: false, preview: '' };
-    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal);
+    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal, activeWsDir);
     return { ok: true, preview: (d.stdout || '').slice(0, 4000) };
   };
   /** Post-edit verification: lint (falls back to build) then test, each bounded.
@@ -1411,14 +1463,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
     const lintCmd = cmds.lint || cmds.build;
     if (lintCmd) {
-      const check = await coderExec(lintCmd, undefined, 120000, undefined, false, signal);
+      const check = await coderExec(lintCmd, undefined, 120000, undefined, false, signal, activeWsDir);
       if (check.exitCode !== 0) {
         const diags = parseDiagnostics(lintCmd, check.stderr || check.stdout || '');
         return { ...out, linter_error: (check.stderr || check.stdout || '').slice(0, 8000), diagnostics: diags };
       }
     }
     if (cmds.test) {
-      const t = await coderExec(cmds.test, undefined, 180000, undefined, false, signal);
+      const t = await coderExec(cmds.test, undefined, 180000, undefined, false, signal, activeWsDir);
       if (t.exitCode !== 0) {
         const diags = parseDiagnostics(cmds.test, t.stderr || t.stdout || '');
         return { ...out, test_error: (t.stderr || t.stdout || '').slice(0, 8000), diagnostics: diags };
@@ -1429,6 +1481,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
     let mutated = false;
+    // Fires once per turn (handleToolCalls runs fresh each turn), right before
+    // the first mutating call actually executes — a safety snapshot so a bad
+    // multi-step turn is always recoverable even if the user never remembered
+    // to hit "+ checkpoint" themselves.
+    let autoCheckpointed = false;
     // Passed to every tool-call API call below so Stop actually cancels an
     // in-flight one instead of only taking effect on the next loop turn.
     const toolSignal = abortRef.current?.signal ?? new AbortController().signal;
@@ -1527,6 +1584,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const permVerdict = checkPerm(call.name, args);
         // Set when the user approves an `ask` call — the dispatch below runs.
         let approvedAfterAsk = false;
+        // Minted by coderPermsApprove the moment a human approves below —
+        // attached to the actual dispatch call so the endpoint (enforce_perm)
+        // can tell an approved call apart from one that skipped this dialog
+        // entirely. Only meaningful for the tools with their own dedicated
+        // server-side gate (bash/read/write/edit/apply_patch/grep/glob/
+        // web_fetch/web_search/browser) — a pseudo-tool like git_commit that
+        // routes through the same `bash` endpoint is gated by bash's own
+        // tier server-side regardless of git_commit's own client-side tier.
+        let approvalToken: string | undefined;
         if (permVerdict !== null) {
           logType = 'error';
           logDetail = `${call.name} blocked`;
@@ -1539,12 +1605,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
             } else {
               approvedAfterAsk = true;
+              try {
+                approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+              } catch { /* best-effort — enforce_perm rejects without a token */ }
             }
           } else {
             result = JSON.stringify({ error: permVerdict });
           }
         }
         if (result === '' && (permVerdict === null || approvedAfterAsk)) {
+          if (!autoCheckpointed && MUTATING_TOOLS.has(call.name)) {
+            autoCheckpointed = true;
+            // Awaited so the snapshot's HEAD read happens strictly before this
+            // call's own mutation, not racing it.
+            try { await createCheckpoint({ auto: true }); } catch { /* best-effort safety snapshot */ }
+          }
           if (call.name === 'bash') {
           logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
           // Risky-command HITL gate + per-workspace approval memory. Truly
@@ -1575,7 +1650,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             if (commitBlocked) {
               result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
             } else {
-              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true, toolSignal);
+              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true, toolSignal, activeWsDir, approvalToken);
               result = JSON.stringify(res);
               if (args.background === true) mutated = true;
               if (res.jobId) {
@@ -1601,7 +1676,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           result = JSON.stringify(await readRecallChunk(id, offset));
         } else if (call.name === 'read') {
           logType = 'read'; logDetail = args.path;
-          const res = await coderRead(args.path, args.offset, args.limit, toolSignal);
+          const res = await coderRead(args.path, args.offset, args.limit, toolSignal, activeWsDir, approvalToken);
           result = JSON.stringify(res);
           readPathsRef.current.add(String(args.path || ''));
         } else if (call.name === 'write') {
@@ -1621,7 +1696,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // which is exactly the case this guard cares about) must not
             // silently disable the guard by being mistaken for "doesn't
             // exist"; fail closed (assume it exists) instead.
-            const exists = await coderRead(wpath, 0, 1, toolSignal).then(
+            const exists = await coderRead(wpath, 0, 1, toolSignal, activeWsDir).then(
               () => true,
               (e: unknown) => !(e instanceof Error && /HTTP 404\b/.test(e.message)),
             );
@@ -1632,7 +1707,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             }
           }
           if (!blockedUnread) {
-            const res = await coderWrite(args.path, args.content, toolSignal);
+            const res = await coderWrite(args.path, args.content, toolSignal, activeWsDir, approvalToken);
             readPathsRef.current.add(wpath);
             mutated = true;
             if (commitApproval) {
@@ -1646,7 +1721,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } else if (call.name === 'edit') {
           logType = 'edit'; logDetail = args.path;
           const epath = String(args.path || '');
-          const res = await coderEdit(args.path, args.old, args.new, args.replaceAll, toolSignal);
+          const res = await coderEdit(args.path, args.old, args.new, args.replaceAll, toolSignal, activeWsDir, approvalToken);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
@@ -1663,7 +1738,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } else if (call.name === 'apply_patch') {
           logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
           const ppath = String(args.path || '');
-          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], toolSignal);
+          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], toolSignal, activeWsDir, approvalToken);
           result = JSON.stringify(res);
           mutated = true;
           if (res.replacements > 0) {
@@ -1682,7 +1757,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           if (action === 'list') {
-            const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, undefined, false, toolSignal);
+            const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, undefined, false, toolSignal, activeWsDir);
             const { current, branches } = parseBranchList(r.stdout || '');
             result = JSON.stringify({ current, branches, ...r });
           } else if (action === 'create' || action === 'switch') {
@@ -1693,7 +1768,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify({ error: `invalid branch name: ${name}` });
             } else {
               const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
-              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
+              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
               result = JSON.stringify(r);
               if (r.exitCode === 0) mutated = true;
             }
@@ -1705,7 +1780,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'bash'; logDetail = `git worktree ${action}${args.path ? ` ${args.path}` : ''}`;
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           if (action === 'list') {
-            const r = await coderExec('git worktree list', undefined, 15000, undefined, false, toolSignal);
+            const r = await coderExec('git worktree list', undefined, 15000, undefined, false, toolSignal, activeWsDir);
             const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
             result = JSON.stringify({ worktrees: lines, ...r });
           } else if (action === 'add') {
@@ -1717,7 +1792,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               result = JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
             } else {
               const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
-              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
+              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
               result = JSON.stringify(r);
               if (r.exitCode === 0) {
                 // Link the conversation to this new worktree
@@ -1749,36 +1824,36 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             }
             return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
           };
-          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, undefined, false, toolSignal);
+          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, undefined, false, toolSignal, activeWsDir);
           const branch = (br.stdout || '').trim();
           if (!branch || branch === 'HEAD') {
             result = JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
           } else {
-            const st = await coderExec('git status --porcelain', undefined, 10000, undefined, false, toolSignal);
+            const st = await coderExec('git status --porcelain', undefined, 10000, undefined, false, toolSignal, activeWsDir);
             if ((st.stdout || '').trim()) {
               result = JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
             } else {
-              const rm = await coderExec('git remote', undefined, 10000, undefined, false, toolSignal);
+              const rm = await coderExec('git remote', undefined, 10000, undefined, false, toolSignal, activeWsDir);
               const remote = (rm.stdout || '').trim().split('\n')[0];
               if (!remote) {
                 result = JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
               } else {
                 const base = String(args.base || '').trim()
-                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, undefined, false, toolSignal)).stdout.trim()
+                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim()
                   || 'main';
-                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, undefined, false, toolSignal);
+                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, undefined, false, toolSignal, activeWsDir);
                 if (push.exitCode !== 0) {
                   result = JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
                 } else {
-                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, undefined, false, toolSignal);
+                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, undefined, false, toolSignal, activeWsDir);
                   if ((gh.stdout || '').trim() === 'yes') {
                     let cmd = `gh pr create --title ${q(args.title)} --body ${q(args.body || '')}`;
                     if (base) cmd += ` --base ${q(base)}`;
-                    const pr = await coderExec(cmd, undefined, 60000, undefined, false, toolSignal);
+                    const pr = await coderExec(cmd, undefined, 60000, undefined, false, toolSignal, activeWsDir);
                     const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
                     result = JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
                   } else {
-                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, undefined, false, toolSignal);
+                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, undefined, false, toolSignal, activeWsDir);
                     const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
                     result = JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
                   }
@@ -1788,34 +1863,34 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           }
         } else if (call.name === 'repo_search') {
           logType = 'read'; logDetail = `search: ${String(args.query ?? '').slice(0, 30)}`;
-          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, toolSignal);
+          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, toolSignal, activeWsDir);
           result = JSON.stringify(sr);
         } else if (call.name === 'grep') {
           logType = 'grep'; logDetail = args.pattern;
-          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, toolSignal);
+          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, toolSignal, activeWsDir, approvalToken);
           result = JSON.stringify(res);
         } else if (call.name === 'glob') {
           logType = 'glob'; logDetail = args.pattern;
-          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, toolSignal);
+          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, toolSignal, activeWsDir, approvalToken);
           result = JSON.stringify(res);
         } else if (call.name === 'ast_grep') {
           logType = 'grep'; logDetail = `[AST] ${args.pattern}`;
-          const res = await coderExec(`sg -p '${args.pattern.replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, toolSignal);
+          const res = await coderExec(`sg -p '${args.pattern.replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, toolSignal, activeWsDir);
           result = JSON.stringify(res);
         } else if (call.name === 'web_fetch') {
           logType = 'web'; logDetail = args.url;
-          const res = await coderWebFetch(args.url, toolSignal);
+          const res = await coderWebFetch(args.url, toolSignal, approvalToken);
           result = JSON.stringify(res);
         } else if (call.name === 'web_search') {
           logType = 'web'; logDetail = args.query;
-          const res = await coderWebSearch(args.query, toolSignal);
+          const res = await coderWebSearch(args.query, toolSignal, approvalToken);
           result = JSON.stringify(res);
         } else if (call.name === 'browser') {
           logType = 'web'; logDetail = `browser ${String(args.action ?? '')}${args.url ? ` ${args.url}` : ''}`;
           const bargs: Record<string, string | number> = {};
           for (const k of ['url', 'selector', 'value', 'key', 'expression', 'wait_until']) if (typeof args[k] === 'string') bargs[k] = String(args[k]);
           if (typeof args.timeout === 'number') bargs.timeout = args.timeout;
-          result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), bargs, toolSignal));
+          result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), bargs, toolSignal, approvalToken));
         } else if (call.name === 'git_commit') {
           logType = 'bash'; logDetail = `git commit ${args.files}`;
           // Commit-approval gate: when ON, the human must sign off on the
@@ -1838,7 +1913,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             : ['-A'];
           const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
           const message = args.message || 'Agent commit';
-          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, undefined, false, toolSignal);
+          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, undefined, false, toolSignal, activeWsDir);
           result = JSON.stringify(commitRes);
           // Note: a commit doesn't change the file tree, so we deliberately do
           // NOT set mutated=true (which would trigger a repo-map rescan, M5).
@@ -1851,7 +1926,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const refArg = ref ? q(ref) : '';
           const pathArg = pathTokens.map(q).join(' ');
           const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
-          const diffRes = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal);
+          const diffRes = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
           result = JSON.stringify(diffRes);
         } else if (call.name === 'ask_user') {
           // Pause the run and surface the question to the user. We record the
@@ -1926,7 +2001,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           jobs.registerSub({ id: subId, label: 'subagent', task: task.slice(0, 100), ws: activeWsDir });
           try {
             let preTree = '';
-            try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim(); } catch { /* no git */ }
+            try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim(); } catch { /* no git */ }
             const ideation = await runIdeation(task, wmodel, toolSignal);
             addLog({ type: 'read', label: 'subagent', detail: ideation ? `ideation: ${ideation.slice(0, 150)}` : 'ideation pass produced no candidates' });
             let res = { summary: '', diff: '', ok: false };
@@ -1968,9 +2043,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             // Net diff across all worker attempts (git write-tree before/after).
             let diff = res.diff;
             try {
-              const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal)).stdout.trim();
+              const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim();
               if (preTree && postTree && preTree !== postTree) {
-                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, toolSignal);
+                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, toolSignal, activeWsDir);
                 diff = (d.stdout || '').slice(0, 60000);
               }
             } catch { /* keep res.diff */ }
@@ -2098,6 +2173,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // tool the user tiered "ask" would silently run for a delegate/scout
       // subagent while still correctly pausing for the supervisor.
       const permVerdict = checkPerm(call.name, args);
+      let approvalToken: string | undefined;
       if (permVerdict !== null) {
         if (permVerdict === 'ask') {
           const detail = String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
@@ -2105,19 +2181,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const ok = await requestApproval(call.name, detail);
           addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
           if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+          try {
+            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+          } catch { /* best-effort — enforce_perm rejects without a token */ }
         } else {
           return JSON.stringify({ error: permVerdict });
         }
       }
       let result: string;
       switch (call.name) {
-        case 'read': result = JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal)); break;
-        case 'grep': result = JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal)); break;
-        case 'glob': result = JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal)); break;
-        case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal)); break;
-        case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal)); break;
-        case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal)); break;
-        case 'browser': result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal)); break;
+        case 'read': result = JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal, activeWsDir, approvalToken)); break;
+        case 'grep': result = JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken)); break;
+        case 'glob': result = JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken)); break;
+        case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal, activeWsDir)); break;
+        case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal, approvalToken)); break;
+        case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal, approvalToken)); break;
+        case 'browser': result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal, approvalToken)); break;
         case 'obs_recall': result = JSON.stringify(await readRecallChunk(String(args.id || ''), Number(args.offset) || 0)); break;
         default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
       }
@@ -2199,6 +2278,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // silently execute for a worker even though the supervisor's own call
       // to the same tool correctly pauses for a human.
       const permVerdict = checkPerm(call.name, args);
+      let approvalToken: string | undefined;
       if (permVerdict !== null) {
         if (permVerdict === 'ask') {
           const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
@@ -2206,22 +2286,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           const ok = await requestApproval(call.name, detail);
           addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
           if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
+          try {
+            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+          } catch { /* best-effort — enforce_perm rejects without a token */ }
         } else {
           return JSON.stringify({ error: permVerdict });
         }
       }
       switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal));
-        case 'browser': return JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal));
-        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, signal));
-        case 'write': return JSON.stringify(await coderWrite(args.path, args.content, signal));
-        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll, signal));
-        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], signal));
+        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal, activeWsDir, approvalToken));
+        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken));
+        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken));
+        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal, activeWsDir));
+        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal, approvalToken));
+        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal, approvalToken));
+        case 'browser': return JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal, approvalToken));
+        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, signal, activeWsDir));
+        case 'write': return JSON.stringify(await coderWrite(args.path, args.content, signal, activeWsDir, approvalToken));
+        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll, signal, activeWsDir, approvalToken));
+        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], signal, activeWsDir, approvalToken));
         case 'bash': {
           const command0 = String(args.command || '');
           // Same risky-command + commit-approval HITL gates the supervisor's
@@ -2249,7 +2332,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // environment (export / venv / conda activation) survive across calls;
           // background jobs get their own process and stay stateless.
           const sid = !args.background && activeWsDir ? 'sh:' + activeWsDir : (args.background ? activeWsDir : undefined);
-          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true, signal);
+          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true, signal, activeWsDir, approvalToken);
           // Register with the Jobs panel — previously a worker's background
           // job had no panel entry and so no way to see or kill it.
           if (res.jobId) {
@@ -2259,7 +2342,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           return JSON.stringify(res);
         }
         case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || ''), signal));
-        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal));
+        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal, activeWsDir));
         case 'delegate': {
           const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
           return JSON.stringify({ summary: r });
@@ -2336,7 +2419,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const allowed = allowedTools ? new Set(allowedTools) : WORKER_TOOL_NAMES;
     const tools = TOOLS.filter((t) => allowed.has(t.function.name));
     let preTree = '';
-    try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal)).stdout.trim(); } catch { /* no git */ }
+    try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal, activeWsDir)).stdout.trim(); } catch { /* no git */ }
     let summary = '';
     // Set only when the loop runs out of steps without the model finishing —
     // used below so that outcome is reported like every other bounded loop
@@ -2387,9 +2470,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // a Stop, whatever the worker already changed on disk should still be
     // surfaced as a diff instead of silently discarded.
     try {
-      const postTree = (await coderExec('git write-tree', undefined, 10000)).stdout.trim();
+      const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, undefined, activeWsDir)).stdout.trim();
       if (preTree && postTree && preTree !== postTree) {
-        const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000);
+        const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, undefined, activeWsDir);
         diff = (d.stdout || '').slice(0, 60000);
       }
     } catch { /* no diff */ }
@@ -2547,6 +2630,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // entry even if the user moves to a different conversation mid-run.
     setRunConv(opts?.pin ?? { ws: activeWs, convId: activeConv });
     setRunning(true);
+    stoppedRef.current = false;
     // Pin the run's token accounting; the visible meter may follow the view.
     runTokensRef.current = lastPromptTokensRef.current;
     // Settle any in-flight control-plane re-point BEFORE the first tool call: a
@@ -2559,7 +2643,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // diff of everything the agent did this run (including auto-committed edits),
     // not just the (often empty) working-tree-vs-HEAD diff.
     let runStartHead = '';
-    try { runStartHead = (await coderExec('git rev-parse HEAD', undefined, 10000)).stdout.trim(); } catch { /* not a repo yet */ }
+    try { runStartHead = (await coderExec('git rev-parse HEAD', undefined, 10000, undefined, false, undefined, activeWsDir)).stdout.trim(); } catch { /* not a repo yet */ }
 
     // Reset all per-run reliability-guard state (read-before-write tracking,
     // tool-call dedup cache, patch-spiral counters, read-loop streak) — these
@@ -2955,8 +3039,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             let d = '';
             try {
               d = runStartHead
-                ? (await coderExec(`git --no-pager diff ${runStartHead}`, undefined, 60000)).stdout || ''
-                : (await coderDiff()).diff || '';
+                ? (await coderExec(`git --no-pager diff ${runStartHead}`, undefined, 60000, undefined, false, undefined, activeWsDir)).stdout || ''
+                : (await coderDiff(activeWsDir)).diff || '';
             } catch { d = ''; }
             if (d.trim()) {
               const c = await runCritic(d, taskText);
@@ -3020,14 +3104,48 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         setMessages((prev) => [...prev, { role: 'user', displayName: 'System', content: `[Run failed: ${msg}]`, error: true }]);
       }
     } finally {
+      // Captured before setRunConv(null) below clears the ref — identifies
+      // whose queue (if any) to drain now that this run is done.
+      const finishedConv = runConvRef.current;
+      const wasPaused = askConvRef.current !== null; // ask_user pause, not a real finish
       setRunning(false);
       abortRef.current = null;
       setRunConv(null);
+      if (finishedConv && !stoppedRef.current && !wasPaused) {
+        const pending = queuedRef.current[finishedConv.convId];
+        if (pending && pending.length > 0) {
+          const [item, ...rest] = pending;
+          setQueued((q) => ({ ...q, [finishedConv.convId]: rest }));
+          const base = storeRef.current.workspaces[finishedConv.ws]?.conversations[finishedConv.convId]?.messages ?? [];
+          const msg: ChatMessage = { role: 'user', content: item.text, attachments: item.attachments.length ? item.attachments : undefined };
+          setStore((prev) => {
+            const wsd = prev.workspaces[finishedConv.ws];
+            const meta = wsd?.conversations[finishedConv.convId];
+            if (!wsd || !meta) return prev;
+            return { ...prev, workspaces: { ...prev.workspaces, [finishedConv.ws]: { ...wsd, conversations: { ...wsd.conversations, [finishedConv.convId]: { ...meta, messages: [...(meta.messages ?? []), msg], updatedAt: Date.now() } } } } };
+          });
+          if (finishedConv.ws === storeRef.current.activeWs && finishedConv.convId === storeRef.current.activeConv) {
+            setMessages((prev) => [...prev, msg]);
+          }
+          runAgent(compactedContext(base).concat(msg), { scout: true, pin: finishedConv });
+        }
+      }
     }
   };
 
   const onSubmit = () => {
-    if ((!input.trim() && attachments.length === 0) || running || !activeWs) return;
+    if ((!input.trim() && attachments.length === 0) || !activeWs) return;
+    if (running) {
+      // Don't block on a run in flight — queue for whichever conversation is
+      // on screen right now, and it auto-sends once that conversation's run
+      // finishes (see runAgent's finally block).
+      if (!activeConv) return;
+      const item: QueuedItem = { text: input.trim(), attachments: [...attachments] };
+      setQueued((q) => ({ ...q, [activeConv]: [...(q[activeConv] ?? []), item] }));
+      setInput('');
+      setAttachments([]);
+      return;
+    }
     // Answering a pending ask_user question: clear the pause and continue. The
     // answer is just a normal user message that resumes the run (#5). Resumed
     // runs skip the scout — its findings are already in context.
@@ -3080,6 +3198,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const runElsewhere = running && !!runConv && (runConv.ws !== activeWs || runConv.convId !== activeConv);
 
   const stop = () => {
+    stoppedRef.current = true;
     abortRef.current?.abort();
     // Never leave the agent loop parked on an approval dialog after Stop.
     approvalResolveRef.current?.(false);
@@ -3467,13 +3586,25 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             <button
               type="button"
               onClick={() => toggleSandbox(!coderSandbox)}
-              className={cn('ml-auto rounded px-2 py-0.5 text-[11px] font-medium', coderSandbox ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
-              title={coderSandbox ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)' : 'Agent shell runs directly on the host'}
+              className={cn(
+                'ml-auto rounded px-2 py-0.5 text-[11px] font-medium',
+                coderSandbox && bwrapAvailable ? 'bg-ok/20 text-ok' : coderSandbox ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger',
+              )}
+              title={
+                coderSandbox && bwrapAvailable
+                  ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)'
+                  : coderSandbox
+                    ? 'Sandbox is enabled but bwrap is not installed — the shell is actually running unsandboxed on the host'
+                    : 'Agent shell runs directly on the host'
+              }
             >
-              {coderSandbox ? 'ON' : 'OFF'}
+              {coderSandbox && bwrapAvailable ? 'ON' : coderSandbox ? 'ON · bwrap missing' : 'OFF'}
             </button>
           </div>
           <p className="mt-1 text-[10.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
+          {coderSandbox && !bwrapAvailable && (
+            <p className="mt-1 text-[10.5px] text-warn">bwrap isn&apos;t installed on this host — the agent shell is running unsandboxed despite this being ON.</p>
+          )}
         </div>
         </SidebarSection>
         {/* Commit approval — gate: the agent cannot commit without human sign-off */}
@@ -3868,7 +3999,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               <button
                 type="button"
                 className="ml-auto rounded border border-line px-2 py-px text-[10.5px] normal-case tracking-normal text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-                onClick={createCheckpoint}
+                onClick={() => createCheckpoint()}
                 disabled={!activeConv || running}
                 title="Snapshot the transcript and workspace HEAD"
               >
@@ -3882,6 +4013,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                 {checkpoints.map((cp) => (
                   <div key={cp.id} className="flex items-center gap-2 rounded border border-line px-2 py-1">
                     <span className="shrink-0 font-mono text-[10.5px] text-accent">{cp.label}</span>
+                    {cp.auto && <span className="shrink-0 rounded bg-panel2 px-1 py-0.5 text-[9.5px] uppercase tracking-wide text-faint" title="Taken automatically before this turn's first edit/write/commit">auto</span>}
                     <span className="min-w-0 flex-1 truncate text-[11px] text-mute">{new Date(cp.time).toLocaleString()} · {cp.messages} msgs · {cp.todos.length} todos</span>
                     <button
                       type="button"
@@ -4109,23 +4241,44 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             <Button variant="ghost" onClick={() => setShowCoderParams((v) => !v)} disabled={!activeWs} title="Sampling params (thinking, temperature, top_p, top_k, seed)">
               <SlidersHorizontal size={14} />
             </Button>
-            <input 
-              className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50" 
+            <input
+              className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50"
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && onSubmit()}
-              placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : activeWs ? "Instruct the coder agent..." : "Add a workspace to begin"}
-              disabled={running || !activeWs || pendingQuestion !== null}
+              placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent..."}
+              disabled={!activeWs || pendingQuestion !== null}
             />
             {running ? (
-               <Button variant="danger" onClick={stop} disabled={runElsewhere}
-                 title={runElsewhere && runConv
-                   ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
-                   : 'Stop the running agent'}><Square size={14} /> Stop</Button>
+              <>
+                <Button variant="ghost" onClick={onSubmit} disabled={!input.trim() && attachments.length === 0} title="Queue this for when the current run finishes"><Plus size={14} /> Queue</Button>
+                <Button variant="danger" onClick={stop} disabled={runElsewhere}
+                  title={runElsewhere && runConv
+                    ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
+                    : 'Stop the running agent'}><Square size={14} /> Stop</Button>
+              </>
             ) : (
                <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0 || pendingQuestion !== null}><Play size={14} /> Run</Button>
             )}
           </div>
+          {activeConv && (queued[activeConv]?.length ?? 0) > 0 && (
+            <div className="mt-2 space-y-1">
+              {queued[activeConv].map((item, i) => (
+                <div key={i} className="flex items-center gap-2 rounded border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
+                  <span className="shrink-0 font-mono text-[10px] text-faint">#{i + 1} queued</span>
+                  <span className="min-w-0 flex-1 truncate">{item.text}</span>
+                  <button
+                    type="button"
+                    title="Remove from queue"
+                    onClick={() => setQueued((q) => ({ ...q, [activeConv]: q[activeConv].filter((_, j) => j !== i) }))}
+                    className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           {activeWs && (
             <div className={cn('mt-2 text-[10.5px]', coderSafeMode ? 'text-faint' : 'font-medium text-danger')}>
               {coderSafeMode

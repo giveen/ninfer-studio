@@ -25,7 +25,7 @@ mod web;
 mod workspace;
 
 pub use browser::{browser, BrowserSlot};
-pub use common::{perms_get, perms_set, CoderPerms, PermTier};
+pub use common::{perms_approve, perms_get, perms_set, ApprovalTicket, CoderPerms, PermTier};
 pub use exec::{
     bwrap_available, exec, job_get, job_kill, safe_mode_get, safe_mode_set, sandbox_get, sandbox_set, BgJob,
 };
@@ -173,6 +173,45 @@ mod tests {
         assert!(fs_read(ws(), Json(json!({"path": "secret"}))).await.is_err());
         // unrelated read-only tools are unaffected.
         assert!(grep(ws(), Json(json!({"pattern": "yes"}))).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `ask` used to have zero server-side effect (only `deny`/`denyPaths`
+    /// were enforced) — a call that skipped the approval dialog entirely was
+    /// treated exactly like `allow`. Now it requires a valid, matching,
+    /// single-use token minted by `perms_approve` at the moment a human
+    /// approves.
+    #[tokio::test]
+    async fn ask_tier_requires_a_valid_approval_token() {
+        use axum::extract::State as AxumState;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-ask-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
+        let ws = || AxumState(state.clone());
+
+        let _ = perms_set(ws(), Json(json!({"tools": {"write": "ask"}, "denyPaths": []}))).await;
+
+        // No token at all: rejected.
+        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x"}))).await.is_err());
+        assert!(!tmp.join("a.txt").exists());
+
+        // Wrong tool's token: still rejected.
+        let bash_token = perms_approve(ws(), Json(json!({"tool": "bash"}))).await.unwrap().0;
+        let bash_token = bash_token.get("token").and_then(|v| v.as_str()).unwrap();
+        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x", "approvalToken": bash_token}))).await.is_err());
+
+        // A matching approval lets the call through...
+        let r = perms_approve(ws(), Json(json!({"tool": "write"}))).await.unwrap().0;
+        let token = r.get("token").and_then(|v| v.as_str()).unwrap().to_string();
+        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x", "approvalToken": token}))).await.is_ok());
+        assert!(tmp.join("a.txt").exists());
+
+        // ...but only once: the same token is rejected on a second use.
+        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "y", "approvalToken": token}))).await.is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

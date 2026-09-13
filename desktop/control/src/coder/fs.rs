@@ -4,7 +4,7 @@
 //! read/write/edit/patch, and base64 attachment reads — all confined to the
 //! workspace root by `common::within_ws` and gated by `common::enforce_perm`.
 
-use super::common::{coder_root, enforce_perm, rel_of, within_ws, CODER_IGNORE};
+use super::common::{enforce_perm, rel_of, resolve_ws, within_ws, CODER_IGNORE};
 use crate::engine::S;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
@@ -16,8 +16,7 @@ use std::path::Path;
 const MAX_READ_BYTES: usize = 256 * 1024;
 
 pub async fn tree(AxumState(state): AxumState<S>, Query(params): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, params.get("workspace").map(String::as_str)).await?;
     let depth = params.get("depth").and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 6);
     let rel = params.get("root").map(|s| s.as_str()).unwrap_or(".");
     let base = within_ws(&ws_root, rel)?;
@@ -83,13 +82,12 @@ fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Val
 }
 
 pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "read", Some(rel)).await?;
+    enforce_perm(&state, "read", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let buf = tokio::fs::read(&full)
         .await
@@ -122,13 +120,12 @@ pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
 }
 
 pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "write", Some(rel)).await?;
+    enforce_perm(&state, "write", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let content = match req.get("content").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
@@ -147,13 +144,12 @@ pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
 }
 
 pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "edit", Some(rel)).await?;
+    enforce_perm(&state, "edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let (old, new) = match (req.get("old").and_then(|v| v.as_str()), req.get("new").and_then(|v| v.as_str())) {
         (Some(o), Some(n)) => (o.to_string(), n.to_string()),
@@ -271,13 +267,12 @@ fn apply_edit_hunk(file_text: &str, old: &str, new: &str, replace_all: bool) -> 
 }
 
 pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "apply_patch", Some(rel)).await?;
+    enforce_perm(&state, "apply_patch", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let hunks = match req.get("edits").and_then(|v| v.as_array()) {
         Some(h) if !h.is_empty() => h.clone(),
@@ -318,8 +313,7 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
 /// Base64 file read for image/file attachments (mirrors `/api/coder/fs/b64`).
 pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const MAX_ATTACH_BYTES: usize = 50 * 1024 * 1024;
-    let ws = state.config.read().await.coder_workspace.clone();
-    let ws_root = coder_root(&ws)?;
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
@@ -350,6 +344,53 @@ pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit `workspace` field on the request wins over the global
+    /// `coderWorkspace` pointer — the correctness fix that lets a specific
+    /// conversation's tool calls stay addressed at its own repo regardless of
+    /// what another tab/conversation last pointed the backend at.
+    #[tokio::test]
+    async fn explicit_workspace_overrides_global_pointer() {
+        let base = std::env::temp_dir().join(format!("ninfier-fsws-{}", std::process::id()));
+        let global_ws = base.join("global");
+        let other_ws = base.join("other");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&global_ws).unwrap();
+        std::fs::create_dir_all(&other_ws).unwrap();
+
+        let state: S = std::sync::Arc::new(crate::types::State::new(base.clone(), base.clone(), None));
+        state.config.write().await.coder_workspace = global_ws.to_string_lossy().into_owned();
+
+        // No override: lands in the global pointer's workspace.
+        let _ = fs_write(AxumState(state.clone()), Json(json!({"path": "a.txt", "content": "global"})))
+            .await
+            .unwrap();
+        assert!(global_ws.join("a.txt").exists());
+        assert!(!other_ws.join("a.txt").exists());
+
+        // Explicit override: lands in the OTHER workspace, untouched by the
+        // still-unchanged global pointer.
+        let _ = fs_write(
+            AxumState(state.clone()),
+            Json(json!({"path": "b.txt", "content": "other", "workspace": other_ws.to_string_lossy()})),
+        )
+        .await
+        .unwrap();
+        assert!(other_ws.join("b.txt").exists());
+        assert!(!global_ws.join("b.txt").exists());
+        assert_eq!(state.config.read().await.coder_workspace, global_ws.to_string_lossy());
+
+        let r = fs_read(
+            AxumState(state.clone()),
+            Json(json!({"path": "b.txt", "workspace": other_ws.to_string_lossy()})),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("other"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn patch_hunks_apply_in_sequence() {

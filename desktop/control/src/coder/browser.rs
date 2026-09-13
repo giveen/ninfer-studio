@@ -389,7 +389,7 @@ async fn actor_main(
 }
 
 pub async fn browser(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_perm(&state, "browser", None).await?;
+    enforce_perm(&state, "browser", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("status");
     let sel = req.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let mut slot = state.browser.lock().await;

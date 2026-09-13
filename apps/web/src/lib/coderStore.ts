@@ -40,6 +40,11 @@ export interface Checkpoint {
   messages: number;
   ledger: number;
   todos: TodoItem[];
+  /** Taken automatically before the turn's first mutating tool call, rather
+   *  than via the manual "+ checkpoint" button — kept out of the way (not
+   *  auto-opened) and capped separately so a long session doesn't grow
+   *  localStorage unbounded. */
+  auto?: boolean;
 }
 export interface WsData {
   expanded: boolean;

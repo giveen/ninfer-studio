@@ -150,6 +150,15 @@ pub struct State {
     /// `deny`-tiered tool or path server-side, not only in the client
     /// dispatcher that normally decides whether to call the endpoint.
     pub coder_perms: tokio::sync::RwLock<crate::coder::CoderPerms>,
+    /// Short-lived, single-use approval tickets for `ask`-tiered tools,
+    /// minted by `/api/coder/perms/approve` the moment a human approves the
+    /// UI's dialog. `enforce_perm` requires a valid matching one for an
+    /// `ask`-tiered call — without this an `ask` tier had no server-side
+    /// meaning at all (anything that could reach the endpoint directly was
+    /// treated as `allow`, bypassing the approval dialog entirely).
+    pub coder_approvals: tokio::sync::Mutex<HashMap<String, crate::coder::ApprovalTicket>>,
+    /// Monotonic counter backing approval-token ids, mirrors `bg_job_counter`.
+    pub coder_approval_counter: AtomicU64,
     /// Per-session working directories so the agent's shell behaves like a
     /// stateful terminal (cd persists across calls within a session id).
     pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
@@ -197,6 +206,8 @@ impl State {
             update_job: tokio::sync::Mutex::new(None),
             coder_safe_mode: AtomicBool::new(true),
             coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
+            coder_approvals: tokio::sync::Mutex::new(HashMap::new()),
+            coder_approval_counter: AtomicU64::new(0),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
             browser: tokio::sync::Mutex::new(crate::coder::BrowserSlot::new()),
             bg_jobs: tokio::sync::Mutex::new(HashMap::new()),

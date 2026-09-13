@@ -4,7 +4,7 @@
 //! blocklist, optional bubblewrap sandbox, secret-env scrubbing, and the
 //! background-job registry the client polls.
 
-use super::common::{coder_root, enforce_perm, is_safe_base_dir, rel_of, within_ws};
+use super::common::{enforce_perm, is_safe_base_dir, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
@@ -153,9 +153,8 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if command.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "command required"}))));
     }
-    enforce_perm(&state, "bash", None).await?;
-    let ws = state.config.read().await.coder_workspace.clone();
-    let root = coder_root(&ws)?;
+    enforce_perm(&state, "bash", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    let root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel_cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let session_id = req.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let timeout_ms = req.get("timeoutMs").and_then(|v| v.as_u64()).unwrap_or(120_000).clamp(1_000, 600_000);
@@ -218,8 +217,13 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     let mut cmd = if sandboxed {
         let mut c = Command::new("bwrap");
         c.arg("--ro-bind").arg("/").arg("/");
-        c.arg("--bind").arg(&root).arg(&root);
+        // bwrap layers mounts in argument order — a later mount at a parent
+        // path hides an earlier one at a child path. `--tmpfs /tmp` MUST come
+        // before the workspace bind: a workspace under /tmp (the common case
+        // for temp/scratch dirs) would otherwise be buried under an empty
+        // tmpfs and become invisible inside the sandbox.
         c.arg("--tmpfs").arg("/tmp");
+        c.arg("--bind").arg(&root).arg(&root);
         c.arg("--proc").arg("/proc");
         c.arg("--dev").arg("/dev");
         c.arg("--unshare-pid");
@@ -602,10 +606,11 @@ mod tests {
         let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         let w = || AxumState(state.clone());
 
-        // Default off; set true; round-trips through the JSON store (a fresh
-        // process reading config.json sees the same value).
+        // Default on (an agent running arbitrary shell should be contained
+        // unless a user opts out); toggle and round-trip through the JSON
+        // store (a fresh process reading config.json sees the same value).
         let g = sandbox_get(w()).await;
-        assert_eq!(g["enabled"], false);
+        assert_eq!(g["enabled"], true);
         let r = sandbox_set(w(), Json(json!({"enabled": true, "sandboxBinds": ["/mnt/models"]}))).await;
         assert_eq!(r["enabled"], true);
         assert_eq!(r["sandboxBinds"][0], "/mnt/models");
