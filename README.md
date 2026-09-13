@@ -16,8 +16,10 @@ Linux, WebView2 on Windows) for the
 | Chat | Engine |
 |------|--------|
 | ![Chat](screenshots/chat.png) | ![Engine](screenshots/engine.png) |
-| **Models** | **Settings** |
+| **Models** | **Settings — Safety & Permissions** |
 | ![Models](screenshots/models.png) | ![Settings](screenshots/settings.png) |
+| **Coder** | |
+| ![Coder](screenshots/coder.png) | |
 
 ## Features
 
@@ -65,7 +67,14 @@ Linux, WebView2 on Windows) for the
   worker/subagent delegation with depth and step budgets, conversation **checkpoints**
   with restore, human-approval (HITL) gates, sandboxed vs. live execution modes, and a
   per-workspace memory bank — with a live **prefill/decode indicator** so the model
-  thinking is never invisible.
+  thinking is never invisible. Safe Mode, Sandbox, and Commit Approval live in
+  Settings > Safety & Permissions (shared live across screens), with per-workspace
+  tool permissions still in the Coder sidebar.
+- **Tabbed Settings & Engine screens** — Settings splits into **Engine / Safety &
+  Permissions / Agent / About**; Engine itself splits into **Basics / Performance /
+  Advanced / Profiles** to cut down on scrolling through every `ninfer-serve` option
+  at once. A default permissions template in Settings seeds new Coder workspaces
+  without touching existing ones.
 - **Engine supervision** — starts/stops `ninfer-serve` from the UI, adopts
   already-running engines (never double-spawns), tails the engine log, reports GPU
   state via `nvidia-smi`, and **stops a running engine before Rebuild** so a fresh
@@ -236,6 +245,9 @@ created on first save. Key files:
 | `hfToken` | (empty) | optional HF token for downloads; redacted to `********` in API responses |
 | `buildCommand` | cmake/Ninja one-liner | engine rebuild command (Rebuild engine button) |
 | `coderWorkspace` | (empty) | default Coder mode workspace |
+| `coderSafeMode` | `true` | refuse a fixed set of clearly destructive shell command patterns |
+| `coderSandbox` | (per-machine) | wrap the agent shell in `bwrap` (workspace read-write, host read-only) |
+| `coderCommitApproval` | `false` | require explicit human sign-off before the agent commits |
 
 ## Security
 
