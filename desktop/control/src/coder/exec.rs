@@ -102,6 +102,17 @@ pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value
     Json(json!({"enabled": state.coder_safe_mode.load(Ordering::SeqCst)}))
 }
 
+pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    Json(json!({"enabled": state.coder_commit_approval.load(Ordering::SeqCst)}))
+}
+
+pub async fn commit_approval_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
+    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
+        state.coder_commit_approval.store(enabled, Ordering::SeqCst);
+    }
+    Json(json!({"enabled": state.coder_commit_approval.load(Ordering::SeqCst)}))
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem sandbox (bubblewrap) — mirrors the sidecar's `coderSandbox`.
 // ---------------------------------------------------------------------------

@@ -23,7 +23,8 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderPermsApprove, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
@@ -33,7 +34,7 @@ import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EX
 import { compactedContext, isCompactedMsg, humanizePassText, runToolLoop, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
 import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, isReadOnlyCommand, type PermTier, type PermConfig } from '../lib/coderTools';
-import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
+import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -282,30 +283,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Background jobs + live subagents (state + polling live in the hook;
   // the call sits after addLog, which the kill-error path reports through).
 
-  // Coder "safe mode": the control plane refuses clearly destructive shell commands
-  // (release blocker #2). Surfaced as a toggle + warning banner.
-  const [coderSafeMode, setCoderSafeMode] = useState(true);
-  const toggleSafeMode = useCallback(async (next: boolean) => {
-    setCoderSafeMode(next);
-    try { await coderSafeModeSet(next); } catch { /* keep UI state as-is */ }
-  }, []);
-  const [coderSandbox, setCoderSandbox] = useState(true);
-  // Whether `bwrap` is actually installed on this host — the toggle can be ON
-  // while this is false, in which case the shell silently runs unsandboxed
-  // (exec.rs's gate no-ops). Surfaced so the label never claims protection it
-  // isn't actually providing.
-  const [bwrapAvailable, setBwrapAvailable] = useState(true);
-  const toggleSandbox = useCallback(async (next: boolean) => {
-    setCoderSandbox(next);
-    try {
-      const r = await coderSandboxSet(next);
-      setBwrapAvailable(r.bwrapAvailable);
-    } catch { /* keep UI state as-is */ }
-  }, []);
-  // Commit approval gate: when ON, the agent may not commit without an explicit
-  // human sign-off on the working-tree-vs-HEAD diff. Auto-commits on write/edit
-  // are suppressed so the only commits are intentional, reviewed ones.
-  const [commitApproval, setCommitApproval] = useState(false);
+  // Safe Mode / Sandbox / Commit Approval now live in Settings > Safety &
+  // Permissions (shared, backend-backed state via CoderSafetyProvider so
+  // this screen and Settings never go stale relative to each other — see
+  // lib/coderSafety.tsx). Commit approval gate: when ON, the agent may not
+  // commit without an explicit human sign-off on the working-tree-vs-HEAD
+  // diff; auto-commits on write/edit are suppressed so the only commits are
+  // intentional, reviewed ones.
+  const { safeMode: coderSafeMode, sandbox: coderSandbox, bwrapAvailable, commitApproval } = useCoderSafety();
   // Diff-review viewer (opened from the toolbar "Diff" button).
   const [diffViewOpen, setDiffViewOpen] = useState(false);
   /** Per-file diff (opened from a file tab's Diff button). */
@@ -367,22 +352,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Refresh the self-improving memory whenever the active workspace changes —
   // and again once the control is confirmed at it (wsFlushed). The effect
   // lives in useCoderMemory; this call site only needs the loader.
-
-  // Sync the safe-mode toggle with the control plane's current state on mount.
-  useEffect(() => {
-    coderSafeModeGet()
-      .then((r) => setCoderSafeMode(r.enabled))
-      .catch(() => { /* leave default true */ });
-  }, []);
-
-  // Sync the sandbox toggle + bwrap-availability with the control plane on
-  // mount — without this the toggle always started at its React default
-  // regardless of what was actually persisted/running server-side.
-  useEffect(() => {
-    coderSandboxGet()
-      .then((r) => { setCoderSandbox(r.enabled); setBwrapAvailable(r.bwrapAvailable); })
-      .catch(() => { /* leave defaults */ });
-  }, []);
 
   // The conversation an in-flight run is pinned to. Set at run start so that
   // switching conversations/workspaces mid-run is a pure VIEW change: the run
@@ -579,7 +548,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setStore((prev) => {
       if (prev.workspaces[coderWs]) return prev;
       const id = newConvId();
-      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id };
+      const ws: WsData = { expanded: true, conversations: { [id]: emptyConv(id) }, order: [id], activeConv: id, perms: loadDefaultPerms() };
       return { ...prev, activeWs: coderWs, activeConv: id, workspaces: { ...prev.workspaces, [coderWs]: ws } };
     });
     setMessages([]);
@@ -594,7 +563,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!ws) return;
     const id = newConvId();
     setStore((prev) => {
-      const wsd = prev.workspaces[ws] ?? { expanded: true, conversations: {}, order: [], activeConv: undefined };
+      const wsd = prev.workspaces[ws] ?? { expanded: true, conversations: {}, order: [], activeConv: undefined, perms: loadDefaultPerms() };
       return {
         ...prev,
         activeWs: ws,
@@ -3563,66 +3532,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         </div>
         </SidebarSection>
 
-        {/* Safe mode — blocks destructive shell commands (release blocker #2) */}
-        <SidebarSection title="Safe Mode" icon={<Shield size={13} />} defaultOpen={true}>
-        <div className="shrink-0 border-t border-line p-2">
-          <div className="flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => toggleSafeMode(!coderSafeMode)}
-              className={cn("ml-auto rounded px-2 py-0.5 text-[11px] font-medium", coderSafeMode ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
-              title={coderSafeMode ? 'Destructive commands are blocked' : 'Destructive commands are allowed'}
-            >
-              {coderSafeMode ? 'ON' : 'OFF'}
-            </button>
-          </div>
-          <p className="mt-1 text-[10.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>
-        </div>
-        </SidebarSection>
-        {/* Sandbox — wraps the agent shell in bwrap (workspace read-write, host read-only) */}
-        <SidebarSection title="Sandbox" icon={<Shield size={13} />} defaultOpen={false}>
-        <div className="shrink-0 border-t border-line p-2">
-          <div className="flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => toggleSandbox(!coderSandbox)}
-              className={cn(
-                'ml-auto rounded px-2 py-0.5 text-[11px] font-medium',
-                coderSandbox && bwrapAvailable ? 'bg-ok/20 text-ok' : coderSandbox ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger',
-              )}
-              title={
-                coderSandbox && bwrapAvailable
-                  ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)'
-                  : coderSandbox
-                    ? 'Sandbox is enabled but bwrap is not installed — the shell is actually running unsandboxed on the host'
-                    : 'Agent shell runs directly on the host'
-              }
-            >
-              {coderSandbox && bwrapAvailable ? 'ON' : coderSandbox ? 'ON · bwrap missing' : 'OFF'}
-            </button>
-          </div>
-          <p className="mt-1 text-[10.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
-          {coderSandbox && !bwrapAvailable && (
-            <p className="mt-1 text-[10.5px] text-warn">bwrap isn&apos;t installed on this host — the agent shell is running unsandboxed despite this being ON.</p>
-          )}
-        </div>
-        </SidebarSection>
-        {/* Commit approval — gate: the agent cannot commit without human sign-off */}
-        <SidebarSection title="Commit approval" icon={<GitCommit size={13} />} defaultOpen={false}>
-        <div className="shrink-0 border-t border-line p-2">
-          <div className="flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setCommitApproval((v) => !v)}
-              className={cn('ml-auto rounded px-2 py-0.5 text-[11px] font-medium', commitApproval ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
-              title={commitApproval ? 'Agent commits require your approval of the working-tree diff' : 'Agent may commit freely (auto-commits on every write)'}
-            >
-              {commitApproval ? 'ON' : 'OFF'}
-            </button>
-          </div>
-          <p className="mt-1 text-[10.5px] text-faint">When ON, the agent cannot commit until you review the working-tree-vs-HEAD diff and approve. Auto-commits on write/edit are paused so only intentional, reviewed commits land.</p>
-        </div>
-        </SidebarSection>
+        {/* Safe Mode / Sandbox / Commit approval now live in Settings > Safety & Permissions */}
         {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
         <SidebarSection title="Permissions" icon={<Shield size={13} />} defaultOpen={false}>
         <div className="shrink-0 border-t border-line p-2">
@@ -4060,7 +3970,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           {coderSafeMode && (
             <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[11.5px] text-warn flex items-center gap-2">
               <span>🛡</span>
-              <span>Safe mode is on — destructive commands (e.g. <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, piping a download into a shell) are blocked. Turn it off in the sidebar only for trusted workspaces.</span>
+              <span>Safe mode is on — destructive commands (e.g. <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, piping a download into a shell) are blocked. Turn it off in Settings &gt; Safety &amp; Permissions only for trusted workspaces.</span>
             </div>
           )}
           {!activeWs ? (

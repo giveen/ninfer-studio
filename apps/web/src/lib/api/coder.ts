@@ -144,6 +144,12 @@ export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
 export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
   return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
 }
+export function coderCommitApprovalGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/coder/commit-approval', 5000);
+}
+export function coderCommitApprovalSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/coder/commit-approval', { enabled }, 5000);
+}
 /** Mirrors the active workspace's tool permission tiers + denied paths to the
  *  control plane, so `deny`/denied-prefix (and, with a valid token from
  *  `coderPermsApprove`, `ask`) are enforced at the endpoint itself — not only

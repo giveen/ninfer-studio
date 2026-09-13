@@ -125,6 +125,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/jobs/{id}", get(coder::job_get))
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
         .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
+        .route("/api/coder/commit-approval", get(coder::commit_approval_get).post(coder::commit_approval_set))
         .route("/api/coder/sandbox", get(coder::sandbox_get).post(coder::sandbox_set))
         .route("/api/coder/search", get(coder::search))
         .route("/api/coder/diff", get(coder::diff))

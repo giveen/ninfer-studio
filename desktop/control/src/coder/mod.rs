@@ -27,7 +27,8 @@ mod workspace;
 pub use browser::{browser, BrowserSlot};
 pub use common::{perms_approve, perms_get, perms_set, ApprovalTicket, CoderPerms, PermTier};
 pub use exec::{
-    bwrap_available, exec, job_get, job_kill, safe_mode_get, safe_mode_set, sandbox_get, sandbox_set, BgJob,
+    bwrap_available, commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
+    safe_mode_set, sandbox_get, sandbox_set, BgJob,
 };
 pub use fs::{fs_b64, fs_edit, fs_patch, fs_read, fs_write, tree};
 pub use grep::{glob, grep};
@@ -123,6 +124,11 @@ mod tests {
         let _ = safe_mode_set(ws(), Json(json!({"enabled": false}))).await;
         assert_eq!(safe_mode_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(false));
         let _ = safe_mode_set(ws(), Json(json!({"enabled": true}))).await;
+
+        // commit approval defaults off, and can be toggled (mirrors safe mode)
+        assert_eq!(commit_approval_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        let _ = commit_approval_set(ws(), Json(json!({"enabled": true}))).await;
+        assert_eq!(commit_approval_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(true));
 
         // b64 + dirs
         let b64 = fs_b64(ws(), Json(json!({"path": "sub/hello.txt"}))).await.unwrap().0;

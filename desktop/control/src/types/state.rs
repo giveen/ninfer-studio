@@ -144,6 +144,11 @@ pub struct State {
     /// Coder "safe mode" (mirrors the sidecar's `coderSafeMode`): when true,
     /// clearly destructive shell commands are refused before they run.
     pub coder_safe_mode: AtomicBool,
+    /// Coder "commit approval" gate (mirrors `coder_safe_mode`'s pattern):
+    /// when true, the agent may not commit without explicit human sign-off
+    /// on the working-tree-vs-HEAD diff. In-memory only, like safe mode —
+    /// not persisted to config.json.
+    pub coder_commit_approval: AtomicBool,
     /// Active workspace's tool permission tiers + denied path prefixes,
     /// pushed by the web UI (`/api/coder/perms`) whenever the user edits
     /// them or switches workspaces. Lets `coder::enforce_perm` reject a
@@ -205,6 +210,7 @@ impl State {
             downloads: tokio::sync::Mutex::new(HashMap::new()),
             update_job: tokio::sync::Mutex::new(None),
             coder_safe_mode: AtomicBool::new(true),
+            coder_commit_approval: AtomicBool::new(false),
             coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
             coder_approvals: tokio::sync::Mutex::new(HashMap::new()),
             coder_approval_counter: AtomicU64::new(0),
