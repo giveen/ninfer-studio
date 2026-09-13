@@ -49,6 +49,19 @@ pub(crate) const LOG_TAIL_WINDOW_BYTES: usize = 512 * 1024;
 pub(crate) const LOG_TAIL_LINES: usize = 2000;
 pub(crate) const LOG_TAIL_LINE_CHARS: usize = 2000;
 
+/// Strip the Python/library env AppImage's AppRun sets for its own bundled
+/// runtime (`PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`) before spawning an
+/// external interpreter or tool. Inherited unchanged, `PYTHONHOME` in
+/// particular points a spawned Python (e.g. a uv-tool-installed `hf` CLI) at
+/// the AppImage's bundled stdlib instead of its own, which fails during
+/// interpreter bootstrap with a "no Python frame" fatal error before any user
+/// code runs. Only relevant on Linux, where AppImage is the packaging format.
+pub(crate) fn clear_appimage_env(cmd: &mut tokio::process::Command) {
+    cmd.env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .env_remove("LD_LIBRARY_PATH");
+}
+
 /// Append `line` to a rolling job log, keeping only the most recent
 /// `max_lines` lines.
 pub(crate) fn append_log_line(out: &mut String, line: &str, max_lines: usize) {

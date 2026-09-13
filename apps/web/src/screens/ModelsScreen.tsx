@@ -52,8 +52,16 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
     return { localNames };
   }, [artifacts]);
 
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+
   const startDownload = async (repo: string, file: string) => {
-    await downloadModel(repo, file);
+    setCatalogError(null);
+    try {
+      const r = await downloadModel(repo, file);
+      if (!r.ok) setCatalogError(r.message || `failed to start download for ${file}`);
+    } catch (e) {
+      setCatalogError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const [dlRepo, setDlRepo] = useState('');
@@ -153,6 +161,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
           description="The five artifact identities NInfer explicitly supports. Weights and the embedded tokenizer, chat template, and media frontends are fixed per artifact."
           icon={<Download size={15} />}
         >
+          {catalogError && <p className="mb-2.5 text-[12px] text-danger">{catalogError}</p>}
           <div className="overflow-x-auto">
             <table className="w-full text-left text-[12.5px]">
               <thead>
@@ -173,7 +182,11 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                 )}
                 {(catalogEntries.length ? catalogEntries : []).map((c: any) => {
                   const local = artifacts.find((a) => a.file === c.file);
-                  const dl = downloads.find((d) => d.file === c.file && !d.done);
+                  const latest = downloads
+                    .filter((d) => d.file === c.file)
+                    .sort((a, b) => b.startedAt - a.startedAt)[0];
+                  const dl = latest && !latest.done ? latest : undefined;
+                  const dlFailed = latest && latest.done && latest.failed ? latest : undefined;
                   return (
                     <tr key={c.file} className="border-b border-line/60 last:border-0">
                       <td className="py-2.5 pr-4 font-mono text-[12px] text-ink">{c.file}</td>
@@ -187,6 +200,13 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                           </span>
                         ) : dl ? (
                           <DlProgress dl={dl} />
+                        ) : dlFailed ? (
+                          <span
+                            className="inline-flex items-center gap-1.5 font-mono text-[11.5px] text-danger"
+                            title={dlFailed.out.split('\n').slice(-5).join('\n')}
+                          >
+                            ✗ exit {dlFailed.exitCode}
+                          </span>
                         ) : (
                           <span className="font-mono text-[11.5px] text-faint">not downloaded</span>
                         )}

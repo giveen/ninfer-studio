@@ -2,6 +2,7 @@
 
 // Rust guideline compliant 2026-07-28
 
+use crate::clear_appimage_env;
 use crate::types::{AppEvent, State, now_ms};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -107,14 +108,15 @@ pub async fn start_update(state: &S, action: &str) -> Value {
         started_at: now_ms(),
     };
 
-    let Ok(mut child) = tokio::process::Command::new("sh")
+    let mut sh_cmd = tokio::process::Command::new("sh");
+    sh_cmd
         .arg("-c")
         .arg(&cmd)
         .current_dir(&repo)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    else {
+        .stderr(std::process::Stdio::piped());
+    clear_appimage_env(&mut sh_cmd);
+    let Ok(mut child) = sh_cmd.spawn() else {
         return json!({ "ok": false, "message": format!("could not spawn: {cmd}") });
     };
     rec.pid = child.id();

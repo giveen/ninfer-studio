@@ -2,6 +2,7 @@
 
 // Rust guideline compliant 2026-07-28
 
+use crate::clear_appimage_env;
 use crate::types::{now_ms, AppEvent, ARTIFACTS, JobRec, ModelArtifact, State};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -83,6 +84,7 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         .arg(&dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    clear_appimage_env(&mut cmd);
     // Token goes via env, never argv — argv is world-readable in /proc.
     if !hf_token.is_empty() {
         cmd.env("HF_TOKEN", hf_token);
@@ -257,17 +259,16 @@ fn largest_file_size_under(root: &std::path::Path) -> u64 {
 /// Resolve the total download size via `hf download --dry-run --json` (no
 /// actual network transfer). Returns None if the size can't be determined.
 async fn fetch_download_size(cli: &str, repo: &str, file: &str, dir: &str) -> Option<u64> {
-    let out = tokio::process::Command::new(cli)
-        .arg("download")
+    let mut cmd = tokio::process::Command::new(cli);
+    cmd.arg("download")
         .arg(repo)
         .arg(file)
         .arg("--local-dir")
         .arg(dir)
         .arg("--dry-run")
-        .arg("--json")
-        .output()
-        .await
-        .ok()?;
+        .arg("--json");
+    clear_appimage_env(&mut cmd);
+    let out = cmd.output().await.ok()?;
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
     let arr = v.as_array()?;
     let first = arr.first()?;
