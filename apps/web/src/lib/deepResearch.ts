@@ -17,6 +17,19 @@ Respond with ONLY a numbered list, one angle per line, nothing else:
 1. <angle>
 2. <angle>`;
 
+/** Pure parse of the planner's raw numbered-list output into angle strings —
+ *  extracted so the line-splitting/numbering-strip logic is directly
+ *  unit-testable. `fallback` (the original question) is returned when
+ *  nothing parseable came back, so a planning hiccup degrades to
+ *  "research the whole question" rather than zero angles. */
+export function parseResearchAngles(raw: string, maxAngles: number, fallback: string): string[] {
+  const angles = raw
+    .split('\n')
+    .map((l) => l.replace(/^\s*\d+[.)]\s*/, '').trim())
+    .filter(Boolean);
+  return angles.length ? angles.slice(0, maxAngles) : [fallback];
+}
+
 /** Break `question` into up to `maxAngles` research angles. Best-effort:
  *  any failure, abort, or unparseable response falls back to a single
  *  angle — the question itself — so a planning hiccup degrades to "research
@@ -43,11 +56,7 @@ async function planResearchAngles(opts: {
     return [opts.question];
   }
   if (signal.aborted) return [opts.question];
-  const angles = acc
-    .split('\n')
-    .map((l) => l.replace(/^\s*\d+[.)]\s*/, '').trim())
-    .filter(Boolean);
-  return angles.length ? angles.slice(0, opts.maxAngles) : [opts.question];
+  return parseResearchAngles(acc, opts.maxAngles, opts.question);
 }
 
 const RESEARCH_ANGLE_SYSTEM = 'You are researching one specific angle of a larger question. Use the available tools to investigate, then reply with a concise findings report: the key facts, with source URLs where relevant. Do not answer the original overall question directly — just report findings for this angle.';

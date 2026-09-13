@@ -414,6 +414,20 @@ function formatReflectionHistory(history: ChatMessage[]): string {
 /** One critique pass over a draft reply. Resolves `null` when approved (or
  *  on any failure — best-effort, never blocks the turn), otherwise the
  *  specific issue to fix. */
+/** Pure parse of a critique model's raw output into a verdict — extracted so
+ *  the regex-based verdict/critique-text split is directly unit-testable
+ *  without a network round-trip. `null` = approved (or the raw text simply
+ *  had no verdict line at all, treated the same way: nothing to fix). */
+export function parseReflectionVerdict(raw: string): string | null {
+  // No recognizable verdict line at all (the critique model ignored the
+  // requested format) — treat as approved rather than feeding the whole raw
+  // response into regenerateChatReply as a "critique".
+  if (!/VERDICT:\s*(?:APPROVED|NEEDS_REVISION)/i.test(raw)) return null;
+  if (/VERDICT:\s*APPROVED/i.test(raw)) return null;
+  const critique = raw.replace(/VERDICT:\s*NEEDS_REVISION\s*/i, '').trim();
+  return critique || null;
+}
+
 export function critiqueChatReply(opts: {
   model: string;
   history: ChatMessage[];
@@ -428,11 +442,7 @@ export function critiqueChatReply(opts: {
     let acc = '';
     streamChat(body, signal, {
       onContentDelta: (d) => { acc += d; },
-      onDone: () => {
-        if (signal.aborted || /VERDICT:\s*APPROVED/i.test(acc)) { resolve(null); return; }
-        const critique = acc.replace(/VERDICT:\s*(?:APPROVED|NEEDS_REVISION)\s*/i, '').trim();
-        resolve(critique || null);
-      },
+      onDone: () => resolve(signal.aborted ? null : parseReflectionVerdict(acc)),
       onError: () => resolve(null),
     });
   });

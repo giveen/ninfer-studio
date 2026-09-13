@@ -119,7 +119,7 @@ interface CCMessage {
  *  `video_url` shape here too (unverified for non-text parts beyond this;
  *  flag for follow-up testing once vision-in-Chat is exercised through this
  *  transport). */
-function toResponsesItems(m: CCMessage): Array<Record<string, unknown>> {
+export function toResponsesItems(m: CCMessage): Array<Record<string, unknown>> {
   if (m.role === 'tool') {
     return [{ type: 'function_call_output', call_id: m.tool_call_id, output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') }];
   }
@@ -134,7 +134,7 @@ function toResponsesItems(m: CCMessage): Array<Record<string, unknown>> {
   return items;
 }
 
-function toResponsesTools(tools: unknown): unknown[] | undefined {
+export function toResponsesTools(tools: unknown): unknown[] | undefined {
   if (!Array.isArray(tools) || !tools.length) return undefined;
   return tools.map((t) => {
     const f = (t as { function?: { name: string; description?: string; parameters?: unknown } }).function;
@@ -147,14 +147,14 @@ function toResponsesTools(tools: unknown): unknown[] | undefined {
  *  (explicit off); otherwise an explicit reasoning_effort is forwarded;
  *  otherwise reasoning is left unset so the engine applies its own default
  *  (matches today's Chat Completions behavior when no override is chosen). */
-function toResponsesReasoning(req: Record<string, unknown>): Record<string, unknown> | undefined {
+export function toResponsesReasoning(req: Record<string, unknown>): Record<string, unknown> | undefined {
   if (req.enable_thinking === false) return { effort: 'none' };
   const effort = req.reasoning_effort;
   if (typeof effort === 'string' && effort) return { effort };
   return undefined;
 }
 
-function buildResponsesBody(req: Record<string, unknown>): Record<string, unknown> {
+export function buildResponsesBody(req: Record<string, unknown>): Record<string, unknown> {
   const messages = Array.isArray(req.messages) ? (req.messages as CCMessage[]) : [];
   const input = messages.flatMap(toResponsesItems);
   const body: Record<string, unknown> = {
@@ -179,6 +179,108 @@ function buildResponsesBody(req: Record<string, unknown>): Record<string, unknow
 // Streaming: parse the confirmed event/data SSE stream into ChatStreamCallbacks
 // ---------------------------------------------------------------------------
 
+interface ResponsesMeta {
+  promptTokens?: number;
+  completionTokens?: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+  ttftMs?: number;
+  finishReason?: string;
+}
+
+/** Mutable accumulator threaded through one stream's worth of events —
+ *  `calls`/`itemIdToCallId` collect tool-call pieces that arrive across
+ *  several events, `meta`/`completed` are the terminal summary. Exported
+ *  (with `initResponsesState`) purely so `applyResponsesEvent` is directly
+ *  unit-testable against canned event fixtures, without touching
+ *  fetch/ReadableStream at all. */
+export interface ResponsesState {
+  calls: Map<string, { name: string; arguments: string }>;
+  itemIdToCallId: Map<string, string>;
+  meta: ResponsesMeta;
+  completed: boolean;
+}
+
+export function initResponsesState(): ResponsesState {
+  return { calls: new Map(), itemIdToCallId: new Map(), meta: {}, completed: false };
+}
+
+/** What one parsed SSE event should cause the caller to emit — `state` is
+ *  mutated in place (calls/meta/completed), this return value covers only
+ *  the parts that map to a ChatStreamCallbacks call. */
+export interface ResponsesEventEffect {
+  contentDelta?: string;
+  reasoningDelta?: string;
+  usage?: Record<string, unknown>;
+  error?: string;
+}
+
+/** Pure reducer over one decoded `data:` line's JSON payload — the actual
+ *  event-type switch, extracted from the fetch/ReadableStream loop so it can
+ *  be tested directly against the confirmed event shapes (see the plan doc)
+ *  without any network mocking. Malformed JSON is silently ignored (mirrors
+ *  the original inline `try { JSON.parse } catch { return }` — a single bad
+ *  line must never abort an otherwise-healthy stream). */
+export function applyResponsesEvent(payload: string, state: ResponsesState): ResponsesEventEffect {
+  let chunk: Record<string, any>;
+  try {
+    chunk = JSON.parse(payload);
+  } catch {
+    return {};
+  }
+  switch (chunk.type) {
+    case 'response.output_text.delta':
+      return { contentDelta: chunk.delta ?? '' };
+    case 'response.reasoning_text.delta':
+      return { reasoningDelta: chunk.delta ?? '' };
+    case 'response.output_item.added': {
+      if (chunk.item?.type === 'function_call' && chunk.item.call_id) {
+        state.itemIdToCallId.set(chunk.item.id, chunk.item.call_id);
+        state.calls.set(chunk.item.call_id, { name: chunk.item.name ?? '', arguments: '' });
+      }
+      return {};
+    }
+    case 'response.function_call_arguments.done': {
+      // Fall back to item_id as the key if output_item.added somehow wasn't
+      // seen first, so the call is never silently dropped.
+      const callId = state.itemIdToCallId.get(chunk.item_id) ?? chunk.item_id;
+      const entry = state.calls.get(callId) ?? { name: '', arguments: '' };
+      entry.name = chunk.name ?? entry.name;
+      entry.arguments = chunk.arguments ?? '';
+      state.calls.set(callId, entry);
+      return {};
+    }
+    case 'response.completed': {
+      state.completed = true;
+      const usage = chunk.response?.usage;
+      if (usage) {
+        state.meta.promptTokens = usage.input_tokens;
+        state.meta.completionTokens = usage.output_tokens;
+        state.meta.cachedTokens = usage.input_tokens_details?.cached_tokens;
+        state.meta.reasoningTokens = usage.output_tokens_details?.reasoning_tokens;
+      }
+      // Reconcile the final call list against the server's own output array
+      // (authoritative call_id/name/arguments), in case any per-event
+      // bookkeeping above missed something.
+      const output = Array.isArray(chunk.response?.output) ? chunk.response.output : [];
+      for (const item of output) {
+        if (item?.type === 'function_call' && item.call_id) {
+          state.calls.set(item.call_id, { name: item.name ?? '', arguments: item.arguments ?? '' });
+        }
+      }
+      state.meta.finishReason = output.some((i: any) => i?.type === 'function_call') ? 'tool_calls' : (chunk.response?.status === 'incomplete' ? 'length' : 'stop');
+      return usage ? { usage } : {};
+    }
+    case 'response.failed':
+    case 'response.incomplete': {
+      const msg = chunk.response?.error?.message || chunk.response?.incomplete_details?.reason || 'response did not complete';
+      return { error: String(msg) };
+    }
+    default:
+      return {};
+  }
+}
+
 /** Drop-in StreamFn (see agentLoop.ts) — same signature as streamChat, so
  *  streamTurn's `stream?: StreamFn` injection point works unchanged. */
 export async function streamResponses(
@@ -188,14 +290,8 @@ export async function streamResponses(
 ): Promise<void> {
   const body = buildResponsesBody(ccReq);
   const t0 = performance.now();
-  const meta: { promptTokens?: number; completionTokens?: number; cachedTokens?: number; reasoningTokens?: number; ttftMs?: number; finishReason?: string } = {};
+  const state = initResponsesState();
   let firstContentAt: number | null = null;
-  // call_id -> accumulated {name, arguments} for the final onToolCalls batch.
-  const calls = new Map<string, { name: string; arguments: string }>();
-  // function_call_arguments.* events key by the item's own id (fc_...), not
-  // call_id — output_item.added is where we first learn the pairing.
-  const itemIdToCallId = new Map<string, string>();
-  let completed = false;
 
   try {
     const r = await fetch(API_BASE + '/v1/responses', {
@@ -225,70 +321,14 @@ export async function streamResponses(
     // JSON payload's own `type` field always mirrors the `event:` line, so
     // only `data:` lines need parsing — `event:`/blank lines are no-ops.
     const handleDataLine = (payload: string) => {
-      let chunk: Record<string, any>;
-      try {
-        chunk = JSON.parse(payload);
-      } catch {
-        return;
+      const effect = applyResponsesEvent(payload, state);
+      if (effect.contentDelta !== undefined) {
+        if (firstContentAt === null) firstContentAt = performance.now();
+        cb.onContentDelta?.(effect.contentDelta);
       }
-      switch (chunk.type) {
-        case 'response.output_text.delta': {
-          if (firstContentAt === null) firstContentAt = performance.now();
-          cb.onContentDelta?.(chunk.delta ?? '');
-          break;
-        }
-        case 'response.reasoning_text.delta': {
-          cb.onReasoningDelta?.(chunk.delta ?? '');
-          break;
-        }
-        case 'response.output_item.added': {
-          if (chunk.item?.type === 'function_call' && chunk.item.call_id) {
-            itemIdToCallId.set(chunk.item.id, chunk.item.call_id);
-            calls.set(chunk.item.call_id, { name: chunk.item.name ?? '', arguments: '' });
-          }
-          break;
-        }
-        case 'response.function_call_arguments.done': {
-          // Fall back to item_id as the key if output_item.added somehow
-          // wasn't seen first, so the call is never silently dropped.
-          const callId = itemIdToCallId.get(chunk.item_id) ?? chunk.item_id;
-          const entry = calls.get(callId) ?? { name: '', arguments: '' };
-          entry.name = chunk.name ?? entry.name;
-          entry.arguments = chunk.arguments ?? '';
-          calls.set(callId, entry);
-          break;
-        }
-        case 'response.completed': {
-          completed = true;
-          const usage = chunk.response?.usage;
-          if (usage) {
-            meta.promptTokens = usage.input_tokens;
-            meta.completionTokens = usage.output_tokens;
-            meta.cachedTokens = usage.input_tokens_details?.cached_tokens;
-            meta.reasoningTokens = usage.output_tokens_details?.reasoning_tokens;
-            cb.onUsage?.(usage, meta as any);
-          }
-          // Reconcile the final call list against the server's own output
-          // array (authoritative call_id/name/arguments), in case any
-          // per-event bookkeeping above missed something.
-          const output = Array.isArray(chunk.response?.output) ? chunk.response.output : [];
-          for (const item of output) {
-            if (item?.type === 'function_call' && item.call_id) {
-              calls.set(item.call_id, { name: item.name ?? '', arguments: item.arguments ?? '' });
-            }
-          }
-          meta.finishReason = output.some((i: any) => i?.type === 'function_call') ? 'tool_calls' : (chunk.response?.status === 'incomplete' ? 'length' : 'stop');
-          break;
-        }
-        case 'response.failed':
-        case 'response.incomplete': {
-          const msg = chunk.response?.error?.message || chunk.response?.incomplete_details?.reason || 'response did not complete';
-          cb.onError?.(String(msg));
-          break;
-        }
-        default:
-          break;
-      }
+      if (effect.reasoningDelta !== undefined) cb.onReasoningDelta?.(effect.reasoningDelta);
+      if (effect.usage) cb.onUsage?.(effect.usage, state.meta as any);
+      if (effect.error) cb.onError?.(effect.error);
     };
 
     while (true) {
@@ -310,19 +350,19 @@ export async function streamResponses(
       if (payload) handleDataLine(payload);
     }
 
-    if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
-    if (calls.size) {
-      cb.onToolCalls?.([...calls.entries()].map(([id, c]) => ({ id, name: c.name, arguments: c.arguments })));
+    if (firstContentAt !== null) state.meta.ttftMs = firstContentAt - t0;
+    if (state.calls.size) {
+      cb.onToolCalls?.([...state.calls.entries()].map(([id, c]) => ({ id, name: c.name, arguments: c.arguments })));
     }
-    if (!completed) {
+    if (!state.completed) {
       cb.onError?.('The response stream ended before completion — the connection may have dropped.');
       return;
     }
-    cb.onDone?.(meta as any);
+    cb.onDone?.(state.meta as any);
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') {
-      meta.finishReason = meta.finishReason || 'cancelled';
-      cb.onDone?.(meta as any);
+      state.meta.finishReason = state.meta.finishReason || 'cancelled';
+      cb.onDone?.(state.meta as any);
       return;
     }
     cb.onError?.(e instanceof Error ? e.message : String(e));
