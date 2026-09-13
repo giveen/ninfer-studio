@@ -27,16 +27,16 @@ import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatu
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { coderBrowser } from '../lib/api';
+import { coderBrowser, chatMemoryAddLearning, type CoderLearningKind } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch } = useChatAgent();
+  const { agentResearch, memoryEnabled, memoryRef, adoptMemory } = useChatAgent();
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -273,8 +273,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
       // Chat tools as a registry for the shared runner: the same ToolRegistry
       // contract the coder loops use. Agent Mode "research" tier adds the
-      // workspace-independent `browser` tool on top of the always-on
-      // read-only web tools.
+      // workspace-independent `browser` tool; the Memory toggle adds
+      // `memory_update`, routed to the global chat store (not per-workspace).
       const registry: ToolRegistry = {
         web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
         web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
@@ -288,14 +288,32 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 ).then((r) => JSON.stringify(r)),
             }
           : {}),
+        ...(memoryEnabled
+          ? {
+              memory_update: (args, signal) => {
+                const text = String(args.text || '').trim();
+                const rawKind = String(args.kind || 'tip');
+                const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
+                if (!text) return Promise.resolve(JSON.stringify({ error: 'memory_update requires non-empty `text`.' }));
+                return chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal).then((m) => {
+                  adoptMemory(m);
+                  return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
+                });
+              },
+            }
+          : {}),
       };
-      const tools = agentResearch ? [...CHAT_TOOLS, CHAT_BROWSER_TOOL] : CHAT_TOOLS;
+      const tools = [
+        ...CHAT_TOOLS,
+        ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
+        ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
+      ];
       // The runner owns the turn messages; these events mirror each turn into
       // the conversation store so streaming stays live.
       let lastTurnMeta: MessageMeta | undefined;
       const res = await runToolLoop({
         model: useModel,
-        system: chatSystemWithCapabilities(params),
+        system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
         messages: history,
         params,
         tools,
@@ -480,7 +498,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory],
   );
 
   const send = useCallback(async () => {

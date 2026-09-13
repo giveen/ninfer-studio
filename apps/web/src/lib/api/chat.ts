@@ -4,6 +4,7 @@
 
 import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
 import { API_BASE, getJSON, postJSON } from './core';
+import type { CoderMemory, CoderLearningKind } from './coder';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -611,4 +612,27 @@ export function chatDeepResearchEnabledGet(): Promise<{ enabled: boolean }> {
 }
 export function chatDeepResearchEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
   return postJSON<{ enabled: boolean }>('/api/chat/deep-research-enabled', { enabled }, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Chat memory — one global bank + learnings store (no per-workspace slug).
+// Same {bank, learnings} shape and body contract as /api/coder/memory, so
+// this reuses CoderMemory/CoderLearningKind rather than declaring twins.
+// ---------------------------------------------------------------------------
+export function chatMemoryGet(): Promise<CoderMemory> {
+  return getJSON<CoderMemory>('/api/chat/memory', 8000);
+}
+export function chatMemorySetBank(bank: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { bank }, 8000);
+}
+export function chatMemoryAddLearning(learning: {
+  text: string;
+  kind: CoderLearningKind;
+  provenance?: string;
+  task?: string;
+}, signal?: AbortSignal): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { learning }, 8000, signal);
+}
+export function chatMemoryDropLearning(id: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { dropLearningId: id }, 8000);
 }

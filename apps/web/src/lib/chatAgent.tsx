@@ -5,12 +5,13 @@
 // other changes it), kept as its own provider rather than folded into
 // CoderSafetyProvider since these are a distinct, Chat-only concern.
 
-import { createContext, useContext, useCallback, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useCallback, useEffect, useRef, useState, type ReactNode, type MutableRefObject } from 'react';
 import {
   chatAgentResearchGet, chatAgentResearchSet,
   chatMemoryEnabledGet, chatMemoryEnabledSet,
   chatReflectionEnabledGet, chatReflectionEnabledSet,
   chatDeepResearchEnabledGet, chatDeepResearchEnabledSet,
+  chatMemoryGet, type CoderMemory,
 } from './api';
 
 interface ChatAgentState {
@@ -23,6 +24,16 @@ interface ChatAgentState {
   setReflectionEnabled: (v: boolean) => void;
   deepResearchEnabled: boolean;
   setDeepResearchEnabled: (v: boolean) => void;
+  /** The global chat memory bank + learnings — same {bank, learnings} shape
+   *  Coder's per-workspace store uses. `memoryRef` mirrors `memory` for the
+   *  system-prompt injection point, which needs the latest snapshot without
+   *  closing over a stale render. */
+  memory: CoderMemory;
+  memoryRef: MutableRefObject<CoderMemory>;
+  loadMemory: () => Promise<void>;
+  adoptMemory: (m: CoderMemory) => void;
+  memoryModalOpen: boolean;
+  setMemoryModalOpen: (v: boolean) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -33,12 +44,34 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [reflectionEnabled, setReflectionEnabledState] = useState(false);
   const [deepResearchEnabled, setDeepResearchEnabledState] = useState(false);
 
+  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
+  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+
+  const adoptMemory = useCallback((m: CoderMemory) => {
+    setMemory(m);
+    memoryRef.current = m;
+  }, []);
+  const loadMemory = useCallback(async () => {
+    try {
+      adoptMemory(await chatMemoryGet());
+    } catch {
+      // best-effort — keep the last good snapshot rather than wiping the UI
+    }
+  }, [adoptMemory]);
+
   useEffect(() => {
     chatAgentResearchGet().then((r) => setAgentResearchState(r.enabled)).catch(() => {});
     chatMemoryEnabledGet().then((r) => setMemoryEnabledState(r.enabled)).catch(() => {});
     chatReflectionEnabledGet().then((r) => setReflectionEnabledState(r.enabled)).catch(() => {});
     chatDeepResearchEnabledGet().then((r) => setDeepResearchEnabledState(r.enabled)).catch(() => {});
   }, []);
+
+  // Load the bank/learnings once memory is confirmed on — no point fetching
+  // it while the toggle (and thus the injection/tool) is off.
+  useEffect(() => {
+    if (memoryEnabled) void loadMemory();
+  }, [memoryEnabled, loadMemory]);
 
   const setAgentResearch = useCallback((v: boolean) => {
     setAgentResearchState(v);
@@ -64,6 +97,7 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         memoryEnabled, setMemoryEnabled,
         reflectionEnabled, setReflectionEnabled,
         deepResearchEnabled, setDeepResearchEnabled,
+        memory, memoryRef, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
       }}
     >
       {children}

@@ -11,6 +11,7 @@ pub mod chat;
 pub mod coder;
 pub mod engine;
 pub mod gpu;
+pub mod memstore;
 pub mod models;
 pub mod proxy;
 pub mod repo;
@@ -140,6 +141,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))
         .route("/api/coder/memory", get(coder::memory_get).post(coder::memory_set))
+        .route("/api/chat/memory", get(chat::memory_get).post(chat::memory_set))
         .route("/api/coder/glob", post(coder::glob))
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/browser", post(coder::browser))

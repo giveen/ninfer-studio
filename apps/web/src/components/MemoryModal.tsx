@@ -6,6 +6,8 @@ import type { CoderLearning, CoderMemory, CoderLearningKind } from '../lib/api';
 interface MemoryModalProps {
   open: boolean;
   onClose: () => void;
+  /** Header title — defaults to "Repository Memory" (Coder's per-workspace store). */
+  title?: string;
   /** Current bank + learnings (read-only snapshot from the parent). */
   memory: CoderMemory;
   /** Persist an edited bank (markdown). */
@@ -28,7 +30,7 @@ function fmtTs(ts: string): string {
   return d.toLocaleString();
 }
 
-export function MemoryModal({ open, onClose, memory, onSaveBank, onDropLearning, onChanged }: MemoryModalProps) {
+export function MemoryModal({ open, onClose, title = 'Repository Memory', memory, onSaveBank, onDropLearning, onChanged }: MemoryModalProps) {
   const [bank, setBank] = useState(memory.bank);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -72,7 +74,7 @@ export function MemoryModal({ open, onClose, memory, onSaveBank, onDropLearning,
         {/* Header */}
         <div className="flex shrink-0 items-center gap-2 border-b border-line p-3">
           <BookmarkPlus size={15} className="text-accent" />
-          <div className="text-sm font-semibold">Repository Memory</div>
+          <div className="text-sm font-semibold">{title}</div>
           <span className="rounded bg-panel2 px-1.5 py-0.5 text-[11px] text-mute">
             {memory.learnings.length} learning{memory.learnings.length === 1 ? '' : 's'}
           </span>

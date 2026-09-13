@@ -1,6 +1,8 @@
-import { Bot, Globe, Brain, Sparkles, Users } from 'lucide-react';
-import { cn, SectionCard } from '../../components/ui';
+import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus } from 'lucide-react';
+import { Button, cn, SectionCard } from '../../components/ui';
+import { MemoryModal } from '../../components/MemoryModal';
 import { useChatAgent } from '../../lib/chatAgent';
+import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
 import { engineMaxConcurrency } from '../../lib/engineInfo';
 import type { StatusPayload } from '../../lib/types';
 
@@ -20,7 +22,10 @@ function ToggleRow({ on, onToggle, onTitle, offTitle }: {
 }
 
 export function AgentTab({ status }: { status: StatusPayload | null }) {
-  const { agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled } = useChatAgent();
+  const {
+    agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled,
+    memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
+  } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
 
@@ -48,14 +53,36 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
       <SectionCard title="Memory" icon={<Brain size={15} />} description="A persistent, cross-conversation bank of facts and preferences the model can write to.">
         <div className="flex items-center justify-between gap-3">
           <p className="text-[12.5px] text-faint">The model can proactively remember durable facts about you (name, preferences, ongoing projects) and recall them in every future conversation — separate from Coder's per-workspace memory.</p>
-          <ToggleRow
-            on={memoryEnabled}
-            onToggle={setMemoryEnabled}
-            onTitle="Chat can read/write a persistent memory bank"
-            offTitle="Chat has no memory beyond the current conversation"
-          />
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                void loadMemory();
+                setMemoryModalOpen(true);
+              }}
+            >
+              <BookmarkPlus size={13} /> Manage
+            </Button>
+            <ToggleRow
+              on={memoryEnabled}
+              onToggle={setMemoryEnabled}
+              onTitle="Chat can read/write a persistent memory bank"
+              offTitle="Chat has no memory beyond the current conversation"
+            />
+          </div>
         </div>
       </SectionCard>
+
+      <MemoryModal
+        open={memoryModalOpen}
+        onClose={() => setMemoryModalOpen(false)}
+        title="Chat Memory"
+        memory={memory}
+        onSaveBank={(bank) => chatMemorySetBank(bank).then(adoptMemory)}
+        onDropLearning={(id) => chatMemoryDropLearning(id).then(adoptMemory)}
+        onChanged={loadMemory}
+      />
 
       <SectionCard title="Reflection" icon={<Sparkles size={15} />} description="An extra self-review pass before a reply is shown.">
         <div className="flex items-center justify-between gap-3">

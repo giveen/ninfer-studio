@@ -5,6 +5,7 @@
 import { frameCompactedSummary } from './api';
 import { effectiveSystemPrompt } from './notai';
 import type { ChatMessage, ChatParams, Conversation } from './types';
+import type { CoderMemory } from './api/coder';
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
@@ -80,9 +81,26 @@ export function localDateTimeBlock(): string {
   return `# Current date and time\n${formatted} (${tz})`;
 }
 
-export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0]): string => {
+/** Bank + up to 15 most recent learnings, formatted the same way Coder
+ *  injects its per-repo memory — omitted entirely when there's nothing to
+ *  show, so an empty/never-used store adds no prompt overhead. */
+function memoryBlock(memory: CoderMemory | undefined): string {
+  if (!memory) return '';
+  const blocks: string[] = [];
+  if (memory.bank && memory.bank.trim()) {
+    blocks.push(`# What you know about this user\n${memory.bank.trim()}`);
+  }
+  const recent = (memory.learnings ?? []).slice(-15);
+  if (recent.length) {
+    const tagged = recent.map((l) => `- [${l.kind}] ${l.text}`).join('\n');
+    blocks.push(`# Learnings from prior conversations (most recent first)\n${tagged}`);
+  }
+  return blocks.join('\n\n');
+}
+
+export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory): string => {
   const base = effectiveSystemPrompt(params);
-  return [base, localDateTimeBlock(), CHAT_CAPABILITIES].filter(Boolean).join('\n\n');
+  return [base, localDateTimeBlock(), CHAT_CAPABILITIES, memoryBlock(memory)].filter(Boolean).join('\n\n');
 };
 
 export const CHAT_TOOLS = [
@@ -134,6 +152,25 @@ export const CHAT_BROWSER_TOOL = {
         timeout: { type: "number", description: "wait_for: seconds to poll (default 5, max 15)." }
       },
       required: ["action"]
+    }
+  }
+};
+
+/** Memory toggle adds this tool — exact schema copy of Coder's `memory_update`
+ *  (coderTools.ts), routed by ChatScreen's registry to the global chat store
+ *  (/api/chat/memory) instead of the per-workspace coder one. */
+export const CHAT_MEMORY_TOOL = {
+  type: "function",
+  function: {
+    name: "memory_update",
+    description: "Record a durable learning to your persistent memory bank so future conversations start smarter. Use it proactively when you discover something non-obvious about the user: a preference, an ongoing project, a durable fact worth recalling. Pass kind='avoid' for mistakes/anti-patterns to steer future replies away from them.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "One concise, self-contained learning (imperative, e.g. 'User prefers terse replies with no trailing summary.')." },
+        kind: { type: "string", enum: ["success", "tip", "avoid"], description: "success = a working approach/fix; tip = a preference/fact worth remembering; avoid = a mistake or anti-pattern." }
+      },
+      required: ["text", "kind"]
     }
   }
 };
