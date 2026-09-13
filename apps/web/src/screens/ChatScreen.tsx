@@ -143,12 +143,25 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     };
   }, []);
 
+  // Tracks the last runningModel we synced from, so the effect below can
+  // tell "the engine's model actually changed" apart from "nothing changed,
+  // don't re-render". Deliberately not just `model !== runningModel`: after
+  // a manual /model override, model and runningModel legitimately disagree
+  // (multi-engine setups), and that disagreement must NOT keep resetting.
+  const syncedRunningModelRef = useRef('');
   useEffect(() => {
     // Keep the selector pointed at the running engine's actual id. The engine
-    // only answers to the id it was started with (e.g. "qwen-coder"); never leave
-    // a stale catalog fallback (e.g. "qwen3.8-27b") selected, which 404s.
-    if (runningModel && !model) setModel(runningModel);
-  }, [runningModel, model]);
+    // only answers to the id it was started with — if it changes underneath
+    // us (the user restarts it with a different model/artifact), a selection
+    // still pointed at the old id 404s on every turn, forever, until this
+    // fires. Comparing against the *previous* runningModel (not the current
+    // `model`) is what makes this fire again after such a restart, not just
+    // on the very first engine-up.
+    if (runningModel && runningModel !== syncedRunningModelRef.current) {
+      setModel(runningModel);
+      syncedRunningModelRef.current = runningModel;
+    }
+  }, [runningModel]);
 
   // Probe once per engine readiness change whether /v1/responses is
   // implemented (community forks may not have it) — cached, so `send` can
