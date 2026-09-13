@@ -432,10 +432,11 @@ export function critiqueChatReply(opts: {
   model: string;
   history: ChatMessage[];
   reply: string;
+  maxTokens?: number;
   signal?: AbortSignal;
 }): Promise<string | null> {
   const prompt = `CONVERSATION (most recent messages):\n${formatReflectionHistory(opts.history)}\n\nDRAFT REPLY:\n${opts.reply.slice(0, 4000)}\n\nReview the draft reply against the conversation.`;
-  const critiqueParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 400 };
+  const critiqueParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: opts.maxTokens ?? 400 };
   const body = buildChatRequest(opts.model, CHAT_REFLECTION_SYSTEM, [{ role: 'user', content: prompt }], critiqueParams);
   const signal = opts.signal ?? AbortSignal.timeout(60_000);
   return new Promise<string | null>((resolve) => {

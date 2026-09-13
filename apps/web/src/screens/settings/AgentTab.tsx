@@ -1,5 +1,5 @@
 import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus } from 'lucide-react';
-import { Button, TextField, cn, SectionCard } from '../../components/ui';
+import { Button, TextField, NumberField, cn, SectionCard } from '../../components/ui';
 import { MemoryModal } from '../../components/MemoryModal';
 import { useChatAgent } from '../../lib/chatAgent';
 import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
@@ -55,6 +55,8 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
     memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
     reflectionModel, setReflectionModel,
     browserTier, setBrowserTier, memoryToolTier, setMemoryToolTier,
+    deepResearchMaxAngles, setDeepResearchMaxAngles, deepResearchMaxSteps, setDeepResearchMaxSteps,
+    reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
   } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
@@ -143,13 +145,24 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
             className="max-w-[220px]"
           />
         </div>
+        <div className="mt-3 flex items-center gap-2 border-t border-line pt-3" title="Token budget for the critique call itself (the verdict/critique text, not the regenerated reply).">
+          <span className="shrink-0 text-[11.5px] text-faint">Critique token budget</span>
+          <NumberField
+            value={reflectionCritiqueMaxTokens}
+            onChange={setReflectionCritiqueMaxTokens}
+            min={50}
+            max={4000}
+            placeholder="400"
+            className="max-w-[100px]"
+          />
+        </div>
       </SectionCard>
 
       <SectionCard title="Deep research" icon={<Users size={15} />} description="Fans a question out into parallel research angles, then synthesizes one answer.">
         <div className="flex items-center justify-between gap-3">
           <p className="text-[12.5px] text-faint">
             {deepResearchAvailable
-              ? `Breaks a question into up to ${Math.min(maxConcurrency, 3)} independent angles, researches each in parallel, then combines the findings into one answer.`
+              ? `Breaks a question into up to ${Math.min(maxConcurrency, deepResearchMaxAngles)} independent angles, researches each in parallel, then combines the findings into one answer.`
               : 'Needs an engine profile with max-concurrency > 1 to actually run in parallel — the current profile only has 1 lane.'}
           </p>
           <ToggleRow
@@ -158,6 +171,16 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
             onTitle={deepResearchAvailable ? 'Chat can fan a question out into parallel research angles' : 'Enabled, but inert until the engine runs with max-concurrency > 1'}
             offTitle="Chat researches a question in one pass"
           />
+        </div>
+        <div className="mt-3 flex items-center gap-4 border-t border-line pt-3">
+          <div className="flex items-center gap-2" title="Cap on parallel research angles — still bounded by the engine's max-concurrency at run time.">
+            <span className="shrink-0 text-[11.5px] text-faint">Max angles</span>
+            <NumberField value={deepResearchMaxAngles} onChange={setDeepResearchMaxAngles} min={1} max={10} placeholder="3" className="max-w-[80px]" />
+          </div>
+          <div className="flex items-center gap-2" title="Tool-call step budget for each individual research angle.">
+            <span className="shrink-0 text-[11.5px] text-faint">Steps per angle</span>
+            <NumberField value={deepResearchMaxSteps} onChange={setDeepResearchMaxSteps} min={1} max={30} placeholder="5" className="max-w-[80px]" />
+          </div>
         </div>
       </SectionCard>
     </div>

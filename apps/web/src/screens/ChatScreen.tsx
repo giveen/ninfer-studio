@@ -40,7 +40,10 @@ import { engineMaxConcurrency } from '../lib/engineInfo';
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier } = useChatAgent();
+  const {
+    agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
+    deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
+  } = useChatAgent();
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
   // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
   const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
@@ -287,10 +290,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
         const question = [...history].reverse().find((m) => m.role === 'user')?.content ?? '';
         if (question.trim()) {
-          const maxAngles = Math.min(maxConcurrency, 3);
+          const maxAngles = Math.min(maxConcurrency, deepResearchMaxAngles);
           setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
           try {
-            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, signal: ac.signal });
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal });
             if (report && !ac.signal.aborted) {
               const researchMsg: ChatMessage = {
                 role: 'user',
@@ -450,7 +453,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           if (reflectionEnabled) {
             setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
             try {
-              const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, signal: ac.signal });
+              const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
               if (critique && !ac.signal.aborted) {
                 setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
                 const revised = await regenerateChatReply({
@@ -607,7 +610,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens],
   );
 
   const send = useCallback(async () => {

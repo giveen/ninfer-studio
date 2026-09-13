@@ -91,6 +91,17 @@ pub struct AppSettings {
     /// Permission tier for Chat's `memory_update` tool. Serializes as
     /// `chatMemoryToolTier`.
     pub chat_memory_tool_tier: String,
+    /// Cap on how many parallel research angles Deep Research fans out to
+    /// (still bounded by the running engine's maxConcurrency at call time).
+    /// Serializes as `chatDeepResearchMaxAngles`.
+    pub chat_deep_research_max_angles: u32,
+    /// Tool-call step budget for each individual Deep Research angle.
+    /// Serializes as `chatDeepResearchMaxSteps`.
+    pub chat_deep_research_max_steps: u32,
+    /// Token budget for the Reflection pass's critique call (the verdict/
+    /// critique text itself, not the regenerated reply). Serializes as
+    /// `chatReflectionCritiqueMaxTokens`.
+    pub chat_reflection_critique_max_tokens: u32,
 }
 
 impl Default for AppSettings {
@@ -123,6 +134,9 @@ impl Default for AppSettings {
             chat_reflection_model: String::new(),
             chat_browser_tier: "allow".into(),
             chat_memory_tool_tier: "allow".into(),
+            chat_deep_research_max_angles: 3,
+            chat_deep_research_max_steps: 5,
+            chat_reflection_critique_max_tokens: 400,
         }
     }
 }

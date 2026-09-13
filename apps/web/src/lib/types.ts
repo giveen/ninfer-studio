@@ -82,6 +82,11 @@ export interface AppSettings {
   /** Permission tier ('allow'/'ask'/'deny') for Chat's browser/memory_update tools. */
   chatBrowserTier?: string;
   chatMemoryToolTier?: string;
+  /** Deep Research: max parallel angles / tool-call steps per angle. */
+  chatDeepResearchMaxAngles?: number;
+  chatDeepResearchMaxSteps?: number;
+  /** Reflection: token budget for the critique call itself. */
+  chatReflectionCritiqueMaxTokens?: number;
 }
 
 interface UpdateJob {

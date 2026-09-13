@@ -94,6 +94,21 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     {
         merged.chat_memory_tool_tier = v.into();
     }
+    if let Some(v) = body.get("chatDeepResearchMaxAngles").and_then(|v| v.as_u64())
+        && (1..=10).contains(&v)
+    {
+        merged.chat_deep_research_max_angles = v as u32;
+    }
+    if let Some(v) = body.get("chatDeepResearchMaxSteps").and_then(|v| v.as_u64())
+        && (1..=30).contains(&v)
+    {
+        merged.chat_deep_research_max_steps = v as u32;
+    }
+    if let Some(v) = body.get("chatReflectionCritiqueMaxTokens").and_then(|v| v.as_u64())
+        && (50..=4000).contains(&v)
+    {
+        merged.chat_reflection_critique_max_tokens = v as u32;
+    }
     let path = state.data_dir.join("config.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(

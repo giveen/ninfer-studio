@@ -46,6 +46,14 @@ interface ChatAgentState {
   setBrowserTier: (v: PermTier) => void;
   memoryToolTier: PermTier;
   setMemoryToolTier: (v: PermTier) => void;
+  /** Deep Research: max parallel angles / tool-call steps per angle. */
+  deepResearchMaxAngles: number;
+  setDeepResearchMaxAngles: (v: number) => void;
+  deepResearchMaxSteps: number;
+  setDeepResearchMaxSteps: (v: number) => void;
+  /** Reflection: token budget for the critique call itself. */
+  reflectionCritiqueMaxTokens: number;
+  setReflectionCritiqueMaxTokens: (v: number) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -63,6 +71,9 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [reflectionModel, setReflectionModelState] = useState('');
   const [browserTier, setBrowserTierState] = useState<PermTier>('allow');
   const [memoryToolTier, setMemoryToolTierState] = useState<PermTier>('allow');
+  const [deepResearchMaxAngles, setDeepResearchMaxAnglesState] = useState(3);
+  const [deepResearchMaxSteps, setDeepResearchMaxStepsState] = useState(5);
+  const [reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokensState] = useState(400);
 
   const adoptMemory = useCallback((m: CoderMemory) => {
     setMemory(m);
@@ -85,6 +96,9 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
       setReflectionModelState(c.chatReflectionModel ?? '');
       setBrowserTierState((c.chatBrowserTier as PermTier) || 'allow');
       setMemoryToolTierState((c.chatMemoryToolTier as PermTier) || 'allow');
+      setDeepResearchMaxAnglesState(c.chatDeepResearchMaxAngles ?? 3);
+      setDeepResearchMaxStepsState(c.chatDeepResearchMaxSteps ?? 5);
+      setReflectionCritiqueMaxTokensState(c.chatReflectionCritiqueMaxTokens ?? 400);
     }).catch(() => {});
   }, []);
 
@@ -122,6 +136,18 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     setMemoryToolTierState(v);
     saveConfig({ chatMemoryToolTier: v }).catch(() => {});
   }, []);
+  const setDeepResearchMaxAngles = useCallback((v: number) => {
+    setDeepResearchMaxAnglesState(v);
+    saveConfig({ chatDeepResearchMaxAngles: v }).catch(() => {});
+  }, []);
+  const setDeepResearchMaxSteps = useCallback((v: number) => {
+    setDeepResearchMaxStepsState(v);
+    saveConfig({ chatDeepResearchMaxSteps: v }).catch(() => {});
+  }, []);
+  const setReflectionCritiqueMaxTokens = useCallback((v: number) => {
+    setReflectionCritiqueMaxTokensState(v);
+    saveConfig({ chatReflectionCritiqueMaxTokens: v }).catch(() => {});
+  }, []);
 
   return (
     <Ctx.Provider
@@ -134,6 +160,9 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         reflectionModel, setReflectionModel,
         browserTier, setBrowserTier,
         memoryToolTier, setMemoryToolTier,
+        deepResearchMaxAngles, setDeepResearchMaxAngles,
+        deepResearchMaxSteps, setDeepResearchMaxSteps,
+        reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
       }}
     >
       {children}
