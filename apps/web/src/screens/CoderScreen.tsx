@@ -776,7 +776,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     try {
       const rMap = await coderRepoMap();
       if (rMap && rMap.map) {
-        sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${rMap.map}\n\`\`\`\n`;
+        // Unlike conventions/skills/followed-files below, this comes straight
+        // from an AST scan of the whole repo with no size control of its own —
+        // cap it so a large codebase can't silently balloon every turn's prompt.
+        const REPO_MAP_CAP = 20000;
+        const map = rMap.map.length > REPO_MAP_CAP
+          ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
+          : rMap.map;
+        sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
       }
     } catch { /* ignore */ }
     // Project conventions: AGENTS.md preferred, CLAUDE.md fallback — refreshed
@@ -896,8 +903,15 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     try {
       const mem = memoryRef.current;
       const blocks: string[] = [];
-      if (mem.bank && mem.bank.trim()) {
-        blocks.push(`# Repository Memory Bank\n${mem.bank.trim()}`);
+      const bank = mem.bank?.trim();
+      if (bank) {
+        // User-authored and free-growing (Memory modal) — cap it like every
+        // other injected block so a long-lived bank can't dominate the prompt.
+        const MEMORY_BANK_CAP = 6000;
+        const bankText = bank.length > MEMORY_BANK_CAP
+          ? bank.slice(0, MEMORY_BANK_CAP) + '\n…(truncated — trim the Memory Bank in the Memory modal)'
+          : bank;
+        blocks.push(`# Repository Memory Bank\n${bankText}`);
       }
       const recent = (mem.learnings ?? []).slice(-15);
       if (recent.length) {
@@ -2822,12 +2836,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         let toolCalls: AgentToolCall[] = [];
         let finishReason: string | undefined;
 
+        // Tools the workspace denies outright never need to be advertised —
+        // checkPerm would reject them anyway, so dropping them from the schema
+        // saves prompt space every turn instead of just wasting a round trip.
+        const undeniedTools = TOOLS.filter((t) => (perms.tools[t.function.name] ?? 'allow') !== 'deny');
         // Plan mode advertises read-only tools only; the permission gate in
         // handleToolCalls enforces it even if the model tries otherwise.
         // Plan mode keeps read-only tools PLUS bash (enforced to inspection
         // commands by checkPerm), so investigation doesn't push the model
         // into inventing tool markup for an undeclared tool.
-        const activeTools = planMode ? TOOLS.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : TOOLS;
+        const activeTools = planMode ? undeniedTools.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : undeniedTools;
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
         const system = (planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
