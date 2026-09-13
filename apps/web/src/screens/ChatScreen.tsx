@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react';
+import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react';
 import {
   BrainCircuit,
   ChevronDown,
@@ -32,7 +32,7 @@ import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chat
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
-export function ChatScreen({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
+function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -1365,3 +1365,17 @@ export function ChatScreen({ status, onNavigate }: { status: StatusPayload | nul
     </div>
   );
 }
+
+// ChatScreen only reads status.engine/status.engines — never gpu/vram/downloads/etc,
+// which tick on every 2.5s status poll while the engine is running. Without this,
+// the heaviest screen (full history, streaming, message rendering) re-renders on
+// every GPU utilization blip regardless of what the user is doing.
+function sameRelevantStatus(a: StatusPayload | null, b: StatusPayload | null): boolean {
+  if (a === b) return true;
+  return JSON.stringify(a?.engine) === JSON.stringify(b?.engine) && JSON.stringify(a?.engines) === JSON.stringify(b?.engines);
+}
+
+export const ChatScreen = memo(
+  ChatScreenImpl,
+  (prev, next) => prev.onNavigate === next.onNavigate && sameRelevantStatus(prev.status, next.status),
+);
