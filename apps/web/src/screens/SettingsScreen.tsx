@@ -40,7 +40,7 @@ export function SettingsScreen({ status }: { status: StatusPayload | null }) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className={cn(tab !== 'engine' && 'hidden')}><EngineTab status={status} /></div>
         <div className={cn(tab !== 'safety' && 'hidden')}><SafetyTab /></div>
-        <div className={cn(tab !== 'agent' && 'hidden')}><AgentTab /></div>
+        <div className={cn(tab !== 'agent' && 'hidden')}><AgentTab status={status} /></div>
         <div className={cn(tab !== 'about' && 'hidden')}><AboutTab /></div>
       </div>
     </div>

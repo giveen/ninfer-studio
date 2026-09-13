@@ -242,10 +242,24 @@ what runs.
 2. `shiki` code highlighting + KaTeX in chat.
 3. Metrics screen: parse `--log-stats-interval-ms` records / `--request-log-jsonl` (schema v20)
    into live throughput & KV-utilization charts.
-4. Responses-API-based tool calls in chat (engine parses; client executes).
+4. Responses-API-based tool calls in chat (engine parses; client executes) — **done**, opportunistic
+   per-turn (falls back to Chat Completions when the request needs a sampling param `/v1/responses`
+   doesn't accept, or the engine doesn't support the endpoint).
 5. Per-model parameter presets persisted per artifact (FreeToken "Console restores each model's
    last applied config").
 6. First-run wizard (paths, GPU check via nvidia-smi, model download).
+7. Chat Agent Mode — **done**: an opt-in autonomy tier for Chat (Settings > Agent), built on the
+   Responses-API transport above and reusing Coder's permission/HITL infrastructure:
+   - **Tool tier**: off (web_fetch/web_search only, unchanged default) or research (adds the
+     workspace-independent `browser` tool).
+   - **Memory**: a persistent, cross-conversation bank of facts/learnings the model can write to
+     via `memory_update`, separate from Coder's per-workspace store.
+   - **Reflection**: an optional Generate → Reflect → Refine self-review pass (bounded to one
+     retry), with an independent critic-model override and a configurable critique token budget.
+   - **Deep research**: concurrency-gated parallel research fan-out (orchestrator-workers), with
+     configurable max angles and per-angle step budget.
+   - **Permission tiers**: `browser`/`memory_update` each get an independent allow/ask/deny tier
+     (mirrors Coder's `PermTier`); `ask` pauses the tool loop on a HITL approval dialog.
 
 ## 7. Desktop build notes (Ubuntu 26.10 dev branch, 2026-09-09)
 

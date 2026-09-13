@@ -61,6 +61,47 @@ pub struct AppSettings {
     /// Coding harness: require explicit human sign-off on the working-tree
     /// diff before the agent may commit. Serializes as `coderCommitApproval`.
     pub coder_commit_approval: bool,
+    /// Chat's Agent Mode tier: off (web_fetch/web_search only, the original
+    /// default) or on (adds the workspace-independent `browser` tool).
+    /// Serializes as `chatAgentResearch`.
+    pub chat_agent_research: bool,
+    /// Persistent cross-conversation Chat memory (global bank + learnings,
+    /// distinct from Coder's per-workspace one — see `chat::memory`).
+    /// Serializes as `chatMemoryEnabled`.
+    pub chat_memory_enabled: bool,
+    /// Optional self-review pass on Chat's final replies (Generate → Reflect
+    /// → Refine, bounded to one retry). Serializes as `chatReflectionEnabled`.
+    pub chat_reflection_enabled: bool,
+    /// Concurrency-gated parallel research fan-out for Chat (only usable
+    /// when the running engine's maxConcurrency > 1). Serializes as
+    /// `chatDeepResearchEnabled`.
+    pub chat_deep_research_enabled: bool,
+    /// Optional model id the Reflection pass critiques/regenerates with,
+    /// instead of the conversation's own model — lets a stronger model
+    /// review a weaker one's replies, avoiding the same-model
+    /// self-agreement-bias risk of a model critiquing its own output.
+    /// Empty = use the active chat model (today's behavior). Mirrors
+    /// Coder's `criticModel` param. Serializes as `chatReflectionModel`.
+    pub chat_reflection_model: String,
+    /// Permission tier ("allow"/"ask"/"deny") for Chat's `browser` tool —
+    /// mirrors Coder's per-tool `PermTier`, simplified to no denyPaths/
+    /// server-side enforcement since Chat's tools are workspace-independent.
+    /// Serializes as `chatBrowserTier`.
+    pub chat_browser_tier: String,
+    /// Permission tier for Chat's `memory_update` tool. Serializes as
+    /// `chatMemoryToolTier`.
+    pub chat_memory_tool_tier: String,
+    /// Cap on how many parallel research angles Deep Research fans out to
+    /// (still bounded by the running engine's maxConcurrency at call time).
+    /// Serializes as `chatDeepResearchMaxAngles`.
+    pub chat_deep_research_max_angles: u32,
+    /// Tool-call step budget for each individual Deep Research angle.
+    /// Serializes as `chatDeepResearchMaxSteps`.
+    pub chat_deep_research_max_steps: u32,
+    /// Token budget for the Reflection pass's critique call (the verdict/
+    /// critique text itself, not the regenerated reply). Serializes as
+    /// `chatReflectionCritiqueMaxTokens`.
+    pub chat_reflection_critique_max_tokens: u32,
 }
 
 impl Default for AppSettings {
@@ -86,6 +127,16 @@ impl Default for AppSettings {
             coder_workspace: String::new(),
             coder_safe_mode: true,
             coder_commit_approval: false,
+            chat_agent_research: false,
+            chat_memory_enabled: false,
+            chat_reflection_enabled: false,
+            chat_deep_research_enabled: false,
+            chat_reflection_model: String::new(),
+            chat_browser_tier: "allow".into(),
+            chat_memory_tool_tier: "allow".into(),
+            chat_deep_research_max_angles: 3,
+            chat_deep_research_max_steps: 5,
+            chat_reflection_critique_max_tokens: 400,
         }
     }
 }

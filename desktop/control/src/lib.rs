@@ -7,9 +7,11 @@
 
 // Rust guideline compliant 2026-07-28
 
+pub mod chat;
 pub mod coder;
 pub mod engine;
 pub mod gpu;
+pub mod memstore;
 pub mod models;
 pub mod proxy;
 pub mod repo;
@@ -126,6 +128,10 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
         .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
         .route("/api/coder/commit-approval", get(coder::commit_approval_get).post(coder::commit_approval_set))
+        .route("/api/chat/agent-research", get(chat::agent_research_get).post(chat::agent_research_set))
+        .route("/api/chat/memory-enabled", get(chat::memory_enabled_get).post(chat::memory_enabled_set))
+        .route("/api/chat/reflection-enabled", get(chat::reflection_enabled_get).post(chat::reflection_enabled_set))
+        .route("/api/chat/deep-research-enabled", get(chat::deep_research_enabled_get).post(chat::deep_research_enabled_set))
         .route("/api/coder/sandbox", get(coder::sandbox_get).post(coder::sandbox_set))
         .route("/api/coder/search", get(coder::search))
         .route("/api/coder/diff", get(coder::diff))
@@ -135,6 +141,7 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))
         .route("/api/coder/memory", get(coder::memory_get).post(coder::memory_set))
+        .route("/api/chat/memory", get(chat::memory_get).post(chat::memory_set))
         .route("/api/coder/glob", post(coder::glob))
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/browser", post(coder::browser))

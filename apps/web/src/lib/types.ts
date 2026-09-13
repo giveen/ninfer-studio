@@ -76,6 +76,17 @@ export interface AppSettings {
   reasoningEffort: string;
   /** Coding harness: the directory the "Code" mode may read/write/execute within. Empty = not configured. */
   coderWorkspace: string;
+  /** Optional model id the Reflection pass critiques/regenerates with,
+   *  instead of the conversation's own model. '' = use the active chat model. */
+  chatReflectionModel?: string;
+  /** Permission tier ('allow'/'ask'/'deny') for Chat's browser/memory_update tools. */
+  chatBrowserTier?: string;
+  chatMemoryToolTier?: string;
+  /** Deep Research: max parallel angles / tool-call steps per angle. */
+  chatDeepResearchMaxAngles?: number;
+  chatDeepResearchMaxSteps?: number;
+  /** Reflection: token budget for the critique call itself. */
+  chatReflectionCritiqueMaxTokens?: number;
 }
 
 interface UpdateJob {

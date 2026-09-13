@@ -6,6 +6,7 @@ import type { StatusPayload } from './lib/types';
 import { formatBytes, formatPct } from './lib/format';
 import { applyTheme, getStoredTheme, type ThemeMode } from './lib/theme';
 import { CoderSafetyProvider } from './lib/coderSafety';
+import { ChatAgentProvider } from './lib/chatAgent';
 import { ChatScreen } from './screens/ChatScreen';
 import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
@@ -155,24 +156,26 @@ export function App() {
             params, and scroll positions alive across tabs. */}
         <main className="min-h-0 flex-1 overflow-hidden">
           <CoderSafetyProvider>
-            <div className={cn('h-full', screen !== 'chat' && 'hidden')}>
-              <ChatScreen status={status} onNavigate={setScreen} />
-            </div>
-            <div className={cn('h-full', screen !== 'code' && 'hidden')}>
-              <CoderScreen coderWs={coderWs} />
-            </div>
-            <div className={cn('h-full', screen !== 'engine' && 'hidden')}>
-              <EngineScreen status={status} />
-            </div>
-            <div className={cn('h-full', screen !== 'log' && 'hidden')}>
-              <LogScreen status={status} />
-            </div>
-            <div className={cn('h-full', screen !== 'models' && 'hidden')}>
-              <ModelsScreen status={status} />
-            </div>
-            <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
-              <SettingsScreen status={status} />
-            </div>
+            <ChatAgentProvider>
+              <div className={cn('h-full', screen !== 'chat' && 'hidden')}>
+                <ChatScreen status={status} onNavigate={setScreen} />
+              </div>
+              <div className={cn('h-full', screen !== 'code' && 'hidden')}>
+                <CoderScreen coderWs={coderWs} />
+              </div>
+              <div className={cn('h-full', screen !== 'engine' && 'hidden')}>
+                <EngineScreen status={status} />
+              </div>
+              <div className={cn('h-full', screen !== 'log' && 'hidden')}>
+                <LogScreen status={status} />
+              </div>
+              <div className={cn('h-full', screen !== 'models' && 'hidden')}>
+                <ModelsScreen status={status} />
+              </div>
+              <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
+                <SettingsScreen status={status} />
+              </div>
+            </ChatAgentProvider>
           </CoderSafetyProvider>
         </main>
       </div>

@@ -12,11 +12,13 @@ import {
   Plus,
   Search,
   Send,
+  Shield,
   SlidersHorizontal,
   Square,
   Trash2,
   X,
 } from 'lucide-react';
+import { HitlDialog } from '../components/HitlDialog';
 import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { isCompactedMsg, runToolLoop, humanizePassText, type ToolRegistry } from '../lib/agentLoop';
@@ -27,12 +29,35 @@ import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatu
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
+import { useChatAgent } from '../lib/chatAgent';
+import { coderBrowser, chatMemoryAddLearning, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
+import { runDeepResearch } from '../lib/deepResearch';
+import { engineMaxConcurrency } from '../lib/engineInfo';
 
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
+  const {
+    agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
+    deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
+  } = useChatAgent();
+  // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
+  // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
+  const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
+  const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  const requestApproval = useCallback((name: string, detail: string): Promise<boolean> => {
+    setPendingApproval({ name, detail });
+    return new Promise<boolean>((resolve) => {
+      approvalResolveRef.current = (ok: boolean) => {
+        approvalResolveRef.current = null;
+        setPendingApproval(null);
+        resolve(ok);
+      };
+    });
+  }, []);
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -124,6 +149,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     // a stale catalog fallback (e.g. "qwen3.8-27b") selected, which 404s.
     if (runningModel && !model) setModel(runningModel);
   }, [runningModel, model]);
+
+  // Probe once per engine readiness change whether /v1/responses is
+  // implemented (community forks may not have it) — cached, so `send` can
+  // check it synchronously per turn without blocking on a fresh request.
+  useEffect(() => {
+    if (engineUp) void probeResponsesSupport();
+  }, [engineUp]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -244,6 +276,50 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const ac = new AbortController();
       abortRef.current = ac;
 
+      // Deep research: concurrency-gated fan-out over the user's latest
+      // question, run BEFORE the main turn so the findings are already in
+      // context for the synthesis reply — same shape as Scout's
+      // fan-out-then-inject-report pre-pass. The report is both appended to
+      // `effectiveHistory` (for this call's model context) AND spliced into
+      // the visible conv.messages as a collapsed "Deep Research" report
+      // (ReportBlock, via MessageRow's displayName+collapsed branch) — same
+      // treatment Coder gives Scout, so the findings are auditable instead
+      // of only ever reaching the model invisibly.
+      let effectiveHistory = history;
+      const maxConcurrency = engineMaxConcurrency(status);
+      if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
+        const question = [...history].reverse().find((m) => m.role === 'user')?.content ?? '';
+        if (question.trim()) {
+          const maxAngles = Math.min(maxConcurrency, deepResearchMaxAngles);
+          setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
+          try {
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal });
+            if (report && !ac.signal.aborted) {
+              const researchMsg: ChatMessage = {
+                role: 'user',
+                id: uid(),
+                displayName: 'Deep Research',
+                collapsed: true,
+                content: `# Deep Research (${angles.length} parallel angle${angles.length === 1 ? '' : 's'})\n${angles.map((a, i) => `## ${i + 1}. ${a}`).join('\n\n')}\n\n---\n\n${report}`,
+              };
+              effectiveHistory = [...history, researchMsg];
+              setConvs((cs) => cs.map((c) => {
+                if (c.id !== convId) return c;
+                const idx = placeholderId ? c.messages.findIndex((m) => m.id === placeholderId) : c.messages.length;
+                const insertAt = idx >= 0 ? idx : c.messages.length;
+                return { ...c, messages: [...c.messages.slice(0, insertAt), researchMsg, ...c.messages.slice(insertAt)] };
+              }));
+            }
+          } catch (deepResearchError) {
+            // Best-effort — a fan-out failure falls back to the main turn
+            // researching unaided rather than blocking the reply entirely.
+            console.warn('[chat] deep research skipped (fan-out failed)', deepResearchError);
+          } finally {
+            if (!ac.signal.aborted) setNotice(null);
+          }
+        }
+      }
+
       // Live target for streamed deltas: the caller's placeholder for turn 0;
       // each later tool turn appends its own placeholder (onTurnStart) and
       // re-points this target. Falls back to the last message only when no id
@@ -260,24 +336,76 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         );
       };
 
-      // Chat tools as a registry for the shared runner: two read-only web
-      // tools under the same ToolRegistry contract the coder loops use.
+      // Chat tools as a registry for the shared runner: the same ToolRegistry
+      // contract the coder loops use. Agent Mode "research" tier adds the
+      // workspace-independent `browser` tool; the Memory toggle adds
+      // `memory_update`, routed to the global chat store (not per-workspace).
       const registry: ToolRegistry = {
         web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
         web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
+        ...(agentResearch
+          ? {
+              browser: async (args, signal) => {
+                const detail = String(args.action ?? 'status');
+                if (browserTier === 'deny') {
+                  return JSON.stringify({ error: 'Denied by Agent Mode settings (browser is set to deny).' });
+                }
+                if (browserTier === 'ask' && !(await requestApproval('browser', detail))) {
+                  return JSON.stringify({ error: 'Denied by the user (browser). Ask for an alternative or proceed without it.' });
+                }
+                const r = await coderBrowser(
+                  detail,
+                  { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
+                  signal,
+                );
+                return JSON.stringify(r);
+              },
+            }
+          : {}),
+        ...(memoryEnabled
+          ? {
+              memory_update: async (args, signal) => {
+                const text = String(args.text || '').trim();
+                const rawKind = String(args.kind || 'tip');
+                const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
+                if (!text) return JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
+                if (memoryToolTier === 'deny') {
+                  return JSON.stringify({ error: 'Denied by Agent Mode settings (memory_update is set to deny).' });
+                }
+                if (memoryToolTier === 'ask' && !(await requestApproval('memory_update', text))) {
+                  return JSON.stringify({ error: 'Denied by the user (memory_update). Ask for an alternative or proceed without it.' });
+                }
+                const m = await chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal);
+                adoptMemory(m);
+                return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
+              },
+            }
+          : {}),
       };
+      const tools = [
+        ...CHAT_TOOLS,
+        ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
+        ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
+      ];
       // The runner owns the turn messages; these events mirror each turn into
       // the conversation store so streaming stays live.
       let lastTurnMeta: MessageMeta | undefined;
       const res = await runToolLoop({
         model: useModel,
-        system: chatSystemWithCapabilities(params),
-        messages: history,
+        system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
+        messages: effectiveHistory,
         params,
-        tools: CHAT_TOOLS,
+        tools,
         registry,
         maxSteps: 12,
         signal: ac.signal,
+        // Route through the engine's /v1/responses transport when it's
+        // available AND this turn's sampling params are fully expressible
+        // there (see responses.ts) — never silently drop a knob the user
+        // set (top_k/min_p/penalties/seed aren't accepted on that endpoint
+        // on this engine build). Falls back to the proven Chat Completions
+        // path (streamTurn's own default) otherwise.
+        stream: knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : undefined,
         onTurnStart: (turn) => {
           if (turn === 0 || ac.signal.aborted) return;
           const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
@@ -312,12 +440,46 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onAssistantTurn: async (msg, info) => {
           lastTurnMeta = info.meta;
           setLatestRequestMetrics(info.meta, useModel);
+          // Both passes below only apply to the final content-only turn (no
+          // pending tool calls) — an intermediate tool-call turn is left
+          // untouched either way.
+          if (ac.signal.aborted || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
+
+          let content = msg.content;
+
+          // Reflection: Generate → Reflect → Refine, bounded to one
+          // regenerate (never a loop). Best-effort — any failure at either
+          // step keeps the original reply and never strands the turn.
+          if (reflectionEnabled) {
+            setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
+            try {
+              const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
+              if (critique && !ac.signal.aborted) {
+                setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
+                const revised = await regenerateChatReply({
+                  model: useModel,
+                  system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
+                  history,
+                  originalReply: content,
+                  critique,
+                  params,
+                  signal: ac.signal,
+                });
+                if (revised && !ac.signal.aborted) content = revised;
+              }
+            } catch (reflectionError) {
+              console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
+            } finally {
+              if (!ac.signal.aborted) setNotice(null);
+            }
+          }
+
           // Not-Ai auto-rewrite: plain content replies run the deterministic
-          // tell-gate (best-effort — any failure keeps the original reply and
+          // tell-gate (best-effort — any failure keeps the reply so far and
           // never strands the streaming state).
-          if (ac.signal.aborted || !params.humanize || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
+          if (!params.humanize) return content !== msg.content ? { content } : undefined;
           try {
-            const humanized = await humanizePassText(msg.content, {
+            const humanized = await humanizePassText(content, {
               voice: effectiveVoice(params),
               signal: ac.signal,
               rewrite: (current) => humanizeRewriteText({
@@ -329,12 +491,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 signal: ac.signal,
               }),
             });
-            if (!ac.signal.aborted && humanized.trim() !== msg.content.trim()) return { content: humanized };
+            if (!ac.signal.aborted && humanized.trim() !== content.trim()) return { content: humanized };
           } catch (humanizeError) {
-            // The gate or rewrite must never take the whole run down — the reply
-            // is already complete and shown; keep it and release the UI.
             console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
           }
+          return content !== msg.content ? { content } : undefined;
         },
       });
 
@@ -449,7 +610,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens],
   );
 
   const send = useCallback(async () => {
@@ -1431,6 +1592,27 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           </div>
         </div>
       </div>
+          {pendingApproval && (
+            <HitlDialog
+              tone="warn"
+              width={480}
+              icon={<Shield size={15} />}
+              title="Agent requests approval"
+              subtitle={<span><span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in Agent Mode settings.</span>}
+              footer={
+                <>
+                  <Button variant="ghost" size="sm" onClick={() => approvalResolveRef.current?.(false)}>
+                    Deny
+                  </Button>
+                  <Button variant="primary" size="sm" onClick={() => approvalResolveRef.current?.(true)}>
+                    Approve once
+                  </Button>
+                </>
+              }
+            >
+              <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{pendingApproval.detail || '(no details)'}</pre>
+            </HitlDialog>
+          )}
           </>
       </div>
     </div>

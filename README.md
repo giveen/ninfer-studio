@@ -61,6 +61,15 @@ Linux, WebView2 on Windows) for the
   conversation history. Type `/compact` to ask the engine to condense the whole
   conversation into a structured checkpoint summary, which replaces the thread and
   becomes its starting context (handy before a context-limit warning).
+- **Chat Agent Mode** (Settings > Agent, opt-in) — turns Chat into more of an agent:
+  a **research** tool tier adds the sandboxed headless `browser` tool alongside
+  web_fetch/web_search; a persistent cross-conversation **memory** bank the model can
+  write to; a **Reflection** self-review pass (Generate → Reflect → Refine, bounded to
+  one retry, with an independent critic-model override); and concurrency-gated **Deep
+  research** that fans a question out into parallel research angles and synthesizes one
+  answer. Tool calls route through the engine's `/v1/responses` transport when
+  available. `browser`/`memory_update` each get an independent allow/ask/deny
+  permission tier with a HITL approval dialog on `ask`.
 - **Coder mode** — an agentic coding harness over the same engine: plan/act loop with
   file read/write/edit, grep/glob, shell exec with sessions and background jobs, git
   integration, **Scout / Verify / Critic** harness passes (opt-in, labeled, collapsible),

@@ -3,7 +3,8 @@
 // ChatScreen.tsx and (via lib/agentLoop) CoderScreen.tsx.
 
 import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
-import { API_BASE } from './core';
+import { API_BASE, getJSON, postJSON } from './core';
+import type { CoderMemory, CoderLearningKind } from './coder';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -384,6 +385,101 @@ export function summarizeConversation(opts: {
 }
 
 // ---------------------------------------------------------------------------
+// Reflection pass (Agent Mode > Reflection): a Generate → Reflect → Refine
+// gate over the final reply, adapted from Coder's Critic gate without the
+// git-diff dependency — there's nothing to diff in Chat, so this reviews the
+// reply text against the recent conversation instead. Both calls are
+// best-effort: any failure (network, abort, malformed response) is treated
+// as "approved" / "no revision" so reflection can never strand a turn that
+// already streamed successfully.
+// ---------------------------------------------------------------------------
+const CHAT_REFLECTION_SYSTEM = `You are reviewing an AI assistant's draft reply before it is shown to the user. You are given the recent conversation and the draft. Decide whether it is good enough to send as-is.
+
+Respond with EXACTLY one verdict line, then (only when requesting changes) a short, specific critique:
+VERDICT: APPROVED
+or
+VERDICT: NEEDS_REVISION
+<one or two sentences on what's wrong and what to fix>
+
+Only request revision for a real problem: a wrong or unsupported claim, a misread of the question, a missing part of a multi-part request, or a reply that ignores relevant context already in the conversation. Do not request revision for style, tone, length, or formatting preferences alone.`;
+
+function formatReflectionHistory(history: ChatMessage[]): string {
+  return history
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .slice(-8)
+    .map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 1500)}`)
+    .join('\n\n');
+}
+
+/** One critique pass over a draft reply. Resolves `null` when approved (or
+ *  on any failure — best-effort, never blocks the turn), otherwise the
+ *  specific issue to fix. */
+/** Pure parse of a critique model's raw output into a verdict — extracted so
+ *  the regex-based verdict/critique-text split is directly unit-testable
+ *  without a network round-trip. `null` = approved (or the raw text simply
+ *  had no verdict line at all, treated the same way: nothing to fix). */
+export function parseReflectionVerdict(raw: string): string | null {
+  // No recognizable verdict line at all (the critique model ignored the
+  // requested format) — treat as approved rather than feeding the whole raw
+  // response into regenerateChatReply as a "critique".
+  if (!/VERDICT:\s*(?:APPROVED|NEEDS_REVISION)/i.test(raw)) return null;
+  if (/VERDICT:\s*APPROVED/i.test(raw)) return null;
+  const critique = raw.replace(/VERDICT:\s*NEEDS_REVISION\s*/i, '').trim();
+  return critique || null;
+}
+
+export function critiqueChatReply(opts: {
+  model: string;
+  history: ChatMessage[];
+  reply: string;
+  maxTokens?: number;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const prompt = `CONVERSATION (most recent messages):\n${formatReflectionHistory(opts.history)}\n\nDRAFT REPLY:\n${opts.reply.slice(0, 4000)}\n\nReview the draft reply against the conversation.`;
+  const critiqueParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: opts.maxTokens ?? 400 };
+  const body = buildChatRequest(opts.model, CHAT_REFLECTION_SYSTEM, [{ role: 'user', content: prompt }], critiqueParams);
+  const signal = opts.signal ?? AbortSignal.timeout(60_000);
+  return new Promise<string | null>((resolve) => {
+    let acc = '';
+    streamChat(body, signal, {
+      onContentDelta: (d) => { acc += d; },
+      onDone: () => resolve(signal.aborted ? null : parseReflectionVerdict(acc)),
+      onError: () => resolve(null),
+    });
+  });
+}
+
+/** Regenerate a reply once, given a critique — appended as a hidden user-role
+ *  nudge after the original reply (buildChatRequest drops mid-history
+ *  `system`-role messages, so a nudge must ride as `user`). Resolves `null`
+ *  on failure/abort/empty output so the caller keeps the original reply. */
+export function regenerateChatReply(opts: {
+  model: string;
+  system: string | undefined;
+  history: ChatMessage[];
+  originalReply: string;
+  critique: string;
+  params: ChatParams;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const nudge: ChatMessage = {
+    role: 'user',
+    content: `[Your previous reply had an issue — ${opts.critique}\n\nPlease reply again, addressing this.]`,
+  };
+  const messages: ChatMessage[] = [...opts.history, { role: 'assistant', content: opts.originalReply }, nudge];
+  const body = buildChatRequest(opts.model, opts.system, messages, opts.params);
+  const signal = opts.signal ?? AbortSignal.timeout(120_000);
+  return new Promise<string | null>((resolve) => {
+    let acc = '';
+    streamChat(body, signal, {
+      onContentDelta: (d) => { acc += d; },
+      onDone: () => resolve(signal.aborted ? null : (acc.trim() || null)),
+      onError: () => resolve(null),
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Evidence-verified output reducer: condense a giant tool result (command
 // output, a large file read, a fetched page) into an actionable summary so
 // the agent's context stays small instead of ingesting a raw multi-hundred-KB
@@ -583,3 +679,55 @@ export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; 
 }
 
 export type { ChatAttachment };
+
+// ---------------------------------------------------------------------------
+// Chat Agent Mode settings (Settings > Agent) — mirrors coderSafeModeGet/Set's
+// shape exactly, one pair per toggle.
+// ---------------------------------------------------------------------------
+export function chatAgentResearchGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/agent-research', 5000);
+}
+export function chatAgentResearchSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/agent-research', { enabled }, 5000);
+}
+export function chatMemoryEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/memory-enabled', 5000);
+}
+export function chatMemoryEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/memory-enabled', { enabled }, 5000);
+}
+export function chatReflectionEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/reflection-enabled', 5000);
+}
+export function chatReflectionEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/reflection-enabled', { enabled }, 5000);
+}
+export function chatDeepResearchEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/deep-research-enabled', 5000);
+}
+export function chatDeepResearchEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/deep-research-enabled', { enabled }, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Chat memory — one global bank + learnings store (no per-workspace slug).
+// Same {bank, learnings} shape and body contract as /api/coder/memory, so
+// this reuses CoderMemory/CoderLearningKind rather than declaring twins.
+// ---------------------------------------------------------------------------
+export function chatMemoryGet(): Promise<CoderMemory> {
+  return getJSON<CoderMemory>('/api/chat/memory', 8000);
+}
+export function chatMemorySetBank(bank: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { bank }, 8000);
+}
+export function chatMemoryAddLearning(learning: {
+  text: string;
+  kind: CoderLearningKind;
+  provenance?: string;
+  task?: string;
+}, signal?: AbortSignal): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { learning }, 8000, signal);
+}
+export function chatMemoryDropLearning(id: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/chat/memory', { dropLearningId: id }, 8000);
+}
