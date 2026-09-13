@@ -138,7 +138,7 @@ const EM_DASH = '—';
 const EN_DASH = '–';
 const CURLY = ['“', '”', '‘', '’'];
 
-export interface GateFinding {
+interface GateFinding {
   rule: string;
   severity: 'error' | 'warning' | 'review';
   message: string;
@@ -146,7 +146,7 @@ export interface GateFinding {
   sentence?: number | null;
 }
 
-export interface GateCounts {
+interface GateCounts {
   dashes: number;
   curly_quotes: number;
   contractions: number;
@@ -336,7 +336,7 @@ export function needsHumanize(r: GateResult, opts: { ascii?: boolean } = {}): bo
 }
 
 /** Build the "rewrite this reply" instruction sent to the model. */
-export function humanizeInstruction(text: string, res: GateResult): string {
+function humanizeInstruction(text: string, res: GateResult): string {
   const spans = [...new Set(res.findings.map((f) => f.span).filter((s): s is string => !!s))]
     .slice(0, 12)
     .map((s) => `"${s.length > 60 ? s.slice(0, 57) + '…' : s}"`)
@@ -402,4 +402,4 @@ export async function humanizeRewriteText(opts: {
 export const HUMANIZE_MAX_DEPTH = 2;
 
 // Hard cap for the Not-Ai rewrite pass (see humanizeRewriteText above).
-export const HUMANIZE_REWRITE_MAX_TOKENS = 2048;
+const HUMANIZE_REWRITE_MAX_TOKENS = 2048;

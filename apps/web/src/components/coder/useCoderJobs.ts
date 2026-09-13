@@ -2,8 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { coderJob, coderJobKill } from '../../lib/api';
 import type { CoderJob } from '../../lib/types';
 
-export interface BgJobEntry { id: string; command: string; ws: string; }
-export interface SubEntry { id: string; label: string; task: string; since: number; ws: string; }
+interface BgJobEntry { id: string; command: string; ws: string; }
+interface SubEntry { id: string; label: string; task: string; since: number; ws: string; }
 export interface CoderJobs {
   bgJobs: BgJobEntry[];
   activeSubs: SubEntry[];

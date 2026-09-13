@@ -22,7 +22,7 @@ import { fileKind, type FileKind, type LangId } from '../../lib/fileKind';
 import { fetchGitStatusMap, type GitFileStatus } from '../../lib/gitStatus';
 import { parseDiagnostics } from '../../lib/diagnostics';
 
-export interface TabDiag {
+interface TabDiag {
   file?: string;
   line?: number;
   col?: number;

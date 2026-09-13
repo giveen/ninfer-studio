@@ -285,15 +285,6 @@ export async function streamChat(
   }
 }
 
-export function attachmentsToParts(att: ChatAttachment[]): Array<Record<string, unknown>> | null {
-  if (!att.length) return null;
-  return att.map((a) =>
-    a.kind === 'image'
-      ? { type: 'image_url', image_url: { url: a.dataUrl } }
-      : { type: 'video_url', video_url: { url: a.dataUrl } },
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Conversation compaction (/compact): condense the current chat into a
 // structured checkpoint so context is preserved while token usage drops. The
@@ -412,8 +403,8 @@ const RECEIPT_MAX_QUOTE_CHARS = 400;
  *  require cited evidence — never to override a known real exit code. */
 const FAILURE_SIGNAL_RE = /\b(error|exception|fail(?:ed|ure)?|traceback|panicked?|fatal)\b/i;
 
-export type OutputReceiptEvidenceKind = 'fatal' | 'failure' | 'warning' | 'target' | 'summary';
-export interface OutputReceiptEvidence {
+type OutputReceiptEvidenceKind = 'fatal' | 'failure' | 'warning' | 'target' | 'summary';
+interface OutputReceiptEvidence {
   kind: OutputReceiptEvidenceKind;
   quote: string;
 }
@@ -442,7 +433,7 @@ const OUTPUT_REDUCER_INSTRUCTION = [
  *  contains an unverifiable (hallucinated/paraphrased) quote, or — when
  *  `isError` is known — disagrees with the actual outcome. Exported for
  *  unit testing. */
-export function validateOutputReceipt(raw: string, sourceText: string, isError?: boolean): OutputReceipt | null {
+function validateOutputReceipt(raw: string, sourceText: string, isError?: boolean): OutputReceipt | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);

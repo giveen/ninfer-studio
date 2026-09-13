@@ -54,6 +54,13 @@ pub struct AppSettings {
     /// (e.g. shared model dirs a build step needs to write to). Serializes as
     /// `sandboxBinds`.
     pub sandbox_binds: Vec<String>,
+    /// Coding harness: refuse a fixed set of clearly destructive shell
+    /// command patterns before spawning (not a security boundary — see
+    /// SECURITY.md). Serializes as `coderSafeMode`.
+    pub coder_safe_mode: bool,
+    /// Coding harness: require explicit human sign-off on the working-tree
+    /// diff before the agent may commit. Serializes as `coderCommitApproval`.
+    pub coder_commit_approval: bool,
 }
 
 impl Default for AppSettings {
@@ -77,6 +84,8 @@ impl Default for AppSettings {
             coder_sandbox: true,
             sandbox_binds: Vec::new(),
             coder_workspace: String::new(),
+            coder_safe_mode: true,
+            coder_commit_approval: false,
         }
     }
 }

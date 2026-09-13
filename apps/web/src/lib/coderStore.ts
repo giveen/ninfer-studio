@@ -6,7 +6,7 @@
 // + localStorage load/normalize — no React, no closure state.
 
 import { ChatMessage } from './types';
-import { PermConfig } from './coderTools';
+import { PermConfig, DEFAULT_PERMS } from './coderTools';
 import { getConfig, coderRead } from './api';
 
 export type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number };
@@ -61,7 +61,7 @@ export interface CoderStore {
 }
 
 export const CONV_KEY = 'ninfier.coder.conversations.v2';
-export const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
+const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
 
 export function newConvId(): string {
   return 'conv-' + crypto.randomUUID();
@@ -84,7 +84,7 @@ export function relTime(ts: number): string {
   if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
   return `${Math.floor(diff / (365 * DAY))}y`;
 }
-export function stripExtPrefix(p: string): string {
+function stripExtPrefix(p: string): string {
   let rest: string | null = null;
   for (const pre of ['\\\\?\\', '\\\\?/', '//?/']) {
     if (p.startsWith(pre)) { rest = p.slice(pre.length); break; }
@@ -178,6 +178,33 @@ export function loadStore(): CoderStore {
     }
   } catch { /* ignore */ }
   return { activeWs: '', activeConv: '', workspaces: {} };
+}
+
+// ---- Default permissions template ---------------------------------------------
+// The tool-tier/denyPaths template used to seed a NEW workspace's `perms` the
+// first time it's created (Settings > Safety & Permissions). Purely additive:
+// changing the template never touches a workspace that already has its own
+// `perms` value written (see the two WsData-construction sites in
+// CoderScreen.tsx that call loadDefaultPerms()).
+const DEFAULT_PERMS_KEY = 'ninfier.coder.defaultPerms.v1';
+
+export function loadDefaultPerms(): PermConfig {
+  try {
+    const raw = localStorage.getItem(DEFAULT_PERMS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p === 'object') {
+        return { tools: p.tools ?? {}, denyPaths: Array.isArray(p.denyPaths) ? p.denyPaths : [] };
+      }
+    }
+  } catch { /* ignore */ }
+  return { tools: { ...DEFAULT_PERMS.tools }, denyPaths: [...DEFAULT_PERMS.denyPaths] };
+}
+
+export function saveDefaultPerms(perms: PermConfig): void {
+  try {
+    localStorage.setItem(DEFAULT_PERMS_KEY, JSON.stringify({ tools: perms.tools, denyPaths: perms.denyPaths }));
+  } catch { /* ignore */ }
 }
 
 // ---- Verification gate helpers ------------------------------------------------

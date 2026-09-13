@@ -33,7 +33,7 @@ export const redactSecrets = (s: string): string => {
   return o;
 };
 
-export function BashResultView({ data }: { data: any }) {
+function BashResultView({ data }: { data: any }) {
   return (
     <div className="rounded-md bg-[#1e1e1e] text-[#d4d4d4] font-mono text-[11px] overflow-hidden mt-1">
       <div className="bg-[#2d2d2d] px-2 py-1 flex justify-between items-center text-[#858585]">
@@ -53,7 +53,7 @@ export function BashResultView({ data }: { data: any }) {
   );
 }
 
-export function ReadResultView({ data }: { data: any }) {
+function ReadResultView({ data }: { data: any }) {
   return (
     <div className="mt-1">
        <CodeBlock code={redactSecrets(data.content || '')} />
@@ -61,7 +61,7 @@ export function ReadResultView({ data }: { data: any }) {
   );
 }
 
-export function WebSearchResultView({ data }: { data: any }) {
+function WebSearchResultView({ data }: { data: any }) {
   return (
     <div className="mt-1 p-3 bg-panel border border-line rounded-lg flex flex-col gap-2">
       <div className="flex items-center gap-1.5 text-xs font-semibold text-mute border-b border-line pb-1.5">
@@ -80,7 +80,7 @@ export function WebSearchResultView({ data }: { data: any }) {
   );
 }
 
-export function WebFetchResultView({ data }: { data: any }) {
+function WebFetchResultView({ data }: { data: any }) {
   return (
     <div className="mt-1 rounded-lg border border-line bg-panel overflow-hidden">
       <div className="bg-panel2 px-3 py-1.5 border-b border-line flex items-center gap-2">
@@ -98,7 +98,7 @@ export function WebFetchResultView({ data }: { data: any }) {
 
 /** Shared by `write`/`edit`/`apply_patch`: a status line, an optional diff
  *  preview, and optional lint/test failure output. */
-export function FileMutationResultView({ data, label }: { data: any, label: string }) {
+function FileMutationResultView({ data, label }: { data: any, label: string }) {
   return (
     <div className="mt-1 p-2 bg-ok/10 border border-ok/30 rounded-md text-[11px] text-ok font-mono">
       {label}
@@ -109,7 +109,7 @@ export function FileMutationResultView({ data, label }: { data: any, label: stri
   );
 }
 
-export function RawJsonResultView({ data }: { data: any }) {
+function RawJsonResultView({ data }: { data: any }) {
   return (
     <div className="mt-1 p-2 bg-inset border border-line rounded-md text-[11px] font-mono overflow-auto max-h-48 whitespace-pre">
       {redactSecrets(JSON.stringify(data, null, 2))}
@@ -117,7 +117,7 @@ export function RawJsonResultView({ data }: { data: any }) {
   );
 }
 
-export function AskUserResultView({ data, content }: { data: any, content: string }) {
+function AskUserResultView({ data, content }: { data: any, content: string }) {
   return (
     <div className="mt-1 p-2 bg-accent/10 border border-accent/30 rounded-md text-[11px] text-ink">
       <div className="font-semibold text-accent mb-0.5 flex items-center gap-1">
@@ -130,7 +130,7 @@ export function AskUserResultView({ data, content }: { data: any, content: strin
 
 /** Renders one tool's result by name; each shape has its own small view
  *  component above so this stays a plain lookup. */
-export function ToolResultBlock({ name, content }: { name: string, content: string }) {
+function ToolResultBlock({ name, content }: { name: string, content: string }) {
   try {
     const data = JSON.parse(content);
     switch (name) {
