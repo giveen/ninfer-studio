@@ -31,12 +31,14 @@ import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chat
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
 import { coderBrowser, chatMemoryAddLearning, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
+import { runDeepResearch } from '../lib/deepResearch';
+import { engineMaxConcurrency } from '../lib/engineInfo';
 
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled } = useChatAgent();
+  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled } = useChatAgent();
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -255,6 +257,38 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const ac = new AbortController();
       abortRef.current = ac;
 
+      // Deep research: concurrency-gated fan-out over the user's latest
+      // question, run BEFORE the main turn so the findings are already in
+      // context for the synthesis reply — same shape as Scout's
+      // fan-out-then-inject-report pre-pass. Only the local
+      // `effectiveHistory` used for this call is extended; the visible
+      // transcript (conv.messages) never shows the raw per-angle findings,
+      // only the final synthesized reply that cites them.
+      let effectiveHistory = history;
+      const maxConcurrency = engineMaxConcurrency(status);
+      if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
+        const question = [...history].reverse().find((m) => m.role === 'user')?.content ?? '';
+        if (question.trim()) {
+          const maxAngles = Math.min(maxConcurrency, 3);
+          setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
+          try {
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, signal: ac.signal });
+            if (report && !ac.signal.aborted) {
+              effectiveHistory = [
+                ...history,
+                { role: 'user', content: `[Deep research findings for ${angles.length} angle${angles.length === 1 ? '' : 's'} — use these to inform your answer, citing sources where relevant]\n\n${report}` },
+              ];
+            }
+          } catch (deepResearchError) {
+            // Best-effort — a fan-out failure falls back to the main turn
+            // researching unaided rather than blocking the reply entirely.
+            console.warn('[chat] deep research skipped (fan-out failed)', deepResearchError);
+          } finally {
+            if (!ac.signal.aborted) setNotice(null);
+          }
+        }
+      }
+
       // Live target for streamed deltas: the caller's placeholder for turn 0;
       // each later tool turn appends its own placeholder (onTurnStart) and
       // re-points this target. Falls back to the last message only when no id
@@ -314,7 +348,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const res = await runToolLoop({
         model: useModel,
         system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
-        messages: history,
+        messages: effectiveHistory,
         params,
         tools,
         registry,
@@ -527,7 +561,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled],
   );
 
   const send = useCallback(async () => {
