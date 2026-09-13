@@ -81,6 +81,9 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     if let Some(v) = body.get("sandboxBinds").and_then(|v| v.as_array()) {
         merged.sandbox_binds = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
     }
+    if let Some(v) = body.get("chatReflectionModel").and_then(|v| v.as_str()) {
+        merged.chat_reflection_model = v.into();
+    }
     let path = state.data_dir.join("config.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(

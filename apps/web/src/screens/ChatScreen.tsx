@@ -38,7 +38,7 @@ import { engineMaxConcurrency } from '../lib/engineInfo';
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled } = useChatAgent();
+  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel } = useChatAgent();
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -420,7 +420,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           if (reflectionEnabled) {
             setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
             try {
-              const critique = await critiqueChatReply({ model: useModel, history, reply: content, signal: ac.signal });
+              const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, signal: ac.signal });
               if (critique && !ac.signal.aborted) {
                 setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
                 const revised = await regenerateChatReply({
@@ -577,7 +577,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel],
   );
 
   const send = useCallback(async () => {

@@ -1,5 +1,5 @@
 import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus } from 'lucide-react';
-import { Button, cn, SectionCard } from '../../components/ui';
+import { Button, TextField, cn, SectionCard } from '../../components/ui';
 import { MemoryModal } from '../../components/MemoryModal';
 import { useChatAgent } from '../../lib/chatAgent';
 import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
@@ -25,6 +25,7 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
   const {
     agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled,
     memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
+    reflectionModel, setReflectionModel,
   } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
@@ -92,6 +93,15 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
             onToggle={setReflectionEnabled}
             onTitle="Replies get one self-review pass before showing"
             offTitle="Replies show as soon as generation finishes"
+          />
+        </div>
+        <div className="mt-3 flex items-center gap-2 border-t border-line pt-3" title="Optional model id the critique/regenerate pass uses instead of the conversation's own model. A stronger model reviewing a weaker one's replies avoids a model being lenient on its own output. Empty = same model.">
+          <span className="shrink-0 text-[11.5px] text-faint">Critic model</span>
+          <TextField
+            value={reflectionModel}
+            onChange={setReflectionModel}
+            placeholder="same model"
+            className="max-w-[220px]"
           />
         </div>
       </SectionCard>

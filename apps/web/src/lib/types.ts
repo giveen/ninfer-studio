@@ -76,6 +76,9 @@ export interface AppSettings {
   reasoningEffort: string;
   /** Coding harness: the directory the "Code" mode may read/write/execute within. Empty = not configured. */
   coderWorkspace: string;
+  /** Optional model id the Reflection pass critiques/regenerates with,
+   *  instead of the conversation's own model. '' = use the active chat model. */
+  chatReflectionModel?: string;
 }
 
 interface UpdateJob {

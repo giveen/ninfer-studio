@@ -12,6 +12,7 @@ import {
   chatReflectionEnabledGet, chatReflectionEnabledSet,
   chatDeepResearchEnabledGet, chatDeepResearchEnabledSet,
   chatMemoryGet, type CoderMemory,
+  getConfig, saveConfig,
 } from './api';
 
 interface ChatAgentState {
@@ -34,6 +35,10 @@ interface ChatAgentState {
   adoptMemory: (m: CoderMemory) => void;
   memoryModalOpen: boolean;
   setMemoryModalOpen: (v: boolean) => void;
+  /** Optional model id Reflection critiques/regenerates with instead of the
+   *  conversation's own model — '' = same model (today's default). */
+  reflectionModel: string;
+  setReflectionModel: (v: string) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -47,6 +52,8 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
   const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
   const [memoryModalOpen, setMemoryModalOpen] = useState(false);
+
+  const [reflectionModel, setReflectionModelState] = useState('');
 
   const adoptMemory = useCallback((m: CoderMemory) => {
     setMemory(m);
@@ -65,6 +72,7 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     chatMemoryEnabledGet().then((r) => setMemoryEnabledState(r.enabled)).catch(() => {});
     chatReflectionEnabledGet().then((r) => setReflectionEnabledState(r.enabled)).catch(() => {});
     chatDeepResearchEnabledGet().then((r) => setDeepResearchEnabledState(r.enabled)).catch(() => {});
+    getConfig().then((c) => setReflectionModelState(c.chatReflectionModel ?? '')).catch(() => {});
   }, []);
 
   // Load the bank/learnings once memory is confirmed on — no point fetching
@@ -89,6 +97,10 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     setDeepResearchEnabledState(v);
     chatDeepResearchEnabledSet(v).catch(() => {});
   }, []);
+  const setReflectionModel = useCallback((v: string) => {
+    setReflectionModelState(v);
+    saveConfig({ chatReflectionModel: v }).catch(() => {});
+  }, []);
 
   return (
     <Ctx.Provider
@@ -98,6 +110,7 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         reflectionEnabled, setReflectionEnabled,
         deepResearchEnabled, setDeepResearchEnabled,
         memory, memoryRef, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
+        reflectionModel, setReflectionModel,
       }}
     >
       {children}

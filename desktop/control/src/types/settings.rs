@@ -76,6 +76,13 @@ pub struct AppSettings {
     /// when the running engine's maxConcurrency > 1). Serializes as
     /// `chatDeepResearchEnabled`.
     pub chat_deep_research_enabled: bool,
+    /// Optional model id the Reflection pass critiques/regenerates with,
+    /// instead of the conversation's own model — lets a stronger model
+    /// review a weaker one's replies, avoiding the same-model
+    /// self-agreement-bias risk of a model critiquing its own output.
+    /// Empty = use the active chat model (today's behavior). Mirrors
+    /// Coder's `criticModel` param. Serializes as `chatReflectionModel`.
+    pub chat_reflection_model: String,
 }
 
 impl Default for AppSettings {
@@ -105,6 +112,7 @@ impl Default for AppSettings {
             chat_memory_enabled: false,
             chat_reflection_enabled: false,
             chat_deep_research_enabled: false,
+            chat_reflection_model: String::new(),
         }
     }
 }
