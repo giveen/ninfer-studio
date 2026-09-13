@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod memstore;
 pub mod models;
 pub mod proxy;
+pub mod remote;
 pub mod repo;
 pub mod routes_config;
 pub mod routes_data;
@@ -97,11 +98,16 @@ where
 // ---------------------------------------------------------------------------
 // App construction
 // ---------------------------------------------------------------------------
-pub fn build_router(state: S) -> Router {
+/// Build the router. `restrict_to_local` gates the CORS allow-list and the
+/// `guard_local_host` Host check: the loopback listener (`serve_until_ready`)
+/// passes `true`; the Remote Access listener (`remote::start`) passes `false`
+/// since a device on the network sends a Host/Origin that would otherwise be
+/// rejected — see `remote.rs` for why that's intentional, not a hole.
+pub fn build_router(state: S, restrict_to_local: bool) -> Router {
     let dist = state.dist_dir.clone();
     let index = dist.join("index.html");
     let spa = tower_http::services::ServeFile::new(index.clone());
-    Router::new()
+    let router = Router::new()
         .route("/api/health", get(routes_engine::health))
         .route("/api/status", get(routes_engine::status))
         .route("/api/config", get(routes_config::get_config).post(routes_config::set_config))
@@ -146,12 +152,19 @@ pub fn build_router(state: S) -> Router {
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/browser", post(coder::browser))
         .route("/api/coder/web/search", post(coder::web_search))
+        .route("/api/remote", get(remote::get_status))
+        .route("/api/remote/start", post(remote::post_start))
+        .route("/api/remote/stop", post(remote::post_stop))
         .route("/health", get(proxy::proxy))
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))
         .with_state(state)
         .fallback_service(
             tower_http::services::ServeDir::new(dist).not_found_service(spa),
-        )
+        );
+    if !restrict_to_local {
+        return router;
+    }
+    router
         // The bundled webview (origin tauri://localhost) may call the
         // in-process control plane on 127.0.0.1 cross-origin in release
         // builds; dev Vite proxies server-side. Anything else — i.e. random
@@ -233,7 +246,7 @@ pub async fn serve_until_ready(
     if let Some(tx) = ready {
         let _ = tx.send(());
     }
-    axum::serve(listener, build_router(state)).await
+    axum::serve(listener, build_router(state, true)).await
 }
 
 /// Boot-time adoption of an externally running engine on the configured port.

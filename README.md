@@ -257,15 +257,25 @@ created on first save. Key files:
 | `coderSafeMode` | `true` | refuse a fixed set of clearly destructive shell command patterns |
 | `coderSandbox` | (per-machine) | wrap the agent shell in `bwrap` (workspace read-write, host read-only) |
 | `coderCommitApproval` | `false` | require explicit human sign-off before the agent commits |
+| `remoteAccessEnabled` | `false` | serve the app on `0.0.0.0` instead of loopback-only (Settings — Safety & Permissions → Remote Access) |
+| `remoteAccessPort` | `1337` | port the Remote Access listener binds when enabled |
 
 ## Security
 
-The control plane binds to loopback and validates every request's `Host` and `Origin`
-against loopback names and the allow-listed Tauri/Vite origins — a malicious website
-can neither call the API cross-origin nor rebind its DNS to `127.0.0.1` to reach it.
-Secrets (the HF token) are never returned by the API: clients see only a `********`
-mask, and writes of the mask preserve the stored value. Coder file operations are
-confined to the configured workspace.
+By default, the control plane binds to loopback and validates every request's `Host`
+and `Origin` against loopback names and the allow-listed Tauri/Vite origins — a
+malicious website can neither call the API cross-origin nor rebind its DNS to
+`127.0.0.1` to reach it. Secrets (the HF token) are never returned by the API: clients
+see only a `********` mask, and writes of the mask preserve the stored value. Coder
+file operations are confined to the configured workspace.
+
+Turning on **Remote Access** (Settings — Safety & Permissions) opts out of that
+loopback boundary on purpose: it binds a second, unauthenticated listener on
+`0.0.0.0:<remoteAccessPort>` so another device on your network can open the same
+live session (e.g. from a laptop). There is no login or token — anyone who can reach
+that port gets the same agent access a local user has (shell, file writes, git, the
+browser tool). Only enable it on a network you trust; see [SECURITY.md](SECURITY.md)
+for the full threat model.
 
 See [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy and the current
 dependency/audit status.

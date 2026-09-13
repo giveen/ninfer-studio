@@ -23,6 +23,7 @@ fn main() {
     rt.block_on(async {
         let state = ninfier_control::init_state(None).await;
         ninfier_control::boot_adopt(&state).await;
+        ninfier_control::remote::boot_start(&state).await;
         if let Err(e) = ninfier_control::serve(state, port).await {
             tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "server error: {{error}}");
             std::process::exit(1);

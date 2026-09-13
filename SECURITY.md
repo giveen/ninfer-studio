@@ -78,3 +78,15 @@ This project takes a pragmatic stance on third-party advisories:
   thread); the threat model is intentionally the same as `exec`, where the
   agent already has an unsandboxed shell. The page session is torn down
   automatically after 10 minutes of inactivity.
+- **Remote Access (`remoteAccessEnabled`, Settings → Safety & Permissions) is
+  intentionally unauthenticated.** Turning it on binds a second listener on
+  `0.0.0.0:<remoteAccessPort>` (default 1337) serving the identical app and API
+  the loopback listener does — the same `exec`/`fs`/`git`/`browser` tool access
+  described above, with no login, token, or CORS/Host restriction. Unlike the
+  loopback listener, it does not run `guard_local_host`, by design: the whole
+  point is letting another device on the network open it directly. This is a
+  user-opted-in tradeoff for zero-friction LAN access, not an oversight. Anyone
+  who can reach the port — any device on the same network, or the whole
+  internet if a router forwards it — gets full agent control of the host
+  machine. Enable it only on a trusted network, and turn it off when done; it
+  persists across restarts if left on.

@@ -177,6 +177,7 @@ fn main() {
                 rt.block_on(async move {
                     let state = init_state(Some(ev_tx)).await;
                     boot_adopt(&state).await;
+                    ninfier_control::remote::boot_start(&state).await;
                     if let Err(e) = serve_until_ready(state, port, Some(ready_tx)).await {
                         tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {{error}}");
                     }

@@ -109,6 +109,14 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     {
         merged.chat_reflection_critique_max_tokens = v as u32;
     }
+    persist_config(&state, &merged).await?;
+    Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
+}
+
+/// Write `cfg` to `<data>/config.json` and install it as the live config.
+/// Shared by [`set_config`] and any other handler that mutates settings with
+/// a side effect beyond a plain field edit (e.g. `remote::start`/`stop`).
+pub(crate) async fn persist_config(state: &S, cfg: &AppSettings) -> Result<(), (StatusCode, String)> {
     let path = state.data_dir.join("config.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(
@@ -120,7 +128,7 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
     }
-    if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await {
+    if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(cfg).unwrap()).await {
         tracing::event!(
             name: "config.persist.failed",
             tracing::Level::ERROR,
@@ -130,11 +138,8 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save config: {e}")));
     }
-    {
-        let mut c = state.config.write().await;
-        *c = merged.clone();
-    }
-    Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
+    *state.config.write().await = cfg.clone();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
