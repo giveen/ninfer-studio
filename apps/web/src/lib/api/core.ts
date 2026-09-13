@@ -6,7 +6,18 @@
 // plane on :8787, so relative paths work. In a bundled desktop build the webview
 // is loaded from the Tauri asset origin (tauri://localhost) and must reach the
 // in-process control plane by its absolute loopback URL instead.
-export const API_BASE = import.meta.env.DEV ? '' : 'http://127.0.0.1:8787';
+//
+// A THIRD case: Remote Access (see remote.ts) serves this same bundle from
+// the control plane itself, at http://<lan-ip>:1337/ — a plain browser page,
+// not the Tauri webview. Its loopback would be the *other* machine's, so
+// relative paths (same-origin, hitting the server that served the page) are
+// required there, same as dev. Only the Tauri webview needs the hardcoded
+// loopback origin; detect it by scheme/host rather than assuming "not dev
+// means Tauri".
+const isTauriWebview =
+  typeof window !== 'undefined' &&
+  (window.location.protocol === 'tauri:' || window.location.hostname === 'tauri.localhost');
+export const API_BASE = !import.meta.env.DEV && isTauriWebview ? 'http://127.0.0.1:8787' : '';
 
 /** Combine the per-call timeout with an optional caller-supplied abort
  *  signal (e.g. a running agent's Stop button) so either one can cut the

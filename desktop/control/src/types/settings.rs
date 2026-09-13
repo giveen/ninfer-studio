@@ -102,6 +102,16 @@ pub struct AppSettings {
     /// critique text itself, not the regenerated reply). Serializes as
     /// `chatReflectionCritiqueMaxTokens`.
     pub chat_reflection_critique_max_tokens: u32,
+    /// Remote Access: serve the full app (SPA + API) on `0.0.0.0` instead of
+    /// loopback-only, so another device on the network can open it. See
+    /// SECURITY.md — there is deliberately NO authentication on this listener;
+    /// anyone who can reach the port gets full agent control (shell, file
+    /// writes, git). Persisted so it resumes across a restart if left on.
+    /// Serializes as `remoteAccessEnabled`.
+    pub remote_access_enabled: bool,
+    /// Port the remote listener binds on `0.0.0.0` when enabled. Serializes
+    /// as `remoteAccessPort`.
+    pub remote_access_port: u16,
 }
 
 impl Default for AppSettings {
@@ -137,6 +147,8 @@ impl Default for AppSettings {
             chat_deep_research_max_angles: 3,
             chat_deep_research_max_steps: 5,
             chat_reflection_critique_max_tokens: 400,
+            remote_access_enabled: false,
+            remote_access_port: 1337,
         }
     }
 }

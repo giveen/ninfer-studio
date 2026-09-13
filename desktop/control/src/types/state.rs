@@ -182,6 +182,10 @@ pub struct State {
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,
     pub dist_dir: std::path::PathBuf,
+    /// Live task for the Remote Access listener (`remote::start`/`stop`).
+    /// `None` when off; the persisted `remote_access_enabled`/`_port` in
+    /// `config` describe the desired state, this is the actual running one.
+    pub remote: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl State {
@@ -213,6 +217,7 @@ impl State {
             event_tx,
             data_dir,
             dist_dir,
+            remote: tokio::sync::Mutex::new(None),
         }
     }
 
