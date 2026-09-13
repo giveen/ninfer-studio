@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, BookmarkPlus, Trash2, Save, RefreshCw } from 'lucide-react';
+import { X, BookmarkPlus, Trash2, Save, RefreshCw, Sparkles } from 'lucide-react';
 import { Button, cn } from './ui';
 import type { CoderLearning, CoderMemory, CoderLearningKind } from '../lib/api';
 
@@ -16,6 +16,11 @@ interface MemoryModalProps {
   onDropLearning: (id: string) => Promise<void> | void;
   /** Called after any mutation so the parent can refresh its snapshot. */
   onChanged?: () => void;
+  /** Distill the full learning history into a proposed bank draft (does not
+   *  save it — the result replaces the textarea draft for review). Omit to
+   *  hide the "Reflect" button (e.g. the Chat memory store, which has no
+   *  per-workspace learnings model). */
+  onReflect?: () => Promise<string>;
 }
 
 const KIND_META: Record<CoderLearningKind, { label: string; cls: string }> = {
@@ -30,10 +35,11 @@ function fmtTs(ts: string): string {
   return d.toLocaleString();
 }
 
-export function MemoryModal({ open, onClose, title = 'Repository Memory', memory, onSaveBank, onDropLearning, onChanged }: MemoryModalProps) {
+export function MemoryModal({ open, onClose, title = 'Repository Memory', memory, onSaveBank, onDropLearning, onChanged, onReflect }: MemoryModalProps) {
   const [bank, setBank] = useState(memory.bank);
   const [saving, setSaving] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [reflecting, setReflecting] = useState(false);
 
   // Re-seed the draft from the snapshot whenever the modal opens.
   useEffect(() => {
@@ -55,6 +61,17 @@ export function MemoryModal({ open, onClose, title = 'Repository Memory', memory
       /* surface nothing fatal; the modal stays open for a retry */
     } finally {
       setSaving(false);
+    }
+  };
+
+  const reflect = async () => {
+    if (!onReflect || reflecting) return;
+    setReflecting(true);
+    try {
+      const draft = await onReflect();
+      setBank(draft); // draft only — the user still has to hit Save to persist it
+    } finally {
+      setReflecting(false);
     }
   };
 
@@ -104,7 +121,18 @@ export function MemoryModal({ open, onClose, title = 'Repository Memory', memory
               placeholder={'# Project conventions\n- Run `pnpm test`, not npm — this repo uses pnpm.\n- Web handlers live in apps/web/src/lib/api.ts.'}
               className="h-48 w-full resize-y rounded border border-line bg-inset p-2 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-accent/50"
             />
-            <div className="mt-1 flex justify-end">
+            <div className="mt-1 flex justify-end gap-2">
+              {onReflect && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={reflect}
+                  disabled={reflecting || saving}
+                  title="Distill the full learning history (not just what's shown below) into this draft — review and Save to keep it"
+                >
+                  <Sparkles size={13} className={reflecting ? 'animate-pulse' : ''} /> {reflecting ? 'Reflecting…' : 'Reflect'}
+                </Button>
+              )}
               <Button variant="primary" size="sm" onClick={save} disabled={saving}>
                 <Save size={13} /> {saving ? 'Saving…' : 'Save bank'}
               </Button>
