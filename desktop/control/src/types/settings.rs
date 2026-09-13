@@ -83,6 +83,14 @@ pub struct AppSettings {
     /// Empty = use the active chat model (today's behavior). Mirrors
     /// Coder's `criticModel` param. Serializes as `chatReflectionModel`.
     pub chat_reflection_model: String,
+    /// Permission tier ("allow"/"ask"/"deny") for Chat's `browser` tool —
+    /// mirrors Coder's per-tool `PermTier`, simplified to no denyPaths/
+    /// server-side enforcement since Chat's tools are workspace-independent.
+    /// Serializes as `chatBrowserTier`.
+    pub chat_browser_tier: String,
+    /// Permission tier for Chat's `memory_update` tool. Serializes as
+    /// `chatMemoryToolTier`.
+    pub chat_memory_tool_tier: String,
 }
 
 impl Default for AppSettings {
@@ -113,6 +121,8 @@ impl Default for AppSettings {
             chat_reflection_enabled: false,
             chat_deep_research_enabled: false,
             chat_reflection_model: String::new(),
+            chat_browser_tier: "allow".into(),
+            chat_memory_tool_tier: "allow".into(),
         }
     }
 }

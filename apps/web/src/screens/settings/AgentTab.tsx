@@ -4,6 +4,7 @@ import { MemoryModal } from '../../components/MemoryModal';
 import { useChatAgent } from '../../lib/chatAgent';
 import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
 import { engineMaxConcurrency } from '../../lib/engineInfo';
+import type { PermTier } from '../../lib/coderTools';
 import type { StatusPayload } from '../../lib/types';
 
 function ToggleRow({ on, onToggle, onTitle, offTitle }: {
@@ -21,11 +22,39 @@ function ToggleRow({ on, onToggle, onTitle, offTitle }: {
   );
 }
 
+/** 3-way allow/ask/deny selector for a single Chat tool — same visual
+ *  language as Coder's per-tool tier grid in SafetyTab, scoped to
+ *  useChatAgent's two Chat-only tiers instead of Coder's PermConfig. */
+function TierRow({ label, tier, onChange }: { label: string; tier: PermTier; onChange: (v: PermTier) => void }) {
+  return (
+    <div className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
+      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute">{label}</span>
+      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+        <button
+          key={v}
+          type="button"
+          onClick={() => onChange(v)}
+          title={`${v} ${label}`}
+          className={cn(
+            'rounded px-2 py-0.5 text-[11px] font-medium',
+            tier === v
+              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+              : 'text-faint hover:bg-panel2 hover:text-mute',
+          )}
+        >
+          {v}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function AgentTab({ status }: { status: StatusPayload | null }) {
   const {
     agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled,
     memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
     reflectionModel, setReflectionModel,
+    browserTier, setBrowserTier, memoryToolTier, setMemoryToolTier,
   } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
@@ -49,6 +78,11 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
             offTitle="Chat has only web_fetch/web_search — today's default"
           />
         </div>
+        {agentResearch && (
+          <div className="mt-3 border-t border-line pt-3">
+            <TierRow label="browser" tier={browserTier} onChange={setBrowserTier} />
+          </div>
+        )}
       </SectionCard>
 
       <SectionCard title="Memory" icon={<Brain size={15} />} description="A persistent, cross-conversation bank of facts and preferences the model can write to.">
@@ -73,6 +107,11 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
             />
           </div>
         </div>
+        {memoryEnabled && (
+          <div className="mt-3 border-t border-line pt-3">
+            <TierRow label="memory_update" tier={memoryToolTier} onChange={setMemoryToolTier} />
+          </div>
+        )}
       </SectionCard>
 
       <MemoryModal

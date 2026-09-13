@@ -79,6 +79,9 @@ export interface AppSettings {
   /** Optional model id the Reflection pass critiques/regenerates with,
    *  instead of the conversation's own model. '' = use the active chat model. */
   chatReflectionModel?: string;
+  /** Permission tier ('allow'/'ask'/'deny') for Chat's browser/memory_update tools. */
+  chatBrowserTier?: string;
+  chatMemoryToolTier?: string;
 }
 
 interface UpdateJob {

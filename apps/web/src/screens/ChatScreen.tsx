@@ -12,11 +12,13 @@ import {
   Plus,
   Search,
   Send,
+  Shield,
   SlidersHorizontal,
   Square,
   Trash2,
   X,
 } from 'lucide-react';
+import { HitlDialog } from '../components/HitlDialog';
 import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { isCompactedMsg, runToolLoop, humanizePassText, type ToolRegistry } from '../lib/agentLoop';
@@ -38,7 +40,21 @@ import { engineMaxConcurrency } from '../lib/engineInfo';
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel } = useChatAgent();
+  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier } = useChatAgent();
+  // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
+  // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
+  const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
+  const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  const requestApproval = useCallback((name: string, detail: string): Promise<boolean> => {
+    setPendingApproval({ name, detail });
+    return new Promise<boolean>((resolve) => {
+      approvalResolveRef.current = (ok: boolean) => {
+        approvalResolveRef.current = null;
+        setPendingApproval(null);
+        resolve(ok);
+      };
+    });
+  }, []);
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -326,25 +342,39 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
         ...(agentResearch
           ? {
-              browser: (args, signal) =>
-                coderBrowser(
-                  String(args.action ?? 'status'),
+              browser: async (args, signal) => {
+                const detail = String(args.action ?? 'status');
+                if (browserTier === 'deny') {
+                  return JSON.stringify({ error: 'Denied by Agent Mode settings (browser is set to deny).' });
+                }
+                if (browserTier === 'ask' && !(await requestApproval('browser', detail))) {
+                  return JSON.stringify({ error: 'Denied by the user (browser). Ask for an alternative or proceed without it.' });
+                }
+                const r = await coderBrowser(
+                  detail,
                   { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
                   signal,
-                ).then((r) => JSON.stringify(r)),
+                );
+                return JSON.stringify(r);
+              },
             }
           : {}),
         ...(memoryEnabled
           ? {
-              memory_update: (args, signal) => {
+              memory_update: async (args, signal) => {
                 const text = String(args.text || '').trim();
                 const rawKind = String(args.kind || 'tip');
                 const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
-                if (!text) return Promise.resolve(JSON.stringify({ error: 'memory_update requires non-empty `text`.' }));
-                return chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal).then((m) => {
-                  adoptMemory(m);
-                  return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
-                });
+                if (!text) return JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
+                if (memoryToolTier === 'deny') {
+                  return JSON.stringify({ error: 'Denied by Agent Mode settings (memory_update is set to deny).' });
+                }
+                if (memoryToolTier === 'ask' && !(await requestApproval('memory_update', text))) {
+                  return JSON.stringify({ error: 'Denied by the user (memory_update). Ask for an alternative or proceed without it.' });
+                }
+                const m = await chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal);
+                adoptMemory(m);
+                return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
               },
             }
           : {}),
@@ -577,7 +607,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval],
   );
 
   const send = useCallback(async () => {
@@ -1559,6 +1589,27 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           </div>
         </div>
       </div>
+          {pendingApproval && (
+            <HitlDialog
+              tone="warn"
+              width={480}
+              icon={<Shield size={15} />}
+              title="Agent requests approval"
+              subtitle={<span><span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in Agent Mode settings.</span>}
+              footer={
+                <>
+                  <Button variant="ghost" size="sm" onClick={() => approvalResolveRef.current?.(false)}>
+                    Deny
+                  </Button>
+                  <Button variant="primary" size="sm" onClick={() => approvalResolveRef.current?.(true)}>
+                    Approve once
+                  </Button>
+                </>
+              }
+            >
+              <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{pendingApproval.detail || '(no details)'}</pre>
+            </HitlDialog>
+          )}
           </>
       </div>
     </div>

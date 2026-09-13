@@ -14,6 +14,7 @@ import {
   chatMemoryGet, type CoderMemory,
   getConfig, saveConfig,
 } from './api';
+import type { PermTier } from './coderTools';
 
 interface ChatAgentState {
   /** Tool tier: false = today's default (web_fetch/web_search only), true = adds `browser`. */
@@ -39,6 +40,12 @@ interface ChatAgentState {
    *  conversation's own model — '' = same model (today's default). */
   reflectionModel: string;
   setReflectionModel: (v: string) => void;
+  /** Permission tier for the `browser`/`memory_update` tools — reuses
+   *  Coder's PermTier vocabulary. Default 'allow' (today's behavior). */
+  browserTier: PermTier;
+  setBrowserTier: (v: PermTier) => void;
+  memoryToolTier: PermTier;
+  setMemoryToolTier: (v: PermTier) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -54,6 +61,8 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [memoryModalOpen, setMemoryModalOpen] = useState(false);
 
   const [reflectionModel, setReflectionModelState] = useState('');
+  const [browserTier, setBrowserTierState] = useState<PermTier>('allow');
+  const [memoryToolTier, setMemoryToolTierState] = useState<PermTier>('allow');
 
   const adoptMemory = useCallback((m: CoderMemory) => {
     setMemory(m);
@@ -72,7 +81,11 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     chatMemoryEnabledGet().then((r) => setMemoryEnabledState(r.enabled)).catch(() => {});
     chatReflectionEnabledGet().then((r) => setReflectionEnabledState(r.enabled)).catch(() => {});
     chatDeepResearchEnabledGet().then((r) => setDeepResearchEnabledState(r.enabled)).catch(() => {});
-    getConfig().then((c) => setReflectionModelState(c.chatReflectionModel ?? '')).catch(() => {});
+    getConfig().then((c) => {
+      setReflectionModelState(c.chatReflectionModel ?? '');
+      setBrowserTierState((c.chatBrowserTier as PermTier) || 'allow');
+      setMemoryToolTierState((c.chatMemoryToolTier as PermTier) || 'allow');
+    }).catch(() => {});
   }, []);
 
   // Load the bank/learnings once memory is confirmed on — no point fetching
@@ -101,6 +114,14 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     setReflectionModelState(v);
     saveConfig({ chatReflectionModel: v }).catch(() => {});
   }, []);
+  const setBrowserTier = useCallback((v: PermTier) => {
+    setBrowserTierState(v);
+    saveConfig({ chatBrowserTier: v }).catch(() => {});
+  }, []);
+  const setMemoryToolTier = useCallback((v: PermTier) => {
+    setMemoryToolTierState(v);
+    saveConfig({ chatMemoryToolTier: v }).catch(() => {});
+  }, []);
 
   return (
     <Ctx.Provider
@@ -111,6 +132,8 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         deepResearchEnabled, setDeepResearchEnabled,
         memory, memoryRef, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
         reflectionModel, setReflectionModel,
+        browserTier, setBrowserTier,
+        memoryToolTier, setMemoryToolTier,
       }}
     >
       {children}

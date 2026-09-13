@@ -84,6 +84,16 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     if let Some(v) = body.get("chatReflectionModel").and_then(|v| v.as_str()) {
         merged.chat_reflection_model = v.into();
     }
+    if let Some(v) = body.get("chatBrowserTier").and_then(|v| v.as_str())
+        && matches!(v, "allow" | "ask" | "deny")
+    {
+        merged.chat_browser_tier = v.into();
+    }
+    if let Some(v) = body.get("chatMemoryToolTier").and_then(|v| v.as_str())
+        && matches!(v, "allow" | "ask" | "deny")
+    {
+        merged.chat_memory_tool_tier = v.into();
+    }
     let path = state.data_dir.join("config.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(
