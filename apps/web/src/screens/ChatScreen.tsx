@@ -260,10 +260,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // Deep research: concurrency-gated fan-out over the user's latest
       // question, run BEFORE the main turn so the findings are already in
       // context for the synthesis reply — same shape as Scout's
-      // fan-out-then-inject-report pre-pass. Only the local
-      // `effectiveHistory` used for this call is extended; the visible
-      // transcript (conv.messages) never shows the raw per-angle findings,
-      // only the final synthesized reply that cites them.
+      // fan-out-then-inject-report pre-pass. The report is both appended to
+      // `effectiveHistory` (for this call's model context) AND spliced into
+      // the visible conv.messages as a collapsed "Deep Research" report
+      // (ReportBlock, via MessageRow's displayName+collapsed branch) — same
+      // treatment Coder gives Scout, so the findings are auditable instead
+      // of only ever reaching the model invisibly.
       let effectiveHistory = history;
       const maxConcurrency = engineMaxConcurrency(status);
       if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
@@ -274,10 +276,20 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           try {
             const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, signal: ac.signal });
             if (report && !ac.signal.aborted) {
-              effectiveHistory = [
-                ...history,
-                { role: 'user', content: `[Deep research findings for ${angles.length} angle${angles.length === 1 ? '' : 's'} — use these to inform your answer, citing sources where relevant]\n\n${report}` },
-              ];
+              const researchMsg: ChatMessage = {
+                role: 'user',
+                id: uid(),
+                displayName: 'Deep Research',
+                collapsed: true,
+                content: `# Deep Research (${angles.length} parallel angle${angles.length === 1 ? '' : 's'})\n${angles.map((a, i) => `## ${i + 1}. ${a}`).join('\n\n')}\n\n---\n\n${report}`,
+              };
+              effectiveHistory = [...history, researchMsg];
+              setConvs((cs) => cs.map((c) => {
+                if (c.id !== convId) return c;
+                const idx = placeholderId ? c.messages.findIndex((m) => m.id === placeholderId) : c.messages.length;
+                const insertAt = idx >= 0 ? idx : c.messages.length;
+                return { ...c, messages: [...c.messages.slice(0, insertAt), researchMsg, ...c.messages.slice(insertAt)] };
+              }));
             }
           } catch (deepResearchError) {
             // Best-effort — a fan-out failure falls back to the main turn
@@ -406,9 +418,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           // regenerate (never a loop). Best-effort — any failure at either
           // step keeps the original reply and never strands the turn.
           if (reflectionEnabled) {
+            setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
             try {
               const critique = await critiqueChatReply({ model: useModel, history, reply: content, signal: ac.signal });
               if (critique && !ac.signal.aborted) {
+                setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
                 const revised = await regenerateChatReply({
                   model: useModel,
                   system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
@@ -422,6 +436,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               }
             } catch (reflectionError) {
               console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
+            } finally {
+              if (!ac.signal.aborted) setNotice(null);
             }
           }
 

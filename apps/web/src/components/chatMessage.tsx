@@ -7,6 +7,7 @@ import { BrainCircuit, ChevronDown, ChevronsRight, Copy, GitBranch, Pencil, Refr
 import type { ChatMessage } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTokens } from '../lib/format';
 import { Button, cn } from './ui';
+import { ReportBlock } from './toolResults';
 
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
 // ~300KB chunk that costs nothing at startup this way, only when the first
@@ -188,6 +189,14 @@ export const MessageRow = memo(function MessageRow({
       </ActionBtn>
     </div>
   );
+
+  // Harness-injected reports (Deep Research findings) get a labeled,
+  // collapsed-by-default block instead of showing up as a plain "user" wall
+  // of text — same treatment Coder gives its Scout/Verify/Critic messages
+  // (no row toolbar either: Edit/Regenerate don't apply to a report).
+  if (m.displayName && m.collapsed) {
+    return <ReportBlock message={m} />;
+  }
 
   if (m.role === 'user') {
     return (
