@@ -30,13 +30,13 @@ import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { coderBrowser, chatMemoryAddLearning, type CoderLearningKind } from '../lib/api';
+import { coderBrowser, chatMemoryAddLearning, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
-  const { agentResearch, memoryEnabled, memoryRef, adoptMemory } = useChatAgent();
+  const { agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled } = useChatAgent();
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -361,12 +361,42 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onAssistantTurn: async (msg, info) => {
           lastTurnMeta = info.meta;
           setLatestRequestMetrics(info.meta, useModel);
+          // Both passes below only apply to the final content-only turn (no
+          // pending tool calls) — an intermediate tool-call turn is left
+          // untouched either way.
+          if (ac.signal.aborted || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
+
+          let content = msg.content;
+
+          // Reflection: Generate → Reflect → Refine, bounded to one
+          // regenerate (never a loop). Best-effort — any failure at either
+          // step keeps the original reply and never strands the turn.
+          if (reflectionEnabled) {
+            try {
+              const critique = await critiqueChatReply({ model: useModel, history, reply: content, signal: ac.signal });
+              if (critique && !ac.signal.aborted) {
+                const revised = await regenerateChatReply({
+                  model: useModel,
+                  system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
+                  history,
+                  originalReply: content,
+                  critique,
+                  params,
+                  signal: ac.signal,
+                });
+                if (revised && !ac.signal.aborted) content = revised;
+              }
+            } catch (reflectionError) {
+              console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
+            }
+          }
+
           // Not-Ai auto-rewrite: plain content replies run the deterministic
-          // tell-gate (best-effort — any failure keeps the original reply and
+          // tell-gate (best-effort — any failure keeps the reply so far and
           // never strands the streaming state).
-          if (ac.signal.aborted || !params.humanize || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
+          if (!params.humanize) return content !== msg.content ? { content } : undefined;
           try {
-            const humanized = await humanizePassText(msg.content, {
+            const humanized = await humanizePassText(content, {
               voice: effectiveVoice(params),
               signal: ac.signal,
               rewrite: (current) => humanizeRewriteText({
@@ -378,12 +408,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 signal: ac.signal,
               }),
             });
-            if (!ac.signal.aborted && humanized.trim() !== msg.content.trim()) return { content: humanized };
+            if (!ac.signal.aborted && humanized.trim() !== content.trim()) return { content: humanized };
           } catch (humanizeError) {
-            // The gate or rewrite must never take the whole run down — the reply
-            // is already complete and shown; keep it and release the UI.
             console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
           }
+          return content !== msg.content ? { content } : undefined;
         },
       });
 
@@ -498,7 +527,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled],
   );
 
   const send = useCallback(async () => {
