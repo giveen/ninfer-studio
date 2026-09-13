@@ -4,7 +4,21 @@ import { coderExec, type CoderDiffResult } from './api';
 export type GitFileStatus = 'M' | 'A' | 'U' | 'D' | 'R';
 
 /** Same single-quote shell escaping as CoderScreen's exec helpers. */
-const shellQuote = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
+export const shellQuote = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+/** Lists local branches: current branch + full branch list (current included).
+ *  `git branch --show-current` emits zero bytes (not even a blank line) when
+ *  HEAD is detached, which would otherwise shift every line after it by one —
+ *  the `printf` wrapper guarantees exactly one line of output for the current
+ *  branch (empty string when detached) so the split below stays aligned. */
+export const GIT_BRANCH_LIST_CMD = `printf '%s\\n' "$(git branch --show-current)" && git branch --format='%(refname:short)'`;
+
+export function parseBranchList(stdout: string): { current: string; branches: string[] } {
+  const nl = stdout.indexOf('\n');
+  const current = (nl === -1 ? stdout : stdout.slice(0, nl)).trim();
+  const rest = nl === -1 ? '' : stdout.slice(nl + 1);
+  return { current, branches: rest.split('\n').map((s) => s.trim()).filter(Boolean) };
+}
 
 /** git status --porcelain v1 → Map<workspace-relative path, letter>.
  *  Never throws: not a git repo / exec failure → empty map (no badges).
