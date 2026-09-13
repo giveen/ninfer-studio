@@ -4,7 +4,7 @@
 //! repo search over a cached symbol index, the repo map (declaration
 //! signatures per file), and the git working-tree diff.
 
-use super::common::coder_root;
+use super::common::resolve_ws;
 use crate::engine::S;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
@@ -117,6 +117,8 @@ pub struct SearchQuery {
     q: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 pub async fn search(
@@ -128,8 +130,7 @@ pub async fn search(
         return Json(json!({"results": [], "truncated": false}));
     }
     let limit = params.limit.unwrap_or(15).clamp(1, 50) as usize;
-    let ws = state.config.read().await.coder_workspace.clone();
-    let Ok(root) = coder_root(&ws) else {
+    let Ok(root) = resolve_ws(&state, params.workspace.as_deref()).await else {
         return Json(json!({"results": [], "truncated": false}));
     };
     let terms: Vec<String> = q
@@ -216,11 +217,15 @@ pub async fn search(
     Json(result)
 }
 
-pub async fn repo_map(AxumState(state): AxumState<S>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    if ws.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
-    }
+/// Shared `?workspace=<path>` override for the no-body GET endpoints below.
+#[derive(Debug, Deserialize)]
+pub struct WsQuery {
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ws = resolve_ws(&state, params.workspace.as_deref()).await?;
 
     let result = tokio::task::spawn_blocking(move || {
         let mut map = String::new();
@@ -284,9 +289,8 @@ async fn git_run(root: &Path, args: &[&str], secs: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-pub async fn diff(AxumState(state): AxumState<S>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let ws = state.config.read().await.coder_workspace.clone();
-    let root = coder_root(&ws)?;
+pub async fn diff(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let root = resolve_ws(&state, params.workspace.as_deref()).await?;
     let stat = git_run(&root, &["diff", "HEAD", "--stat"], 15).await;
     let full = git_run(&root, &["diff", "HEAD"], 60).await;
     let (stat_text, diff_text) = match (stat, full) {
@@ -337,11 +341,11 @@ mod tests {
         state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
 
         // Empty query short-circuits (no walk at all).
-        let e = search(AxumState(state.clone()), Query(SearchQuery { q: Some("   ".into()), limit: None })).await;
+        let e = search(AxumState(state.clone()), Query(SearchQuery { q: Some("   ".into()), limit: None, workspace: None })).await;
         assert!(e["results"].as_array().unwrap().is_empty());
 
         // Symbol name hits outrank plain content hits of the same term.
-        let r = search(AxumState(state.clone()), Query(SearchQuery { q: Some("SymbolIndex".into()), limit: Some(50) })).await;
+        let r = search(AxumState(state.clone()), Query(SearchQuery { q: Some("SymbolIndex".into()), limit: Some(50), workspace: None })).await;
         let res = r["results"].as_array().unwrap();
         let symbol = res.iter().find(|x| x["kind"] == "symbol").expect("symbol hit for SymbolIndex");
         assert_eq!(symbol["file"], "src/handler.rs");
@@ -351,7 +355,7 @@ mod tests {
         }
 
         // Content-only term: fixed-string match with a 300-char snippet.
-        let c = search(AxumState(state.clone()), Query(SearchQuery { q: Some("mentions_ranking".into()), limit: Some(50) })).await;
+        let c = search(AxumState(state.clone()), Query(SearchQuery { q: Some("mentions_ranking".into()), limit: Some(50), workspace: None })).await;
         let c_res = c["results"].as_array().unwrap();
         assert!(c_res.iter().any(|x| x["file"] == "src/handler.rs" && x["snippet"].as_str().unwrap().contains("mentions_ranking")));
 
@@ -388,17 +392,17 @@ mod tests {
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "base"]).unwrap();
             std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
-            let r = diff(AxumState(state.clone())).await.unwrap().0;
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
             let files = r["files"].as_array().unwrap();
             assert!(files.iter().any(|f| f["path"] == "a.txt"), "changed file missing: {files:?}");
             assert!(r["diff"].as_str().unwrap().contains("two"));
             // Clean tree → empty diff, no files.
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "b"]).unwrap();
-            let r = diff(AxumState(state.clone())).await.unwrap().0;
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
             assert!(r["files"].as_array().unwrap().is_empty());
         } else {
-            let r = diff(AxumState(state.clone())).await.unwrap().0;
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
             assert!(r.get("error").is_some(), "no git, no repo → soft error: {r:?}");
         }
         let _ = std::fs::remove_dir_all(&tmp);

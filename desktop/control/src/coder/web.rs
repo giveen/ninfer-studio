@@ -190,7 +190,7 @@ pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "url required"})))),
     };
-    enforce_perm(&state, "web_fetch", None).await?;
+    enforce_perm(&state, "web_fetch", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let mut url = reqwest::Url::parse(&raw)
         .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid url"}))))?;
     let client = reqwest::Client::builder()
@@ -335,7 +335,7 @@ pub async fn web_search(AxumState(state): AxumState<S>, Json(req): Json<Value>) 
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "query required"})))),
     };
-    enforce_perm(&state, "web_search", None).await?;
+    enforce_perm(&state, "web_search", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
         .timeout(Duration::from_secs(20))

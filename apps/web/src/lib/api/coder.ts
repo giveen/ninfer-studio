@@ -26,8 +26,9 @@ import { getJSON, postJSON } from './core';
 export function getCoderWorkspace(): Promise<CoderWorkspace> {
   return getJSON<CoderWorkspace>('/api/coder/workspace');
 }
-export function coderRepoMap(): Promise<{ map: string }> {
-  return getJSON<{ map: string }>('/api/coder/repo_map');
+export function coderRepoMap(workspace?: string): Promise<{ map: string }> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<{ map: string }>(`/api/coder/repo_map${qs}`);
 }
 export function setCoderWorkspace(path: string): Promise<CoderWorkspace> {
   return postJSON<CoderWorkspace>('/api/coder/workspace', { path }, 8000);
@@ -42,11 +43,12 @@ export interface CoderDirs {
 export function coderDirs(root: string): Promise<CoderDirs> {
   return getJSON<CoderDirs>(`/api/coder/dirs?root=${encodeURIComponent(root)}`);
 }
-export function coderTree(depth = 3, root = '.'): Promise<CoderTree> {
-  return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}`);
+export function coderTree(depth = 3, root = '.', workspace?: string): Promise<CoderTree> {
+  const ws = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderTree>(`/api/coder/tree?depth=${depth}&root=${encodeURIComponent(root)}${ws}`);
 }
-export function coderRead(path: string, offset?: number, limit?: number, signal?: AbortSignal): Promise<CoderReadResult> {
-  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit }, 8000, signal);
+export function coderRead(path: string, offset?: number, limit?: number, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderReadResult> {
+  return postJSON<CoderReadResult>('/api/coder/fs/read', { path, offset, limit, workspace, approvalToken }, 8000, signal);
 }
 export interface CoderBase64Result {
   path: string;
@@ -54,26 +56,26 @@ export interface CoderBase64Result {
   dataUrl: string;
   size: number;
 }
-export function coderReadBase64(path: string): Promise<CoderBase64Result> {
-  return postJSON<CoderBase64Result>('/api/coder/fs/b64', { path }, 15_000);
+export function coderReadBase64(path: string, workspace?: string): Promise<CoderBase64Result> {
+  return postJSON<CoderBase64Result>('/api/coder/fs/b64', { path, workspace }, 15_000);
 }
-export function coderWrite(path: string, content: string, signal?: AbortSignal): Promise<CoderWriteResult> {
-  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content }, 16_000_000, signal);
+export function coderWrite(path: string, content: string, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderWriteResult> {
+  return postJSON<CoderWriteResult>('/api/coder/fs/write', { path, content, workspace, approvalToken }, 16_000_000, signal);
 }
-export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false, signal?: AbortSignal): Promise<CoderEditResult> {
-  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll }, 16_000_000, signal);
+export function coderEdit(path: string, oldStr: string, newStr: string, replaceAll = false, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/edit', { path, old: oldStr, new: newStr, replaceAll, workspace, approvalToken }, 16_000_000, signal);
 }
 export interface CoderPatchEdit { old: string; new: string; replaceAll?: boolean; }
-export function coderPatch(path: string, edits: CoderPatchEdit[], signal?: AbortSignal): Promise<CoderEditResult> {
-  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits }, 16_000_000, signal);
+export function coderPatch(path: string, edits: CoderPatchEdit[], signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderEditResult> {
+  return postJSON<CoderEditResult>('/api/coder/fs/patch', { path, edits, workspace, approvalToken }, 16_000_000, signal);
 }
-export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean, signal?: AbortSignal): Promise<CoderExecResult> {
+export function coderExec(command: string, cwd?: string, timeoutMs?: number, sessionId?: string, background?: boolean, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderExecResult> {
   // The client-side fetch timeout must be at least as long as the server-side
   // exec timeout it's requesting (timeoutMs, server default 120s) — it used to
   // be hardcoded to 15s regardless, so any command running longer than that
   // threw a spurious client-side timeout while the server kept working.
   const fetchTimeoutMs = Math.max(15_000, (timeoutMs ?? 120_000) + 5_000);
-  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background }, fetchTimeoutMs, signal);
+  return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background, workspace, approvalToken }, fetchTimeoutMs, signal);
 }
 export function coderJob(jobId: string, signal?: AbortSignal): Promise<CoderJob> {
   return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000, signal);
@@ -89,18 +91,21 @@ export function coderGrep(
   offset = 0,
   limit = 200,
   signal?: AbortSignal,
+  workspace?: string,
+  approvalToken?: string,
 ): Promise<CoderGrepResult> {
-  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit }, 15_000, signal);
+  return postJSON<CoderGrepResult>('/api/coder/grep', { pattern, path, include, ignoreCase, offset, limit, workspace, approvalToken }, 15_000, signal);
 }
-export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200, signal?: AbortSignal): Promise<CoderGlobResult> {
-  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit }, 15_000, signal);
+export function coderGlob(pattern: string, path?: string, offset = 0, limit = 200, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderGlobResult> {
+  return postJSON<CoderGlobResult>('/api/coder/glob', { pattern, path, offset, limit, workspace, approvalToken }, 15_000, signal);
 }
 export interface CoderSearchResult {
   results: Array<{ file: string; line: number; snippet: string; score: number; kind: string }>;
   truncated: boolean;
 }
-export function coderSearch(query: string, limit = 15, signal?: AbortSignal): Promise<CoderSearchResult> {
-  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}`, 4000, signal);
+export function coderSearch(query: string, limit = 15, signal?: AbortSignal, workspace?: string): Promise<CoderSearchResult> {
+  const ws = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}${ws}`, 4000, signal);
 }
 export interface CoderDiffResult {
   files: Array<{ path: string; bar?: string }>;
@@ -108,14 +113,15 @@ export interface CoderDiffResult {
   truncated?: boolean;
   error?: string;
 }
-export function coderDiff(): Promise<CoderDiffResult> {
-  return getJSON<CoderDiffResult>('/api/coder/diff', 60000);
+export function coderDiff(workspace?: string): Promise<CoderDiffResult> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderDiffResult>(`/api/coder/diff${qs}`, 60000);
 }
-export function coderWebFetch(url: string, signal?: AbortSignal): Promise<CoderWebFetch> {
-  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url }, 20_000, signal);
+export function coderWebFetch(url: string, signal?: AbortSignal, approvalToken?: string): Promise<CoderWebFetch> {
+  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url, approvalToken }, 20_000, signal);
 }
-export function coderWebSearch(query: string, signal?: AbortSignal): Promise<CoderWebSearch> {
-  return postJSON<CoderWebSearch>('/api/coder/web/search', { query }, 20_000, signal);
+export function coderWebSearch(query: string, signal?: AbortSignal, approvalToken?: string): Promise<CoderWebSearch> {
+  return postJSON<CoderWebSearch>('/api/coder/web/search', { query, approvalToken }, 20_000, signal);
 }
 export interface CoderBrowserResult {
   ok?: boolean;
@@ -129,8 +135,8 @@ export interface CoderBrowserResult {
   idle_seconds?: number;
   error?: string;
 }
-export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal): Promise<CoderBrowserResult> {
-  return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args }, 45_000, signal);
+export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal, approvalToken?: string): Promise<CoderBrowserResult> {
+  return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args, approvalToken }, 45_000, signal);
 }
 export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
@@ -139,19 +145,31 @@ export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }
   return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
 }
 /** Mirrors the active workspace's tool permission tiers + denied paths to the
- *  control plane, so a `deny` tier or denied prefix is enforced at the
- *  endpoint itself — not only by this client's own dispatcher, which an
- *  agent could otherwise route around (e.g. `bash` curling straight at an
- *  endpoint whose tool is denied). `ask` isn't sent — the server has no way
- *  to pause and prompt a human, so that tier stays client-only. */
+ *  control plane, so `deny`/denied-prefix (and, with a valid token from
+ *  `coderPermsApprove`, `ask`) are enforced at the endpoint itself — not only
+ *  by this client's own dispatcher, which an agent could otherwise route
+ *  around (e.g. `bash` curling straight at an endpoint). */
 export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }): Promise<unknown> {
   return postJSON<unknown>('/api/coder/perms', perms, 5000);
 }
-export function coderSandboxGet(): Promise<{ enabled: boolean }> {
-  return getJSON<{ enabled: boolean }>('/api/coder/sandbox', 5000);
+/** Called the moment a human approves an `ask`-tiered tool call in the UI's
+ *  own dialog. Mints a short-lived, single-use token the client then attaches
+ *  to the actual tool-call request as `approvalToken` — without this, the
+ *  endpoint has no way to tell an approved call apart from one that skipped
+ *  the dialog entirely. */
+export function coderPermsApprove(tool: string, path?: string): Promise<{ token: string }> {
+  return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path }, 5000);
 }
-export function coderSandboxSet(enabled: boolean): Promise<{ enabled: boolean }> {
-  return postJSON<{ enabled: boolean }>('/api/coder/sandbox', { enabled }, 5000);
+export interface SandboxStatus {
+  enabled: boolean;
+  sandboxBinds: string[];
+  bwrapAvailable: boolean;
+}
+export function coderSandboxGet(): Promise<SandboxStatus> {
+  return getJSON<SandboxStatus>('/api/coder/sandbox', 5000);
+}
+export function coderSandboxSet(enabled: boolean): Promise<SandboxStatus> {
+  return postJSON<SandboxStatus>('/api/coder/sandbox', { enabled }, 5000);
 }
 
 // ---------------------------------------------------------------------------

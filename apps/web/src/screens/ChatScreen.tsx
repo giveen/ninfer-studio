@@ -62,6 +62,22 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // slot), so viewing a DIFFERENT idle conversation must not render it (or
   // its composer) as if it were the one generating.
   const [streamingConvId, setStreamingConvId] = useState<string | null>(null);
+  /** Messages typed while THIS conversation is streaming — in-memory only
+   *  (like the draft `text` itself), auto-sent one at a time once the
+   *  current turn finishes (see runStream's tail) or left queued if the user
+   *  hits Stop. Ref-mirrored so runStream's closure (captured whenever that
+   *  useCallback was last recreated) sees items queued after that, not a
+   *  stale snapshot. */
+  type QueuedItem = { text: string; attachments: ChatAttachment[] };
+  const queuedRef = useRef<Record<string, QueuedItem[]>>({});
+  const [queued, setQueuedState] = useState<Record<string, QueuedItem[]>>({});
+  const setQueued = (updater: Record<string, QueuedItem[]> | ((prev: Record<string, QueuedItem[]>) => Record<string, QueuedItem[]>)) => {
+    setQueuedState((prev) => {
+      const next = typeof updater === 'function' ? (updater as (p: Record<string, QueuedItem[]>) => Record<string, QueuedItem[]>)(prev) : updater;
+      queuedRef.current = next;
+      return next;
+    });
+  };
   const [paramsOpen, setParamsOpen] = useState(false);
   const [model, setModel] = useState<string>(status?.engine?.modelId || '');
   const abortRef = useRef<AbortController | null>(null);
@@ -414,6 +430,24 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setStreaming(false);
       setStreamingConvId(null);
       abortRef.current = null;
+      // Auto-drain: if this turn finished naturally (not a user Stop) and the
+      // user queued a message for this conversation while it was streaming,
+      // send it next — that's the whole point of queuing instead of blocking.
+      if (!ac.signal.aborted) {
+        const pending = queuedRef.current[convId];
+        if (pending && pending.length > 0) {
+          const [item, ...rest] = pending;
+          setQueued((q) => ({ ...q, [convId]: rest }));
+          const queuedConv = convsRef.current.find((c) => c.id === convId);
+          if (queuedConv) {
+            const userMsg: ChatMessage = { role: 'user', content: item.text, attachments: item.attachments.length ? item.attachments : undefined };
+            const asstMsg: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+            const nextBase: Conversation = { ...queuedConv, messages: [...queuedConv.messages, userMsg, asstMsg] };
+            setConvs((cs) => cs.map((c) => (c.id === convId ? nextBase : c)));
+            await runStream(convId, modelHistory(nextBase), 0, asstMsg.id);
+          }
+        }
+      }
     },
     [engineUp, model, runningModel, params, onNavigate, status],
   );
@@ -422,6 +456,17 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const content = text.trim();
     if (!content && !attachments.length) return;
     if (content.startsWith('/') && runCommand(content)) {
+      setText('');
+      setAttachments([]);
+      return;
+    }
+    // Busy on THIS conversation (streaming or compacting) — queue instead of
+    // blocking; it auto-sends once the current turn finishes. A different
+    // conversation streaming elsewhere is handled by the composer's own
+    // disabled state (this function is simply not reachable then).
+    if (activeId && ((streaming && streamingConvId === activeId) || compacting)) {
+      const item: QueuedItem = { text: content, attachments: [...attachments] };
+      setQueued((q) => ({ ...q, [activeId]: [...(q[activeId] ?? []), item] }));
       setText('');
       setAttachments([]);
       return;
@@ -461,7 +506,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream]);
+  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting]);
 
   // Send a suggested follow-up question straight away (bypassing the composer) —
   // always appends to the active conversation, which is the only one a
@@ -1277,7 +1322,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  if (!streaming && !compacting) send();
+                  // Busy-elsewhere is the one case send() can't handle itself
+                  // (there's nothing sensible to queue against a conversation
+                  // that isn't even the one on screen streaming).
+                  if (!(streamingConvId && streamingConvId !== activeId)) send();
                 }
               }}
               onPaste={(e) => {
@@ -1327,15 +1375,38 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   <Square size={12} /> busy elsewhere
                 </Button>
               ) : streaming || compacting ? (
-                <Button variant="danger" size="sm" onClick={stop}>
-                  <Square size={12} /> {compacting ? 'stop compact' : 'stop'}
-                </Button>
+                <>
+                  <Button variant="ghost" size="sm" onClick={send} disabled={!text.trim() && !attachments.length} title="Queue this for when the current turn finishes">
+                    <Plus size={12} /> queue
+                  </Button>
+                  <Button variant="danger" size="sm" onClick={stop}>
+                    <Square size={12} /> {compacting ? 'stop compact' : 'stop'}
+                  </Button>
+                </>
               ) : (
                 <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUp}>
                   <Send size={13} /> send
                 </Button>
               )}
             </div>
+            {activeId && (queued[activeId]?.length ?? 0) > 0 && (
+              <div className="space-y-1 px-2.5 pb-2">
+                {queued[activeId].map((item, i) => (
+                  <div key={i} className="flex items-center gap-2 rounded border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
+                    <span className="shrink-0 font-mono text-[10px] text-faint">#{i + 1} queued</span>
+                    <span className="min-w-0 flex-1 truncate">{item.text}</span>
+                    <button
+                      type="button"
+                      title="Remove from queue"
+                      onClick={() => setQueued((q) => ({ ...q, [activeId]: q[activeId].filter((_, j) => j !== i) }))}
+                      className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             {paramsOpen && (
               <div className="absolute bottom-full left-2 mb-2 z-30">
                 <ParamsPopover

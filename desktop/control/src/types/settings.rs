@@ -46,7 +46,9 @@ pub struct AppSettings {
     /// Coding harness: wrap the agent's shell in bubblewrap (bwrap) so it can
     /// write only inside the workspace (rest of the host read-only). Mirrors the
     /// sidecar's `coderSandbox`. Ignored when bwrap is not installed (exec then
-    /// runs unsandboxed, like the sidecar). Serializes as `coderSandbox`.
+    /// runs unsandboxed, like the sidecar). Defaults on: an agent running
+    /// arbitrary shell commands should be contained unless a user opts out.
+    /// Serializes as `coderSandbox`.
     pub coder_sandbox: bool,
     /// Extra read-write bind mounts passed to bwrap alongside the workspace
     /// (e.g. shared model dirs a build step needs to write to). Serializes as
@@ -72,7 +74,7 @@ impl Default for AppSettings {
             test_command: String::new(),
             default_request_params: String::new(),
             reasoning_effort: String::new(),
-            coder_sandbox: false,
+            coder_sandbox: true,
             sandbox_binds: Vec::new(),
             coder_workspace: String::new(),
         }
