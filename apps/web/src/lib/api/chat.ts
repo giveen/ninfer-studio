@@ -3,7 +3,7 @@
 // ChatScreen.tsx and (via lib/agentLoop) CoderScreen.tsx.
 
 import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
-import { API_BASE } from './core';
+import { API_BASE, getJSON, postJSON } from './core';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -583,3 +583,32 @@ export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; 
 }
 
 export type { ChatAttachment };
+
+// ---------------------------------------------------------------------------
+// Chat Agent Mode settings (Settings > Agent) — mirrors coderSafeModeGet/Set's
+// shape exactly, one pair per toggle.
+// ---------------------------------------------------------------------------
+export function chatAgentResearchGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/agent-research', 5000);
+}
+export function chatAgentResearchSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/agent-research', { enabled }, 5000);
+}
+export function chatMemoryEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/memory-enabled', 5000);
+}
+export function chatMemoryEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/memory-enabled', { enabled }, 5000);
+}
+export function chatReflectionEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/reflection-enabled', 5000);
+}
+export function chatReflectionEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/reflection-enabled', { enabled }, 5000);
+}
+export function chatDeepResearchEnabledGet(): Promise<{ enabled: boolean }> {
+  return getJSON<{ enabled: boolean }>('/api/chat/deep-research-enabled', 5000);
+}
+export function chatDeepResearchEnabledSet(enabled: boolean): Promise<{ enabled: boolean }> {
+  return postJSON<{ enabled: boolean }>('/api/chat/deep-research-enabled', { enabled }, 5000);
+}

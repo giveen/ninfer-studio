@@ -27,13 +27,16 @@ import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatu
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
+import { useChatAgent } from '../lib/chatAgent';
+import { coderBrowser } from '../lib/api';
 
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
+  const { agentResearch } = useChatAgent();
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
@@ -268,12 +271,25 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         );
       };
 
-      // Chat tools as a registry for the shared runner: two read-only web
-      // tools under the same ToolRegistry contract the coder loops use.
+      // Chat tools as a registry for the shared runner: the same ToolRegistry
+      // contract the coder loops use. Agent Mode "research" tier adds the
+      // workspace-independent `browser` tool on top of the always-on
+      // read-only web tools.
       const registry: ToolRegistry = {
         web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
         web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
+        ...(agentResearch
+          ? {
+              browser: (args, signal) =>
+                coderBrowser(
+                  String(args.action ?? 'status'),
+                  { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
+                  signal,
+                ).then((r) => JSON.stringify(r)),
+            }
+          : {}),
       };
+      const tools = agentResearch ? [...CHAT_TOOLS, CHAT_BROWSER_TOOL] : CHAT_TOOLS;
       // The runner owns the turn messages; these events mirror each turn into
       // the conversation store so streaming stays live.
       let lastTurnMeta: MessageMeta | undefined;
@@ -282,7 +298,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         system: chatSystemWithCapabilities(params),
         messages: history,
         params,
-        tools: CHAT_TOOLS,
+        tools,
         registry,
         maxSteps: 12,
         signal: ac.signal,
@@ -464,7 +480,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch],
   );
 
   const send = useCallback(async () => {

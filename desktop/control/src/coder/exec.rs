@@ -94,8 +94,9 @@ fn shell_quote(s: &str) -> String {
 /// `sandbox_set`'s exact read-merge-write shape (a full save-config round
 /// trip would also work, but every coder toggle already updates its own
 /// field in isolation this way to avoid clobbering a concurrent edit to an
-/// unrelated field).
-async fn persist_bool_setting(state: &S, set: impl FnOnce(&mut crate::types::AppSettings, bool), enabled: bool) {
+/// unrelated field). `pub(crate)` so non-coder settings (e.g. `chat`'s
+/// Agent Mode toggles) reuse the same shape instead of duplicating it.
+pub(crate) async fn persist_bool_setting(state: &S, set: impl FnOnce(&mut crate::types::AppSettings, bool), enabled: bool) {
     let mut merged = state.config.read().await.clone();
     set(&mut merged, enabled);
     if is_safe_base_dir(&state.data_dir) {

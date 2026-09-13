@@ -112,6 +112,32 @@ export const CHAT_TOOLS = [
   }
 ];
 
+/** Agent Mode "research" tier adds this on top of CHAT_TOOLS — same schema
+ *  as Coder's `browser` tool (coderTools.ts), workspace-independent (runs a
+ *  sandboxed headless browser session, never touches the host filesystem),
+ *  so it's safe to offer in Chat with no permission-tier gating. */
+export const CHAT_BROWSER_TOOL = {
+  type: "function",
+  function: {
+    name: "browser",
+    description: "Built-in headless web browser (runs page JavaScript, unlike web_fetch). Use for JS-rendered pages. Actions: navigate (url), snapshot (page URL/title/Markdown), click (selector), fill (selector, value), press_key (key, optional selector), select_option (selector, value), evaluate (expression), wait_for (selector, optional timeout), close, status. Prefer web_fetch for simple static pages; use the browser when the content only renders via JavaScript.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["navigate", "snapshot", "click", "fill", "press_key", "select_option", "evaluate", "wait_for", "close", "status"] },
+        url: { type: "string", description: "For navigate." },
+        wait_until: { type: "string", enum: ["domcontentloaded", "load"], description: "navigate only, default domcontentloaded." },
+        selector: { type: "string", description: "CSS selector for click/fill/press_key/select_option/wait_for." },
+        value: { type: "string", description: "For fill / select_option." },
+        key: { type: "string", description: "press_key: key name, e.g. \"Enter\"." },
+        expression: { type: "string", description: "evaluate: JavaScript expression to run in the page." },
+        timeout: { type: "number", description: "wait_for: seconds to poll (default 5, max 15)." }
+      },
+      required: ["action"]
+    }
+  }
+};
+
 // Slash-command palette (type `/` in the composer to see suggestions).
 export const SLASH_COMMANDS: Array<{ cmd: string; desc: string; needsArg?: boolean }> = [
   { cmd: '/clear', desc: 'Clear the current chat' },

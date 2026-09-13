@@ -61,6 +61,21 @@ pub struct AppSettings {
     /// Coding harness: require explicit human sign-off on the working-tree
     /// diff before the agent may commit. Serializes as `coderCommitApproval`.
     pub coder_commit_approval: bool,
+    /// Chat's Agent Mode tier: off (web_fetch/web_search only, the original
+    /// default) or on (adds the workspace-independent `browser` tool).
+    /// Serializes as `chatAgentResearch`.
+    pub chat_agent_research: bool,
+    /// Persistent cross-conversation Chat memory (global bank + learnings,
+    /// distinct from Coder's per-workspace one — see `chat::memory`).
+    /// Serializes as `chatMemoryEnabled`.
+    pub chat_memory_enabled: bool,
+    /// Optional self-review pass on Chat's final replies (Generate → Reflect
+    /// → Refine, bounded to one retry). Serializes as `chatReflectionEnabled`.
+    pub chat_reflection_enabled: bool,
+    /// Concurrency-gated parallel research fan-out for Chat (only usable
+    /// when the running engine's maxConcurrency > 1). Serializes as
+    /// `chatDeepResearchEnabled`.
+    pub chat_deep_research_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -86,6 +101,10 @@ impl Default for AppSettings {
             coder_workspace: String::new(),
             coder_safe_mode: true,
             coder_commit_approval: false,
+            chat_agent_research: false,
+            chat_memory_enabled: false,
+            chat_reflection_enabled: false,
+            chat_deep_research_enabled: false,
         }
     }
 }

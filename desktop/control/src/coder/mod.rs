@@ -30,6 +30,9 @@ pub use exec::{
     bwrap_available, commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
     safe_mode_set, sandbox_get, sandbox_set, BgJob,
 };
+/// Crate-internal only — reused by `chat`'s Agent Mode toggles so they don't
+/// duplicate the read-merge-write shape.
+pub(crate) use exec::persist_bool_setting;
 pub use fs::{fs_b64, fs_edit, fs_patch, fs_read, fs_write, tree};
 pub use grep::{glob, grep};
 pub use memory::{memory_get, memory_set, MemQuery};
