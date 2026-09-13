@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -21,9 +21,9 @@ import { MemoryModal } from '../components/MemoryModal';
 import { HitlDialog } from '../components/HitlDialog';
 import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
-import { fetchFileDiff } from '../lib/gitStatus';
+import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderSafeModeGet, coderSafeModeSet, coderPermsSet, coderSandboxGet, coderSandboxSet, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type ChatStreamCallbacks } from '../lib/api';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
@@ -996,6 +996,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       refreshRepoMap();
     }
   }, [running, activeWsDir, git, refreshRepoMap]);
+  const [showBranchMenu, setShowBranchMenu] = useState(false);
+  const branchMenuRef = useRef<HTMLDivElement>(null);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
   /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git). */
@@ -1150,6 +1152,37 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!flushed) return;
     void tabs.refreshOpenTabs();
   }, [tabs.refreshOpenTabs, wsFlushed]);
+
+  /** Prompt for a name, create the branch, and switch to it. */
+  const handleCreateBranch = useCallback(async () => {
+    if (!activeWs || running) return;
+    const name = window.prompt('New branch name:');
+    if (!name) return;
+    const ok = await git.createBranch(name);
+    if (ok) { refreshRepoMap(); loadTree(); tabsRefreshRef.current(); }
+  }, [activeWs, running, git, refreshRepoMap, loadTree]);
+  /** Switch to an existing branch from the branch menu. */
+  const handleSwitchBranch = useCallback(async (name: string) => {
+    setShowBranchMenu(false);
+    if (!activeWs || running || name === git.currentBranch) return;
+    const ok = await git.switchBranch(name);
+    if (ok) { refreshRepoMap(); loadTree(); tabsRefreshRef.current(); }
+  }, [activeWs, running, git, refreshRepoMap, loadTree]);
+  // Close the branch menu on an outside click or Escape — it's a dropdown,
+  // not a modal, so it shouldn't linger over the transcript.
+  useEffect(() => {
+    if (!showBranchMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (branchMenuRef.current && !branchMenuRef.current.contains(e.target as Node)) setShowBranchMenu(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowBranchMenu(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showBranchMenu]);
 
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
@@ -1649,9 +1682,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
           const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           if (action === 'list') {
-            const r = await coderExec(`git branch --show-current && git branch --format='%(refname:short)'`, undefined, 15000, undefined, false, toolSignal);
-            const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
-            result = JSON.stringify({ current: lines[0] || '', branches: lines.slice(1), ...r });
+            const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, undefined, false, toolSignal);
+            const { current, branches } = parseBranchList(r.stdout || '');
+            result = JSON.stringify({ current, branches, ...r });
           } else if (action === 'create' || action === 'switch') {
             const name = String(args.name || '').trim();
             if (!name) {
@@ -2860,6 +2893,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             await refreshRepoMap();
             await tabs.refreshOpenTabs();
             await tabs.refreshGitStatus();
+            git.loadBranches();
           });
           // Keep the Commit History panel live as the agent commits changes.
           git.loadCommits();
@@ -2946,6 +2980,32 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             }
           }
           if (bounced) continue;
+          // Suggested follow-ups: a fast, best-effort pass offering 3 one-click
+          // next instructions so the user isn't stuck staring at a blank
+          // composer. Mirrors the Chat screen; skipped on abort or a
+          // truncated/empty final reply — neither is a clean "done" to build
+          // suggestions from. `wireMessages` is this turn's already-packed
+          // request context — reusing it (plus the reply it produced) avoids
+          // re-packing a potentially large transcript just for this.
+          if (!abortRef.current?.signal.aborted && finishReason !== 'length') {
+            const lastAssistant = currentMessages[currentMessages.length - 1];
+            if (lastAssistant?.role === 'assistant' && lastAssistant.content.trim()) {
+              try {
+                const followUps = await suggestFollowUps({
+                  model,
+                  history: [...wireMessages, lastAssistant],
+                  signal: abortRef.current?.signal,
+                });
+                if (!abortRef.current?.signal.aborted && followUps.length) {
+                  const withFollowUps: ChatMessage = { ...lastAssistant, followUps };
+                  currentMessages = currentMessages.map((m) => (m === lastAssistant ? withFollowUps : m));
+                  updateRunMessages((prev) => prev.map((m) => (m === lastAssistant ? withFollowUps : m)));
+                }
+              } catch (followUpError) {
+                console.warn('[coder] follow-up suggestions skipped', followUpError);
+              }
+            }
+          }
           break; // Done!
         }
       }
@@ -2999,6 +3059,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // The visible transcript keeps the full history; only the engine's context is
     // cleared to the summary and re-injected as leading context.
     runAgent(compactedContext(messages).concat(msg), { scout: !resuming, pin: resumePin ?? undefined });
+  };
+
+  // Send a suggested follow-up straight away (bypassing the composer) — only
+  // ever shown against the latest, already-finished turn, so a plain new
+  // instruction on the current conversation is always the right action.
+  const onFollowUp = (content: string) => {
+    const trimmed = content.trim();
+    if (!trimmed || running || !activeWs || pendingQuestion !== null) return;
+    const msg: ChatMessage = { role: 'user', content: trimmed };
+    const next = [...messages, msg];
+    setMessages(next);
+    runAgent(compactedContext(messages).concat(msg), { scout: true });
   };
 
   // True while a run is in flight in a DIFFERENT conversation than the one on
@@ -3684,6 +3756,48 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           >
             <Play size={11} className={criticNowBusy ? 'animate-pulse' : ''} />
           </button>
+          <div className="relative" ref={branchMenuRef}>
+            <button
+              type="button"
+              onClick={() => { const next = !showBranchMenu; setShowBranchMenu(next); if (next) git.loadBranches(); }}
+              disabled={!activeWs}
+              title="Switch branch"
+              className="flex max-w-[140px] items-center gap-1 rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+            >
+              <GitBranch size={13} /> <span className="truncate">{git.currentBranch || 'branch'}</span>
+            </button>
+            {showBranchMenu && (
+              <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-auto rounded border border-line bg-panel py-1 shadow-lg">
+                {git.branchesLoading ? (
+                  <div className="px-2 py-1 text-[11px] italic text-faint">Loading…</div>
+                ) : git.branches.length === 0 ? (
+                  <div className="px-2 py-1 text-[11px] italic text-faint">No branches.</div>
+                ) : (
+                  git.branches.map((b) => (
+                    <button
+                      key={b}
+                      type="button"
+                      onClick={() => void handleSwitchBranch(b)}
+                      disabled={running}
+                      title={running ? 'Stop the agent before switching branches' : `Switch to ${b}`}
+                      className={cn('block w-full truncate px-2 py-1 text-left text-[11px] hover:bg-panel2 disabled:opacity-40', b === git.currentBranch ? 'text-accent' : 'text-ink')}
+                    >
+                      {b}
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleCreateBranch()}
+            disabled={!activeWs || running}
+            title={running ? 'Stop the agent before creating a branch' : 'Create a new branch from HEAD and switch to it'}
+            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
+          >
+            <Plus size={13} />
+          </button>
           <button
             type="button"
             onClick={() => setDiffViewOpen(true)}
@@ -3851,6 +3965,20 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                       g.items[0].role === 'assistant' || g.items[0].displayName
                         ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown>{g.items[0].content}</Markdown></Suspense></div>
                         : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
+                    )}
+                    {i === messageGroups.length - 1 && !running && !pendingQuestion && g.items[0].followUps && g.items[0].followUps.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {g.items[0].followUps.map((q, qi) => (
+                          <button
+                            key={qi}
+                            type="button"
+                            onClick={() => onFollowUp(q)}
+                            className="rounded-full border border-line bg-panel px-3 py-1.5 text-left text-[12px] text-mute transition-colors hover:border-accent/40 hover:text-ink"
+                          >
+                            {q}
+                          </button>
+                        ))}
+                      </div>
                     )}
                   </div>
                 )}
