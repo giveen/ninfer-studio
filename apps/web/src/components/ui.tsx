@@ -1,7 +1,6 @@
 import { forwardRef, type ReactNode, useEffect, useRef, useState } from 'react';
 import * as Switch from '@radix-ui/react-switch';
 import * as Popover from '@radix-ui/react-popover';
-import * as Dialog from '@radix-ui/react-dialog';
 import { Check, ChevronDown, ChevronRight, Copy, Info } from 'lucide-react';
 
 export function cn(...parts: Array<string | false | null | undefined>): string {
@@ -113,7 +112,7 @@ export function Field({
   );
 }
 
-export function HintTip({ text }: { text: string }) {
+function HintTip({ text }: { text: string }) {
   return (
     <Popover.Root>
       <Popover.Trigger asChild>
@@ -425,41 +424,6 @@ export function CodeBlock({ code, onCopy, singleLine }: { code: string; onCopy?:
         {copied ? <Check size={13} className="text-accent" /> : <Copy size={13} />}
       </button>
     </div>
-  );
-}
-
-// ---------------------------------------------------------------- Modal
-export function Modal({
-  open,
-  onClose,
-  title,
-  children,
-  wide,
-}: {
-  open: boolean;
-  onClose: () => void;
-  title: string;
-  children: ReactNode;
-  wide?: boolean;
-}) {
-  return (
-    <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/60 backdrop-blur-[2px]" />
-        <Dialog.Content
-          className={cn(
-            'fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-line bg-panel shadow-2xl',
-            wide ? 'w-[720px] max-w-[94vw]' : 'w-[460px] max-w-[92vw]',
-          )}
-        >
-          <header className="flex items-center justify-between border-b border-line px-4 py-3">
-            <Dialog.Title className="text-sm font-semibold text-ink">{title}</Dialog.Title>
-            <Dialog.Close className="rounded-md p-1 text-mute hover:text-ink">✕</Dialog.Close>
-          </header>
-          <div className="max-h-[76vh] overflow-y-auto p-4">{children}</div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
   );
 }
 

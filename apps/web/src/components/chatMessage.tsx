@@ -30,7 +30,7 @@ export function CompactDivider() {
 // ---------------------------------------------------------------------------
 // Message rendering
 // ---------------------------------------------------------------------------
-export function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean }) {
+function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean }) {
   // Collapsed by default — long chains-of-thought shouldn't dominate the view.
   // A live pulse shows while it's actively thinking; a short preview is shown so
   // the gist is visible without expanding.

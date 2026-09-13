@@ -20,11 +20,11 @@ const STORE_NAME = 'observations';
 const DB_VERSION = 1;
 
 /** Only tool results larger than this participate. */
-export const PACK_THRESHOLD_BYTES = 4 * 1024;
+const PACK_THRESHOLD_BYTES = 4 * 1024;
 /** Sent in full for this many prior turns before being packed. */
-export const PACK_FULL_SENDS = 2;
+const PACK_FULL_SENDS = 2;
 /** Placeholder excerpt budget, split evenly between head and tail. */
-export const PACK_EXCERPT_BYTES = 1024;
+const PACK_EXCERPT_BYTES = 1024;
 
 const RECALL_MAX_BYTES = 4000;
 const RECALL_MAX_LINES = 200;
@@ -55,7 +55,7 @@ async function hashText(text: string): Promise<string> {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function isObservationId(id: string): boolean {
+function isObservationId(id: string): boolean {
   return OBSERVATION_ID_PATTERN.test(id);
 }
 

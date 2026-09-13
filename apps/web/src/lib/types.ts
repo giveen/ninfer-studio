@@ -1,7 +1,7 @@
 // Shared types mirroring the control plane's API surface and the NInfer engine's
 // HTTP contract (docs/serving.md).
 
-export type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed' | 'external';
+type EngineState = 'stopped' | 'starting' | 'running' | 'stopping' | 'failed' | 'external';
 
 export interface EngineStatus {
   state: EngineState;
@@ -18,13 +18,13 @@ export interface EngineStatus {
   maxContext?: number | null;
 }
 
-export interface GpuApp {
+interface GpuApp {
   pid: number;
   name: string;
   memMiB: number;
 }
 
-export interface GpuStats {
+interface GpuStats {
   available: boolean;
   name: string | null;
   memUsedMiB: number | null;
@@ -45,7 +45,7 @@ export interface ModelArtifact {
   repo: string | null;
 }
 
-export interface CatalogEntry {
+interface CatalogEntry {
   file: string;
   modelId: string;
   model: string;
@@ -78,7 +78,7 @@ export interface AppSettings {
   coderWorkspace: string;
 }
 
-export interface UpdateJob {
+interface UpdateJob {
   id: string;
   action: 'pull' | 'build';
   cmd: string;
@@ -90,7 +90,7 @@ export interface UpdateJob {
   startedAt: number;
 }
 
-export interface LastStart {
+interface LastStart {
   port: number;
   profile: EngineProfile;
   artifact: string | null;
@@ -326,18 +326,18 @@ export interface AgentToolCall {
   arguments: string;
 }
 
-export interface CoderToolCall extends AgentToolCall {
+interface CoderToolCall extends AgentToolCall {
   status?: 'running' | 'done' | 'error';
   result?: string;
   error?: string;
 }
 
-export interface CoderUserMsg {
+interface CoderUserMsg {
   role: 'user';
   id: string;
   content: string;
 }
-export interface CoderAssistantMsg {
+interface CoderAssistantMsg {
   role: 'assistant';
   id: string;
   content: string;
@@ -346,7 +346,7 @@ export interface CoderAssistantMsg {
   meta?: MessageMeta;
   error?: boolean;
 }
-export interface CoderToolMsg {
+interface CoderToolMsg {
   role: 'tool';
   id: string;
   toolCallId: string;
@@ -354,12 +354,6 @@ export interface CoderToolMsg {
   content: string;
 }
 export type CoderMessage = CoderUserMsg | CoderAssistantMsg | CoderToolMsg;
-
-export interface CoderTodo {
-  content: string;
-  status: 'pending' | 'in_progress' | 'completed';
-  activeForm?: string;
-}
 
 // Control-plane response shapes (mirrors desktop/control/src/coder/*).
 export interface FileNode {
@@ -426,7 +420,7 @@ export interface CoderJob {
   cwd?: string;
   error?: string;
 }
-export interface GrepMatch {
+interface GrepMatch {
   file: string;
   line: number;
   text: string;

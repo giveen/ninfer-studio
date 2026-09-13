@@ -62,7 +62,7 @@ export function compactedContext(msgs: ChatMessage[]): ChatMessage[] {
  *  parsed calls and the exact raw substrings consumed, so the caller can
  *  strip only those from the visible reply without touching unrelated code
  *  fences or prose. */
-export function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; consumed: string[] } {
+function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; consumed: string[] } {
   const calls: AgentToolCall[] = [];
   const consumed: string[] = [];
 
@@ -137,7 +137,7 @@ export function parseMarkupToolCalls(text: string): { calls: AgentToolCall[]; co
 
   return { calls, consumed };
 }
-export function stripToolMarkup(text: string, consumed: string[]): string {
+function stripToolMarkup(text: string, consumed: string[]): string {
   let out = text;
   for (const c of consumed) out = out.split(c).join('');
   return out.trim();
@@ -146,7 +146,7 @@ export function stripToolMarkup(text: string, consumed: string[]): string {
 // ---------------------------------------------------------------------------
 // Tool registry + dispatch
 /** Parsed model args object (JSON). Handlers read fields with String()/Number()/Array checks. */
-export type ToolArgs = Record<string, unknown>;
+type ToolArgs = Record<string, unknown>;
 
 /** A tool executor: parsed args in, JSON result string out. Throwing is
 + *  allowed — executeToolCalls converts it to an error result for the model. */
@@ -159,7 +159,7 @@ export type ToolRegistry = Record<string, ToolHandler>;
 /** Run one tool call per entry through the registry, isolating failures so
  *  one bad call (bad JSON args, unknown tool, throwing handler) becomes an
  *  error result for the model instead of killing the run. */
-export async function executeToolCalls(
+async function executeToolCalls(
   calls: AgentToolCall[],
   registry: ToolRegistry,
   signal: AbortSignal,
@@ -303,9 +303,9 @@ export async function humanizePassText(
 // Bounded tool loop
 // ---------------------------------------------------------------------------
 
-export type ToolLoopStop = 'done' | 'steps' | 'aborted' | 'empty' | 'halted';
+type ToolLoopStop = 'done' | 'steps' | 'aborted' | 'empty' | 'halted';
 
-export interface AssistantHook {
+interface AssistantHook {
   /** Replacement assistant content (e.g. humanized rewrite). */
   content?: string;
   /** Extra messages appended right after the assistant turn (e.g. a

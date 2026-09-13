@@ -428,9 +428,9 @@ export function filterToolAllowList(raw: unknown, allowed: Set<string>): string[
 }
 
 /** Binaries bash may run in plan mode (inspection only). */
-export const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
+const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
 /** Read-only git subcommands allowed in plan mode. */
-export const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'tag', 'remote', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
+const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'tag', 'remote', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
 
 /** True when a bash command is pure inspection (plan mode). Conservative:
  *  rejects shell composition (redirection, pipes, chaining, substitution)

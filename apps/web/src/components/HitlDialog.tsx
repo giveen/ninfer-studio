@@ -1,7 +1,7 @@
 import { ReactNode } from 'react';
 import { cn } from './ui';
 
-export type HitlTone = 'accent' | 'warn' | 'danger';
+type HitlTone = 'accent' | 'warn' | 'danger';
 
 // Visual treatment per tone. `accent` is used for the neutral ask_user prompt,
 // `warn` for permission/risky gates, `danger` reserved for hard-blocks.

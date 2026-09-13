@@ -269,8 +269,6 @@ export const PRESETS: Preset[] = [
   },
 ];
 
-export const KV_DTYPES = ['bf16', 'int8', 'fp8', 'nvfp4', 'k8v4'] as const;
-
 export const KV_DTYPE_OPTIONS = [
   {
     value: 'bf16',
@@ -298,13 +296,6 @@ export const KV_DTYPE_OPTIONS = [
     hint: 'Asymmetric: FP8 keys + NVFP4 values. Keeps the precision-sensitive key path at 8-bit while compressing values — nvfp4 capacity with quality closer to fp8.',
   },
 ] as const;
-export const SPEC_BACKENDS = [
-  { id: '', name: 'off' },
-  { id: 'mtp', name: 'MTP' },
-  { id: 'dflash', name: 'DFlash' },
-  { id: 'dflash2', name: 'DFlash2' },
-] as const;
-
 export const SPEC_BACKEND_OPTIONS = [
   {
     id: '',

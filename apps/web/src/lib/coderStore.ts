@@ -61,7 +61,7 @@ export interface CoderStore {
 }
 
 export const CONV_KEY = 'ninfier.coder.conversations.v2';
-export const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
+const CONV_V1_KEY = 'ninfier.coder.conversations.v1';
 
 export function newConvId(): string {
   return 'conv-' + crypto.randomUUID();
@@ -84,7 +84,7 @@ export function relTime(ts: number): string {
   if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
   return `${Math.floor(diff / (365 * DAY))}y`;
 }
-export function stripExtPrefix(p: string): string {
+function stripExtPrefix(p: string): string {
   let rest: string | null = null;
   for (const pre of ['\\\\?\\', '\\\\?/', '//?/']) {
     if (p.startsWith(pre)) { rest = p.slice(pre.length); break; }
@@ -186,7 +186,7 @@ export function loadStore(): CoderStore {
 // changing the template never touches a workspace that already has its own
 // `perms` value written (see the two WsData-construction sites in
 // CoderScreen.tsx that call loadDefaultPerms()).
-export const DEFAULT_PERMS_KEY = 'ninfier.coder.defaultPerms.v1';
+const DEFAULT_PERMS_KEY = 'ninfier.coder.defaultPerms.v1';
 
 export function loadDefaultPerms(): PermConfig {
   try {
