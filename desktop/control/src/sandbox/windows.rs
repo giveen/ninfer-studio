@@ -365,14 +365,6 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     Ok(())
 }
 
-impl Drop for AclGuard {
-    fn drop(&mut self) {
-        // The grant must not outlive the child. Deleting an ACE that is
-        // already gone is a no-op we can ignore.
-        let _ = set_low_integrity_ace(&self.path, false);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Child handle
 // ---------------------------------------------------------------------------
