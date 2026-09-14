@@ -717,15 +717,18 @@ mod tests {
 
     #[test]
     fn command_lines_use_the_right_shell_form() {
-        // Bash: the whole script is POSIX single-quoted, exactly as the
-        // Linux runner quotes it (`shell_quote`) — bash parses the command
-        // line itself, so there is no MSVCRT layer between us and the script.
+        // Bash: the script is POSIX single-quoted, then MSVCRT-quoted so
+        // CreateProcessW's argv parsing hands bash ONE argument (a
+        // single-quoted script containing spaces would otherwise be split —
+        // `'` is not a quote character for the CRT parser).
         let script = "echo 'it's'";
         assert_eq!(
             command_line(&Shell::Bash, script),
-            format!("bash -lc {}", shell_quote(script))
+            format!("bash -lc {}", arg_quote(&shell_quote(script)))
         );
         assert!(command_line(&Shell::Bash, "ls").starts_with("bash -lc "));
+        // A script with spaces must come out double-quoted (one argument):
+        assert_eq!(command_line(&Shell::Bash, "a b"), "bash -lc \"'a b'\"");
         // Cmd: `/d /s /c` with the script wrapped in one pair of quotes.
         assert_eq!(
             command_line(&Shell::Cmd, "echo hi"),
