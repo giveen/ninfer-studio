@@ -38,6 +38,13 @@ dirs = "7"
 # unifies with the one above, so no duplicate TLS stack.
 rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 
+# `process` enables tokio's `ChildStdout/Stderr::into_std()` (AsyncFd-backed
+# pipes), which the sandbox layer (src/sandbox/mod.rs) uses to hand the
+# child's stdio to blocking reader threads. Windows doesn't need it — the
+# sandbox owns raw pipes there.
+[target.'cfg(not(windows))'.dependencies]
+tokio = { workspace = true, features = ["process"] }
+
 # Windows-only: the coder sandbox runs the shell at low integrity inside a
 # Job Object (see src/sandbox/windows.rs). Target-scoped so Linux builds
 # never pay for it.
