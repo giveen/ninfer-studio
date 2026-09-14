@@ -95,15 +95,28 @@ enum Shell {
 /// Pick the shell once per process. git-bash (Git for Windows) gives full
 /// POSIX parity — including the stateful-session cwd marker — and is present
 /// on essentially every dev box; `cmd` is the bare fallback (stateless only).
+///
+/// The probe rejects WSL app-execution aliases: a WSL install puts a
+/// `bash.exe` on PATH (in `WindowsApps`) that also answers `--version`, but
+/// it is a *Linux* process — Windows-form cwd paths, our pipe inheritance,
+/// and the job/label semantics do not carry over. A native bash (git-bash,
+/// MSYS2) reports `cygwin`/`msys` in its version string; WSL reports
+/// `linux-gnu`.
 fn pick_shell() -> &'static Shell {
     static SHELL: LazyLock<Shell> = LazyLock::new(|| {
-        std::process::Command::new("bash")
+        let native_bash = std::process::Command::new("bash")
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-            .then_some(Shell::Bash)
-            .unwrap_or(Shell::Cmd)
+            .map(|o| {
+                o.status.success()
+                    && !String::from_utf8_lossy(&o.stdout).contains("linux-gnu")
+            })
+            .unwrap_or(false);
+        if native_bash {
+            Shell::Bash
+        } else {
+            Shell::Cmd
+        }
     });
     &SHELL
 }
