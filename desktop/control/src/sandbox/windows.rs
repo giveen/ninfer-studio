@@ -313,16 +313,18 @@ impl Drop for AclGuard {
 /// integrity. Dropping it revokes the ACL grants and — via
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills anything still running.
 /// A HANDLE is a raw pointer, and raw pointers are not `Send` — wrap one so
-/// the reaper thread can own it after we detach it from [`WinChild`].
+/// [`WinChild`] can cross threads (the background-job drain task owns the
+/// child on another runtime worker thread).
+///
+/// Safe: each handle is used through its owning `WinChild` only; the process
+/// handle is detached (nulled here, owned by the reaper) before it moves.
 struct SendableHandle(*mut std::ffi::c_void);
 
-// Safe: the HANDLE is detached (the struct's own copy is nulled) before it
-// moves into the blocking reaper, which is the only owner that uses/closes it.
 unsafe impl Send for SendableHandle {}
 
 pub struct WinChild {
-    process: windows_sys::Win32::Foundation::HANDLE,
-    job: windows_sys::Win32::Foundation::HANDLE,
+    process: SendableHandle,
+    job: SendableHandle,
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
     /// One-shot exit channel fed by a blocking reaper (see [`Self::wait`]).
@@ -344,7 +346,7 @@ impl WinChild {
     /// Kill the whole tree (shell + grandchildren) via the job object.
     pub fn start_kill(&mut self) {
         unsafe {
-            let _ = TerminateJobObject(self.job, 1);
+            let _ = TerminateJobObject(self.job.0, 1);
         }
     }
 
@@ -360,8 +362,8 @@ impl WinChild {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             // A HANDLE is a raw pointer (not `Send`) — detach it and hand it
             // to the blocking reaper through a `Send` wrapper.
-            let process = SendableHandle(self.process);
-            self.process = std::ptr::null_mut();
+            let process = self.process;
+            self.process = SendableHandle(std::ptr::null_mut());
             tokio::task::spawn_blocking(move || {
                 let handle = process.0;
                 let code = unsafe {
@@ -399,10 +401,10 @@ impl Drop for WinChild {
             // Kill any survivors (no-op if already exited), then release the
             // job — `KILL_ON_JOB_CLOSE` is the last line of containment if
             // the exec future is abandoned without a wait/kill.
-            let _ = TerminateJobObject(self.job, 1);
-            let _ = CloseHandle(self.job);
-            if !self.process.is_null() {
-                let _ = CloseHandle(self.process);
+            let _ = TerminateJobObject(self.job.0, 1);
+            let _ = CloseHandle(self.job.0);
+            if !self.process.0.is_null() {
+                let _ = CloseHandle(self.process.0);
             }
         }
         // `acls` drop here → revoke the low-integrity write grants.
