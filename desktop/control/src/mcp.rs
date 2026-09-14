@@ -657,6 +657,15 @@ pub async fn mcp_call(
             Json(json!({ "error": format!("'{name}' is not an mcp__<server>__<tool> name") })),
         )
     })?;
+    // A name for a server that isn't configured is a 404, not a connection
+    // error — the model can react to "no such server" without burning a
+    // reconnect attempt.
+    if !state.config.read().await.mcp_servers.iter().any(|s| s.name == server) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown MCP server '{server}'") })),
+        ));
+    }
     let scope = perm_scope(&req);
     let token = req.get("approvalToken").and_then(|v| v.as_str());
     enforce_perm(&state, &scope, name, None, token).await?;
