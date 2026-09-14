@@ -441,7 +441,7 @@ async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: crate::sandbox::Exe
             let _ = child.start_kill();
         }
         match timeout(Duration::from_secs(1), child.wait()).await {
-            Ok(Ok(code)) => break (if code >= 0 { Some(code) } else { None }),
+            Ok(Ok(code)) => break if code >= 0 { Some(code) } else { None },
             Ok(Err(_)) => break None,
             Err(_) => continue,
         }
