@@ -241,12 +241,15 @@ export function dedupeTools<T extends { function: { name: string } }>(tools: T[]
 /** Client-side permission gate for Computer Use tools — mirrors Coder's own
  *  `checkPerm` (CoderScreen.tsx) minus plan-mode, which Chat has no concept
  *  of. Returns a denial reason, `'ask'` to pause for approval, or `null` to
- *  proceed. The control plane re-checks `deny`/`denyPaths` itself (see
+ *  proceed. Tiers resolve through `mcpToolTier`, so namespaced MCP tools
+ *  (`mcp__<server>__<tool>`) fall back to the server-level row. The control
+ *  plane re-checks `deny`/`denyPaths` itself (see
  *  `coder::common::enforce_perm`, scoped to the same directory) so a tool
  *  routing around this client-side check (e.g. `bash` curling an endpoint
  *  directly) still can't bypass a `deny` tier. */
 export function checkComputerUsePerm(perms: PermConfig, name: string, args: Record<string, unknown>): string | 'ask' | null {
-  if ((perms.tools[name] ?? 'allow') === 'deny') {
+  const tier = mcpToolTier(perms, name);
+  if (tier === 'deny') {
     return `Denied by Computer Use permissions (${name} is set to deny).`;
   }
   const target = typeof args.path === 'string' ? args.path : '';
@@ -257,7 +260,7 @@ export function checkComputerUsePerm(perms: PermConfig, name: string, args: Reco
     });
     if (hit) return `Denied by Computer Use permissions (path is under denied prefix "${hit.trim()}").`;
   }
-  if ((perms.tools[name] ?? 'allow') === 'ask') return 'ask';
+  if (tier === 'ask') return 'ask';
   return null;
 }
 
