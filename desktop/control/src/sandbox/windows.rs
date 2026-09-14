@@ -378,11 +378,6 @@ impl WinChild {
         }
         if self.exit_rx.is_none() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            // The reaper gets the handle VALUE (an `i32` — `Send`); the
-            // `OwnedHandle` field keeps the handle valid (and closes it) for
-            // as long as this struct lives. If this struct is dropped first,
-            // the reaper's wait simply unblocks and its exit-code query is a
-            // harmless no-op.
             // The reaper gets the handle VALUE (an `isize` — `Send`); the
             // `OwnedHandle` field keeps the handle valid (and closes it) for
             // as long as this struct lives. If this struct is dropped first,
