@@ -109,6 +109,14 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     {
         merged.chat_reflection_critique_max_tokens = v as u32;
     }
+    if let Some(v) = body.get("currencySymbol").and_then(|v| v.as_str()) {
+        merged.currency_symbol = v.into();
+    }
+    if let Some(v) = body.get("costPerKwh").and_then(|v| v.as_f64())
+        && v >= 0.0
+    {
+        merged.cost_per_kwh = v;
+    }
     persist_config(&state, &merged).await?;
     Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
 }

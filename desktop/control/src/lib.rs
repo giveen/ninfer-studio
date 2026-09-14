@@ -13,6 +13,7 @@ pub mod engine;
 pub mod gpu;
 pub mod memstore;
 pub mod models;
+pub mod power;
 pub mod proxy;
 pub mod remote;
 pub mod repo;
@@ -20,6 +21,7 @@ pub mod routes_config;
 pub mod routes_data;
 pub mod routes_engine;
 pub mod types;
+pub mod usage;
 use crate::engine::{engine_health, refresh_engine_status, S};
 use crate::types::{strip_extended_prefix, AppEvent, AppSettings, LastStart, State};
 use tokio::sync::mpsc::UnboundedSender;
@@ -107,7 +109,13 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
     let dist = state.dist_dir.clone();
     let index = dist.join("index.html");
     let spa = tower_http::services::ServeFile::new(index.clone());
+    // Tag every request on this router with its listener, read back by
+    // `proxy::proxy` for usage logging (see `usage.rs`) — the loopback
+    // listener passes `restrict_to_local: true`, Remote Access `false`.
+    let request_source =
+        if restrict_to_local { crate::usage::RequestSource::Local } else { crate::usage::RequestSource::Remote };
     let router = Router::new()
+        .route("/api/usage", get(usage::usage_stats))
         .route("/api/health", get(routes_engine::health))
         .route("/api/status", get(routes_engine::status))
         .route("/api/config", get(routes_config::get_config).post(routes_config::set_config))
@@ -157,6 +165,7 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/remote/stop", post(remote::post_stop))
         .route("/health", get(proxy::proxy))
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))
+        .layer(axum::extract::Extension(request_source))
         .with_state(state)
         .fallback_service(
             tower_http::services::ServeDir::new(dist).not_found_service(spa),
@@ -352,6 +361,10 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     {
         *state.last_start.write().await = Some(ls);
     }
+    // Background GPU energy sampler (see `power.rs`) — started once here so
+    // both boot paths (the Tauri app and the standalone dev binary, which
+    // both call `init_state`) get it without duplicating the wiring.
+    tokio::spawn(power::run_power_sampler(state.clone()));
     state
 }
 #[cfg(test)]

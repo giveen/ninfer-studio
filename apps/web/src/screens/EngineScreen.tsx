@@ -14,14 +14,16 @@ import { BasicsTab } from './engine/BasicsTab';
 import { PerformanceTab } from './engine/PerformanceTab';
 import { AdvancedTab } from './engine/AdvancedTab';
 import { ProfilesTab } from './engine/ProfilesTab';
+import { UsageTrackerTab } from './engine/UsageTrackerTab';
 
-type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles';
+type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage';
 
 const TABS: Array<{ id: EngineTab; label: string }> = [
   { id: 'basics', label: 'Basics' },
   { id: 'performance', label: 'Performance' },
   { id: 'advanced', label: 'Advanced' },
   { id: 'profiles', label: 'Profiles' },
+  { id: 'usage', label: 'Usage' },
 ];
 
 // P0-2: the in-UI launch-arg builder (buildArgs) and the restart-dirty logic
@@ -459,29 +461,31 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
           </div>
         )}
 
-        {/* generated command */}
-        <SectionCard
-          title="Generated launch command"
-          description="The exact argv Studio sends to ninfer-serve; omitted flags use engine defaults."
-          icon={<Terminal size={15} />}
-          anchor="command"
-          collapsible
-          actions={
-            <div className="flex items-center gap-2">
-              {running && engine?.argv && <Badge tone="ok">running</Badge>}
-              {appliedPreset && (
-                <span title={presetMatches ? `Preset "${appliedPreset.name}" is active` : `Profile changed since "${appliedPreset.name}" was applied`}>
-                  <Badge tone={presetMatches ? 'info' : 'warn'}>
-                    {appliedPreset.name}
-                    {!presetMatches && ' (modified)'}
-                  </Badge>
-                </span>
-              )}
-            </div>
-          }
-        >
-          <CodeBlock code={generatedCommand.command} />
-        </SectionCard>
+        {/* generated command — not relevant to the Usage tab */}
+        {tab !== 'usage' && (
+          <SectionCard
+            title="Generated launch command"
+            description="The exact argv Studio sends to ninfer-serve; omitted flags use engine defaults."
+            icon={<Terminal size={15} />}
+            anchor="command"
+            collapsible
+            actions={
+              <div className="flex items-center gap-2">
+                {running && engine?.argv && <Badge tone="ok">running</Badge>}
+                {appliedPreset && (
+                  <span title={presetMatches ? `Preset "${appliedPreset.name}" is active` : `Profile changed since "${appliedPreset.name}" was applied`}>
+                    <Badge tone={presetMatches ? 'info' : 'warn'}>
+                      {appliedPreset.name}
+                      {!presetMatches && ' (modified)'}
+                    </Badge>
+                  </span>
+                )}
+              </div>
+            }
+          >
+            <CodeBlock code={generatedCommand.command} />
+          </SectionCard>
+        )}
 
         <div className={cn(tab !== 'basics' && 'hidden')}>
           <BasicsTab
@@ -522,6 +526,9 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
             saved={saved}
             setSaved={setSaved}
           />
+        </div>
+        <div className={cn(tab !== 'usage' && 'hidden')}>
+          <UsageTrackerTab />
         </div>
       </div>
     </div>
