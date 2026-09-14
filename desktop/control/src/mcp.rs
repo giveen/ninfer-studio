@@ -775,7 +775,7 @@ pub async fn mcp_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coder::common::perms_approve;
+    use crate::coder::perms_approve;
 
     fn tmp_state() -> (S, std::path::PathBuf) {
         let tmp = std::env::temp_dir().join(format!("ninfier-mcp-test-{}", std::process::id()));
