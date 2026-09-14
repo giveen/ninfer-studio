@@ -161,6 +161,14 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/browser", post(coder::browser))
         .route("/api/coder/web/search", post(coder::web_search))
+        // MCP — external tool servers (stdio / streamable-HTTP); their tools
+        // reach the agent loop as `mcp__<server>__<tool>` through the same
+        // allow/ask/deny tiers as the built-in tools (see `mcp.rs`).
+        .route("/api/mcp/servers", get(mcp::servers_get).post(mcp::servers_upsert))
+        .route("/api/mcp/servers/{name}", post(mcp::server_delete))
+        .route("/api/mcp/servers/{name}/restart", post(mcp::server_restart))
+        .route("/api/mcp/tools", get(mcp::tools_get))
+        .route("/api/mcp/call", post(mcp::mcp_call))
         .route("/api/remote", get(remote::get_status))
         .route("/api/remote/start", post(remote::post_start))
         .route("/api/remote/stop", post(remote::post_stop))
