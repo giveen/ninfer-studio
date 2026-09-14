@@ -1,13 +1,13 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus, Terminal, FolderOpen } from 'lucide-react';
 import { Button, TextField, NumberField, cn, SectionCard } from '../../components/ui';
 import { MemoryModal } from '../../components/MemoryModal';
 import { DirBrowser } from '../../components/DirBrowser';
 import { useChatAgent } from '../../lib/chatAgent';
-import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
+import { chatMemorySetBank, chatMemoryDropLearning, mcpToolsGet, type McpToolInfo } from '../../lib/api';
 import { engineMaxConcurrency } from '../../lib/engineInfo';
 import { COMPUTER_USE_TOOLS } from '../../lib/chatHelpers';
-import type { PermTier } from '../../lib/coderTools';
+import { mcpToolTier, type PermTier } from '../../lib/coderTools';
 import type { StatusPayload } from '../../lib/types';
 
 function ToggleRow({ on, onToggle, onTitle, offTitle }: {
@@ -67,6 +67,22 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const setComputerUseToolPerm = (tool: string, tier: PermTier) =>
     setComputerUsePerms({ ...computerUsePerms, tools: { ...computerUsePerms.tools, [tool]: tier } });
+
+  // MCP tools offered to Chat's agent (same scope/directory as the loop in
+  // ChatScreen). The catalog can take a while on a cold start — it connects
+  // the servers on demand — so fire-and-forget and render when it lands.
+  const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
+  useEffect(() => {
+    if (!computerUseEnabled) {
+      setMcpTools([]);
+      return;
+    }
+    let live = true;
+    mcpToolsGet(computerUseDir)
+      .then((r) => { if (live) setMcpTools(r.tools); })
+      .catch(() => { if (live) setMcpTools([]); });
+    return () => { live = false; };
+  }, [computerUseEnabled, computerUseDir]);
 
   return (
     <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
@@ -148,6 +164,38 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
                 );
               })}
             </div>
+            {mcpTools.length > 0 && (
+              <div className="space-y-1.5 border-t border-line pt-2">
+                <p className="text-[11.5px] text-faint">
+                  MCP tools — external servers configured in Settings → Safety &amp; Permissions. A row for the whole server
+                  (<code className="font-mono">mcp__&lt;server&gt;</code>) applies to every one of its tools; a per-tool row overrides it.
+                </p>
+                {mcpTools.map((t) => {
+                  const tier = mcpToolTier(computerUsePerms, t.name);
+                  return (
+                    <div key={t.name} className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
+                      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={t.description}>{t.name}</span>
+                      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          onClick={() => setComputerUseToolPerm(t.name, v)}
+                          title={`${v} ${t.name}`}
+                          className={cn(
+                            'rounded px-2 py-0.5 text-[11px] font-medium',
+                            tier === v
+                              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                              : 'text-faint hover:bg-panel2 hover:text-mute',
+                          )}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <input
               defaultValue={computerUsePerms.denyPaths.join(' ')}
               placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
