@@ -758,7 +758,7 @@ async fn send_cmd(
             Json(json!({ "error": "MCP actor failed to start" })),
         ));
     };
-    let (reply_tx, reply_rx) = unbounded_channel();
+    let (reply_tx, mut reply_rx) = unbounded_channel();
     if tx.send((cmd, reply_tx)).is_err() {
         // The actor's receiver is gone — drop the dead channel so the next
         // request gets a fresh actor instead of failing forever.
@@ -855,7 +855,7 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
                 ConnMeta {
                     peer: None,
                     pid: None,
-                    error: Some(e),
+                    error: Some(e.clone()),
                     error_at: Some(Instant::now()),
                     tools: Vec::new(),
                     tools_at: None,
@@ -1160,6 +1160,11 @@ pub async fn tools_get(
                     mark_dead(&state, &spec.name, s.to_string()).await;
                     continue;
                 }
+                Ok(_) => {
+                    mark_dead(&state, &spec.name, "unexpected MCP actor reply".to_string())
+                        .await;
+                    continue;
+                }
             }
         }
         let m = state.mcp.read().await;
@@ -1243,6 +1248,12 @@ async fn call_tool(
             Err(e) => {
                 mark_dead(state, &server, "tool call failed".to_string()).await;
                 return Err(e);
+            }
+            Ok(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "unexpected MCP actor reply" })),
+                ));
             }
         }
     }
