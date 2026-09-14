@@ -151,9 +151,15 @@ fn arg_quote(s: &str) -> String {
 /// The full `CreateProcessW` command line for one script run.
 fn command_line(shell: &Shell, script: &str) -> String {
     match shell {
-        // Bash parses the command line itself, so POSIX single-quoting works
-        // exactly as it would typed in a terminal.
-        Shell::Bash => format!("{} -lc {}", arg_quote("bash"), shell_quote(script)),
+        // The script is POSIX single-quoted (`shell_quote`), then MSVCRT-quoted
+        // so CreateProcessW's argv parsing hands bash ONE argument (a
+        // single-quoted script containing spaces would otherwise be split —
+        // `'` is not a quote character for the CRT parser).
+        Shell::Bash => format!(
+            "{} -lc {}",
+            arg_quote("bash"),
+            arg_quote(&shell_quote(script))
+        ),
         // `cmd /d /s /c` runs everything between the outer quotes verbatim.
         Shell::Cmd => format!("{} /d /s /c \"{}\"", arg_quote("cmd"), script),
     }
