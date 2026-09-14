@@ -21,8 +21,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
-use tokio::sync::{broadcast, oneshot};
-use tokio::task::AbortHandle;
+use tokio::sync::{broadcast, oneshot, watch};
 
 /// Soft ceiling on concurrent non-terminal runs. The engine already caps
 /// real generation via maxConcurrency; this just stops a runaway fan-out
@@ -64,8 +63,7 @@ pub enum AgentEvent {
     Status { status: RunStatus },
     /// Terminal: the loop finished (done/steps), errored, or was stopped.
     Done { stop: Option<String>, status: RunStatus },
-    /// Non-terminal loop error message (the run continues or has errored —
-    /// see `Done.status`).
+    /// Loop error message (the run has moved to `error` status).
     Error { message: String },
 }
 
@@ -118,20 +116,50 @@ pub struct RunUsage {
     pub total_tokens: u64,
 }
 
-/// Mutable, loop-owned part of a run. The loop is the single writer;
-/// snapshot endpoints read under the same std::sync::Mutex (never held
-/// across an await).
-#[derive(Debug)]
-pub struct RunLive {
+/// Snapshot of a run — what a client gets from `GET /runs/{id}` and as the
+/// first SSE frame.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSnapshot {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub model: String,
+    pub system: Option<String>,
+    pub max_steps: usize,
+    pub created_at: u64,
+    pub tool_set: String,
+    pub tool_names: Vec<String>,
+    pub parent: Option<String>,
     pub status: RunStatus,
-    /// Transcript in wire format (see engine_loop::build_request_messages):
-    /// `{role, content, ...}` objects, append-only.
+    /// Transcript in wire format (see engine_loop::build_request_messages).
     pub messages: Vec<Value>,
     pub turns: usize,
     pub updated_at: u64,
     pub finish_reason: Option<String>,
     pub error: Option<String>,
     /// Terminal stop reason: "done" | "steps" | "aborted" | None (error).
+    pub stop: Option<String>,
+    pub scope: Option<String>,
+    pub todo: Option<Value>,
+    pub usage: RunUsage,
+    pub last_meta: Option<Value>,
+    pub pending_approvals: Vec<PendingApproval>,
+    pub user_question: Option<PendingQuestion>,
+}
+
+/// Mutable, loop-owned part of a run. The loop is the single writer;
+/// snapshot endpoints read under the same std::sync::Mutex (never held
+/// across an await).
+#[derive(Debug)]
+pub struct RunLive {
+    pub status: RunStatus,
+    /// Transcript in wire format, append-only.
+    pub messages: Vec<Value>,
+    pub turns: usize,
+    pub updated_at: u64,
+    pub finish_reason: Option<String>,
+    pub error: Option<String>,
     pub stop: Option<String>,
     pub pending_approvals: Vec<PendingApproval>,
     pub user_question: Option<PendingQuestion>,
@@ -166,7 +194,7 @@ pub struct RunMeta {
     pub parent: Option<String>,
 }
 
-/// Shared handle to one run. `Arc`ed into the loop task and into every
+/// Shared handle to one run. `Arc`ed into the loop task and every
 /// in-flight HTTP handler; all interior mutability is explicit.
 pub struct RunShared {
     pub meta: RunMeta,
@@ -176,11 +204,15 @@ pub struct RunShared {
     pub approvals: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
     /// Resolver for a waiting `ask_user` dispatch.
     pub question_tx: Mutex<Option<oneshot::Sender<String>>>,
-    /// obs_recall store: content hash id → full tool-result text.
+    /// obs_recall store: content-hash id → full tool-result text.
     pub recall: Mutex<HashMap<String, String>>,
     /// Packed-content cache: original raw content → placeholder JSON string.
     pub packed_cache: Mutex<HashMap<String, String>>,
-    pub abort: AbortHandle,
+    /// Stop flag (watch): the loop `select!`s on it around every engine and
+    /// tool await, so a stop cancels in-flight reads, not just the next
+    /// loop iteration.
+    pub stop_tx: watch::Sender<bool>,
+    pub stop_rx: watch::Receiver<bool>,
     pub client: reqwest::Client,
 }
 
@@ -239,22 +271,28 @@ impl RunShared {
         }
     }
 
+    pub fn status(&self) -> RunStatus {
+        lock(&self.live).status
+    }
+
     pub fn set_status(&self, status: RunStatus) {
         let mut live = lock(&self.live);
         if live.status != status {
             live.status = status;
             live.updated_at = now_ms();
+            drop(live);
             let _ = self.tx.send(AgentEvent::Status { status });
         }
     }
 
-    /// Append to the transcript + bump turns/updated_at; emit `appended`.
+    /// Append to the transcript; emit `appended`.
     pub fn append(&self, message: Value) {
-        let mut live = lock(&self.live);
-        let turns = live.turns;
-        live.messages.push(message.clone());
-        live.updated_at = now_ms();
-        drop(live);
+        let turns = {
+            let mut live = lock(&self.live);
+            live.messages.push(message.clone());
+            live.updated_at = now_ms();
+            live.turns
+        };
         let _ = self.tx.send(AgentEvent::Appended { message, turns });
     }
 
@@ -268,14 +306,35 @@ impl RunShared {
             live.pending_approvals.clear();
             live.user_question = None;
         }
-        let _ = self
-            .tx
-            .send(AgentEvent::Error { message: error.unwrap_or_default() })
-            .filter(|_| error.is_some());
-        let _ = self
-            .tx
-            .send(AgentEvent::Done { stop, status })
-            .filter(|_| true);
+        if let Some(message) = &error {
+            let _ = self.tx.send(AgentEvent::Error { message: message.clone() });
+        }
+        let _ = self.tx.send(AgentEvent::Done { stop, status });
+    }
+
+    /// Future that resolves when a stop is requested. `select!`ing on it
+    /// alongside an engine/tool await cancels the other side (dropping the
+    /// in-flight read) when the stop wins.
+    pub async fn wait_stop(&self) {
+        let mut rx = self.stop_rx.clone();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Stop + terminal-mark in one place (the `stop` endpoint).
+    pub fn stop_run(&self) {
+        let was_terminal = {
+            let live = lock(&self.live);
+            live.status.is_terminal()
+        };
+        if was_terminal {
+            return;
+        }
+        let _ = self.stop_tx.send(true);
+        self.mark_terminal(RunStatus::Stopped, Some("aborted".into()), None);
     }
 }
 
@@ -297,8 +356,8 @@ struct StartBody {
     /// Engine tool spec array (OpenAI shape), sent verbatim to the engine.
     #[serde(default)]
     tools: Value,
-    /// Names the server may dispatch in-process. Defaults to the `function.name`
-    /// of every offered tool spec.
+    /// Names the server may dispatch in-process. Defaults to the
+    /// `function.name` of every offered tool spec.
     tool_names: Option<Vec<String>>,
     #[serde(default = "default_tool_set")]
     tool_set: String,
@@ -306,7 +365,7 @@ struct StartBody {
     max_steps: usize,
     #[serde(default)]
     params: Value,
-    /// Workspace / CU directory scope for permission + tool resolution.
+    /// Workspace / CU directory scope for permissions + tool resolution.
     scope: Option<String>,
     parent: Option<String>,
 }
@@ -323,28 +382,20 @@ fn default_max_steps() -> usize {
 
 /// `POST /api/agent/runs` — start a run. Returns `{id, status}`; follow the
 /// run via `GET /api/agent/runs/{id}/events` (SSE) or poll the snapshot.
-pub async fn start(
-    AxumState(state): AxumState<S>,
-    Json(body): Json<StartBody>,
-) -> impl IntoResponse {
+pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) -> Response {
     if body.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "messages must not be empty"})),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "messages must not be empty"}))).into_response();
     }
     if body.max_steps == 0 || body.max_steps > 500 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "maxSteps must be 1..=500"})),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "maxSteps must be 1..=500"}))).into_response();
     }
     // Fail fast when no engine can serve the model — a run that can't stream
     // its first turn is a client error, not a zombie.
-    let body_val = json!({ "model": body.model, "stream": true });
-    let raw = serde_json::to_vec(&body_val).unwrap_or_default();
+    let probe = match &body.model {
+        Some(m) if !m.is_empty() => json!({ "model": m, "stream": true }),
+        _ => json!({ "stream": true }),
+    };
+    let raw = serde_json::to_vec(&probe).unwrap_or_default();
     if crate::proxy::route_port(&state, &raw).await.is_err() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -352,30 +403,11 @@ pub async fn start(
         )
             .into_response();
     }
-    let tool_names = match body.tool_names {
-        Some(names) if !names.is_empty() => names,
-        _ => {
-            let mut names = Vec::new();
-            if let Some(arr) = body.tools.as_array() {
-                for t in arr {
-                    if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
-                        names.push(n.to_string());
-                    }
-                }
-            }
-            names
-        }
-    };
-
-    let registry: RunRegistry = {
-        // State exposes the registry via its field (see types::state::State).
-        state.agent_runs.clone()
-    };
     {
-        let runs = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
         let active = runs
             .values()
-            .filter(|r| !RunShared::status_of(r).is_terminal())
+            .filter(|r| !r.status().is_terminal())
             .count();
         if active >= MAX_CONCURRENT_RUNS {
             return (
@@ -386,12 +418,32 @@ pub async fn start(
         }
     }
 
-    let model = body.model.unwrap_or_else(|| {
-        // Primary engine's model (status shape); fallback "" → engine default.
-        crate::routes_engine::primary_model(&state)
+    let tool_names = match body.tool_names {
+        Some(names) if !names.is_empty() => names,
+        _ => {
+            let mut names = Vec::new();
+            if let Some(arr) = body.tools.as_array() {
+                for t in arr {
+                    if let Some(n) = t
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                    {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+            names
+        }
+    };
+
+    let model = body.model.filter(|m| !m.is_empty()).unwrap_or_else(|| {
+        // Primary engine's model; "" → the engine's own default model.
+        state.engine.read().await.model_id.clone().unwrap_or_default()
     });
 
     let (tx, _rx) = broadcast::channel(512);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let id = format!(
         "run_{:x}_{}",
         now_ms(),
@@ -426,41 +478,33 @@ pub async fn start(
         params: body.params,
         parent: body.parent,
     };
-    let (task, abort) = tokio::task::spawn_abort(engine_loop::run(state.clone(), Arc::new(()), tx.clone(), meta.clone(), live));
-    let (_handle, abort) = task;
     let shared = Arc::new(RunShared {
         meta,
-        live: Mutex::new(RunLive { status: RunStatus::Running, messages: Vec::new(), turns: 0, updated_at: now_ms(), finish_reason: None, error: None, stop: None, pending_approvals: Vec::new(), user_question: None, todo: None, scope: body.scope.clone(), usage: RunUsage::default(), last_meta: None }),
+        live: Mutex::new(live),
         tx,
         approvals: Mutex::new(HashMap::new()),
         question_tx: Mutex::new(None),
         recall: Mutex::new(HashMap::new()),
         packed_cache: Mutex::new(HashMap::new()),
-        abort,
+        stop_tx,
+        stop_rx,
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3600))
             .build()
             .unwrap_or_default(),
     });
-    registry
+    state
+        .agent_runs
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(id.clone(), shared.clone());
 
-    Json(json!({ "id": id, "status": "running" }))
-        .into_response()
-}
-
-/// `RunShared::status` without cloning the whole run (used by the
-/// concurrency cap).
-impl RunShared {
-    fn status_of(r: &Arc<RunShared>) -> RunStatus {
-        lock(&r.live).status
-    }
+    tokio::spawn(engine_loop::run(state, shared));
+    Json(json!({ "id": id, "status": "running" })).into_response()
 }
 
 /// `GET /api/agent/runs` — list runs (newest first), light summaries.
-pub async fn list(AxumState(state): AxumState<S>) -> impl IntoResponse {
+pub async fn list(AxumState(state): AxumState<S>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let mut out: Vec<Value> = runs.values().map(|r| {
         let snap = r.snapshot();
@@ -489,7 +533,7 @@ pub async fn list(AxumState(state): AxumState<S>) -> impl IntoResponse {
 
 /// `GET /api/agent/runs/{id}` — full snapshot (transcript, pending
 /// approvals, usage).
-pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     match runs.get(&id) {
         Some(r) => Json(Value::Object(serde_json::to_value(r.snapshot()).unwrap())).into_response(),
@@ -497,21 +541,18 @@ pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> impl
     }
 }
 
-/// `POST /api/agent/runs/{id}/stop` — abort the loop task. The run is
-/// marked stopped; in-flight engine reads and tool dispatches are dropped.
-pub async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> impl IntoResponse {
+/// `POST /api/agent/runs/{id}/stop` — abort the loop. The run is marked
+/// stopped; in-flight engine reads and tool dispatches are dropped.
+pub async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
     };
-    {
-        let live = lock(&r.live);
-        if live.status.is_terminal() {
-            return Json(json!({ "status": live.status })).into_response();
-        }
+    let status = r.status();
+    if status.is_terminal() {
+        return Json(json!({ "status": status })).into_response();
     }
-    r.abort.abort();
-    r.mark_terminal(RunStatus::Stopped, Some("aborted".into()), None);
+    r.stop_run();
     Json(json!({ "status": "stopped" })).into_response()
 }
 
@@ -524,7 +565,7 @@ pub async fn approve(
     AxumState(state): AxumState<S>,
     Path((id, aid)): Path<(String, String)>,
     Json(body): Json<ApproveBody>,
-) -> impl IntoResponse {
+) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
@@ -558,13 +599,13 @@ struct ApproveBody {
     token: Option<String>,
 }
 
-/// `POST /api/agent/runs/{id}/questions/{qid}` — answer a pending `ask_user`
-/// pause. Body: `{answer}`.
+/// `POST /api/agent/runs/{id}/questions/{qid}` — answer a pending
+/// `ask_user` pause. Body: `{answer}`.
 pub async fn answer(
     AxumState(state): AxumState<S>,
     Path((id, qid)): Path<(String, String)>,
     Json(body): Json<AnswerBody>,
-) -> impl IntoResponse {
+) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
@@ -588,8 +629,8 @@ struct AnswerBody {
 /// `GET /api/agent/runs/{id}/events` — SSE attach. First frame: a `state`
 /// snapshot (the full snapshot JSON as event data, event name `state`);
 /// subsequent frames: one per [`AgentEvent`], event name = its `type`
-/// value. Lagging subscribers get the next event (SSE clients resync via
-/// the snapshot they already hold + `GET` if they fall behind).
+/// value. A lagging subscriber just drops frames; it can resync with a
+/// `GET /runs/{id}` snapshot (same shape as the first frame).
 pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
@@ -635,20 +676,15 @@ impl futures_util::Stream for SseStream {
         loop {
             if !self.started {
                 self.started = true;
-                let snap = serde_json::to_string(&self.run.snapshot()).unwrap_or_default();
-                return Poll::Ready(Some(Self::frame("state", &snap)));
+                let ev = AgentEvent::State { snapshot: self.run.snapshot() };
+                let data = serde_json::to_string(&ev).unwrap_or_default();
+                return Poll::Ready(Some(Self::frame("state", &data)));
             }
             match self.rx.recv() {
                 Ok(ev) => {
-                    let (name, data) = match &ev {
-                        AgentEvent::State { snapshot } => ("state", &serde_json::to_string(snapshot).unwrap_or_default()),
-                        other => {
-                            let v = serde_json::to_value(other).unwrap_or(Value::Null);
-                            let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
-                            (name, &serde_json::to_string(other).unwrap_or_default())
-                        }
-                    };
-                    return Poll::Ready(Some(Self::frame(&name, &data)));
+                    let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+                    let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
+                    return Poll::Ready(Some(Self::frame(&name, &v.to_string())));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     cx.waker().wake_by_ref();
@@ -671,65 +707,78 @@ pub fn router() -> Router<S> {
         .route("/runs/{id}/questions/{qid}", post(answer))
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn test_run(state: &S, kind: &str, tool_names: &[&str], scope: Option<String>) -> Arc<RunShared> {
+    let (tx, _rx) = broadcast::channel(64);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let meta = RunMeta {
+        id: format!("run_test_{:x}_{}", now_ms(), std::process::id()),
+        kind: kind.into(),
+        label: "test".into(),
+        model: "test-model".into(),
+        system: None,
+        max_steps: 4,
+        created_at: now_ms(),
+        tool_set: "coder".into(),
+        tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
+        tools_spec: Value::Array(vec![]),
+        params: Value::Null,
+        parent: None,
+    };
+    Arc::new(RunShared {
+        meta,
+        live: Mutex::new(RunLive {
+            status: RunStatus::Running,
+            messages: vec![json!({"role": "user", "content": "go"})],
+            turns: 0,
+            updated_at: now_ms(),
+            finish_reason: None,
+            error: None,
+            stop: None,
+            pending_approvals: vec![],
+            user_question: None,
+            todo: None,
+            scope,
+            usage: RunUsage::default(),
+            last_meta: None,
+        }),
+        tx,
+        approvals: Mutex::new(HashMap::new()),
+        question_tx: Mutex::new(None),
+        recall: Mutex::new(HashMap::new()),
+        packed_cache: Mutex::new(HashMap::new()),
+        stop_tx,
+        stop_rx,
+        client: reqwest::Client::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::State;
 
-    fn fresh() -> (S, RunRegistry) {
+    fn fresh() -> S {
         let tmp = std::env::temp_dir().join(format!("ninfier-agent-{}-{}", std::process::id(), now_ms()));
-        let state: S = Arc::new(State::new(tmp.clone(), tmp.clone(), None));
-        let reg: RunRegistry = state.agent_runs.clone();
-        (state, reg)
+        Arc::new(State::new(tmp, tmp, None))
     }
 
     #[tokio::test]
     async fn registry_round_trip_and_snapshot_shape() {
-        let (_state, reg) = fresh();
-        let (tx, _rx) = broadcast::channel(8);
-        let meta = RunMeta {
-            id: "run_test".into(),
-            kind: "chat".into(),
-            label: "t".into(),
-            model: "m".into(),
-            system: None,
-            max_steps: 4,
-            created_at: now_ms(),
-            tool_set: "chat".into(),
-            tool_names: vec!["web_search".into()],
-            tools_spec: Value::Array(vec![]),
-            params: Value::Null,
-            parent: None,
-        };
-        let shared = Arc::new(RunShared {
-            meta,
-            live: Mutex::new(RunLive {
-                status: RunStatus::Running,
-                messages: vec![json!({"role": "user", "content": "hi"})],
-                turns: 0,
-                updated_at: now_ms(),
-                finish_reason: None,
-                error: None,
-                stop: None,
-                pending_approvals: vec![],
-                user_question: None,
-                todo: None,
-                scope: None,
-                usage: RunUsage::default(),
-                last_meta: None,
-            }),
-            tx,
-            approvals: Mutex::new(HashMap::new()),
-            question_tx: Mutex::new(None),
-            recall: Mutex::new(HashMap::new()),
-            packed_cache: Mutex::new(HashMap::new()),
-            abort: tokio::task::current().abort_handle(),
-            client: reqwest::Client::new(),
-        });
-        reg.lock().unwrap().insert("run_test".into(), shared.clone());
+        let state = fresh();
+        let shared = test_run(&state, "chat", &["web_search"], None);
+        state
+            .agent_runs
+            .lock()
+            .unwrap()
+            .insert(shared.meta.id.clone(), shared.clone());
 
         let snap = shared.snapshot();
-        assert_eq!(snap.id, "run_test");
+        assert_eq!(snap.id, shared.meta.id);
         assert_eq!(snap.status, RunStatus::Running);
         assert_eq!(snap.messages.len(), 1);
 
@@ -737,65 +786,30 @@ mod tests {
         assert_eq!(shared.snapshot().messages.len(), 2);
 
         shared.mark_terminal(RunStatus::Done, Some("done".into()), None);
-        assert!(RunShared::status_of(&shared).is_terminal());
-        let _ = std::fs::remove_dir_all(_state.data_dir.clone());
+        assert!(shared.status().is_terminal());
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
 
     #[tokio::test]
-    async fn tool_dispatch_read_round_trip() {
-        let (state, _reg) = fresh();
+    async fn tool_dispatch_round_trip() {
+        let state = fresh();
         let dir = state.data_dir.clone();
         std::fs::create_dir_all(dir.join("ws")).unwrap();
-        let scope = dir.join("ws");
-        // In-process dispatch of `write` then `read` (allow tier → no token).
-        let shared = test_run(&state, &["write", "read"]);
+        let shared = test_run(&state, "coder", &["write", "read"], Some(dir.join("ws").to_string_lossy().into()));
         let w = tools::dispatch(&state, &shared, "write", &json!({"path": "a.txt", "content": "hello"})).await;
-        assert!(w.get("ok").and_then(|v| v.as_bool()) == Some(true), "write: {w}");
+        assert_eq!(w.get("ok").and_then(|v| v.as_bool()), Some(true), "write: {w}");
         let r = tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
         assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("hello"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn test_run(state: &S, tool_names: &[&str]) -> Arc<RunShared> {
-        let (tx, _rx) = broadcast::channel(8);
-        let meta = RunMeta {
-            id: format!("run_test_{}", now_ms()),
-            kind: "coder".into(),
-            label: "test".into(),
-            model: "m".into(),
-            system: None,
-            max_steps: 2,
-            created_at: now_ms(),
-            tool_set: "coder".into(),
-            tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
-            tools_spec: Value::Array(vec![]),
-            params: Value::Null,
-            parent: None,
-        };
-        Arc::new(RunShared {
-            meta,
-            live: Mutex::new(RunLive {
-                status: RunStatus::Running,
-                messages: vec![json!({"role": "user", "content": "go"})],
-                turns: 0,
-                updated_at: now_ms(),
-                finish_reason: None,
-                error: None,
-                stop: None,
-                pending_approvals: vec![],
-                user_question: None,
-                todo: None,
-                scope: None,
-                usage: RunUsage::default(),
-                last_meta: None,
-            }),
-            tx,
-            approvals: Mutex::new(HashMap::new()),
-            question_tx: Mutex::new(None),
-            recall: Mutex::new(HashMap::new()),
-            packed_cache: Mutex::new(HashMap::new()),
-            abort: tokio::task::current().abort_handle(),
-            client: reqwest::Client::new(),
-        })
+    #[tokio::test]
+    async fn unknown_tool_returns_model_error() {
+        let state = fresh();
+        let shared = test_run(&state, "coder", &["read"], None);
+        let r = tools::dispatch(&state, &shared, "nope", &json!({})).await;
+        let err = r.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(err.contains("unknown tool"), "{r}");
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
 }
