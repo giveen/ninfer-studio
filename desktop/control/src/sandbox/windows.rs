@@ -151,18 +151,19 @@ fn arg_quote(s: &str) -> String {
 }
 
 /// The full `CreateProcessW` command line for one script run.
+///
+/// `bash -lc <script>`: the script IS bash's command string — bash parses it
+/// as shell code, exactly like the Linux runner's `bash -lc <argv>` shape.
+/// `arg_quote` (MSVCRT double-quoting) is what makes CreateProcessW's argv
+/// parsing hand it to bash as ONE argument, and the round-trip is lossless
+/// for any script bytes (quotes, backslashes, spaces) under the UCRT parser
+/// rules — so no POSIX quoting is applied here (single-quoting the script
+/// would make bash treat it as one program name, not a command line).
 fn command_line(shell: &Shell, script: &str) -> String {
     match shell {
-        // The script is POSIX single-quoted (`shell_quote`), then MSVCRT-quoted
-        // so CreateProcessW's argv parsing hands bash ONE argument (a
-        // single-quoted script containing spaces would otherwise be split —
-        // `'` is not a quote character for the CRT parser).
-        Shell::Bash => format!(
-            "{} -lc {}",
-            arg_quote("bash"),
-            arg_quote(&shell_quote(script))
-        ),
-        // `cmd /d /s /c` runs everything between the outer quotes verbatim.
+        Shell::Bash => format!("{} -lc {}", arg_quote("bash"), arg_quote(script)),
+        // `cmd /d /s /c` runs everything between the outer quotes verbatim
+        // (degraded fallback only: POSIX-specific scripts need git-bash).
         Shell::Cmd => format!("{} /d /s /c \"{}\"", arg_quote("cmd"), script),
     }
 }
