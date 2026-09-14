@@ -33,7 +33,7 @@ pub use common::{perms_approve, perms_get, perms_set, ApprovalTicket, CoderPerms
 /// same allow/ask/deny gate as the built-in coder tools).
 pub(crate) use common::{enforce_perm, is_safe_base_dir, perm_scope, tier_for};
 pub use exec::{
-    bwrap_available, commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
+    commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
     safe_mode_set, sandbox_get, sandbox_set, BgJob,
 };
 /// Crate-internal only — reused by `chat`'s Agent Mode toggles so they don't
