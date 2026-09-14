@@ -37,3 +37,18 @@ dirs = "7"
 # false` skips the server/macro half we never use; its reqwest (0.13.x)
 # unifies with the one above, so no duplicate TLS stack.
 rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+
+# Windows-only: the coder sandbox runs the shell at low integrity inside a
+# Job Object (see src/sandbox/windows.rs). Target-scoped so Linux builds
+# never pay for it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Console",
+] }
