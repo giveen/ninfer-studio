@@ -66,22 +66,43 @@ pub enum ExecChild {
     Windows(windows::WinChild),
 }
 
+/// tokio 1.53's `ChildStdout/Stderr` have no `into_std()` — the pipe's
+/// underlying handle is exposed as `OwnedFd` (Unix) / `OwnedHandle`
+/// (Windows), both of which convert into a `File`.
+fn take_unix_stdio(stdio: &mut Option<tokio::process::ChildStdout>) -> Option<std::fs::File> {
+    let pipe = stdio.take()?;
+    #[cfg(unix)]
+    let owned = pipe.into_owned_fd().ok()?;
+    #[cfg(not(unix))]
+    let owned = pipe.into_owned_handle().ok()?;
+    Some(std::fs::File::from(owned))
+}
+
+fn take_unix_stderr(stdio: &mut Option<tokio::process::ChildStderr>) -> Option<std::fs::File> {
+    let pipe = stdio.take()?;
+    #[cfg(unix)]
+    let owned = pipe.into_owned_fd().ok()?;
+    #[cfg(not(unix))]
+    let owned = pipe.into_owned_handle().ok()?;
+    Some(std::fs::File::from(owned))
+}
+
 impl ExecChild {
     /// Take the stdout pipe (as a raw `File`, async-capable on both OSes).
     pub fn take_stdout(&mut self) -> Option<std::fs::File> {
         match self {
-            Self::Unix(c) => c.stdout.take().and_then(|f| f.into_std().ok()),
+            Self::Unix(c) => take_unix_stdio(&mut c.stdout),
             #[cfg(windows)]
-            Self::Windows(w) => w.stdout.take(),
+            Self::Windows(w) => w.take_stdout(),
         }
     }
 
     /// Take the stderr pipe.
     pub fn take_stderr(&mut self) -> Option<std::fs::File> {
         match self {
-            Self::Unix(c) => c.stderr.take().and_then(|f| f.into_std().ok()),
+            Self::Unix(c) => take_unix_stderr(&mut c.stderr),
             #[cfg(windows)]
-            Self::Windows(w) => w.stderr.take(),
+            Self::Windows(w) => w.take_stderr(),
         }
     }
 
