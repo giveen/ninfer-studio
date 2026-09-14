@@ -7,6 +7,7 @@
 
 // Rust guideline compliant 2026-07-28
 
+pub mod agent;
 pub mod chat;
 pub mod coder;
 pub mod engine;
