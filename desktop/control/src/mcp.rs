@@ -19,7 +19,7 @@
 //!     machinery (`coder::common::enforce_perm`) — a tier row for the full
 //!     tool name overrides a row for the server-level key `mcp__<server>`.
 
-use crate::coder::common::{enforce_perm, perm_scope, tier_for, CoderPerms, PermTier};
+use crate::coder::{enforce_perm, perm_scope, tier_for, CoderPerms, PermTier};
 use crate::engine::S;
 use crate::types::McpServerSpec;
 use axum::extract::{Path as AxumPath, Query, State as AxumState};
