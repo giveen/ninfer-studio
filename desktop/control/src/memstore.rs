@@ -63,6 +63,13 @@ pub fn iso_now() -> (String, u64) {
     )
 }
 
+/// `YYYY-MM-DD` (UTC) for a unix-ms timestamp — the calendar-day bucket key
+/// used by usage-log aggregation (active days, heatmap, daily trend).
+pub fn day_string(ms: u64) -> String {
+    let (y, m, d) = civil_from_days(ms / 1000 / 86_400);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 /// Hinnant's `civil_from_days`: days since 1970-01-01 → (year, month, day).
 fn civil_from_days(days: u64) -> (i64, u32, u32) {
     let z = days as i64 + 719_468;

@@ -29,17 +29,20 @@ fn wait_capped(mut child: std::process::Child, deadline: std::time::Instant) -> 
     }
 }
 
-/// A parsed `nvidia-smi --query-gpu` line: name, used/total VRAM (MiB), and
-/// utilization percent. Each numeric field is `None` on a non-numeric cell
-/// (e.g. `[N/A]`) — that alone doesn't fail the parse, see `parse_gpu_csv`.
-type GpuCsvLine = (String, Option<u64>, Option<u64>, Option<u64>);
+/// A parsed `nvidia-smi --query-gpu` line: name, used/total VRAM (MiB),
+/// utilization percent, and power draw (watts). Each numeric field is `None`
+/// on a non-numeric cell (e.g. `[N/A]`) — that alone doesn't fail the parse,
+/// see `parse_gpu_csv`.
+type GpuCsvLine = (String, Option<u64>, Option<u64>, Option<u64>, Option<f64>);
 
 /// Parse the first line of `--query-gpu=name,memory.used,memory.total,
-/// utilization.gpu --format=csv,noheader,nounits` output (one line per
-/// GPU; only the first is used, as before the refactor). Requires all four
-/// cells to be present — a malformed first line means the whole query is
-/// treated as failed, matching the pre-refactor behavior. Numeric fields
-/// are best-effort (non-numeric cell -> None, not a failure).
+/// utilization.gpu,power.draw --format=csv,noheader,nounits` output (one
+/// line per GPU; only the first is used, as before the refactor). Requires
+/// the first four cells to be present — a malformed first line means the
+/// whole query is treated as failed, matching the pre-refactor behavior. The
+/// trailing power.draw cell is optional (older drivers may omit the field
+/// entirely, yielding a short line) and, like the other numeric fields,
+/// best-effort (non-numeric cell -> None, not a failure).
 fn parse_gpu_csv(stdout: &str) -> Option<GpuCsvLine> {
     let line = stdout.lines().next()?;
     let cols = line.split(',').map(|s| s.trim());
@@ -48,11 +51,13 @@ fn parse_gpu_csv(stdout: &str) -> Option<GpuCsvLine> {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => return None,
         };
+    let power_w = cols.clone().nth(4).and_then(|s| s.parse::<f64>().ok());
     Some((
         name.to_string(),
         used.parse::<u64>().ok(),
         total.parse::<u64>().ok(),
         util.parse::<u64>().ok(),
+        power_w,
     ))
 }
 
@@ -85,6 +90,7 @@ pub async fn gpu_stats() -> GpuStats {
             mem_used_mib: None,
             mem_total_mib: None,
             util_pct: None,
+            power_draw_w: None,
             apps: vec![],
         }
     }
@@ -101,7 +107,7 @@ pub async fn gpu_stats() -> GpuStats {
         // process's own stdout and yield an empty `Output`.
         let gpu_child = match std::process::Command::new("nvidia-smi")
             .args([
-                "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                "--query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw",
                 "--format=csv,noheader,nounits",
             ])
             .stdout(Stdio::piped())
@@ -125,7 +131,7 @@ pub async fn gpu_stats() -> GpuStats {
         let Some(gpu_out) = wait_capped(gpu_child, deadline).filter(|o| o.status.success()) else {
             return fallback;
         };
-        let (name, mem_used_mib, mem_total_mib, util_pct) =
+        let (name, mem_used_mib, mem_total_mib, util_pct, power_draw_w) =
             match parse_gpu_csv(&String::from_utf8_lossy(&gpu_out.stdout)) {
                 Some(v) => v,
                 None => return fallback,
@@ -147,6 +153,7 @@ pub async fn gpu_stats() -> GpuStats {
             mem_used_mib,
             mem_total_mib,
             util_pct,
+            power_draw_w,
             apps,
         }
     })
@@ -165,6 +172,7 @@ pub fn gpu_value(g: &GpuStats) -> serde_json::Value {
         "memUsedMiB": g.mem_used_mib,
         "memTotalMiB": g.mem_total_mib,
         "utilPct": g.util_pct,
+        "powerDrawW": g.power_draw_w,
         "apps": g.apps,
     })
 }
@@ -175,19 +183,20 @@ mod tests {
 
     #[test]
     fn parse_gpu_csv_full_line() {
-        let (name, used, total, util) =
-            parse_gpu_csv("NVIDIA GeForce RTX 5090, 3072, 32768, 47\n").unwrap();
+        let (name, used, total, util, power) =
+            parse_gpu_csv("NVIDIA GeForce RTX 5090, 3072, 32768, 47, 320.50\n").unwrap();
         assert_eq!(name, "NVIDIA GeForce RTX 5090");
         assert_eq!(used, Some(3072));
         assert_eq!(total, Some(32768));
         assert_eq!(util, Some(47));
+        assert_eq!(power, Some(320.50));
     }
 
     #[test]
     fn parse_gpu_csv_multi_gpu_first_line_wins() {
-        let (name, used, total, util) = parse_gpu_csv("GPU A, 1, 2, 3\nGPU B, 4, 5, 6\n").unwrap();
+        let (name, used, total, util, power) = parse_gpu_csv("GPU A, 1, 2, 3, 4\nGPU B, 5, 6, 7, 8\n").unwrap();
         assert_eq!(name, "GPU A");
-        assert_eq!((used, total, util), (Some(1), Some(2), Some(3)));
+        assert_eq!((used, total, util, power), (Some(1), Some(2), Some(3), Some(4.0)));
     }
 
     #[test]
@@ -202,12 +211,22 @@ mod tests {
 
     #[test]
     fn parse_gpu_csv_non_numeric_cells_are_none_not_failure() {
-        let (name, used, total, util) =
-            parse_gpu_csv("GPU A, [N/A], 32768, [N/A]\n").unwrap();
+        let (name, used, total, util, power) =
+            parse_gpu_csv("GPU A, [N/A], 32768, [N/A], [N/A]\n").unwrap();
         assert_eq!(name, "GPU A");
         assert_eq!(used, None);
         assert_eq!(total, Some(32768));
         assert_eq!(util, None);
+        assert_eq!(power, None);
+    }
+
+    #[test]
+    fn parse_gpu_csv_missing_power_column_is_none_not_failure() {
+        // Older drivers/GPUs may omit power.draw entirely — the line is one
+        // cell short, not malformed, since the first four cells are intact.
+        let (name, _, _, _, power) = parse_gpu_csv("GPU A, 1, 2, 3\n").unwrap();
+        assert_eq!(name, "GPU A");
+        assert_eq!(power, None);
     }
 
     #[test]
@@ -256,11 +275,13 @@ mod tests {
             mem_used_mib: Some(1),
             mem_total_mib: Some(2),
             util_pct: Some(3),
+            power_draw_w: Some(250.5),
             apps: vec![GpuApp { pid: 9, name: "x".into(), mem_mib: 4 }],
         };
         let v = gpu_value(&g);
         assert_eq!(v["available"], true);
         assert_eq!(v["memUsedMiB"], 1);
+        assert_eq!(v["powerDrawW"], 250.5);
         assert_eq!(v["apps"][0]["memMiB"], 4);
     }
 }

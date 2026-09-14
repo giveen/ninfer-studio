@@ -112,6 +112,14 @@ pub struct AppSettings {
     /// Port the remote listener binds on `0.0.0.0` when enabled. Serializes
     /// as `remoteAccessPort`.
     pub remote_access_port: u16,
+    /// Currency symbol/code prefixed onto estimated cost figures in the
+    /// Usage tab (e.g. "$", "€", "£") — free text, no locale or
+    /// exchange-rate handling. Serializes as `currencySymbol`.
+    pub currency_symbol: String,
+    /// User-entered electricity price per kWh, in `currency_symbol` units.
+    /// `0.0` means "not configured" — the Usage tab hides cost figures
+    /// rather than showing a misleading $0. Serializes as `costPerKwh`.
+    pub cost_per_kwh: f64,
 }
 
 impl Default for AppSettings {
@@ -149,6 +157,8 @@ impl Default for AppSettings {
             chat_reflection_critique_max_tokens: 400,
             remote_access_enabled: false,
             remote_access_port: 1337,
+            currency_symbol: "$".into(),
+            cost_per_kwh: 0.0,
         }
     }
 }
@@ -172,6 +182,8 @@ impl fmt::Debug for AppSettings {
             .field("default_request_params", &self.default_request_params)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("coder_workspace", &self.coder_workspace)
+            .field("currency_symbol", &self.currency_symbol)
+            .field("cost_per_kwh", &self.cost_per_kwh)
             .finish()
     }
 }

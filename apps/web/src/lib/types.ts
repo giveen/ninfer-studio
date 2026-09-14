@@ -92,6 +92,12 @@ export interface AppSettings {
    *  open it from) comes from GET /api/remote, not this — see remote.ts. */
   remoteAccessEnabled?: boolean;
   remoteAccessPort?: number;
+  /** Currency symbol/code prefixed onto estimated cost figures in the Usage
+   *  tab (e.g. "$", "€", "£"). Free text, no locale/exchange-rate handling. */
+  currencySymbol: string;
+  /** Electricity price per kWh, in currencySymbol units. 0 = not configured
+   *  (the Usage tab hides cost figures rather than showing a false $0). */
+  costPerKwh: number;
 }
 
 interface UpdateJob {

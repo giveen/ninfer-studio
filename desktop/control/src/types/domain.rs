@@ -124,6 +124,10 @@ pub struct GpuStats {
     pub mem_used_mib: Option<u64>,
     pub mem_total_mib: Option<u64>,
     pub util_pct: Option<u64>,
+    /// Instantaneous board power draw in watts (`nvidia-smi`'s `power.draw`).
+    /// `None` on GPUs/drivers that don't report it — power/cost tracking
+    /// (see `power.rs`) simply skips the sample rather than guessing.
+    pub power_draw_w: Option<f64>,
     pub apps: Vec<GpuApp>,
 }
 

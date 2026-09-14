@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::time::Duration;
 use crate::engine::{discover_engines, engine_model_info, S};
+use crate::usage::{is_loggable_completion_path, wrap_for_usage_logging, RequestSource};
 use crate::MAX_REQUEST_BODY_BYTES;
 
 
@@ -120,6 +121,9 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    // Set once per listener by `build_router` (loopback vs Remote Access) —
+    // read before the request is consumed below.
+    let source = req.extensions().get::<RequestSource>().copied().unwrap_or(RequestSource::Local);
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
@@ -136,6 +140,18 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let body_bytes = match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
         Some(v) => v.into(),
         None => body_bytes,
+    };
+
+    // Usage logging is best-effort and only cares about completion-shaped
+    // endpoints; the request model (if named) seeds the logged event when the
+    // engine's own response doesn't echo one back.
+    let should_log = is_loggable_completion_path(uri.path());
+    let request_model: Option<String> = if should_log {
+        serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+    } else {
+        None
     };
 
     let port = match route_port(&state, &body_bytes).await {
@@ -189,9 +205,15 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     }
     resp_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
 
-    // stream the body through (SSE-safe: chunks piped as they arrive)
-    let stream = resp.bytes_stream();
-    let body = Body::from_stream(futures_util::StreamExt::boxed(stream));
+    // stream the body through (SSE-safe: chunks piped as they arrive), tapped
+    // for usage logging on completion-shaped endpoints only.
+    let stream = futures_util::StreamExt::boxed(resp.bytes_stream());
+    let stream = if should_log {
+        wrap_for_usage_logging(state.clone(), request_model, source, stream)
+    } else {
+        stream
+    };
+    let body = Body::from_stream(stream);
     let mut builder = Response::builder().status(status);
     for (k, v) in resp_headers.iter() {
         builder = builder.header(k, v);

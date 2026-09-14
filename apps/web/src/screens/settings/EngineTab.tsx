@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { FolderCog, GitBranch, Hammer, Save } from 'lucide-react';
+import { FolderCog, GitBranch, Hammer, Save, Zap } from 'lucide-react';
 import { getConfig, saveConfig, startEngineUpdate } from '../../lib/api';
 import type { AppSettings, StatusPayload } from '../../lib/types';
-import { Badge, Button, Field, LogPane, SectionCard, TextField } from '../../components/ui';
+import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField } from '../../components/ui';
 
 export function EngineTab({ status }: { status: StatusPayload | null }) {
   const [form, setForm] = useState<AppSettings | null>(null);
@@ -54,6 +54,8 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         lintCommand: form.lintCommand ?? '',
         testCommand: form.testCommand ?? '',
         defaultRequestParams: form.defaultRequestParams ?? '',
+        currencySymbol: form.currencySymbol,
+        costPerKwh: Number(form.costPerKwh) || 0,
       });
       setForm(c);
       setApiKeyDraft('');
@@ -225,6 +227,21 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
           </Field>
           <Field label="Default request params" hint={'JSON object merged into every proxied request as defaults (client fields win). e.g. {"chat_template_kwargs":{"preserve_thinking":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.'}>
             <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />
+          </Field>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Power & cost"
+        description="Studio samples GPU power draw while an engine is running and estimates electricity cost from these — see the Usage tab."
+        icon={<Zap size={15} />}
+      >
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field label="Currency" hint="Prefixed onto cost figures as-is — free text, no locale or exchange-rate conversion.">
+            <TextField value={form.currencySymbol} onChange={(v) => set('currencySymbol', v)} placeholder="$" className="w-24" />
+          </Field>
+          <Field label="Cost per kWh" hint="Your electricity price, in the currency above. 0 hides cost figures in the Usage tab.">
+            <NumberField value={form.costPerKwh} onChange={(v) => set('costPerKwh', v)} onEmpty={() => set('costPerKwh', 0)} min={0} step={0.01} placeholder="0.00" />
           </Field>
         </div>
       </SectionCard>
