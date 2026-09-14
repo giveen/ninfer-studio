@@ -829,52 +829,57 @@ mod tests {
     fn msvcrt_parse_arg(encoded: &str) -> String {
         let b: Vec<u8> = encoded.as_bytes().to_vec();
         let mut out = String::new();
-        let mut i = 0usize;
         let mut in_quotes = false;
-        // `bash -lc <encoded>`: argv[2] starts after `-lc `.
-        let start = encoded.find(' ').map(|p| p + 1).unwrap_or(0);
-        i = start;
-        while i < b.len() {
+        let mut i = 0usize;
+        // The parser skips leading whitespace before each argument.
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i >= b.len() {
+            return out;
+        }
+        loop {
+            let mut copy_character = true;
             let mut numslash = 0usize;
-            while i + numslash < b.len() && b[i + numslash] == b'\\' {
+            while i < b.len() && b[i] == b'\\' {
+                i += 1;
                 numslash += 1;
             }
-            let p = i + numslash;
-            if p < b.len() && b[p] == b'"' {
+            if i < b.len() && b[i] == b'"' {
                 if numslash % 2 == 0 {
-                    // `""` inside quotes is a literal quote (UCRT special
-                    // case); arg_quote never relies on it (it always emits
-                    // an odd backslash run before a literal `"`), but the
-                    // parser model must still match reality.
-                    if in_quotes && p + 1 < b.len() && b[p + 1] == b'"' {
-                        // copy the quote, skip its partner
+                    // `""` inside a quoted string is a literal `"` (the UCRT
+                    // special case); `arg_quote` never relies on it — it
+                    // always emits an odd backslash run before a literal
+                    // `"` — but the model must still match reality.
+                    if in_quotes && i + 1 < b.len() && b[i + 1] == b'"' {
+                        i += 1; // skip the partner quote
                     } else {
+                        copy_character = false;
                         in_quotes = !in_quotes;
-                        out.push_str(&"\\".repeat(numslash / 2));
-                        i = p + 1;
-                        continue;
                     }
                 }
-                out.push_str(&"\\".repeat(numslash / 2));
-                out.push('"');
-                i = p + 1;
-                continue;
+                numslash /= 2;
             }
-            out.push_str(&"\\".repeat(numslash));
-            if p >= b.len() {
+            for _ in 0..numslash {
+                out.push('\\');
+            }
+            if i >= b.len() || (!in_quotes && (b[i] == b' ' || b[i] == b'\t')) {
                 break;
             }
-            if !in_quotes && (b[p] == b' ' || b[p] == b'\t') {
-                break;
+            if copy_character {
+                out.push(b[i] as char);
             }
-            out.push(b[p] as char);
-            i = p + 1;
+            i += 1;
         }
         out
     }
 
     #[test]
     fn arg_quoting_round_trips_through_the_ucrt_parser() {
+        // `command_line(Bash, s)` == `bash -lc ` + `arg_quote(s)`, and the
+        // sole argument after `-lc` is exactly `arg_quote(s)` — so proving
+        // `arg_quote` inverts the UCRT argv parser proves bash receives the
+        // script byte-for-byte.
         for script in [
             "ls",
             "",
@@ -888,7 +893,7 @@ mod tests {
             "echo $HOME && echo `id`",
             "printf '%s\\n' line1 line2",
         ] {
-            let encoded = command_line(&Shell::Bash, script);
+            let encoded = arg_quote(script);
             let parsed = msvcrt_parse_arg(&encoded);
             assert_eq!(
                 parsed, script,
