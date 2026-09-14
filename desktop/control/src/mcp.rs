@@ -30,7 +30,7 @@
 use crate::coder::browser::PanicGuard;
 use crate::coder::{enforce_perm, perm_scope, tier_for};
 use crate::engine::S;
-use crate::types::McpServerSpec;
+use crate::types::{AppSettings, McpServerSpec};
 use axum::extract::{Path as AxumPath, Query, State as AxumState};
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::http::StatusCode;
@@ -114,6 +114,10 @@ pub(crate) struct ConnMeta {
     pub tools: Vec<ToolDef>,
     /// When `tools` was last refreshed.
     pub tools_at: Option<Instant>,
+    /// When `error` was last recorded — gates the implicit-reconnect
+    /// backoff (`failed_recently`) so a broken server doesn't stall every
+    /// catalog fetch or tool call with the full init timeout.
+    pub error_at: Option<Instant>,
     /// Whether the session is believed live (set by connect; cleared when a
     /// round trip reveals the transport died).
     pub alive: bool,
@@ -785,6 +789,7 @@ async fn mark_dead(state: &S, name: &str, reason: String) {
     let mut meta = m.meta_get(name).unwrap_or_default();
     meta.alive = false;
     meta.error = Some(reason);
+    meta.error_at = Some(Instant::now());
     m.meta_set(name, meta);
 }
 
@@ -835,6 +840,7 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
                     peer,
                     pid,
                     error: None,
+                    error_at: None,
                     tools,
                     tools_at: Some(Instant::now()),
                     alive: true,
@@ -851,6 +857,7 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
                     peer: None,
                     pid: None,
                     error: Some(e),
+                    error_at: Some(Instant::now()),
                     tools: Vec::new(),
                     tools_at: None,
                     alive: false,
