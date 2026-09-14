@@ -304,12 +304,28 @@ impl Stream for UsageTapStream {
                 if this.buf.len() < MAX_USAGE_TAP_BYTES {
                     this.buf.extend_from_slice(&chunk);
                 }
+                if this.first_chunk.is_none() {
+                    this.first_chunk = Some(std::time::Instant::now());
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(None) => {
                 if let Some(ctx) = this.ctx.take() {
                     let buf = std::mem::take(&mut this.buf);
-                    tokio::spawn(async move { log_from_response_bytes(ctx, &buf).await });
+                    // Pre-fill/decode timing is only meaningful for streamed
+                    // responses (a single blob has no prefill/decode split).
+                    let (prefill_ms, total_ms) = if ctx.streaming {
+                        match (this.started, this.first_chunk) {
+                            (Some(started), Some(first)) => (
+                                Some(started.elapsed().as_millis() as u64),
+                                Some(std::time::Instant::now().saturating_duration_since(started).as_millis() as u64),
+                            ),
+                            _ => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    tokio::spawn(async move { log_from_response_bytes(ctx, &buf, prefill_ms, total_ms).await });
                 }
                 Poll::Ready(None)
             }
