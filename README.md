@@ -255,7 +255,7 @@ created on first save. Key files:
 | `buildCommand` | cmake/Ninja one-liner | engine rebuild command (Rebuild engine button) |
 | `coderWorkspace` | (empty) | default Coder mode workspace |
 | `coderSafeMode` | `true` | refuse a fixed set of clearly destructive shell command patterns |
-| `coderSandbox` | (per-machine) | wrap the agent shell in `bwrap` (workspace read-write, host read-only) |
+| `coderSandbox` | (per-machine) | wrap the agent shell in the OS sandbox (bwrap on Linux, Job Object + low integrity on Windows) — workspace read-write, host read-only |
 | `coderCommitApproval` | `false` | require explicit human sign-off before the agent commits |
 | `remoteAccessEnabled` | `false` | serve the app on `0.0.0.0` instead of loopback-only (Settings — Safety & Permissions → Remote Access) |
 | `remoteAccessPort` | `1337` | port the Remote Access listener binds when enabled |
