@@ -61,18 +61,17 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // Use is on — the control plane owns the server connections
   // (desktop/control/src/mcp.rs). The catalog is keyed by the same directory
   // the tiers and calls are scoped by, so it refreshes when either changes.
+  // Ref-only (like memoryRef/cuTodosRef): the send handler reads it fresh.
   const mcpToolsRef = useRef<McpToolInfo[]>([]);
-  const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
   useEffect(() => {
     if (!computerUseEnabled || !computerUseDir) {
       mcpToolsRef.current = [];
-      setMcpTools([]);
       return;
     }
     let live = true;
     mcpToolsGet(computerUseDir)
-      .then((r) => { if (live) { mcpToolsRef.current = r.tools; setMcpTools(r.tools); } })
-      .catch(() => { if (live) { mcpToolsRef.current = []; setMcpTools([]); } });
+      .then((r) => { if (live) mcpToolsRef.current = r.tools; })
+      .catch(() => { if (live) mcpToolsRef.current = []; });
     return () => { live = false; };
   }, [computerUseEnabled, computerUseDir]);
   const requestApproval = useCallback((name: string, detail: string): Promise<boolean> => {
