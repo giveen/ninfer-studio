@@ -340,7 +340,7 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         // server from it). `arguments` is the model's args object verbatim.
         let mut req = json!({
             "name": format!("mcp__{rest}"),
-            "arguments": args,
+            "arguments": body.clone(),
             "scope": run.scope_opt().unwrap_or_default(),
         });
         if let Some(t) = body.get("approvalToken").cloned() {
