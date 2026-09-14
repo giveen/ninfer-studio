@@ -217,15 +217,22 @@ pub fn shell_is_bash() -> bool {
     windows::shell_is_bash()
 }
 
-/// `ExecChild` moves to another runtime thread (the background-job drain
-/// task in `coder/exec.rs` calls `tokio::spawn` on it) — keep it `Send`.
-/// Compile-time guard so a future non-`Send` field fails the build instead
-/// of the (Windows-only) drain path at runtime.
-struct SendCheck<T>(T);
-impl<T: Send> SendCheck<T> {
-    const IS_SEND: () = ();
+#[cfg(test)]
+mod send_check {
+    use super::ExecChild;
+
+    /// `ExecChild` moves to another runtime thread (the background-job drain
+    /// task in `coder/exec.rs` calls `tokio::spawn` on it) — it must stay
+    /// `Send`, or the drain path (Windows-only in practice, but the enum
+    /// compiles everywhere) fails at the `tokio::spawn` site. Compile-time
+    /// assertion, executed by `cargo test` on every platform.
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn exec_child_is_send() {
+        assert_send::<ExecChild>();
+    }
 }
-const _EXEC_CHILD_MUST_BE_SEND: () = SendCheck::<ExecChild>::IS_SEND;
 
 #[cfg(test)]
 mod quoting_tests {
