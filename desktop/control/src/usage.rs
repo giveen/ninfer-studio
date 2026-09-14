@@ -362,7 +362,12 @@ pub(crate) fn wrap_for_usage_logging(
 /// responses, or the whole body for a plain JSON completion — and log it.
 /// Silently does nothing when no `usage` object is found (e.g. the engine
 /// doesn't report usage for this call, or the request failed).
-async fn log_from_response_bytes(ctx: UsageLogCtx, buf: &[u8]) {
+async fn log_from_response_bytes(
+    ctx: UsageLogCtx,
+    buf: &[u8],
+    prefill_ms: Option<u64>,
+    total_ms: Option<u64>,
+) {
     let text = String::from_utf8_lossy(buf);
     let mut usage_obj: Option<Value> = None;
     let mut resp_model: Option<String> = None;
