@@ -9,3 +9,4 @@ export * from './api/models';
 export * from './api/chat';
 export * from './api/coder';
 export * from './api/remote';
+export * from './api/mcp';
