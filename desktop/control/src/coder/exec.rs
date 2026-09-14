@@ -229,67 +229,40 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         rel_of(&root, &spawn_cwd)
     };
 
-    // Optional filesystem sandbox (mirrors the sidecar): wrap the shell in
-    // bubblewrap so the agent can only write inside the workspace — the rest
-    // of the host is read-only. Network stays available so builds can fetch.
-    // Falls back to an unsandboxed shell when bwrap is missing or the kernel
-    // won't let it create namespaces (see `bwrap_available`).
+    // Optional filesystem sandbox (per-OS, see `crate::sandbox`): on Linux
+    // the shell is wrapped in bubblewrap so the agent can only write inside
+    // the workspace (host read-only, network still available for builds);
+    // on Windows it runs in a Job Object at low integrity, which makes the
+    // OS refuse writes to medium-integrity host objects. Falls back to an
+    // unsandboxed shell when the mechanism can't run here (e.g. the kernel
+    // won't let bwrap create namespaces).
     let (sandboxed, sandbox_binds) = {
         let c = state.config.read().await;
-        (c.coder_sandbox && bwrap_available() && !root.as_os_str().is_empty(), c.sandbox_binds.clone())
+        (c.coder_sandbox && crate::sandbox::available() && !root.as_os_str().is_empty(), c.sandbox_binds.clone())
     };
-    let mut cmd = if sandboxed {
-        let mut c = Command::new("bwrap");
-        c.arg("--ro-bind").arg("/").arg("/");
-        // bwrap layers mounts in argument order — a later mount at a parent
-        // path hides an earlier one at a child path. `--tmpfs /tmp` MUST come
-        // before the workspace bind: a workspace under /tmp (the common case
-        // for temp/scratch dirs) would otherwise be buried under an empty
-        // tmpfs and become invisible inside the sandbox.
-        c.arg("--tmpfs").arg("/tmp");
-        c.arg("--bind").arg(&root).arg(&root);
-        c.arg("--proc").arg("/proc");
-        c.arg("--dev").arg("/dev");
-        c.arg("--unshare-pid");
-        c.arg("--die-with-parent");
-        c.arg("--cap-drop").arg("ALL");
-        for b in &sandbox_binds {
-            if !b.is_empty() {
-                c.arg("--bind").arg(b).arg(b);
-            }
-        }
-        c.arg("bash");
-        c
-    } else {
-        Command::new("bash")
-    };
-    // Inside the sandbox the child's cwd must already exist in the container.
-    // The bind-mounted root is a safe universal cwd; a workspace-relative
-    // cwd requested for a stateless command is re-applied with `cd` so the
-    // command sees the same starting directory as it would unsandboxed.
-    let (cwd_arg, run_cmd) = if sandboxed {
-        let cd = if spawn_cwd == *root {
-            String::new()
-        } else {
-            format!("cd {} 2>/dev/null || true\n", shell_quote(&spawn_cwd.to_string_lossy()))
-        };
-        (root.clone(), format!("{cd}{run_cmd}"))
-    } else {
-        (spawn_cwd.clone(), run_cmd)
-    };
-    cmd.arg("-lc")
-        .arg(&run_cmd)
-        .current_dir(&cwd_arg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, _) in std::env::vars() {
-        if is_secret_env_var(&k) {
-            cmd.env_remove(k);
-        }
+    // Stateful sessions track cwd via a shell marker — that needs a POSIX
+    // shell. On Windows without git-bash the runner falls back to `cmd`,
+    // which is stateless only.
+    #[cfg(windows)]
+    if session.is_some() && !crate::sandbox::shell_is_bash() {
+        return Ok(Json(json!({
+            "stdout": "",
+            "stderr": "stateful sessions need a POSIX shell: install Git for Windows (git-bash), or run without sessionId",
+            "exitCode": null,
+            "timedOut": false,
+            "truncated": false,
+            "cwd": result_cwd,
+            "sandboxed": sandboxed,
+        })));
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
+    let mut child = crate::sandbox::spawn(&crate::sandbox::SpawnReq {
+        command: run_cmd,
+        workspace: root,
+        cwd: spawn_cwd,
+        sandboxed,
+        writable_roots: sandbox_binds,
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
     // Background mode: hand the child to a detached drain task and return a
     // job id immediately. The client polls `job_get`; output is tail-capped.
     if req.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -315,8 +288,8 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     // Take the pipes up front and drain both streams concurrently so a large
     // stderr can't deadlock a large stdout (and vice versa). The future only
     // borrows `child`, so a timeout can still kill and reap it below.
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+    let mut out_pipe = child.take_stdout().map(tokio::fs::File::from);
+    let mut err_pipe = child.take_stderr().map(tokio::fs::File::from);
     let out_fut = async {
         let (so, se) = tokio::join!(
             async {
