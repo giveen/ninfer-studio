@@ -290,7 +290,8 @@ function McpServersCard({ perms, onServerTier }: {
 }
 
 export function SafetyTab() {
-  const { safeMode, setSafeMode, sandbox, setSandbox, bwrapAvailable, commitApproval, setCommitApproval } = useCoderSafety();
+  const { safeMode, setSafeMode, sandbox, setSandbox, sandboxAvailable, sandboxKind, commitApproval, setCommitApproval } = useCoderSafety();
+  const sandboxIsWindows = sandboxKind !== 'bwrap';
   const [perms, setPermsState] = useState<PermConfig>(loadDefaultPerms);
 
   const setPerms = (next: PermConfig) => {
@@ -340,12 +341,26 @@ export function SafetyTab() {
         </div>
       </SectionCard>
 
-      <SectionCard title="Sandbox" icon={<Shield size={15} />} description="Wraps the agent shell in bwrap (workspace read-write, host read-only).">
+      <SectionCard
+        title="Sandbox"
+        icon={<Shield size={15} />}
+        description={sandboxIsWindows
+          ? 'Runs the agent shell at low integrity in a Job Object (workspace writable, host protected by Windows integrity policy).'
+          : 'Wraps the agent shell in bwrap (workspace read-write, host read-only).'}
+      >
         <div className="flex items-center justify-between gap-3">
           <div className="space-y-1">
-            <p className="text-[12.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
-            {sandbox && !bwrapAvailable && (
-              <p className="text-[12.5px] text-warn">bwrap isn&apos;t usable on this host (not installed, or the kernel refuses its namespaces) — the agent shell is running unsandboxed despite this being ON.</p>
+            {sandboxIsWindows ? (
+              <p className="text-[12.5px] text-faint">
+                Runs the agent shell at <strong>low integrity</strong> inside a Job Object — Windows itself refuses its writes to medium-integrity host files, the registry, and other processes; only the workspace is writable, and the whole process tree is killed on timeout. Note: files created outside the sandbox keep their medium label and can be read, not overwritten, until a sandbox run rewrites them.
+              </p>
+            ) : (
+              <p className="text-[12.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
+            )}
+            {sandbox && !sandboxAvailable && (
+              <p className="text-[12.5px] text-warn">{sandboxIsWindows
+                ? 'The Windows sandbox could not start on this host — the agent shell is running unsandboxed despite this being ON.'
+                : 'bwrap isn&apos;t usable on this host (not installed, or the kernel refuses its namespaces) — the agent shell is running unsandboxed despite this being ON.'}</p>
             )}
           </div>
           <button
@@ -353,17 +368,19 @@ export function SafetyTab() {
             onClick={() => setSandbox(!sandbox)}
             className={cn(
               'shrink-0 rounded px-2.5 py-1 text-[11px] font-medium',
-              sandbox && bwrapAvailable ? 'bg-ok/20 text-ok' : sandbox ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger',
+              sandbox && sandboxAvailable ? 'bg-ok/20 text-ok' : sandbox ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger',
             )}
             title={
-              sandbox && bwrapAvailable
-                ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)'
+              sandbox && sandboxAvailable
+                ? sandboxIsWindows
+                  ? 'Agent shell runs at low integrity in a Job Object (writes limited to the workspace)'
+                  : 'Agent shell is wrapped in bwrap (writes limited to the workspace)'
                 : sandbox
-                  ? 'Sandbox is enabled but bwrap is not usable on this host — the shell is actually running unsandboxed on the host'
+                  ? 'Sandbox is enabled but the mechanism is not usable on this host — the shell is actually running unsandboxed on the host'
                   : 'Agent shell runs directly on the host'
             }
           >
-            {sandbox && bwrapAvailable ? 'ON' : sandbox ? 'ON · bwrap unavailable' : 'OFF'}
+            {sandbox && sandboxAvailable ? 'ON' : sandbox ? 'ON · unavailable' : 'OFF'}
           </button>
         </div>
       </SectionCard>
