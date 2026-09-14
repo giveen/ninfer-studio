@@ -507,28 +507,9 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
         params: body.params,
         parent: body.parent,
     };
-    let shared = Arc::new(RunShared {
-        meta,
-        live: Mutex::new(live),
-        tx,
-        approvals: Mutex::new(HashMap::new()),
-        question_tx: Mutex::new(None),
-        recall: Mutex::new(HashMap::new()),
-        packed_cache: Mutex::new(HashMap::new()),
-        stop_tx,
-        stop_rx,
-        client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3600))
-            .build()
-            .unwrap_or_default(),
-    });
-    state
-        .agent_runs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(id.clone(), shared.clone());
-
-    tokio::spawn(engine_loop::run(state, shared));
+    // Registered + spawned before this response goes out (see spawn_run),
+    // so a client can attach to the SSE stream immediately.
+    let shared = spawn_run(state, meta, live);
     Json(json!({ "id": id, "status": "running" })).into_response()
 }
 
