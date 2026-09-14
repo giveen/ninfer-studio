@@ -338,9 +338,15 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         // The mcp_call handler re-checks the tier server-side against the
         // run's scope; the name keeps its `mcp__` namespace (it derives the
         // server from it). `arguments` is the model's args object verbatim.
+        // The model's arguments verbatim — minus the dispatch-injected
+        // approvalToken (the mcp_call handler reads it at the top level).
+        let mut arguments = body.clone();
+        if let Some(o) = arguments.as_object_mut() {
+            o.remove("approvalToken");
+        }
         let mut req = json!({
             "name": format!("mcp__{rest}"),
-            "arguments": body.clone(),
+            "arguments": arguments,
             "scope": run.scope_opt().unwrap_or_default(),
         });
         if let Some(t) = body.get("approvalToken").cloned() {
