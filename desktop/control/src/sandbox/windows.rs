@@ -27,7 +27,7 @@
 
 use super::{is_secret_env_var, shell_quote, ExecChild, SpawnReq};
 use std::io;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use windows_sys::core::PCWSTR;
