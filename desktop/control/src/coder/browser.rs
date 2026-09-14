@@ -88,7 +88,9 @@ type Reply = Value;
 /// Wraps a future so a panic inside it completes the task with `Ready(())`
 /// instead of unwinding out of the `LocalSet` (a dropped `LocalSet` with a
 /// failed task panics, and the session must always be droppable).
-struct PanicGuard<F>(F);
+/// `pub(crate)` so the other `!Send` actor (the MCP client in `mcp.rs`)
+/// reuses the same guard instead of reinventing it.
+pub(crate) struct PanicGuard<F>(F);
 
 impl<F: std::future::Future<Output = ()>> std::future::Future for PanicGuard<F> {
     type Output = ();
