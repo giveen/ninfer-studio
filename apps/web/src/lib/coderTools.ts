@@ -459,3 +459,61 @@ export function isReadOnlyCommand(cmd: string): boolean {
   if (first === 'git') return words.length >= 2 && READONLY_GIT.has(words[1]);
   return READONLY_BASH.has(first);
 }
+
+// ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) tool namespacing — `mcp__<server>__<tool>`.
+// The control plane (desktop/control/src/mcp.rs) owns the connections; the web
+// side only needs the naming rules + the per-server tier fallback so the
+// client-side gates match the server's `tier_for` exactly.
+// ---------------------------------------------------------------------------
+/** Prefix every MCP-exposed tool name carries. */
+export const MCP_NAME_PREFIX = 'mcp__';
+
+/** Split `mcp__<server>__<tool>` into `{ server, tool }`, or null for any
+ *  other name. Server names never contain `_` (sanitized server-side), so
+ *  the first `__` after the prefix is the separator; the tool part may
+ *  itself contain `__` (mangled from a server-side name that did). */
+export function splitMcpName(name: string): { server: string; tool: string } | null {
+  if (!name.startsWith(MCP_NAME_PREFIX)) return null;
+  const rest = name.slice(MCP_NAME_PREFIX.length);
+  const idx = rest.indexOf('__');
+  if (idx <= 0 || idx === rest.length - 2) return null;
+  return { server: rest.slice(0, idx), tool: rest.slice(idx + 2) };
+}
+
+/** The server-level permission key for an MCP tool name (`mcp__<server>`),
+ *  or null for non-MCP names. */
+export function mcpServerKey(name: string): string | null {
+  const m = splitMcpName(name);
+  return m ? `${MCP_NAME_PREFIX}${m.server}` : null;
+}
+
+/** The effective tier for a (possibly MCP-namespaced) tool: a per-tool row
+ *  wins, then the per-server row for MCP names, then `allow` — mirrors the
+ *  control plane's `tier_for` so client-side gating and the server's
+ *  re-check never disagree. */
+export function mcpToolTier(perms: PermConfig, name: string): PermTier {
+  const exact = perms.tools[name];
+  if (exact === 'allow' || exact === 'ask' || exact === 'deny') return exact;
+  const key = mcpServerKey(name);
+  if (key) {
+    const server = perms.tools[key];
+    if (server === 'allow' || server === 'ask' || server === 'deny') return server;
+  }
+  return 'allow';
+}
+
+/** An LLM tool schema for one MCP catalog entry (same shape as TOOLS). */
+export function mcpToolSchema(t: { name: string; description: string; parameters: Record<string, unknown> }): {
+  type: 'function';
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+} {
+  return {
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description || `MCP tool ${t.name}`,
+      parameters: t.parameters && typeof t.parameters === 'object' ? t.parameters : { type: 'object', properties: {} },
+    },
+  };
+}
