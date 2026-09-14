@@ -18,7 +18,16 @@
 //!   * tool invocation through the existing allow/ask/deny permission
 //!     machinery (`coder::common::enforce_perm`) — a tier row for the full
 //!     tool name overrides a row for the server-level key `mcp__<server>`.
+//!
+//! rmcp's running client service is `!Send` (the same story as Obscura's
+//! `Page` in `coder/browser.rs` — strict thread affinity), so all sessions
+//! live on a dedicated actor thread with its own current-thread tokio
+//! runtime + `LocalSet`. The `McpManager` on `State` is `Send+Sync` (a
+//! command channel plus plain metadata); every route is a
+//! `(command, reply)` round trip through it, and the permission re-check
+//! happens on the axum side where the approval-token machinery lives.
 
+use crate::coder::browser::PanicGuard;
 use crate::coder::{enforce_perm, perm_scope, tier_for};
 use crate::engine::S;
 use crate::types::McpServerSpec;
@@ -39,11 +48,15 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::LocalSet;
 use tokio::time::timeout;
 
-/// A live MCP session (rmcp's running client service).
+/// A live MCP session (rmcp's running client service). `!Send` — it lives
+/// on the actor thread only (see `actor_entry`/`dispatcher`).
 pub(crate) type McpService = RunningService<RoleClient, ClientInfo>;
 
 /// `mcp__<server>__<tool>` — the prefix every MCP-exposed tool name carries.
@@ -66,6 +79,14 @@ const TOOLS_TTL: Duration = Duration::from_secs(120);
 /// the observation-packing discipline the other tools already follow).
 const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 
+/// `tools/list` is 30s inside the actor; the handler-side reply ceiling
+/// adds slack so a slow-but-live server gets marked dead (and is retried
+/// through a fresh connection) instead of wedging the catalog forever.
+const LIST_TOOLS_LIMIT: Duration = Duration::from_secs(35);
+
+/// Same slack idea for `tools/call`, over the actor's `CALL_TIMEOUT` cap.
+const CALL_LIMIT: Duration = CALL_TIMEOUT + Duration::from_secs(10);
+
 /// One MCP server tool in its LLM-facing namespaced form.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,42 +100,143 @@ pub struct ToolDef {
     pub parameters: Value,
 }
 
-/// A live connection (or the last known failure of one). `service` is an
-/// `Arc` so an in-flight `tools/call` keeps the session alive while the
-/// manager drops the connection (reconnect / delete / child exited).
-struct McpConn {
-    service: Option<Arc<McpService>>,
+/// Plain (Send) connection metadata — everything the UI and the agent loop
+/// need that does NOT require a round trip to the actor thread.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConnMeta {
     /// Peer's `serverInfo` (name/version), for the UI.
-    peer: Option<Value>,
+    pub peer: Option<Value>,
     /// Child-process pid for stdio servers (for the UI).
-    pid: Option<u32>,
+    pub pid: Option<u32>,
     /// Last connection error; `None` while alive.
-    error: Option<String>,
-    tools: Vec<ToolDef>,
-    tools_at: Option<Instant>,
+    pub error: Option<String>,
+    /// Last known tool catalog (namespaced).
+    pub tools: Vec<ToolDef>,
+    /// When `tools` was last refreshed.
+    pub tools_at: Option<Instant>,
+    /// Whether the session is believed live (set by connect; cleared when a
+    /// round trip reveals the transport died).
+    pub alive: bool,
 }
 
-impl fmt::Debug for McpConn {
+/// Commands for the MCP actor. Everything is `Send` — these cross from the
+/// axum worker threads into the actor's dedicated driver thread.
+#[derive(Debug)]
+enum McpCmd {
+    /// (Re)connect: drop any existing session for `server`, open the new
+    /// one, and return its `tools/list`.
+    Connect { server: String, spec: McpServerSpec },
+    /// Re-ask a live session for `tools/list` (catalog refresh).
+    ListTools { server: String },
+    /// Invoke one tool on a live session.
+    CallTool {
+        server: String,
+        /// The server's own tool name (not the mangled one).
+        tool: String,
+        arguments: Map<String, Value>,
+    },
+    /// Drop the session (server deleted).
+    Close { server: String },
+}
+
+/// Replies for the MCP actor — one per command, all `Send`.
+#[derive(Debug)]
+enum McpReply {
+    Connect {
+        error: Option<String>,
+        peer: Option<Value>,
+        pid: Option<u32>,
+        tools: Vec<ToolDef>,
+    },
+    ListTools {
+        error: Option<String>,
+        tools: Vec<ToolDef>,
+    },
+    /// `transport_dead` tells the caller the session is gone: drop the
+    /// metadata and retry once through a fresh connection.
+    Call {
+        ok: bool,
+        output: String,
+        transport_dead: bool,
+    },
+    Close,
+}
+
+type ActorTx = UnboundedSender<(McpCmd, UnboundedSender<McpReply>)>;
+
+/// `Send+Sync` handle for the MCP actor. Lives on `State` (behind the
+/// tokio `RwLock` like the other manager fields); the `!Send` sessions
+/// themselves never leave the actor thread.
+///
+/// The driver thread is spawned lazily on the first route hit (mirrors
+/// `BrowserSlot::spawn_driver`) so `State::new` — and the unit tests — stay
+/// cheap.
+#[derive(Default)]
+pub struct McpManager {
+    tx: Mutex<Option<ActorTx>>,
+    started: AtomicBool,
+    meta: Mutex<HashMap<String, ConnMeta>>,
+}
+
+impl fmt::Debug for McpManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("McpConn")
-            .field("alive", &self.alive())
-            .field("pid", &self.pid)
-            .field("error", &self.error)
-            .field("tools", &self.tools.len())
+        let keys: Vec<String> = self
+            .meta
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        f.debug_struct("McpManager")
+            .field("running", &self.started.load(Ordering::Relaxed))
+            .field("servers", &keys)
             .finish()
     }
 }
 
-impl McpConn {
-    fn alive(&self) -> bool {
-        self.service.as_ref().is_some_and(|s| !s.is_closed())
+impl McpManager {
+    /// The actor command channel, spawning the driver thread on first use.
+    /// The `tx` mutex is held across the spawn, so a racing second caller
+    /// always sees the finished state.
+    fn channel(&self) -> Option<ActorTx> {
+        let mut guard = self.tx.lock().unwrap();
+        if guard.is_none() {
+            if self.started.swap(true, Ordering::SeqCst) {
+                return guard.clone();
+            }
+            let (tx, rx) = unbounded_channel();
+            if std::thread::Builder::new()
+                .name("mcp-actor".into())
+                .spawn(move || actor_entry(rx))
+                .is_ok()
+            {
+                *guard = Some(tx);
+            } else {
+                self.started.store(false, Ordering::SeqCst);
+                return None;
+            }
+        }
+        guard.clone()
     }
-}
 
-/// One connection slot per configured server.
-#[derive(Debug, Default)]
-pub struct McpManager {
-    conns: HashMap<String, McpConn>,
+    /// The actor is gone (its command channel closed) — forget the dead
+    /// sender so the next `channel()` call respawns a fresh actor.
+    fn reset(&self) {
+        self.started.store(false, Ordering::SeqCst);
+        *self.tx.lock().unwrap() = None;
+    }
+
+    fn meta_get(&self, name: &str) -> Option<ConnMeta> {
+        self.meta.lock().unwrap().get(name).cloned()
+    }
+
+    fn meta_set(&self, name: &str, meta: ConnMeta) {
+        self.meta.lock().unwrap().insert(name.to_string(), meta);
+    }
+
+    fn meta_remove(&self, name: &str) {
+        self.meta.lock().unwrap().remove(name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +247,9 @@ pub struct McpManager {
 /// are reserved for the `mcp__<server>__<tool>` separators, so they are
 /// dropped rather than translated (the name stays a stable, unique id).
 fn sanitize_server_name(raw: &str) -> String {
-    raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect()
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
 }
 
 /// Mangle an MCP tool name into something the LLM's function-name grammar
@@ -174,7 +298,11 @@ fn mangle_tools(server: &str, tools: &[Tool]) -> Vec<ToolDef> {
         defs.push(ToolDef {
             mangled,
             original: t.name.as_ref().to_string(),
-            description: t.description.as_deref().map(String::from).unwrap_or_default(),
+            description: t
+                .description
+                .as_deref()
+                .map(String::from)
+                .unwrap_or_default(),
             parameters: serde_json::to_value(t.input_schema.as_ref())
                 .unwrap_or_else(|_| json!({ "type": "object" })),
         });
@@ -182,9 +310,10 @@ fn mangle_tools(server: &str, tools: &[Tool]) -> Vec<ToolDef> {
     defs
 }
 
-/// Validate a spec before it is persisted: a usable non-empty name and
-/// exactly one transport. (`AppSettings::load` tolerates a hand-edited
-/// config that violates this; the upsert endpoint is strict.)
+/// Validate a spec before it is persisted: a usable non-empty name and a
+/// usable http(s) url for http transport. (Hand-edited configs that fail
+/// `transport()` are tolerated at load time and simply report as
+/// disconnected; the upsert endpoint is strict.)
 fn validate_spec(spec: &McpServerSpec) -> Result<(), (StatusCode, Json<Value>)> {
     let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     if sanitize_server_name(&spec.name).is_empty() {
@@ -205,7 +334,8 @@ fn validate_spec(spec: &McpServerSpec) -> Result<(), (StatusCode, Json<Value>)> 
 }
 
 // ---------------------------------------------------------------------------
-// Connection lifecycle
+// Connection lifecycle (actor thread only — everything in this section is
+// `!Send` and must never cross a `.await` into the axum world)
 // ---------------------------------------------------------------------------
 
 fn client_info() -> ClientInfo {
@@ -216,7 +346,7 @@ fn client_info() -> ClientInfo {
 }
 
 /// The protocol-version ladder offered during the handshake: prefer the
-/// current stable revisions, fall back to the original streamable-HTTP
+/// newest stable revisions, fall back to the original streamable-HTTP
 /// version (2025-03-26) for legacy servers — every server since then
 /// supports it. `Auto` probes `server/discover` first and falls back to the
 /// legacy `initialize` handshake instantly when the peer answers with a
@@ -238,14 +368,14 @@ fn lifecycle() -> ClientLifecycleMode {
 async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Option<u32>), String> {
     let info = client_info();
     let lc = lifecycle();
-    // Both arms build their transport synchronously, then race the handshake
-    // against INIT_TIMEOUT. (Boxed because the two transports are different
-    // types; the future is awaited here, not spawned, so no Send bound is
-    // needed.)
+    // Both arms build their transport synchronously, then race the
+    // handshake against INIT_TIMEOUT. (Boxed because the two transports are
+    // different types; the future is awaited here, not spawned, so no Send
+    // bound is needed.)
     let mut pid: Option<u32> = None;
     // `spec.transport()` returns `Option<&str>` — `&str` cannot be matched
-    // exhaustively, so the wildcard arm catches any future transport kind the
-    // same way `None` (no transport configured) does.
+    // exhaustively, so the wildcard arm catches any future transport kind
+    // the same way `None` (no transport configured) does.
     let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> =
         match spec.transport() {
             Some("stdio") => {
@@ -286,8 +416,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
                     // rejects it as a reserved header in `custom_headers`, so
                     // drop a duplicated entry here (it would also double-send
                     // the value).
-                    let key = k.to_ascii_lowercase();
-                    if key == "authorization" {
+                    if k.eq_ignore_ascii_case("authorization") {
                         continue;
                     }
                     match (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
@@ -342,7 +471,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     Ok((svc, peer, pid))
 }
 
-/// Refresh the cached `tools/list` for a live service.
+/// Refresh the `tools/list` catalog for a live service.
 async fn fetch_tools(server: &str, svc: &McpService) -> Result<Vec<ToolDef>, String> {
     let tools = timeout(Duration::from_secs(30), svc.list_all_tools())
         .await
@@ -351,94 +480,414 @@ async fn fetch_tools(server: &str, svc: &McpService) -> Result<Vec<ToolDef>, Str
     Ok(mangle_tools(server, &tools))
 }
 
-/// Ensure `name` has a live connection, connecting (or reconnecting) as
-/// needed. Callers hold no `mcp` lock (this one takes the write lock).
-pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    let mut m = state.mcp.write().await;
-    ensure_conn_inner(state, &mut m, name)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))))
+/// Driver-thread entry: a private current-thread tokio runtime + `LocalSet`
+/// so the `!Send` rmcp services can exist (mirrors the Obscura browser
+/// driver in `coder/browser.rs`). Runs until the process exits.
+fn actor_entry(rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>)>) {
+    let res = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    match res {
+        Ok(rt) => {
+            rt.block_on(async {
+                let local = LocalSet::new();
+                // Drive the actor's JoinHandle: the thread lives until the
+                // command channel closes (the manager on State keeps a
+                // sender for the process lifetime).
+                let actor = local.spawn_local(PanicGuard(async move {
+                    let () = dispatcher(rx).await;
+                }));
+                let _ = local.run_until(actor).await;
+            });
+        }
+        Err(e) => tracing::error!("mcp actor runtime failed to start: {e}"),
+    }
 }
 
-/// `ensure_conn` core, for callers that already hold the `mcp` write lock
-/// (the tools catalog refreshes several servers in one pass).
-async fn ensure_conn_inner(state: &S, m: &mut McpManager, name: &str) -> Result<(), String> {
-    let spec = {
-        let cfg = state.config.read().await;
-        cfg.mcp_servers
-            .iter()
-            .find(|s| s.name == name)
-            .cloned()
-            .ok_or_else(|| format!("unknown MCP server '{name}'"))?
+/// The actor dispatcher: receives commands and fans each out to a local
+/// task so a 10-minute `tools/call` on one server cannot wedge
+/// `tools/list` on another. Sessions live in a plain `Mutex` map — guards
+/// are only ever held across synchronous code, never across an `.await`.
+async fn dispatcher(mut rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>)>) {
+    let conns: Arc<Mutex<HashMap<String, Arc<McpService>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    while let Some((cmd, reply)) = rx.recv().await {
+        let conns = conns.clone();
+        tokio::task::spawn_local(async move {
+            match cmd {
+                McpCmd::Connect { server, spec } => {
+                    // Drop the previous session first (its `Drop` closes the
+                    // transport) so an edited spec takes effect immediately.
+                    conns.lock().unwrap().remove(&server);
+                    match connect(&spec).await {
+                        Ok((svc, peer, pid)) => {
+                            let tools = fetch_tools(&server, &svc).await.unwrap_or_default();
+                            let svc = Arc::new(svc);
+                            conns
+                                .lock()
+                                .unwrap()
+                                .insert(server.clone(), svc);
+                            let _ = reply.send(McpReply::Connect {
+                                error: None,
+                                peer,
+                                pid,
+                                tools,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::info!(target: "mcp", "connect '{server}' failed: {e}");
+                            let _ = reply.send(McpReply::Connect {
+                                error: Some(e),
+                                peer: None,
+                                pid: None,
+                                tools: Vec::new(),
+                            });
+                        }
+                    }
+                }
+                McpCmd::ListTools { server } => {
+                    let svc = conns.lock().unwrap().get(&server).cloned();
+                    match svc {
+                        None => {
+                            let _ = reply.send(McpReply::ListTools {
+                                error: Some("not connected".into()),
+                                tools: Vec::new(),
+                            });
+                        }
+                        Some(svc) => match fetch_tools(&server, &svc).await {
+                            Ok(tools) => {
+                                let _ = reply.send(McpReply::ListTools { error: None, tools });
+                            }
+                            Err(e) => {
+                                tracing::info!(target: "mcp", "list tools '{server}': {e}");
+                                let _ = reply.send(McpReply::ListTools {
+                                    error: Some(e),
+                                    tools: Vec::new(),
+                                });
+                            }
+                        },
+                    }
+                }
+                McpCmd::CallTool {
+                    server,
+                    tool,
+                    arguments,
+                } => {
+                    let svc = conns.lock().unwrap().get(&server).cloned();
+                    let result = match svc {
+                        None => McpReply::Call {
+                            ok: false,
+                            output: format!("MCP server '{server}' is not connected"),
+                            transport_dead: true,
+                        },
+                        Some(svc) => {
+                            // `CallToolRequestParams::new` wants a
+                            // `Cow<'static, str>` — `tool` is an owned
+                            // String, so hand it over by value.
+                            let params =
+                                CallToolRequestParams::new(tool).with_arguments(arguments);
+                            match timeout(CALL_TIMEOUT, svc.call_tool_once(params)).await {
+                                Ok(Ok(CallToolResponse::Complete(result))) => {
+                                    let failed = result.is_error == Some(true);
+                                    if failed {
+                                        tracing::info!(
+                                            target: "mcp",
+                                            "tool '{server}' reported an error result"
+                                        );
+                                    }
+                                    McpReply::Call {
+                                        ok: !failed,
+                                        output: render_result(&result),
+                                        transport_dead: false,
+                                    }
+                                }
+                                Ok(Ok(CallToolResponse::InputRequired(_))) => {
+                                    // SEP-2322 multi-round interactive
+                                    // input: we don't drive those rounds
+                                    // (the human-facing dialog doesn't exist
+                                    // here), so tell the model what happened
+                                    // instead of hanging.
+                                    McpReply::Call {
+                                        ok: false,
+                                        output: format!(
+                                            "MCP tool '{server}' requested interactive \
+                                             multi-round input, which this client does \
+                                             not provide."
+                                        ),
+                                        transport_dead: false,
+                                    }
+                                }
+                                // `CallToolResponse` is `#[non_exhaustive]`:
+                                // a newer rmcp release may add variants.
+                                // Surface them instead of silently dropping
+                                // the response.
+                                Ok(Ok(_)) => McpReply::Call {
+                                    ok: false,
+                                    output: format!(
+                                        "MCP tool '{server}' returned an unsupported \
+                                         response shape"
+                                    ),
+                                    transport_dead: false,
+                                },
+                                Ok(Err(e))
+                                    if matches!(
+                                        e,
+                                        ServiceError::TransportClosed
+                                            | ServiceError::TransportSend(_)
+                                    ) =>
+                                {
+                                    McpReply::Call {
+                                        ok: false,
+                                        output: format!(
+                                            "MCP server '{server}' connection died \
+                                             mid-call: {e}"
+                                        ),
+                                        transport_dead: true,
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        target: "mcp",
+                                        "MCP call '{server}' failed: {e}"
+                                    );
+                                    McpReply::Call {
+                                        ok: false,
+                                        output: format!("MCP call '{server}' failed: {e}"),
+                                        transport_dead: false,
+                                    }
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        target: "mcp",
+                                        "MCP call '{server}' timed out after {}s",
+                                        CALL_TIMEOUT.as_secs()
+                                    );
+                                    McpReply::Call {
+                                        ok: false,
+                                        output: format!(
+                                            "MCP call '{server}' timed out after {}s",
+                                            CALL_TIMEOUT.as_secs()
+                                        ),
+                                        transport_dead: false,
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
+                McpCmd::Close { server } => {
+                    conns.lock().unwrap().remove(&server);
+                    let _ = reply.send(McpReply::Close);
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Result rendering
+// ---------------------------------------------------------------------------
+
+/// Render a `tools/call` result into the single text blob the agent loop
+/// feeds back to the model. Binary payloads (images/audio) are described,
+/// not dumped — base64 would only burn context.
+fn render_result(result: &CallToolResult) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for block in &result.content {
+        match block {
+            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::Image(_) => {
+                parts.push("[image content omitted]".into());
+            }
+            ContentBlock::Audio(_) => {
+                parts.push("[audio content omitted]".into());
+            }
+            ContentBlock::Resource(res) => {
+                parts.push(serde_json::to_string(res).unwrap_or_default());
+            }
+            ContentBlock::ResourceLink(link) => {
+                parts.push(serde_json::to_string(link).unwrap_or_default());
+            }
+            other => {
+                // `ContentBlock` is `#[non_exhaustive]`: a newer rmcp may
+                // add block kinds. Describe them by kind instead of
+                // guessing at their shape.
+                let v = serde_json::to_value(other).unwrap_or(Value::Null);
+                let kind = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                parts.push(format!("[{kind} content omitted]"));
+            }
+        }
+    }
+    let mut out = parts.join("\n");
+    if let Some(sc) = &result.structured_content {
+        out.push_str("\n\n");
+        out.push_str(&format!("[structured result] {sc}"));
+    }
+    if out.is_empty() {
+        out = "(no content)".into();
+    }
+    if out.len() > MAX_TOOL_OUTPUT {
+        out.truncate(MAX_TOOL_OUTPUT);
+        out.push_str("\n… (truncated)");
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Handler-side plumbing
+// ---------------------------------------------------------------------------
+
+/// One (command, reply) round trip through the actor. `limit` is the
+/// handler-side ceiling — the actor enforces its own (shorter) timeouts,
+/// so `limit` only fires if the actor itself wedged.
+async fn send_cmd(
+    state: &S,
+    cmd: McpCmd,
+    limit: Duration,
+) -> Result<McpReply, (StatusCode, Json<Value>)> {
+    let manager = state.mcp.read().await;
+    let Some(tx) = manager.channel() else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "MCP actor failed to start" })),
+        ));
     };
-    if spec.transport().is_none() {
-        return Err(format!(
-            "MCP server '{name}' has no usable transport (set command or url)"
+    let (reply_tx, reply_rx) = unbounded_channel();
+    if tx.send((cmd, reply_tx)).is_err() {
+        // The actor's receiver is gone — drop the dead channel so the next
+        // request gets a fresh actor instead of failing forever.
+        manager.reset();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "MCP actor unavailable" })),
         ));
     }
-    if m.conns.get(name).is_some_and(|c| c.alive()) {
-        return Ok(());
+    match timeout(limit, reply_rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_)) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "MCP actor dropped the reply" })),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": "MCP operation timed out" })),
+        )),
     }
-    // Drop the dead slot: dropping the service Arc cancels the rmcp event
-    // loop, which closes the transport — the stdio child is killed by its
-    // own cleanup, the HTTP session just ends.
-    m.conns.remove(name);
-    match connect(&spec).await {
-        Ok((svc, peer, pid)) => {
-            let svc = Arc::new(svc);
-            // A tools/list failure doesn't kill the connection — the server
-            // is up; tools just can't be listed right now. Callers surface
-            // the (empty) catalog and `tools/call` falls back to the raw
-            // suffix, which works for the common case of LLM-safe names.
-            let tools = fetch_tools(name, &svc).await.unwrap_or_default();
-            m.conns.insert(
-                name.to_string(),
-                McpConn {
-                    service: Some(svc),
+}
+
+/// Mark a server's session dead (the transport died mid-operation) so the
+/// next request takes the reconnect path.
+async fn mark_dead(state: &S, name: &str, reason: String) {
+    let m = state.mcp.read().await;
+    let mut meta = m.meta_get(name).unwrap_or_default();
+    meta.alive = false;
+    meta.error = Some(reason);
+    m.meta_set(name, meta);
+}
+
+/// Ensure `name` has a live session (connect or reconnect), and record the
+/// result in the manager's metadata. Shared by upsert/restart/tools/call.
+pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let spec = state
+        .config
+        .read()
+        .await
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown MCP server '{name}'") })),
+            )
+        })?;
+    if spec.transport().is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("MCP server '{name}' has no transport configured")
+            })),
+        ));
+    }
+    match send_cmd(
+        state,
+        McpCmd::Connect {
+            server: name.to_string(),
+            spec,
+        },
+        INIT_TIMEOUT + Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(McpReply::Connect {
+            error: None,
+            peer,
+            pid,
+            tools,
+        }) => {
+            state.mcp.read().await.meta_set(
+                name,
+                ConnMeta {
                     peer,
                     pid,
                     error: None,
                     tools,
                     tools_at: Some(Instant::now()),
+                    alive: true,
                 },
             );
             Ok(())
         }
-        Err(e) => {
-            m.conns.insert(
-                name.to_string(),
-                McpConn {
-                    service: None,
+        Ok(McpReply::Connect {
+            error: Some(e), ..
+        }) => {
+            state.mcp.read().await.meta_set(
+                name,
+                ConnMeta {
                     peer: None,
                     pid: None,
-                    error: Some(e.clone()),
-                    tools: vec![],
+                    error: Some(e),
+                    tools: Vec::new(),
                     tools_at: None,
+                    alive: false,
                 },
             );
-            Err(e)
+            Err((StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))))
         }
+        Err(e) => Err(e),
     }
 }
 
-/// Connect every configured server. Fired at control-plane startup (and
-/// after a config reload); failures are recorded per server, never fatal.
+/// Startup: connect every configured server in the background (best effort
+/// — the tools catalog and each call reconnect on demand anyway).
 pub(crate) async fn connect_all(state: S) {
-    let specs = state.config.read().await.mcp_servers.clone();
-    for spec in specs {
-        if let Err(e) = ensure_conn(&state, &spec.name).await {
-            tracing::warn!(target: "mcp", "startup connect failed for '{}': {:?}", spec.name, e.1);
+    let cfg = state.config.read().await.mcp_servers.clone();
+    for spec in cfg {
+        if spec.transport().is_none() {
+            continue;
+        }
+        if let Err((s, e)) = ensure_conn(&state, &spec.name).await {
+            tracing::info!(
+                target: "mcp",
+                "startup connect for '{0}' failed: {s} {e:?}",
+                spec.name
+            );
         }
     }
 }
 
-/// Serialize one configured server for the management endpoints.
-fn server_value(spec: &McpServerSpec, conn: Option<&McpConn>) -> Value {
-    let status: String = match conn {
-        Some(c) if c.alive() => "connected".to_string(),
-        Some(c) => format!(
+/// The JSON view of one configured server for `GET /api/mcp/servers`.
+/// `authorization` never leaves the control plane — the UI sees a mask.
+fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
+    let status: String = match meta {
+        Some(m) if m.alive && m.error.is_none() => "connected".to_string(),
+        Some(m) => format!(
             "error: {}",
-            c.error.clone().unwrap_or_else(|| "connection closed".into())
+            m.error.clone().unwrap_or_else(|| "connection closed".into())
         ),
         None => "disconnected".to_string(),
     };
@@ -454,704 +903,10 @@ fn server_value(spec: &McpServerSpec, conn: Option<&McpConn>) -> Value {
         // Secret: the UI only ever sees the mask.
         "authorization": spec.authorization.as_ref().map(|_| "***").unwrap_or_default(),
         "status": status,
-        "peer": conn.and_then(|c| c.peer.clone()),
-        "pid": conn.and_then(|c| c.pid),
-        "toolCount": conn.map(|c| c.tools.len()).unwrap_or(0),
+        "peer": meta.and_then(|m| m.peer.clone()),
+        "pid": meta.and_then(|m| m.pid),
+        "toolCount": meta.map(|m| m.tools.len()).unwrap_or(0),
     })
 }
 
-// ---------------------------------------------------------------------------
-// Result rendering
-// ---------------------------------------------------------------------------
-
-/// Render a `tools/call` result into the single text blob the agent loop
-/// feeds back to the model. Binary payloads (images/audio) are described,
-/// not dumped — base64 would only burn context.
-fn render_result(result: &CallToolResult) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for block in &result.content {
-        match block {
-            ContentBlock::Text(t) => parts.push(t.text.clone()),
-            ContentBlock::Image(img) => parts.push(format!(
-                "[image, {} — {} bytes of base64 omitted]",
-                img.mime_type,
-                img.data.len()
-            )),
-            ContentBlock::Audio(a) => parts.push(format!(
-                "[audio, {} — {} bytes of base64 omitted]",
-                a.mime_type,
-                a.data.len()
-            )),
-            ContentBlock::Resource(r) => parts
-                .push(serde_json::to_string(r).unwrap_or_else(|_| "[resource omitted]".into())),
-            ContentBlock::ResourceLink(r) => parts
-                .push(serde_json::to_string(r).unwrap_or_else(|_| "[resource link omitted]".into())),
-            // `ContentBlock` is non-exhaustive in rmcp — future content kinds
-            // are described, never dumped raw.
-            other => {
-                let v = serde_json::to_value(other).unwrap_or(Value::Null);
-                let kind = v
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("unknown");
-                parts.push(format!("[{kind} content omitted]"));
-            }
-        }
-    }
-    let mut out = parts.join("\n");
-    if let Some(sc) = &result.structured_content {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("[structured result] {sc}"));
-    }
-    if out.is_empty() {
-        out = "(no content)".into();
-    }
-    if out.len() > MAX_TOOL_OUTPUT {
-        out.truncate(MAX_TOOL_OUTPUT);
-        out.push_str("\n… (truncated)");
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Routes: /api/mcp/*
-// ---------------------------------------------------------------------------
-
-/// `GET /api/mcp/servers` — configured servers with live status.
-pub async fn servers_get(AxumState(state): AxumState<S>) -> Json<Value> {
-    let cfg = state.config.read().await.clone();
-    let m = state.mcp.read().await;
-    let servers: Vec<Value> = cfg
-        .mcp_servers
-        .iter()
-        .map(|spec| server_value(spec, m.conns.get(&spec.name)))
-        .collect();
-    Json(json!({ "servers": servers }))
-}
-
-/// `POST /api/mcp/servers` — upsert one server spec, persist it, and (re)
-/// connect. The connection is always dropped first so an edited spec takes
-/// effect immediately.
-pub async fn servers_upsert(
-    AxumState(state): AxumState<S>,
-    Json(req): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut spec: McpServerSpec = serde_json::from_value(req)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid server spec: {e}") })),
-            )
-        })?;
-    let raw_name = spec.name.trim().to_string();
-    spec.name = sanitize_server_name(&raw_name);
-    if let Some(u) = spec.url.as_mut() {
-        *u = u.trim().to_string();
-    }
-    if let Some(c) = spec.command.as_mut() {
-        *c = c.trim().to_string();
-    }
-    validate_spec(&spec)?;
-
-    {
-        let mut cfg = state.config.write().await;
-        match cfg.mcp_servers.iter().position(|s| s.name == spec.name) {
-            Some(i) => cfg.mcp_servers[i] = spec.clone(),
-            None => cfg.mcp_servers.push(spec.clone()),
-        }
-    }
-    let cfg = state.config.read().await.clone();
-    crate::routes_config::persist_config(&state, &cfg)
-        .await
-        .map_err(|(_, e)| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))))?;
-
-    {
-        let mut m = state.mcp.write().await;
-        m.conns.remove(&spec.name);
-    }
-    ensure_conn(&state, &spec.name).await?;
-    Ok(servers_get(AxumState(state.clone())).await)
-}
-
-/// `POST /api/mcp/servers/{name}` — drop the connection and remove the
-/// spec from the persisted config. (POST rather than DELETE: the control
-/// plane's CORS allow-list only carries GET/POST.)
-pub async fn server_delete(
-    AxumState(state): AxumState<S>,
-    AxumPath(name): AxumPath<String>,
-) -> Json<Value> {
-    {
-        let mut m = state.mcp.write().await;
-        m.conns.remove(&name);
-    }
-    let changed = {
-        let mut cfg = state.config.write().await;
-        let before = cfg.mcp_servers.len();
-        cfg.mcp_servers.retain(|s| s.name != name);
-        cfg.mcp_servers.len() != before
-    };
-    if changed {
-        let cfg = state.config.read().await.clone();
-        if let Err((s, e)) = crate::routes_config::persist_config(&state, &cfg).await {
-            // The in-memory state is already updated; without this the
-            // removal would silently come back on the next start.
-            tracing::warn!(target: "mcp", "config not persisted after removing MCP server '{name}': {s} {e}");
-        }
-    }
-    Json(json!({ "ok": true, "removed": changed }))
-}
-
-/// `POST /api/mcp/servers/{name}/restart` — force a reconnect now.
-pub async fn server_restart(
-    AxumState(state): AxumState<S>,
-    AxumPath(name): AxumPath<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    {
-        let mut m = state.mcp.write().await;
-        m.conns.remove(&name);
-    }
-    ensure_conn(&state, &name).await?;
-    Ok(servers_get(AxumState(state.clone())).await)
-}
-
-/// `GET /api/mcp/tools?scope=<workspace>` — the merged catalog of
-/// `mcp__<server>__<tool>` definitions (LLM-ready), each annotated with its
-/// effective permission tier for `scope` (per-tool row wins over the
-/// per-server `mcp__<server>` row; default `allow`). Servers are connected
-/// (or reconnected) here on demand, and stale `tools/list` caches are
-/// refreshed.
-pub async fn tools_get(
-    AxumState(state): AxumState<S>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    let scope = q.get("scope").map(String::as_str).unwrap_or("default");
-    let perms = state
-        .coder_perms
-        .read()
-        .await
-        .get(scope)
-        .cloned()
-        .unwrap_or_default();
-    let cfg = state.config.read().await.mcp_servers.clone();
-    let mut m = state.mcp.write().await;
-    let mut tools: Vec<Value> = Vec::new();
-    for spec in &cfg {
-        if spec.transport().is_none() {
-            continue;
-        }
-        if let Err(e) = ensure_conn_inner(&state, &mut m, &spec.name).await {
-            tracing::warn!(target: "mcp", "tools refresh failed for '{}': {e}", spec.name);
-            continue;
-        }
-        if let Some(c) = m.conns.get_mut(&spec.name) {
-            if c.alive() && c.tools_at.map(|t| t.elapsed() > TOOLS_TTL).unwrap_or(true) {
-                if let Some(svc) = &c.service {
-                    if let Ok(fresh) = fetch_tools(&spec.name, svc).await {
-                        c.tools = fresh;
-                        c.tools_at = Some(Instant::now());
-                    }
-                }
-            }
-            for td in &c.tools {
-                tools.push(json!({
-                    "name": td.mangled,
-                    "description": td.description,
-                    "parameters": td.parameters,
-                    "tier": serde_json::to_value(tier_for(&perms, &td.mangled)).unwrap(),
-                }));
-            }
-        }
-    }
-    Json(json!({ "tools": tools }))
-}
-
-/// `POST /api/mcp/call` — body `{ name: "mcp__<server>__<tool>",
-/// arguments?: object, scope?: string, approvalToken?: string }`.
-///
-/// Permission gate first (same allow/ask/deny tiers as the built-in tools,
-/// re-checked server-side via `enforce_perm` so a client-side dispatcher
-/// cannot route around `deny`/`ask`), then the `tools/call`. Tool-level
-/// failures come back as `{ ok: false, output }` — the agent loop feeds
-/// that straight to the model, which is usually the better outcome than an
-/// HTTP error for a single misbehaving external tool.
-pub async fn mcp_call(
-    AxumState(state): AxumState<S>,
-    Json(req): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let name = req
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({ "error": "name required" }))))?;
-    let (server, _tool) = split_mcp_name(name).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("'{name}' is not an mcp__<server>__<tool> name") })),
-        )
-    })?;
-    // A name for a server that isn't configured is a 404, not a connection
-    // error — the model can react to "no such server" without burning a
-    // reconnect attempt.
-    if !state.config.read().await.mcp_servers.iter().any(|s| s.name == server) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("unknown MCP server '{server}'") })),
-        ));
-    }
-    let scope = perm_scope(&req);
-    let token = req.get("approvalToken").and_then(|v| v.as_str());
-    enforce_perm(&state, &scope, name, None, token).await?;
-
-    let arguments: Map<String, Value> = match req.get("arguments") {
-        Some(Value::Object(o)) => o.clone(),
-        Some(Value::Null) | None => Map::new(),
-        Some(_) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "arguments must be an object" })),
-            ))
-        }
-    };
-
-    // Up to two attempts: a transport-level failure (child died, HTTP
-    // session dropped) gets one reconnect + retry; protocol-level errors
-    // are surfaced to the agent as-is.
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let (svc, original) = {
-            ensure_conn(&state, server).await?;
-            let m = state.mcp.read().await;
-            let conn = m.conns.get(server);
-            let svc = conn
-                .and_then(|c| c.service.clone())
-                .ok_or_else(|| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({ "error": format!("MCP server '{server}' is not connected") })),
-                    )
-                })?;
-            // Mangled name → the server's own tool name; fall back to the raw
-            // suffix when the cache is empty (works whenever the server's
-            // tool names are already LLM-safe, which is the common case).
-            let mangled_tool = &name[MCP_PREFIX.len() + server.len() + 2..];
-            let original = conn
-                .and_then(|c| c.tools.iter().find(|t| t.mangled == name))
-                .map(|t| t.original.clone())
-                .unwrap_or_else(|| mangled_tool.to_string());
-            (svc, original)
-        };
-
-            // `CallToolRequestParams::new` wants a `Cow<'static, str>` —
-            // `original` is an owned String, so hand it over by value.
-            let params = CallToolRequestParams::new(original).with_arguments(arguments.clone());
-        match timeout(CALL_TIMEOUT, svc.call_tool_once(params)).await {
-            Ok(Ok(CallToolResponse::Complete(result))) => {
-                let failed = result.is_error == Some(true);
-                if failed {
-                    tracing::info!(target: "mcp", "tool '{name}' reported an error result");
-                }
-                return Ok(Json(json!({
-                    "ok": !failed,
-                    "output": render_result(&result),
-                })));
-            }
-            Ok(Ok(CallToolResponse::InputRequired(_))) => {
-                // SEP-2322 multi-round interactive input: we don't drive
-                // those rounds (the human-facing dialog doesn't exist here),
-                // so tell the model what happened instead of hanging.
-                return Ok(Json(json!({
-                    "ok": false,
-                    "output": format!(
-                        "MCP tool '{name}' requested interactive multi-round input, \
-                         which this client does not provide."
-                    ),
-                })));
-            }
-            // `CallToolResponse` is `#[non_exhaustive]`: a newer rmcp release
-            // may add variants. Surface them instead of silently dropping the
-            // response.
-            Ok(Ok(_)) => {
-                return Ok(Json(json!({
-                    "ok": false,
-                    "output": format!(
-                        "MCP tool '{name}' returned an unsupported response shape"
-                    ),
-                })));
-            }
-            Ok(Err(e))
-                if matches!(
-                    e,
-                    ServiceError::TransportClosed | ServiceError::TransportSend(_)
-                ) &&
-                    attempt < 2 =>
-            {
-                // Connection died mid-call: drop the slot and retry once
-                // through a fresh connection.
-                let mut m = state.mcp.write().await;
-                m.conns.remove(server);
-                continue;
-            }
-            Ok(Err(e)) => {
-                let msg = format!("MCP call '{name}' failed: {e}");
-                tracing::warn!(target: "mcp", "{msg}");
-                return Ok(Json(json!({ "ok": false, "output": msg })));
-            }
-            Err(_) => {
-                let msg = format!(
-                    "MCP call '{name}' timed out after {}s",
-                    CALL_TIMEOUT.as_secs()
-                );
-                tracing::warn!(target: "mcp", "{msg}");
-                return Ok(Json(json!({ "ok": false, "output": msg })));
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::coder::{perms_approve, CoderPerms, PermTier};
-
-    fn tmp_state() -> (S, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!("ninfier-mcp-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
-        (state, tmp)
-    }
-
-    #[test]
-    fn sanitize_server_name_drops_underscores_and_junk() {
-        assert_eq!(sanitize_server_name("my server!"), "myserver");
-        assert_eq!(sanitize_server_name("a_b c-d"), "abcd-d");
-        assert_eq!(sanitize_server_name("__"), "");
-    }
-
-    #[test]
-    fn sanitize_tool_name_is_llm_safe() {
-        assert_eq!(sanitize_tool_name("get-weather@now"), "get-weather_now");
-        assert_eq!(sanitize_tool_name("!!!"), "tool");
-        let long = "x".repeat(100);
-        assert_eq!(sanitize_tool_name(&long).len(), 56);
-    }
-
-    #[test]
-    fn split_mcp_name_parses_server_and_tool() {
-        assert_eq!(
-            split_mcp_name("mcp__github__create_issue"),
-            Some(("github", "create_issue"))
-        );
-        // the tool part may itself contain `__`
-        assert_eq!(split_mcp_name("mcp__srv__a__b"), Some(("srv", "a__b")));
-        assert_eq!(split_mcp_name("mcp__"), None);
-        assert_eq!(split_mcp_name("mcp__github"), None);
-        assert_eq!(split_mcp_name("mcp__github__"), None);
-        assert_eq!(split_mcp_name("read"), None);
-        assert_eq!(split_mcp_name("mcp___x"), None);
-    }
-
-    #[test]
-    fn mangle_tools_namespaces_and_dedupes() {
-        // build two colliding tools by hand via serde
-        let v1: Tool = serde_json::from_value(json!({
-            "name": "echo",
-            "description": "d1",
-            "inputSchema": { "type": "object" }
-        }))
-        .unwrap();
-        let v2: Tool = serde_json::from_value(json!({
-            "name": "echo",
-            "description": "d2",
-            "inputSchema": { "type": "object" }
-        }))
-        .unwrap();
-        let defs = mangle_tools("echo-server", &[v1, v2]);
-        assert_eq!(defs.len(), 2);
-        assert_eq!(defs[0].mangled, "mcp__echo-server__echo");
-        assert_eq!(defs[1].mangled, "mcp__echo-server__echo_2");
-        assert_eq!(defs[0].original, "echo");
-        assert_eq!(defs[0].description, "d1");
-    }
-
-    #[test]
-    fn spec_transport_selection() {
-        let both = McpServerSpec {
-            name: "x".into(),
-            command: Some("uvx".into()),
-            url: Some("https://example.com/mcp".into()),
-            ..Default::default()
-        };
-        assert_eq!(both.transport(), Some("stdio"), "command wins");
-        let none = McpServerSpec {
-            name: "x".into(),
-            ..Default::default()
-        };
-        assert_eq!(none.transport(), None);
-        let http = McpServerSpec {
-            name: "x".into(),
-            url: Some("https://example.com/mcp".into()),
-            ..Default::default()
-        };
-        assert_eq!(http.transport(), Some("http"));
-    }
-
-    #[tokio::test]
-    async fn tier_falls_back_to_server_row() {
-        let mut tools = HashMap::new();
-        tools.insert("mcp__github".to_string(), PermTier::Deny);
-        let perms = CoderPerms {
-            tools: tools.clone(),
-            deny_paths: vec![],
-        };
-        assert_eq!(
-            crate::coder::tier_for(&perms, "mcp__github__push"),
-            PermTier::Deny
-        );
-        // a per-tool row overrides the per-server row
-        tools.insert("mcp__github__push".to_string(), PermTier::Allow);
-        let perms = CoderPerms {
-            tools,
-            deny_paths: vec![],
-        };
-        assert_eq!(
-            crate::coder::tier_for(&perms, "mcp__github__push"),
-            PermTier::Allow
-        );
-        assert_eq!(
-            crate::coder::tier_for(&perms, "mcp__github__other"),
-            PermTier::Deny
-        );
-        // non-MCP names never consult the server row
-        assert_eq!(crate::coder::tier_for(&perms, "bash"), PermTier::Allow);
-    }
-
-    #[tokio::test]
-    async fn call_rejects_bad_names() {
-        let (state, tmp) = tmp_state();
-        let e = mcp_call(AxumState(state.clone()), Json(json!({ "name": "read" })))
-            .await
-            .unwrap_err();
-        assert_eq!(e.0, StatusCode::BAD_REQUEST);
-        let e = mcp_call(
-            AxumState(state.clone()),
-            Json(json!({ "name": "mcp__nosuch__tool" })),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.0, StatusCode::NOT_FOUND, "unknown server is a 404");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// A minimal MCP stdio server: implements the legacy initialize
-    /// handshake plus tools/list + tools/call (echo). The `server/discover`
-    /// probe (sent by the `Auto` lifecycle) is answered with
-    /// method-not-found, so rmcp falls back to legacy initialize instantly.
-    const ECHO_SERVER_PY: &str = r#"
-import json, sys
-
-def send(msg):
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
-
-def main():
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        method = msg.get("method")
-        rid = msg.get("id")
-        if rid is None:
-            continue  # notification
-        if method == "server/discover":
-            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
-        elif method == "initialize":
-            send({"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "echo", "version": "0.1.0"}}})
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [{
-                "name": "echo",
-                "description": "Echo the input text back",
-                "inputSchema": {"type": "object",
-                                "properties": {"text": {"type": "string"}},
-                                "required": ["text"]}}]}})
-        elif method == "tools/call":
-            args = msg.get("params", {}).get("arguments", {})
-            send({"jsonrpc": "2.0", "id": rid, "result": {
-                "content": [{"type": "text", "text": args.get("text", "")}],
-                "isError": False}})
-        else:
-            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
-
-main()
-"#;
-
-    fn find_python() -> Option<String> {
-        ["python3", "python"]
-            .iter()
-            .find(|bin| {
-                std::process::Command::new(bin)
-                    .arg("--version")
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            })
-            .map(|s| s.to_string())
-    }
-
-    #[tokio::test]
-    async fn end_to_end_stdio_server() {
-        let python = match find_python() {
-            Some(p) => p,
-            None => {
-                eprintln!("skip: no python interpreter available for the MCP stdio e2e test");
-                return;
-            }
-        };
-        let (state, tmp) = tmp_state();
-        let script = tmp.join("mcp_echo.py");
-        std::fs::write(&script, ECHO_SERVER_PY).unwrap();
-
-        let spec = McpServerSpec {
-            name: "echo".into(),
-            command: Some(python),
-            args: vec![script.to_string_lossy().into_owned()],
-            ..Default::default()
-        };
-        {
-            let mut cfg = state.config.write().await;
-            cfg.mcp_servers.push(spec);
-        }
-
-        // connect + discover
-        ensure_conn(&state, "echo").await.expect("connect to the stdio echo server");
-
-        // catalog
-        let catalog = tools_get(AxumState(state.clone()), Query(HashMap::new()))
-            .await
-            .0;
-        let tools = catalog["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 1, "one echo tool: {catalog}");
-        assert_eq!(tools[0]["name"], "mcp__echo__echo");
-        assert_eq!(tools[0]["tier"], "allow");
-
-        // call
-        let res = mcp_call(
-            AxumState(state.clone()),
-            Json(json!({ "name": "mcp__echo__echo", "arguments": { "text": "hello mcp" } })),
-        )
-        .await
-        .expect("tools/call")
-        .0;
-        assert_eq!(res["ok"], true, "{res}");
-        assert_eq!(res["output"], "hello mcp", "{res}");
-
-        // per-server deny tier blocks it (server-side enforcement)
-        {
-            let mut all = state.coder_perms.write().await;
-            let mut t = HashMap::new();
-            t.insert("mcp__echo".to_string(), PermTier::Deny);
-            all.insert(
-                "default".to_string(),
-                CoderPerms {
-                    tools: t,
-                    deny_paths: vec![],
-                },
-            );
-        }
-        let e = mcp_call(
-            AxumState(state.clone()),
-            Json(json!({ "name": "mcp__echo__echo", "arguments": { "text": "x" } })),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.0, StatusCode::FORBIDDEN, "{e:?}");
-
-        // ask tier: blocked without a token…
-        {
-            let mut all = state.coder_perms.write().await;
-            let mut t = HashMap::new();
-            t.insert("mcp__echo".to_string(), PermTier::Ask);
-            all.insert(
-                "default".to_string(),
-                CoderPerms {
-                    tools: t,
-                    deny_paths: vec![],
-                },
-            );
-        }
-        let e = mcp_call(
-            AxumState(state.clone()),
-            Json(json!({ "name": "mcp__echo__echo", "arguments": { "text": "x" } })),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.0, StatusCode::FORBIDDEN, "ask without token: {e:?}");
-
-        // …allowed with a fresh approval token (the exact flow the UI's
-        // approval dialog drives).
-        let approval = perms_approve(
-            AxumState(state.clone()),
-            Json(json!({ "tool": "mcp__echo__echo", "scope": "default" })),
-        )
-        .await
-        .expect("mint approval token");
-        let token = approval.0["token"].as_str().expect("token").to_string();
-        let res = mcp_call(
-            AxumState(state.clone()),
-            Json(json!({
-                "name": "mcp__echo__echo",
-                "arguments": { "text": "approved" },
-                "approvalToken": token
-            })),
-        )
-        .await
-        .expect("tools/call with approval token")
-        .0;
-        assert_eq!(res["ok"], true, "{res}");
-        assert_eq!(res["output"], "approved", "{res}");
-
-        // status shows connected
-        let servers = servers_get(AxumState(state.clone())).await.0;
-        assert_eq!(servers["servers"][0]["status"], "connected", "{servers}");
-
-        // delete drops the connection and the spec
-        let del = server_delete(AxumState(state.clone()), AxumPath("echo".to_string())).await.0;
-        assert_eq!(del["removed"], true, "{del}");
-        let m = state.mcp.read().await;
-        assert!(m.conns.get("echo").is_none());
-        drop(m);
-        let cfg = state.config.read().await;
-        assert!(cfg.mcp_servers.is_empty());
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[tokio::test]
-    async fn upsert_rejects_specs_without_transport() {
-        let (state, tmp) = tmp_state();
-        let e = servers_upsert(
-            AxumState(state.clone()),
-            Json(json!({ "name": "bad" })),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e.0, StatusCode::BAD_REQUEST, "{e:?}");
-        let cfg = state.config.read().await;
-        assert!(cfg.mcp_servers.is_empty());
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-}
+// __PART2__
