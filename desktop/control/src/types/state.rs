@@ -231,6 +231,7 @@ impl State {
             data_dir,
             dist_dir,
             remote: tokio::sync::Mutex::new(None),
+            agent_runs: crate::agent::run::RunRegistry::default(),
         }
     }
 
