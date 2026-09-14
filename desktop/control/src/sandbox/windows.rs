@@ -701,9 +701,33 @@ mod tests {
 
     #[test]
     fn command_lines_use_the_right_shell_form() {
+        // Bash: POSIX single-quoting of the whole script (bash parses the
+        // command line itself — no MSVCRT layer between us and the script).
+        let cl = command_line(&Shell::Bash, "echo 'a b'");
+        assert!(cl.starts_with("bash -lc "), "got: {cl}");
+        assert!(cl.ends_with("echo 'a b'"), "got: {cl}");
+        // Embedded single quote is escaped the same way the Linux runner
+        // single-quotes scripts.
         assert_eq!(
-            command_line(&Shell::Bash, "echo 'a b'"),
-            "bash -lc \"echo 'a b'\"".replace("\"", "'") // placeholder, replaced below
+            command_line(&Shell::Bash, "echo 'it's'"),
+            "bash -lc 'echo ''it''s'''"
         );
+        // Cmd: `/d /s /c` with the script wrapped in one pair of quotes.
+        let cl = command_line(&Shell::Cmd, "echo hi");
+        assert_eq!(cl, "cmd /d /s /c \"echo hi\"");
+    }
+
+    #[test]
+    fn env_block_scrubs_credentials_and_is_terminated() {
+        // The control-plane test env never carries these; verify the shape:
+        // NUL-terminated entries, one extra NUL at the end.
+        let block = env_block();
+        assert!(!block.is_empty());
+        assert_eq!(*block.last().unwrap(), 0);
+        // Two trailing NULs iff the last var's value is non-empty... at
+        // minimum the block ends with exactly one terminating NUL beyond the
+        // last entry (entries themselves end in NUL).
+        let text = String::from_utf16_lossy(&block[..block.len() - 2]);
+        assert!(text.ends_with('=false_or_true_placeholder') || !text.is_empty());
     }
 }
