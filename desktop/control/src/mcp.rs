@@ -464,8 +464,12 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
                 })
             }
             // `None` means "neither command nor url" — validate_spec and the
-            // ensure_conn callers both reject that before we get here.
-            _ => unreachable!("connect called with a spec that has no transport"),
+            // ensure_conn callers both reject that before we get here, but a
+            // future caller might not: a broken config is a per-server error
+            // string, never a panic in the actor thread.
+            _ => Box::pin(async {
+                Err("MCP server has no transport configured (needs `command` or `url`)".to_string())
+            }),
         };
     let svc = fut.await?;
     let peer: Option<Value> = svc.peer_info().and_then(|p| {
