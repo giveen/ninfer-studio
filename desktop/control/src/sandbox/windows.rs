@@ -352,20 +352,23 @@ impl WinChild {
         }
         if self.exit_rx.is_none() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let process = self.process;
+            // A HANDLE is a raw pointer and raw pointers are not `Send` —
+            // hand it to the blocking thread through an `AtomicPtr`.
+            let process = std::sync::atomic::AtomicPtr::<std::ffi::c_void>::from_ptr(self.process);
             self.process = std::ptr::null_mut();
             tokio::task::spawn_blocking(move || {
+                let handle = process.load(std::sync::atomic::Ordering::Acquire);
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
-                        process,
+                        handle,
                         windows_sys::Win32::System::Threading::INFINITE,
                     );
                     let mut code: u32 = 0;
                     let _ =
                         windows_sys::Win32::System::Threading::GetExitCodeProcess(
-                            process, &mut code,
+                            handle, &mut code,
                         );
-                    let _ = CloseHandle(process);
+                    let _ = CloseHandle(handle);
                     if code == STILL_ACTIVE { -1 } else { code as i32 }
                 };
                 let _ = tx.send(code);
@@ -644,7 +647,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             (EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW) as _,
             env.as_ptr() as *const _,
             wide_ptr(&cwd_wide),
-            &si_ex as *const _,
+            &si_ex.StartupInfo as *const STARTUPINFOW,
             &mut pi,
         )
     };
