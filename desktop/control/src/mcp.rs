@@ -563,7 +563,11 @@ pub async fn server_delete(
     };
     if changed {
         let cfg = state.config.read().await.clone();
-        let _ = crate::routes_config::persist_config(&state, &cfg).await;
+        if let Err((s, e)) = crate::routes_config::persist_config(&state, &cfg).await {
+            // The in-memory state is already updated; without this the
+            // removal would silently come back on the next start.
+            tracing::warn!(target: "mcp", "config not persisted after removing MCP server '{name}': {s} {e}");
+        }
     }
     Json(json!({ "ok": true, "removed": changed }))
 }
