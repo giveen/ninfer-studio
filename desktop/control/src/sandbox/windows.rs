@@ -708,8 +708,11 @@ mod tests {
         assert_eq!(arg_quote("C:\\Git\\bin\\bash"), "\"C:\\Git\\bin\\bash\"");
         assert_eq!(arg_quote("a b"), "\"a b\"");
         assert_eq!(arg_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
-        assert_eq!(arg_quote("trail\\"), "\"trail\\\"");
-        assert_eq!(arg_quote("back\\slash"), "\"back\\\\slash\"");
+        // Trailing run: doubled so the closing quote survives the parser.
+        assert_eq!(arg_quote("trail\\"), "\"trail\\\\\"");
+        // Run NOT followed by a quote: copied verbatim (MSVCRT only treats
+        // `\` specially before a `"`).
+        assert_eq!(arg_quote("back\\slash"), "\"back\\slash\"");
     }
 
     #[test]
