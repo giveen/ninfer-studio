@@ -279,12 +279,20 @@ struct UsageLogCtx {
     state: S,
     model: Option<String>,
     source: RequestSource,
+    /// True when the client requested a streamed response (`"stream": true`)
+    /// — only those give a meaningful prefill/decode split to measure.
+    streaming: bool,
 }
 
 struct UsageTapStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
     buf: Vec<u8>,
     ctx: Option<UsageLogCtx>,
+    /// When `proxy::proxy` handed the request to the engine (None when the
+    /// proxy failed before the stream existed — then no timing is logged).
+    started: Option<std::time::Instant>,
+    /// When the first response chunk arrived ≈ end of prefill.
+    first_chunk: Option<std::time::Instant>,
 }
 
 impl Stream for UsageTapStream {
