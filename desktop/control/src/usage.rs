@@ -437,19 +437,19 @@ mod tests {
         let recent = now - margin_ms;
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: two_days_ago, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 50, cached_tokens: 20 },
+            UsageEvent { ts_ms: two_days_ago, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 50, cached_tokens: 20, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: one_day_ago, model: "model-b".into(), source: RequestSource::Remote, prompt_tokens: 200, completion_tokens: 100, cached_tokens: 0 },
+            UsageEvent { ts_ms: one_day_ago, model: "model-b".into(), source: RequestSource::Remote, prompt_tokens: 200, completion_tokens: 100, cached_tokens: 0, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: recent, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 300, completion_tokens: 150, cached_tokens: 300 },
+            UsageEvent { ts_ms: recent, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 300, completion_tokens: 150, cached_tokens: 300, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
@@ -460,6 +460,9 @@ mod tests {
         assert_eq!(all["totals"]["tokenUsage"], 100 + 50 + 200 + 100 + 300 + 150);
         assert_eq!(all["totals"]["mostUsedModel"], "model-a");
         assert_eq!(all["modelBreakdown"].as_array().unwrap().len(), 2);
+        // No streamed events logged (no timing) → speed stats are null.
+        assert_eq!(all["totals"]["avgPrefillTps"], Value::Null);
+        assert_eq!(all["totals"]["avgGenerationTps"], Value::Null);
 
         let Json(local_only) =
             usage_stats(AxumState(state.clone()), Query(UsageQuery { days: Some(30), source: Some("local".into()) })).await;
@@ -480,8 +483,10 @@ mod tests {
         let state = temp_state();
         let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         log_from_response_bytes(
-            UsageLogCtx { state: state.clone(), model: Some("qwen3_8_27b_nvfp4.ninfer".into()), source: RequestSource::Local },
+            UsageLogCtx { state: state.clone(), model: Some("qwen3_8_27b_nvfp4.ninfer".into()), source: RequestSource::Local, streaming: false },
             body,
+            None,
+            None,
         )
         .await;
         let events = read_usage_events(&state).await;
@@ -496,7 +501,7 @@ mod tests {
     async fn logged_model_falls_back_to_response_alias_when_artifact_unknown() {
         let state = temp_state();
         let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        log_from_response_bytes(UsageLogCtx { state: state.clone(), model: None, source: RequestSource::Local }, body).await;
+        log_from_response_bytes(UsageLogCtx { state: state.clone(), model: None, source: RequestSource::Local, streaming: false }, body, None, None).await;
         let events = read_usage_events(&state).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["model"].as_str(), Some("qwen3.8-27b"));
@@ -511,7 +516,7 @@ mod tests {
         crate::power::write_power_log(&state, &by_day).await;
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: now_ms(), model: "model-a".into(), source: RequestSource::Remote, prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0 },
+            UsageEvent { ts_ms: now_ms(), model: "model-a".into(), source: RequestSource::Remote, prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
@@ -525,5 +530,58 @@ mod tests {
             usage_stats(AxumState(state), Query(UsageQuery { days: Some(7), source: Some("local".into()) })).await;
         assert_eq!(local_only["totals"]["requests"], 0);
         assert!((local_only["totals"]["energyKwh"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn display_model_name_strips_artifact_extension() {
+        assert_eq!(display_model_name("qwen3_8_27b_nvfp4.ninfer"), "qwen3_8_27b_nvfp4");
+        // OpenAI-facing aliases may contain dots — only the exact artifact
+        // extension is stripped.
+        assert_eq!(display_model_name("qwen3.8-27b"), "qwen3.8-27b");
+        assert_eq!(display_model_name("unknown"), "unknown");
+    }
+
+    /// Streamed events contribute to the average prefill / generation speeds
+    /// (weighted: total tokens / total time across events), non-streamed
+    /// events don't, and the artifact extension is stripped from the model
+    /// name everywhere it surfaces.
+    #[tokio::test]
+    async fn stream_timing_feeds_average_speeds_and_model_extension_is_stripped() {
+        let state = temp_state();
+        // 100 prompt / 200 completion over 500ms prefill + 2000ms decode, and
+        // 50 prompt / 100 completion over 500ms prefill + 1000ms decode:
+        // avgPrefillTps = 150 / 1.0 = 150, avgGenerationTps = 300 / 3.0 = 100.
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "qwen3_8_27b_nvfp4.ninfer".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 200, cached_tokens: 0, prefill_ms: Some(500), total_ms: Some(2500) },
+        )
+        .await
+        .unwrap();
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "qwen3_8_27b_nvfp4.ninfer".into(), source: RequestSource::Local, prompt_tokens: 50, completion_tokens: 100, cached_tokens: 0, prefill_ms: Some(500), total_ms: Some(1500) },
+        )
+        .await
+        .unwrap();
+        // No timing → counts toward tokens/requests but not the speeds.
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "model-b".into(), source: RequestSource::Local, prompt_tokens: 1, completion_tokens: 1, cached_tokens: 0, prefill_ms: None, total_ms: None },
+        )
+        .await
+        .unwrap();
+
+        let Json(all) = usage_stats(AxumState(state), Query(UsageQuery { days: Some(1), source: None })).await;
+        assert_eq!(all["totals"]["mostUsedModel"], "qwen3_8_27b_nvfp4");
+        assert!((all["totals"]["avgPrefillTps"].as_f64().unwrap() - 150.0).abs() < 1e-9);
+        assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+        let models: Vec<&str> = all["modelBreakdown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap())
+            .collect();
+        assert!(models.contains(&"qwen3_8_27b_nvfp4"));
+        assert!(models.iter().all(|m| !m.ends_with(".ninfer")));
     }
 }
