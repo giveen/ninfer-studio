@@ -352,12 +352,6 @@ pub struct WinChild {
     acls: Vec<AclGuard>,
 }
 
-/// Convert a raw handle value back to the pointer form the Win32 APIs take
-/// (through `u32`, so `INVALID_HANDLE_VALUE` keeps its 32-bit shape).
-fn as_handle(raw: std::raw::HANDLE) -> *mut std::ffi::c_void {
-    raw as u32 as *mut _
-}
-
 impl WinChild {
     pub fn take_stdout(&mut self) -> Option<std::fs::File> {
         self.stdout.take()
@@ -370,7 +364,7 @@ impl WinChild {
     /// Kill the whole tree (shell + grandchildren) via the job object.
     pub fn start_kill(&mut self) {
         unsafe {
-            let _ = TerminateJobObject(as_handle(self.job.as_raw_handle()), 1);
+            let _ = TerminateJobObject(self.job.as_raw_handle(), 1);
         }
     }
 
@@ -393,9 +387,9 @@ impl WinChild {
                 .process
                 .as_ref()
                 .map(|h| h.as_raw_handle())
-                .unwrap_or(0);
+                .unwrap_or(std::ptr::null_mut());
             tokio::task::spawn_blocking(move || {
-                let handle = as_handle(raw);
+                let handle = raw;
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
@@ -431,7 +425,7 @@ impl Drop for WinChild {
         // the job object is the last line of containment (`KILL_ON_JOB_CLOSE`)
         // if the exec future is abandoned without a wait/kill.
         unsafe {
-            let _ = TerminateJobObject(as_handle(self.job.as_raw_handle()), 1);
+            let _ = TerminateJobObject(self.job.as_raw_handle(), 1);
         }
         // `acls` drop here → revoke the low-integrity write grants.
     }
@@ -722,11 +716,12 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     let stdout_file = unsafe { std::fs::File::from_raw_handle(out_read) };
     let stderr_file = unsafe { std::fs::File::from_raw_handle(err_read) };
 
+    // `OwnedHandle` takes ownership of the raw handles (closes on drop).
+    // Stable has no `OwnedHandle::new` — `FromRawHandle` is the constructor,
+    // and its `RawHandle` is `*mut c_void`, exactly what windows-sys returns.
     Ok(ExecChild::Windows(WinChild {
-        process: Some(std::os::windows::io::OwnedHandle::new(
-            pi.hProcess as usize as std::raw::HANDLE,
-        )),
-        job: std::os::windows::io::OwnedHandle::new(job as usize as std::raw::HANDLE),
+        process: Some(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(pi.hProcess) }),
+        job: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job) },
         stdout: Some(stdout_file),
         stderr: Some(stderr_file),
         exit_rx: None,
