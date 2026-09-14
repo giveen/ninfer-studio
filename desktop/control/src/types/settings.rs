@@ -142,6 +142,63 @@ pub struct AppSettings {
     /// `0.0` means "not configured" — the Usage tab hides cost figures
     /// rather than showing a misleading $0. Serializes as `costPerKwh`.
     pub cost_per_kwh: f64,
+    /// Configured MCP (Model Context Protocol) servers — external tool
+    /// servers the control plane talks to (stdio child process or
+    /// streamable-HTTP endpoint). Their tools are exposed to the agent loop
+    /// as `mcp__<server>__<tool>` and pass through the same allow/ask/deny
+    /// permission tiers as the built-in coder tools (see `mcp.rs`).
+    /// Serializes as `mcpServers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerSpec>,
+}
+
+/// One configured MCP server. Exactly one of `command` (stdio transport —
+/// spawn a local process speaking newline-delimited JSON-RPC on stdio) or
+/// `url` (streamable-HTTP transport — the current MCP spec, JSON or
+/// SSE-framed responses) must be set. Mirrors the shape opencode/continue/
+/// roo use in their MCP config files.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct McpServerSpec {
+    /// Stable id (sanitized to `[A-Za-z0-9-]`); namespaced into tool names as
+    /// `mcp__<name>__<tool>`.
+    pub name: String,
+    /// stdio: program to spawn (resolved via PATH).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// stdio: argv after the program.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// stdio: extra environment variables (on top of the inherited env).
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+    /// stdio: working directory for the child process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// http: the MCP endpoint (e.g. `https://mcp.example.com/mcp`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// http: extra headers sent with every request (e.g. `{"X-Api-Key": "…"}`).
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
+    /// http: full `Authorization` header value. Secret — redacted in API
+    /// responses (the UI only ever sees the mask).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+}
+
+impl McpServerSpec {
+    /// Which transport this spec selects, or `None` when it's unusable as
+    /// written (both or neither of `command`/`url` set — the upsert endpoint
+    /// rejects those, this is the load-time fallback for hand-edited configs).
+    pub(crate) fn transport(&self) -> Option<&str> {
+        match (self.command.as_deref(), self.url.as_deref()) {
+            (Some(c), _) if !c.trim().is_empty() => Some("stdio"),
+            (_, Some(u)) if u.trim().is_empty() => Some("http"),
+            (None, Some(_)) => Some("http"),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AppSettings {
