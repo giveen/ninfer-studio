@@ -288,8 +288,8 @@ struct UsageTapStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
     buf: Vec<u8>,
     ctx: Option<UsageLogCtx>,
-    /// When `proxy::proxy` handed the request to the engine (None when the
-    /// proxy failed before the stream existed — then no timing is logged).
+    /// When `proxy::proxy` handed the request to the engine, captured just
+    /// before `send()`; `None` disables timing entirely.
     started: Option<std::time::Instant>,
     /// When the first response chunk arrived ≈ end of prefill.
     first_chunk: Option<std::time::Instant>,
