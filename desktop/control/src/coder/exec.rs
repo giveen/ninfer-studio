@@ -166,10 +166,13 @@ pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>)
 
 /// Run a shell command via `bash -lc`. Unlike `fs_*`/`grep`/`glob`, this is
 /// **not** confined to the workspace: `within_ws` only picks the starting
-/// `cwd` (or resumes a session's), and the shell itself is unsandboxed — a
-/// `cd /`, absolute path, or symlink reaches anywhere the OS user can. Safe
-/// mode (default on) blocks a fixed set of destructive patterns before
-/// spawning, but that's a blocklist, not a security boundary. See SECURITY.md.
+/// `cwd` (or resumes a session's), and the shell can `cd /` or use absolute
+/// paths to reach anywhere the OS user can *read*. Containment comes from
+/// the per-OS sandbox (`crate::sandbox`, default on): a read-only root
+/// mount on Linux, a low-integrity child on Windows — plus safe mode
+/// (default on), which blocks a fixed set of destructive patterns before
+/// spawning. The sandbox contains the *writes*; neither it nor the
+/// blocklist is a full security boundary. See SECURITY.md.
 pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let command = req.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if command.trim().is_empty() {
