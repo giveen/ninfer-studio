@@ -238,11 +238,17 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // The same scope bucket the HTTP endpoints use (scope → workspace →
     // "default"), and the same tier table the UI pushes. Tiers default to
     // `allow`; the UI opts tools up to `ask`/`deny` per scope.
+    // Tiers are pushed per scope bucket (scope → workspace → "default"),
+    // so look this run's bucket up before asking for the tool's tier.
     let scope_val = json!({ "scope": run.scope_opt().unwrap_or_default() });
     let scope = crate::coder::common::perm_scope(&scope_val);
-    let perms = state.coder_perms.read().await;
-    let tier = crate::coder::common::tier_for(&perms, name);
-    drop(perms);
+    let tier = {
+        let perms = state.coder_perms.read().await;
+        crate::coder::common::tier_for(
+            perms.get(&scope).unwrap_or(&crate::coder::CoderPerms::default()),
+            name,
+        )
+    };
     let mut body = args.clone();
     match tier {
         crate::coder::common::PermTier::Deny => {
