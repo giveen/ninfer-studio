@@ -356,7 +356,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             Ok(Json(json!({
                 "stdout": stdout_capped,
                 "stderr": stderr_capped,
-                "exitCode": code.try_into().ok(),
+                "exitCode": (code >= 0).then_some(code),
                 "timedOut": false,
                 "truncated": t_out || t_err,
                 "cwd": result_cwd,
