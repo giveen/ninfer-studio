@@ -343,9 +343,18 @@ pub(crate) fn wrap_for_usage_logging(
     state: S,
     model: Option<String>,
     source: RequestSource,
+    streaming: bool,
+    started: Option<std::time::Instant>,
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
 ) -> BoxStream<'static, reqwest::Result<Bytes>> {
-    UsageTapStream { inner, buf: Vec::new(), ctx: Some(UsageLogCtx { state, model, source }) }.boxed()
+    UsageTapStream {
+        inner,
+        buf: Vec::new(),
+        ctx: Some(UsageLogCtx { state, model, source, streaming }),
+        started,
+        first_chunk: None,
+    }
+    .boxed()
 }
 
 /// Best-effort: find the OpenAI-style `usage` object in a completed proxied
