@@ -573,7 +573,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         return Err(last_os_error());
     }
 
-    // stdin: the console handle if one exists, else NUL
+    // stdin: the console handle if one exists, else NUL — the control plane
     // is a GUI app with no console, where `GetStdHandle` would return
     // INVALID_HANDLE_VALUE.
     let mut stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
@@ -644,8 +644,8 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             CloseHandle(out_write);
             CloseHandle(err_read);
             CloseHandle(err_write);
-            if stdin_owned != 0 as _ {
-                CloseHandle(stdin_owned);
+            if !stdin_nul.is_null() {
+                CloseHandle(stdin_nul);
             }
             if !label_sid.is_null() {
                 FreeSid(label_sid);
@@ -660,8 +660,8 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         CloseHandle(out_write);
         CloseHandle(err_write);
         CloseHandle(pi.hThread);
-        if stdin_owned != 0 as _ {
-            CloseHandle(stdin_owned);
+        if !stdin_nul.is_null() {
+            CloseHandle(stdin_nul);
         }
         if !label_sid.is_null() {
             FreeSid(label_sid);
