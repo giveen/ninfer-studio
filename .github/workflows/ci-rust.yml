@@ -49,3 +49,23 @@ jobs:
         run: cargo clippy --locked --manifest-path desktop/Cargo.toml -p ninfier-control -- -D warnings
       - name: Run control-plane tests
         run: cargo test --locked --manifest-path desktop/Cargo.toml -p ninfier-control
+
+  windows-check:
+    # The control plane ships on Windows too (NSIS release build) and its
+    # coder sandbox is OS-specific (Job Object + low integrity, see
+    # desktop/control/src/sandbox/windows.rs) — that code only ever
+    # compiles for a Windows target, so the Linux job above never sees it.
+    # This native check is what gates it (the release build is not a CI
+    # gate).
+    name: cargo check (ninfier-control, windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Check control plane for Windows
+        run: cargo check --locked --manifest-path desktop\Cargo.toml -p ninfier-control
