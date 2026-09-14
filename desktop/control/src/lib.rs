@@ -175,6 +175,9 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/remote/start", post(remote::post_start))
         .route("/api/remote/stop", post(remote::post_stop))
         .route("/health", get(proxy::proxy))
+        // Server-side agent runs (the webview's tool loop, moved here —
+        // runs survive window close; clients attach over SSE).
+        .nest("/api/agent", crate::agent::run::router())
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))
         .layer(axum::extract::Extension(request_source))
         .with_state(state)
