@@ -317,7 +317,7 @@ impl Stream for UsageTapStream {
                     let (prefill_ms, total_ms) = if ctx.streaming {
                         match (this.started, this.first_chunk) {
                             (Some(started), Some(first)) => (
-                                Some(started.elapsed().as_millis() as u64),
+                                Some(first.saturating_duration_since(started).as_millis() as u64),
                                 Some(std::time::Instant::now().saturating_duration_since(started).as_millis() as u64),
                             ),
                             _ => (None, None),
