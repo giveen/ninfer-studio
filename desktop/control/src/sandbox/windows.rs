@@ -573,35 +573,40 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         return Err(last_os_error());
     }
 
-    // stdin: the console handle if one exists, else NUL (the control plane
-    // is a GUI app with no console — `GetStdHandle` would fail).
+    // stdin: the console handle if one exists, else NUL — the control plane
+    // is a GUI app with no console, where `GetStdHandle` would return
+    // INVALID_HANDLE_VALUE.
     let mut stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let stdin_owned: windows_sys::Win32::Foundation::HANDLE =
-        if stdin.is_null()
-            || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
-        {
-            let nul_wide = to_wide("NUL");
-            let h = unsafe {
-                CreateFileW(
-                    wide_ptr(&nul_wide),
-                    GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                0 as _
-            } else {
-                h
-            }
-        } else {
-            0 as _
+    let mut stdin_nul: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+    if stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        let nul_wide = to_wide("NUL");
+        let h = unsafe {
+            CreateFileW(
+                wide_ptr(&nul_wide),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            )
         };
-    if stdin_owned != 0 as _ && (stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE) {
-        stdin = stdin_owned;
+        if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(out_read);
+                CloseHandle(out_write);
+                CloseHandle(err_read);
+                CloseHandle(err_write);
+                DeleteProcThreadAttributeList(list);
+                CloseHandle(job);
+                if !label_sid.is_null() {
+                    FreeSid(label_sid);
+                }
+            }
+            return Err(last_os_error());
+        }
+        stdin_nul = h;
+        stdin = h;
     }
 
     // 5. Create the process (in the job, at the label).
