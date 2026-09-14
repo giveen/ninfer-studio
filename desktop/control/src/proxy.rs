@@ -174,6 +174,21 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
             request_model
         }
     };
+    // Usage speed stats: capture when we hand the request to the engine
+    // (the tap measures first-chunk and stream-end against this) and whether
+    // the client asked for a streamed response (only those give a
+    // prefill/decode split worth measuring).
+    let (usage_started, usage_streaming) = if should_log {
+        (
+            Some(std::time::Instant::now()),
+            serde_json::from_slice::<Value>(&body_bytes)
+                .ok()
+                .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+                .unwrap_or(false),
+        )
+    } else {
+        (None, false)
+    };
     let api_key = { state.config.read().await.api_key.clone() };
     let target = format!("http://127.0.0.1:{port}{}", uri.path());
 
