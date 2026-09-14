@@ -309,9 +309,6 @@ impl Drop for AclGuard {
 // Child handle
 // ---------------------------------------------------------------------------
 
-/// A child spawned via `CreateProcessW` into a job object, optionally at low
-/// integrity. Dropping it revokes the ACL grants and — via
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills anything still running.
 /// A HANDLE is a raw pointer, and raw pointers are not `Send` — wrap one so
 /// [`WinChild`] can cross threads (the background-job drain task owns the
 /// child on another runtime worker thread).
@@ -322,6 +319,9 @@ struct SendableHandle(*mut std::ffi::c_void);
 
 unsafe impl Send for SendableHandle {}
 
+/// A child spawned via `CreateProcessW` into a job object, optionally at low
+/// integrity. Dropping it revokes the ACL grants and — via
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills anything still running.
 pub struct WinChild {
     process: SendableHandle,
     job: SendableHandle,
