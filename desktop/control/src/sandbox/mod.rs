@@ -21,6 +21,7 @@ mod bwrap;
 #[cfg(windows)]
 mod windows;
 
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
@@ -85,6 +86,7 @@ pub(crate) fn arg_quote(s: &str) -> String {
 }
 
 /// Everything the runner needs to launch one contained-or-plain shell.
+#[derive(Debug)]
 pub struct SpawnReq {
     /// The shell script to run (POSIX syntax; on Windows it is fed to
     /// git-bash, or to `cmd /d /s /c` when no POSIX shell is installed).
@@ -105,6 +107,19 @@ pub enum ExecChild {
     Unix(tokio::process::Child),
     #[cfg(windows)]
     Windows(windows::WinChild),
+}
+
+/// Opaque by design — the child's OS process handles must not leak into
+/// logs or status payloads.
+impl fmt::Debug for ExecChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Unix(_) => "unix",
+            #[cfg(windows)]
+            Self::Windows(_) => "windows",
+        };
+        f.debug_struct("ExecChild").field("kind", &kind).finish()
+    }
 }
 
 /// tokio 1.53's `ChildStdout/Stderr` have no `into_std()` — the pipe's
