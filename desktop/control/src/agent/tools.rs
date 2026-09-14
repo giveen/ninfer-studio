@@ -407,7 +407,14 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         "web_fetch" => web::web_fetch(state.clone(), Json(body.clone())).await.map(|j| j.0),
         "web_search" => web::web_search(state.clone(), Json(body.clone())).await.map(|j| j.0),
         "browser" => browser::browser(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "memory" => memory::memory_get(state.clone(), Json(body.clone())).await.map(|j| j.0),
+        "memory" => memory::memory_get(
+            state.clone(),
+            Query(memory::MemQuery {
+                workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
+            }),
+        )
+        .await
+        .map(|j| j.0),
         other => Err((
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown tool: {other}") })),
