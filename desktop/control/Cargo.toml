@@ -32,3 +32,8 @@ scraper = "0.27"
 regex = "1.10"
 futures-util = "0.3"
 dirs = "7"
+# Official Rust MCP SDK (modelcontextprotocol/rust-sdk) — client side only:
+# stdio child-process transport + streamable-HTTP client. `default-features =
+# false` skips the server/macro half we never use; its reqwest (0.13.x)
+# unifies with the one above, so no duplicate TLS stack.
+rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
