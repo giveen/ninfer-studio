@@ -142,12 +142,43 @@ pub async fn commit_approval_set(AxumState(state): AxumState<S>, Json(req): Json
 // Filesystem sandbox (bubblewrap) — mirrors the sidecar's `coderSandbox`.
 // ---------------------------------------------------------------------------
 
-/// Whether bubblewrap is installed. Checked once per process (`which bwrap`);
-/// a missing bwrap means `exec` transparently runs unsandboxed, exactly like
-/// the sidecar's `checkBwrap` fallback.
+/// Whether bubblewrap is *usable* on this machine. Checked once per process:
+/// not only must `bwrap` be installed, it must be able to create its
+/// namespaces — on kernels or hardened runtimes (e.g. default Docker
+/// seccomp) that forbid unprivileged user namespaces, bwrap exits 1 with
+/// "No permissions to create a new namespace" on every invocation. Probing
+/// with the same namespace flags the wrapper uses means such hosts get the
+/// same transparent fallback as hosts without bwrap, instead of every exec
+/// failing with a cryptic exit 1; `sandbox_get` also stops claiming the
+/// sandbox is available when it actually can't start.
 pub fn bwrap_available() -> bool {
-    static AVAILABLE: LazyLock<bool> =
-        LazyLock::new(|| std::process::Command::new("which").arg("bwrap").output().map(|o| o.status.success()).unwrap_or(false));
+    static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+        let installed = std::process::Command::new("which")
+            .arg("bwrap")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !installed {
+            return false;
+        }
+        // Same namespace/unpriv flags as the wrapper below, minimal binds,
+        // trivial payload: if *this* can't start, neither can a real exec.
+        let mut probe = std::process::Command::new("bwrap");
+        probe
+            .arg("--ro-bind").arg("/").arg("/")
+            .arg("--tmpfs").arg("/tmp")
+            .arg("--proc").arg("/proc")
+            .arg("--dev").arg("/dev")
+            .arg("--unshare-pid")
+            .arg("--cap-drop").arg("ALL")
+            .arg("--")
+            .arg("/usr/bin/true");
+        probe.stdout(Stdio::null()).stderr(Stdio::null());
+        probe
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
     *AVAILABLE
 }
 
@@ -246,7 +277,8 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     // Optional filesystem sandbox (mirrors the sidecar): wrap the shell in
     // bubblewrap so the agent can only write inside the workspace — the rest
     // of the host is read-only. Network stays available so builds can fetch.
-    // Falls back to an unsandboxed shell when bwrap is not installed.
+    // Falls back to an unsandboxed shell when bwrap is missing or the kernel
+    // won't let it create namespaces (see `bwrap_available`).
     let (sandboxed, sandbox_binds) = {
         let c = state.config.read().await;
         (c.coder_sandbox && bwrap_available() && !root.as_os_str().is_empty(), c.sandbox_binds.clone())
