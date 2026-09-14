@@ -11,6 +11,7 @@ pub mod chat;
 pub mod coder;
 pub mod engine;
 pub mod gpu;
+pub mod mcp;
 pub mod memstore;
 pub mod models;
 pub mod power;
