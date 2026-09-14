@@ -701,33 +701,44 @@ mod tests {
 
     #[test]
     fn command_lines_use_the_right_shell_form() {
-        // Bash: POSIX single-quoting of the whole script (bash parses the
-        // command line itself — no MSVCRT layer between us and the script).
-        let cl = command_line(&Shell::Bash, "echo 'a b'");
-        assert!(cl.starts_with("bash -lc "), "got: {cl}");
-        assert!(cl.ends_with("echo 'a b'"), "got: {cl}");
-        // Embedded single quote is escaped the same way the Linux runner
-        // single-quotes scripts.
+        // Bash: the whole script is POSIX single-quoted, exactly as the
+        // Linux runner quotes it (`shell_quote`) — bash parses the command
+        // line itself, so there is no MSVCRT layer between us and the script.
+        let script = "echo 'it's'";
         assert_eq!(
-            command_line(&Shell::Bash, "echo 'it's'"),
-            "bash -lc 'echo ''it''s'''"
+            command_line(&Shell::Bash, script),
+            format!("bash -lc {}", shell_quote(script))
         );
+        assert!(command_line(&Shell::Bash, "ls").starts_with("bash -lc "));
         // Cmd: `/d /s /c` with the script wrapped in one pair of quotes.
-        let cl = command_line(&Shell::Cmd, "echo hi");
-        assert_eq!(cl, "cmd /d /s /c \"echo hi\"");
+        assert_eq!(
+            command_line(&Shell::Cmd, "echo hi"),
+            "cmd /d /s /c \"echo hi\""
+        );
     }
 
     #[test]
     fn env_block_scrubs_credentials_and_is_terminated() {
-        // The control-plane test env never carries these; verify the shape:
-        // NUL-terminated entries, one extra NUL at the end.
+        unsafe {
+            std::env::set_var("NINFIER_TEST_SECRET_XYZ", "hunter2");
+            std::env::set_var("NINFIER_TEST_KEEP_XYZ", "fine");
+        }
         let block = env_block();
-        assert!(!block.is_empty());
-        assert_eq!(*block.last().unwrap(), 0);
-        // Two trailing NULs iff the last var's value is non-empty... at
-        // minimum the block ends with exactly one terminating NUL beyond the
-        // last entry (entries themselves end in NUL).
-        let text = String::from_utf16_lossy(&block[..block.len() - 2]);
-        assert!(text.ends_with('=false_or_true_placeholder') || !text.is_empty());
+        let text = String::from_utf16_lossy(&block);
+        // NUL-terminated entries plus one trailing NUL.
+        assert!(text.ends_with('\0'));
+        let entries: Vec<&str> = text.split('\0').filter(|e| !e.is_empty()).collect();
+        assert!(
+            entries.iter().any(|e| e == "NINFIER_TEST_KEEP_XYZ=fine"),
+            "expected the kept var in: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.starts_with("NINFIER_TEST_SECRET_XYZ=")),
+            "credential var leaked into the child env: {entries:?}"
+        );
+        unsafe {
+            std::env::remove_var("NINFIER_TEST_SECRET_XYZ");
+            std::env::remove_var("NINFIER_TEST_KEEP_XYZ");
+        }
     }
 }
