@@ -314,7 +314,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // commit without an explicit human sign-off on the working-tree-vs-HEAD
   // diff; auto-commits on write/edit are suppressed so the only commits are
   // intentional, reviewed ones.
-  const { safeMode: coderSafeMode, sandbox: coderSandbox, bwrapAvailable, commitApproval } = useCoderSafety();
+  const { safeMode: coderSafeMode, commitApproval } = useCoderSafety();
   // Diff-review viewer (opened from the toolbar "Diff" button).
   const [diffViewOpen, setDiffViewOpen] = useState(false);
   /** Per-file diff (opened from a file tab's Diff button). */
