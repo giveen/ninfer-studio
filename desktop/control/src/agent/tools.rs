@@ -73,16 +73,12 @@ Rules:
   what changed (files), how you verified it, and any assumptions or caveats.
   No code blocks in the summary unless a short snippet is genuinely needed."#;
 
-/// One-shot helper: call an endpoint-shaped handler in-process and flatten
-/// its `Result<Json<Value>, (StatusCode, Json<Value>)>` to the payload —
-/// the error payload (usually `{error}`) is exactly what the HTTP path
-/// would have returned, so the model sees the same shape either way.
-async fn flatten<T>(res: Result<T, (axum::http::StatusCode, Json<Value>)>) -> Value
-where
-    T: Into<Value>,
-{
+/// Flatten an endpoint-shaped handler result to its payload — the error
+/// payload (usually `{error}`) is exactly what the HTTP path would have
+/// returned, so the model sees the same shape either way.
+fn flatten(res: Result<Json<Value>, (axum::http::StatusCode, Json<Value>)>) -> Value {
     match res {
-        Ok(v) => v.into(),
+        Ok(Json(v)) => v,
         Err((_, Json(v))) => v,
     }
 }
@@ -204,7 +200,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 body["cwd"] = json!(scope);
                 body["workspace"] = json!(scope);
             }
-            return flatten(exec::exec(state.clone(), Json(body)).await).await;
+            return flatten(exec::exec(state.clone(), Json(body)).await);
         }
         "ast_grep" => {
             // Same invocation the client made through exec: `sg -p '…' -l lang`.
@@ -215,7 +211,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 body["cwd"] = json!(scope);
                 body["workspace"] = json!(scope);
             }
-            return flatten(exec::exec(state.clone(), Json(body)).await).await;
+            return flatten(exec::exec(state.clone(), Json(body)).await);
         }
         _ => {}
     }
@@ -248,12 +244,10 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
         body["approvalToken"] = json!(t);
     }
 
+    // MCP tools are namespaced (`mcp__<server>__<tool>`) and always
+    // endpoint-dispatchable; everything else must be in the tool-set's table.
     let family = if run.meta.tool_set == "chat" { CHAT_TOOLS } else { CODER_TOOLS };
-    if mcp_name(name).is_some() {
-        if !family.contains(&"mcp") {
-            // MCP tools are namespaced and always endpoint-dispatchable.
-        }
-    } else if family.iter().all(|f| f != name) {
+    if mcp_name(name).is_none() && family.iter().all(|f| f != name) {
         return json!({ "error": format!("unknown tool: {name}") });
     }
 
@@ -308,22 +302,16 @@ impl RunShared {
 async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Value {
     if let Some(rest) = mcp_name(name) {
         // The mcp_call handler re-checks the tier server-side; scope + token
-        // come from the run.
-        let mut m = body.clone();
-        if m.get("scope").map(|v| v.is_null()).unwrap_or(true) {
-            m["scope"] = json!(run.scope_opt().unwrap_or_default());
-        }
-        let mut req = body.clone();
-        req["name"] = json!(rest);
-        req["arguments"] = body.clone();
-        if let Some(scope) = run.scope_opt() {
-            req["scope"] = json!(scope);
-        }
+        // come from the run (mirrors the client's mcpCall payload shape).
+        let mut req = json!({
+            "name": rest,
+            "arguments": body,
+            "scope": run.scope_opt().unwrap_or_default(),
+        });
         if let Some(t) = body.get("approvalToken").cloned() {
             req["approvalToken"] = t;
         }
-        let _ = m;
-        return flatten(crate::mcp::mcp_call(state.clone(), Json(req)).await).await;
+        return flatten(crate::mcp::mcp_call(state.clone(), Json(req)).await);
     }
     let res: Result<Value, (axum::http::StatusCode, Json<Value>)> = match name {
         "read" => fs::fs_read(state.clone(), Json(body.clone())).await.map(|j| j.0),
@@ -376,7 +364,10 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         "web_search" => web::web_search(state.clone(), Json(body.clone())).await.map(|j| j.0),
         "browser" => browser::browser(state.clone(), Json(body.clone())).await.map(|j| j.0),
         "memory" => memory::memory_get(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        other => (axum::http::StatusCode::NOT_FOUND, Json(json!({ "error": format!("unknown tool: {other}") }))).into(),
+        other => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown tool: {other}") })),
+        )),
     };
     match res {
         Ok(v) => v,
