@@ -1024,6 +1024,9 @@ pub async fn servers_upsert(
             Json(json!({ "error": "server needs a stdio command or an http(s) url" })),
         ));
     }
+
+    {
+        let mut cfg = state.config.write().await;
         match cfg.mcp_servers.iter_mut().find(|s| s.name == spec.name) {
             Some(s) => *s = spec.clone(),
             None => cfg.mcp_servers.push(spec.clone()),
