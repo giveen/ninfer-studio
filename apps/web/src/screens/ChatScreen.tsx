@@ -33,9 +33,9 @@ import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, checkComputerUsePerm, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { coderBrowser, chatMemoryAddLearning, chatMemoryGet, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
+import { coderBrowser, chatMemoryAddLearning, chatMemoryGet, critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, mcpCall, type CoderLearningKind, type McpToolInfo } from '../lib/api';
 import { readRecallChunk } from '../lib/observationPack';
-import { filterToolAllowList } from '../lib/coderTools';
+import { filterToolAllowList, mcpToolTier, mcpToolSchema, MCP_NAME_PREFIX } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
 
@@ -46,7 +46,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const {
     agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
     deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
-    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir,
+    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir,
   } = useChatAgent();
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
   // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
@@ -57,6 +57,24 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // for the tool to have somewhere to write, so the model isn't calling into
   // a black hole.
   const cuTodosRef = useRef<Array<{ content: string; status: string }>>([]);
+  // MCP tools (mcp__<server>__<tool>) exposed to Chat's agent when Computer
+  // Use is on — the control plane owns the server connections
+  // (desktop/control/src/mcp.rs). The catalog is keyed by the same directory
+  // the tiers and calls are scoped by, so it refreshes when either changes.
+  const mcpToolsRef = useRef<McpToolInfo[]>([]);
+  const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
+  useEffect(() => {
+    if (!computerUseEnabled || !computerUseDir) {
+      mcpToolsRef.current = [];
+      setMcpTools([]);
+      return;
+    }
+    let live = true;
+    mcpToolsGet(computerUseDir)
+      .then((r) => { if (live) { mcpToolsRef.current = r.tools; setMcpTools(r.tools); } })
+      .catch(() => { if (live) { mcpToolsRef.current = []; setMcpTools([]); } });
+    return () => { live = false; };
+  }, [computerUseEnabled, computerUseDir]);
   const requestApproval = useCallback((name: string, detail: string): Promise<boolean> => {
     setPendingApproval({ name, detail });
     return new Promise<boolean>((resolve) => {
@@ -376,6 +394,26 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           return ok ? null : `Denied by the user (${name}). Ask for an alternative or proceed without it.`;
         }
         return verdict;
+      };
+      // One MCP tool (mcp__<server>__<tool>) — the control plane executes it
+      // (desktop/control/src/mcp.rs) and re-checks the tier server-side
+      // (per-tool row over the mcp__<server> row). Unlike the CU built-ins
+      // above, an `ask` approval here mints a real token, so an ask-tiered
+      // MCP tool can't 403 at the endpoint after the human approved.
+      const mcpToolHandler = (toolName: string): ToolHandler => async (args, signal) => {
+        const detail = JSON.stringify(args).slice(0, 160);
+        const verdict = checkComputerUsePerm(computerUsePerms, toolName, args);
+        if (typeof verdict === 'string' && verdict !== 'ask') return JSON.stringify({ error: verdict });
+        let token: string | undefined;
+        if (verdict === 'ask') {
+          const ok = await requestApproval(toolName, detail);
+          if (!ok) return JSON.stringify({ error: `Denied by the user (${toolName}). Ask for an alternative or proceed without it.` });
+          try {
+            token = (await coderPermsApprove(toolName, undefined, computerUseDirRef.current)).token;
+          } catch { /* no token — the endpoint's ask re-check will reject; surfaced to the model */ }
+        }
+        const res = await mcpCall({ name: toolName, arguments: args, scope: computerUseDirRef.current, approvalToken: token }, signal);
+        return res.ok ? res.output : JSON.stringify({ error: res.output });
       };
       // Always-on baseline (today's default, unchanged) — gated by Computer
       // Use's own tiers only once that's turned on, since it's the only
@@ -751,6 +789,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               },
             }
           : {}),
+        // MCP tools — Computer Use gated like every other mutating tool
+        // (their schemas land in `tools` only when it's on, below).
+        ...(computerUseOn
+          ? Object.fromEntries(
+              mcpToolsRef.current
+                .filter((t) => mcpToolTier(computerUsePerms, t.name) !== 'deny')
+                .map((t) => [t.name, mcpToolHandler(t.name)] as const)
+            )
+          : {}),
       };
       // De-duplicated by name, first entry wins — agentResearch/memoryEnabled
       // come before Computer Use so their dedicated schema (and, per the
@@ -761,6 +808,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
         ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
         ...(computerUseOn ? COMPUTER_USE_TOOLS : []),
+        // MCP tools ride on Computer Use — they're external, potentially
+        // mutating actions, so they never ship without its permission gate.
+        ...(computerUseOn
+          ? mcpToolsRef.current
+              .filter((t) => mcpToolTier(computerUsePerms, t.name) !== 'deny')
+              .map(mcpToolSchema)
+          : []),
       ]);
       // The runner owns the turn messages; these events mirror each turn into
       // the conversation store so streaming stays live.
