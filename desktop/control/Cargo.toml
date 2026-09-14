@@ -8,9 +8,8 @@ description = "NInfer Studio control plane: engine process supervision, model ma
 workspace = true
 
 [dependencies]
-# `process` is explicit because tokio 1.53's `full` no longer pulls it in:
-# the sandbox layer (src/sandbox/mod.rs) names `tokio::process::Child` on
-# every target and uses `ChildStdout::into_std()` on Unix.
+# `process` is explicit: the sandbox layer (src/sandbox/mod.rs) names
+# `tokio::process::*` on every target — don't rely on `full`'s composition.
 tokio = { workspace = true, features = ["full", "process"] }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.7", features = ["fs", "cors"] }
