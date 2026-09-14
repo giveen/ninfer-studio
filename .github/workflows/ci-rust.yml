@@ -68,4 +68,7 @@ jobs:
         with:
           workspaces: desktop
       - name: Check control plane for Windows
-        run: cargo check --locked --manifest-path desktop\Cargo.toml -p ninfier-control
+        # --tests: the sandbox layer keeps its pure-logic unit tests (arg
+        # quoting, env scrubbing, command-line shapes) in-crate; a plain
+        # check would never typecheck them.
+        run: cargo check --locked --tests --manifest-path desktop\Cargo.toml -p ninfier-control
