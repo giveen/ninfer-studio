@@ -309,12 +309,12 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
                 buf
             }
         );
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((so, se, status))
+        let code = child.wait().await?;
+        Ok::<_, std::io::Error>((so, se, code))
     };
     match timeout(Duration::from_millis(timeout_ms), out_fut).await {
         Err(_) => {
-            let _ = child.kill().await;
+            child.start_kill();
             let _ = child.wait().await;
             Ok(Json(json!({
                 "stdout": "",
@@ -335,7 +335,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             "cwd": result_cwd,
             "sandboxed": sandboxed,
         }))),
-        Ok(Ok((so, se, status))) => {
+        Ok(Ok((so, se, code))) => {
             let mut stdout = String::from_utf8_lossy(&so).into_owned();
             let stderr_raw = String::from_utf8_lossy(&se).into_owned();
             // Pull the session cwd out of the marker and strip it from stdout.
@@ -356,7 +356,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             Ok(Json(json!({
                 "stdout": stdout_capped,
                 "stderr": stderr_capped,
-                "exitCode": status.code(),
+                "exitCode": code.try_into().ok(),
                 "timedOut": false,
                 "truncated": t_out || t_err,
                 "cwd": result_cwd,
@@ -411,9 +411,9 @@ impl BgJob {
 /// Drain a background child: stream pipes to EOF in the background while a
 /// 1s wait-poll honors kill requests and the deadline, then record capped
 /// output (+ session cwd bookkeeping, like the foreground path).
-async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Child, session: Option<String>, state: S, timeout_ms: u64, cwd_marker: String) {
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: crate::sandbox::ExecChild, session: Option<String>, state: S, timeout_ms: u64, cwd_marker: String) {
+    let mut out_pipe = child.take_stdout().map(tokio::fs::File::from);
+    let mut err_pipe = child.take_stderr().map(tokio::fs::File::from);
     let out_h = tokio::spawn(async move {
         let mut buf = Vec::new();
         if let Some(o) = &mut out_pipe {
@@ -441,7 +441,7 @@ async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Chi
             let _ = child.start_kill();
         }
         match timeout(Duration::from_secs(1), child.wait()).await {
-            Ok(Ok(status)) => break status.code(),
+            Ok(Ok(code)) => break (if code >= 0 { Some(code) } else { None }),
             Ok(Err(_)) => break None,
             Err(_) => continue,
         }
@@ -510,10 +510,10 @@ mod tests {
     #[test]
     fn secret_env_var_detection_is_case_insensitive_and_scoped() {
         for name in ["OPENAI_API_KEY", "github_token", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "hf_token"] {
-            assert!(is_secret_env_var(name), "expected {name} to be flagged as a secret");
+            assert!(crate::sandbox::is_secret_env_var(name), "expected {name} to be flagged as a secret");
         }
         for name in ["PATH", "HOME", "LANG", "TERM", "PWD", "SHELL", "USER"] {
-            assert!(!is_secret_env_var(name), "expected {name} to NOT be flagged as a secret");
+            assert!(!crate::sandbox::is_secret_env_var(name), "expected {name} to NOT be flagged as a secret");
         }
     }
 
