@@ -46,6 +46,21 @@ struct UsageEvent {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    /// Streaming-request timing, in ms, when the response was streamed:
+    /// `prefill_ms` is request-forwarded → first chunk, `total_ms` is
+    /// request-forwarded → stream end. Both feed the average prefill /
+    /// generation speed stats. `None` for non-streaming responses (a single
+    /// blob gives no prefill/decode split) and older log lines.
+    prefill_ms: Option<u64>,
+    total_ms: Option<u64>,
+}
+
+/// Artifact filenames carry a format extension ("qwen3_8_27b_nvfp4.ninfer")
+/// that is meaningless in the Usage tab and overflows its stat box — drop it
+/// when reading events so the tab shows "qwen3_8_27b_nvfp4". Applied at read
+/// time (not log time) so pre-existing log lines get the short name too.
+fn display_model_name(raw: &str) -> String {
+    raw.strip_suffix(".ninfer").unwrap_or(raw).to_string()
 }
 
 fn usage_log_path(state: &S) -> PathBuf {
