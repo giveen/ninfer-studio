@@ -3103,9 +3103,9 @@ dependencies = [
  "mimalloc",
  "obscura-browser",
  "regex",
-  "reqwest 0.13.4",
-  "rmcp",
-  "scraper",
+ "reqwest 0.13.4",
+ "rmcp",
+ "scraper",
  "serde",
  "serde_json",
  "tokio",
@@ -6599,11 +6599,11 @@ version = "0.61.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
- "windows-collections",
+ "windows-collections 0.2.0",
  "windows-core 0.61.2",
- "windows-future",
+ "windows-future 0.2.1",
  "windows-link 0.1.3",
- "windows-numerics",
+ "windows-numerics 0.2.0",
 ]
 
 [[package]]
