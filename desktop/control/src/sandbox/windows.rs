@@ -383,13 +383,18 @@ impl WinChild {
             // as long as this struct lives. If this struct is dropped first,
             // the reaper's wait simply unblocks and its exit-code query is a
             // harmless no-op.
+            // The reaper gets the handle VALUE (an `isize` — `Send`); the
+            // `OwnedHandle` field keeps the handle valid (and closes it) for
+            // as long as this struct lives. If this struct is dropped first,
+            // the reaper's wait simply unblocks and its exit-code query is a
+            // harmless no-op.
             let raw = self
                 .process
                 .as_ref()
                 .map(|h| h.as_raw_handle())
-                .unwrap_or(std::ptr::null_mut());
+                .unwrap_or(std::ptr::null_mut()) as isize;
             tokio::task::spawn_blocking(move || {
-                let handle = raw;
+                let handle = raw as *mut std::ffi::c_void;
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
