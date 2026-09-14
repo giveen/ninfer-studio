@@ -71,6 +71,7 @@ fn usage_log_path(state: &S) -> PathBuf {
 /// lock map `coder::memory`/`chat::memory` use (keyed "usage" here) so
 /// concurrent requests can't interleave partial lines.
 async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
+    let (prefill_ms, total_ms) = (evt.prefill_ms, evt.total_ms);
     let line = json!({
         "ts": evt.ts_ms,
         "day": day_string(evt.ts_ms),
@@ -81,6 +82,14 @@ async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
         "cachedTokens": evt.cached_tokens,
     })
     .to_string();
+    // Timing is optional and only present for streamed responses — omit the
+    // keys entirely when absent so the log line shape stays clean.
+    let mut v: Value = serde_json::from_str(&line).unwrap();
+    if let Some(ms) = prefill_ms {
+        v["prefillMs"] = json!(ms);
+        v["totalMs"] = json!(total_ms.unwrap_or(ms));
+    }
+    let line = v.to_string();
     let lock = mem_lock(state, "usage");
     let _guard = lock.lock().await;
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
