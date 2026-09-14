@@ -354,7 +354,7 @@ impl WinChild {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             // A HANDLE is a raw pointer and raw pointers are not `Send` —
             // hand it to the blocking thread through an `AtomicPtr`.
-            let process = std::sync::atomic::AtomicPtr::<std::ffi::c_void>::from_ptr(self.process);
+            let process = std::sync::atomic::AtomicPtr::from_ptr(self.process);
             self.process = std::ptr::null_mut();
             tokio::task::spawn_blocking(move || {
                 let handle = process.load(std::sync::atomic::Ordering::Acquire);
