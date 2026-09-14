@@ -154,6 +154,13 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
     let mut completion_total = 0u64;
     let mut cached_total = 0u64;
     let mut requests = 0u64;
+    // Weighted speed accumulators (streamed requests only): avg speed is
+    // total tokens / total time across events, so long responses dominate
+    // instead of short 1-token streams skewing a plain per-request mean.
+    let mut speed_prompt_tokens = 0u64;
+    let mut speed_prefill_secs = 0.0f64;
+    let mut speed_completion_tokens = 0u64;
+    let mut speed_decode_secs = 0.0f64;
     let mut days_seen: BTreeSet<String> = BTreeSet::new();
     let mut by_day: BTreeMap<String, DayAgg> = BTreeMap::new();
     let mut by_model: HashMap<String, u64> = HashMap::new(); // model -> tokens
@@ -163,8 +170,26 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
         let completion = e.get("completionTokens").and_then(Value::as_u64).unwrap_or(0);
         let cached = e.get("cachedTokens").and_then(Value::as_u64).unwrap_or(0);
         let day = e.get("day").and_then(Value::as_str).unwrap_or("").to_string();
-        let model = e.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let model = display_model_name(e.get("model").and_then(Value::as_str).unwrap_or("unknown"));
         let tokens = prompt + completion;
+
+        if let (Some(prefill_ms), Some(total_ms)) = (
+            e.get("prefillMs").and_then(Value::as_u64),
+            e.get("totalMs").and_then(Value::as_u64),
+        ) {
+            let prefill_s = prefill_ms as f64 / 1000.0;
+            let decode_ms = total_ms.saturating_sub(prefill_ms);
+            if prefill_s > 0.0 && prompt > 0 {
+                speed_prompt_tokens += prompt;
+                speed_prefill_secs += prefill_s;
+            }
+            // A minimum decode window keeps degenerate events (single-chunk
+            // "streams", near-zero timing jitter) from producing absurd tok/s.
+            if decode_ms >= 50 && completion > 0 {
+                speed_completion_tokens += completion;
+                speed_decode_secs += decode_ms as f64 / 1000.0;
+            }
+        }
 
         prompt_total += prompt;
         completion_total += completion;
