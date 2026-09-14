@@ -246,7 +246,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     // `spec.transport()` returns `Option<&str>` — `&str` cannot be matched
     // exhaustively, so the wildcard arm catches any future transport kind the
     // same way `None` (no transport configured) does.
-    let fut: Pin<Box<dyn std::future::Future<Output = Result<McpService, String>>>> =
+    let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> =
         match spec.transport() {
             Some("stdio") => {
                 let cmd = spec.command.clone().unwrap_or_default();
