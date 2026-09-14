@@ -541,7 +541,7 @@ pub async fn servers_upsert(
         m.conns.remove(&spec.name);
     }
     ensure_conn(&state, &spec.name).await?;
-    Ok(servers_get(state).await)
+    Ok(servers_get(AxumState(state.clone())).await)
 }
 
 /// `POST /api/mcp/servers/{name}` — drop the connection and remove the
