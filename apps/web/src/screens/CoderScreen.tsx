@@ -23,7 +23,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
@@ -33,7 +33,7 @@ import { openExternalLink } from '../lib/externalLink';
 import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
 import { compactedContext, isCompactedMsg, humanizePassText, runToolLoop, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
-import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, isReadOnlyCommand, type PermTier, type PermConfig } from '../lib/coderTools';
+import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
 import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
@@ -1271,11 +1271,27 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setPerms({ ...perms, tools: { ...perms.tools, [tool]: tier } });
   // Mirror tiers + denyPaths to the control plane so `deny` is enforced
   // server-side too (see coderPermsSet) — re-synced on every edit and on
-  // workspace switch, since `perms` is derived from `activeWs`.
+  // workspace switch, since `perms` is derived from `activeWs`. Scoped to the
+  // SAME `activeWsDir` the tool calls below send as `workspace`, so the
+  // control plane's per-endpoint re-check (enforce_perm) reads exactly the
+  // bucket this UI edits.
   useEffect(() => {
     if (!activeWs) return;
-    coderPermsSet({ tools: perms.tools, denyPaths: perms.denyPaths }).catch(() => { /* best-effort mirror */ });
-  }, [activeWs, perms]);
+    coderPermsSet({ tools: perms.tools, denyPaths: perms.denyPaths }, activeWsDir).catch(() => { /* best-effort mirror */ });
+  }, [activeWs, perms, activeWsDir]);
+  // MCP tools (mcp__<server>__<tool>) — the control plane owns the server
+  // connections (desktop/control/src/mcp.rs); this is the LLM-ready catalog
+  // plus each tool's effective tier for this workspace. The ref feeds the run
+  // loop (stable across re-renders), the state feeds the sidebar permission
+  // grid below.
+  const mcpToolsRef = useRef<McpToolInfo[]>([]);
+  const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
+  const refreshMcpTools = useCallback(() => {
+    mcpToolsGet(activeWsDir)
+      .then((r) => { mcpToolsRef.current = r.tools; setMcpTools(r.tools); })
+      .catch(() => { /* control plane unreachable — no MCP tools this run */ });
+  }, [activeWsDir]);
+  useEffect(() => { refreshMcpTools(); }, [refreshMcpTools]);
   /** Human-readable denial reason, or `'ask'` when the user must decide, or null. */
   const checkPerm = (name: string, args: Record<string, unknown>): string | 'ask' | null => {
     if (planMode && MUTATING_TOOLS.has(name)) {
@@ -1289,7 +1305,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         return 'Plan mode is read-only — the run cannot write files or execute commands. Turn Plan off to apply changes.';
       }
     }
-    if ((perms.tools[name] ?? 'allow') === 'deny') {
+    if (planMode && name.startsWith(MCP_NAME_PREFIX)) {
+      return 'Plan mode is read-only — external MCP tools are disabled (they may mutate external state).';
+    }
+    // Per-tool row, else the per-server `mcp__<server>` row for MCP names.
+    const tier = mcpToolTier(perms, name);
+    if (tier === 'deny') {
       return `Denied by workspace permissions (${name} is set to deny).`;
     }
     const target = typeof args.path === 'string' ? args.path : '';
@@ -1300,7 +1321,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       });
       if (hit) return `Denied by workspace permissions (path is under denied prefix "${hit.trim()}").`;
     }
-    if ((perms.tools[name] ?? 'allow') === 'ask') return 'ask';
+    if (tier === 'ask') return 'ask';
     return null;
   };
   /** Pause the agent loop until the user approves or denies this one call. */
@@ -1618,7 +1639,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           logType = 'error';
           logDetail = `${call.name} blocked`;
           if (permVerdict === 'ask') {
-            const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.files ?? args.pattern ?? args.query ?? args.url ?? '');
+            const detail = call.name === 'bash' ? String(args.command ?? '') : call.name.startsWith(MCP_NAME_PREFIX) ? JSON.stringify(args).slice(0, 160) : String(args.path ?? args.files ?? args.pattern ?? args.query ?? args.url ?? '');
             addLog({ type: 'ask', label: call.name, detail });
             const ok = await requestApproval(call.name, detail);
             addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
@@ -1627,7 +1648,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             } else {
               approvedAfterAsk = true;
               try {
-                approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+                approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
               } catch { /* best-effort — enforce_perm rejects without a token */ }
             }
           } else {
@@ -2128,6 +2149,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             const learnings = filtered.slice(-limit).reverse();
             result = JSON.stringify({ query, matched: filtered.length, returned: learnings.length, learnings });
           }
+        } else if (call.name.startsWith(MCP_NAME_PREFIX)) {
+          // External MCP tool (mcp__<server>__<tool>) — executed by the control
+          // plane (desktop/control/src/mcp.rs), which re-checks the tier
+          // server-side (per-tool row over the mcp__<server> row). Tool-level
+          // failures come back as {ok:false} and are fed to the model.
+          logType = 'bash'; logDetail = call.name;
+          const res = await mcpCall({ name: call.name, arguments: args, scope: activeWsDir, approvalToken }, toolSignal);
+          result = res.ok ? res.output : JSON.stringify({ error: res.output });
         } else {
           result = JSON.stringify({ error: 'Unknown tool' });
         }
@@ -2224,7 +2253,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
           if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
           try {
-            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
           } catch { /* best-effort — enforce_perm rejects without a token */ }
         } else {
           return JSON.stringify({ error: permVerdict });
@@ -2329,7 +2358,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
           if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
           try {
-            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined)).token;
+            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
           } catch { /* best-effort — enforce_perm rejects without a token */ }
         } else {
           return JSON.stringify({ error: permVerdict });
@@ -2934,12 +2963,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // checkPerm would reject them anyway, so dropping them from the schema
         // saves prompt space every turn instead of just wasting a round trip.
         const undeniedTools = TOOLS.filter((t) => (perms.tools[t.function.name] ?? 'allow') !== 'deny');
+        // MCP tools (mcp__<server>__<tool>): a per-tool row overrides the
+        // mcp__<server> row; denied ones are dropped from the schema like the
+        // built-in tools above (checkPerm still enforces either way).
+        const undeniedMcp = mcpToolsRef.current
+          .filter((t) => mcpToolTier(perms, t.name) !== 'deny')
+          .map(mcpToolSchema);
         // Plan mode advertises read-only tools only; the permission gate in
         // handleToolCalls enforces it even if the model tries otherwise.
         // Plan mode keeps read-only tools PLUS bash (enforced to inspection
         // commands by checkPerm), so investigation doesn't push the model
-        // into inventing tool markup for an undeclared tool.
-        const activeTools = planMode ? undeniedTools.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash') : undeniedTools;
+        // into inventing tool markup for an undeclared tool. MCP tools never
+        // ship in plan mode (external tools may mutate external state).
+        const activeTools = planMode
+          ? undeniedTools.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash')
+          : [...undeniedTools, ...undeniedMcp];
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
         const system = (planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
@@ -3703,6 +3741,68 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
                     </div>
                   );
                 })}
+                {mcpTools.length > 0 && (
+                  <>
+                    {Array.from(new Set(mcpTools.map((t) => mcpServerKey(t.name) ?? t.name))).map((serverKey) => {
+                      const serverName = serverKey.replace(/^mcp__/, '');
+                      const tools = mcpTools.filter((t) => mcpServerKey(t.name) === serverKey);
+                      const serverTier = mcpToolTier(perms, serverKey);
+                      return (
+                        <div key={serverKey}>
+                          <div className="flex items-center gap-1">
+                            <span
+                              className="min-w-0 flex-1 truncate font-mono text-[10.5px] font-semibold text-mute"
+                              title={`MCP server ${serverName} — this tier applies to every tool the server exposes unless a tool below overrides it`}
+                            >
+                              {serverName}
+                            </span>
+                            {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                              <button
+                                key={v}
+                                type="button"
+                                onClick={() => setToolPerm(serverKey, v)}
+                                title={`${v} every tool from ${serverName}`}
+                                className={cn(
+                                  'rounded px-1.5 py-px text-[10px] font-medium',
+                                  serverTier === v
+                                    ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                                    : 'text-faint hover:bg-panel2 hover:text-mute',
+                                )}
+                              >
+                                {v}
+                              </button>
+                            ))}
+                          </div>
+                          {tools.map((t) => {
+                            const tier = mcpToolTier(perms, t.name);
+                            const short = splitMcpName(t.name)?.tool ?? t.name;
+                            return (
+                              <div key={t.name} className="flex items-center gap-1 pl-3">
+                                <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.description}>{short}</span>
+                                {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                                  <button
+                                    key={v}
+                                    type="button"
+                                    onClick={() => setToolPerm(t.name, v)}
+                                    title={`${v} ${t.name}`}
+                                    className={cn(
+                                      'rounded px-1.5 py-px text-[10px] font-medium',
+                                      tier === v
+                                        ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                                        : 'text-faint hover:bg-panel2 hover:text-mute',
+                                    )}
+                                  >
+                                    {v}
+                                  </button>
+                                ))}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
               </div>
               <input
                 key={activeWs}
