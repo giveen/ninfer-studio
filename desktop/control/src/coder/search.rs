@@ -114,11 +114,13 @@ fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
-    q: Option<String>,
+    // pub(crate): the in-process agent dispatch (src/agent/tools.rs) builds
+    // these extractors directly instead of round-tripping through HTTP.
+    pub q: Option<String>,
     #[serde(default)]
-    limit: Option<u64>,
+    pub limit: Option<u64>,
     #[serde(default)]
-    workspace: Option<String>,
+    pub workspace: Option<String>,
 }
 
 pub async fn search(
