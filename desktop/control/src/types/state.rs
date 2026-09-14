@@ -160,6 +160,8 @@ pub struct State {
     pub coder_approvals: tokio::sync::Mutex<HashMap<String, crate::coder::ApprovalTicket>>,
     /// Monotonic counter backing approval-token ids, mirrors `bg_job_counter`.
     pub coder_approval_counter: AtomicU64,
+    /// Live MCP client connections, keyed by server name (see `mcp.rs`).
+    pub mcp: tokio::sync::RwLock<crate::mcp::McpManager>,
     /// Per-session working directories so the agent's shell behaves like a
     /// stateful terminal (cd persists across calls within a session id).
     pub shell_sessions: tokio::sync::Mutex<HashMap<String, String>>,
