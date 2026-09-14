@@ -27,7 +27,7 @@
 //! `(command, reply)` round trip through it, and the permission re-check
 //! happens on the axum side where the approval-token machinery lives.
 
-use crate::coder::browser::PanicGuard;
+use crate::coder::PanicGuard;
 use crate::coder::{enforce_perm, perm_scope, tier_for};
 use crate::engine::S;
 use crate::types::{AppSettings, McpServerSpec};
@@ -84,9 +84,8 @@ const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 /// through a fresh connection) instead of wedging the catalog forever.
 const LIST_TOOLS_LIMIT: Duration = Duration::from_secs(35);
 
-/// Same slack idea for `tools/call`, over the actor's `CALL_TIMEOUT` cap.
-const CALL_LIMIT: Duration = CALL_TIMEOUT + Duration::from_secs(10);
-
+/// Same slack idea for `tools/call`, over the actor's `CALL_TIMEOUT` cap
+/// (computed at the call site — `Duration` addition is not const-stable).
 /// One MCP server tool in its LLM-facing namespaced form.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -769,9 +768,9 @@ async fn send_cmd(
             Json(json!({ "error": "MCP actor unavailable" })),
         ));
     }
-    match timeout(limit, reply_rx).await {
-        Ok(Ok(reply)) => Ok(reply),
-        Ok(Err(_)) => Err((
+    match timeout(limit, reply_rx.recv()).await {
+        Ok(Some(reply)) => Ok(reply),
+        Ok(None) => Err((
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": "MCP actor dropped the reply" })),
         )),
@@ -865,6 +864,10 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
             );
             Err((StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))))
         }
+        Ok(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected MCP actor reply" })),
+        )),
         Err(e) => Err(e),
     }
 }
@@ -995,14 +998,14 @@ pub async fn servers_upsert(
     // `***` is the mask the list endpoint returns; keep the stored secret
     // instead of persisting the mask over it.
     if spec.authorization.as_deref() == Some("***") {
-        let existing = state
-            .config
-            .read()
-            .await
-            .mcp_servers
-            .iter()
-            .find(|s| s.name == spec.name);
-        spec.authorization = existing.and_then(|s| s.authorization.clone());
+        let existing = {
+            let cfg = state.config.read().await;
+            cfg.mcp_servers
+                .iter()
+                .find(|s| s.name == spec.name)
+                .and_then(|s| s.authorization.clone())
+        };
+        spec.authorization = existing;
     }
     validate_spec(&spec)?;
 
@@ -1110,7 +1113,7 @@ pub async fn tools_get(
             let m = state.mcp.read().await;
             match m.meta_get(&spec.name) {
                 None => true,
-                Some(meta) => !meta.alive && !failed_recently(meta),
+                Some(meta) => !meta.alive && !failed_recently(&meta),
             }
         };
         if need_conn {
@@ -1206,11 +1209,10 @@ async fn call_tool(
             state,
             McpCmd::CallTool {
                 server: server.clone(),
-                original: def.original,
+                tool: def.original,
                 arguments: arguments.clone(),
-                timeout: CALL_TIMEOUT,
             },
-            CALL_LIMIT,
+            CALL_TIMEOUT + Duration::from_secs(10),
         )
         .await
         {
@@ -1274,7 +1276,8 @@ pub async fn mcp_call(
         &name,
         None,
         body.get("approvalToken").and_then(|v| v.as_str()),
-    )?;
+    )
+    .await?;
     // Arguments: absent/`null` → `{}`, a JSON object when present.
     let arguments = match body.get("arguments") {
         None | Some(Value::Null) => Map::new(),
@@ -1300,7 +1303,7 @@ pub async fn mcp_call(
     {
         let m = state.mcp.read().await;
         if let Some(meta) = m.meta_get(&server) {
-            if !meta.alive && failed_recently(meta) {
+            if !meta.alive && failed_recently(&meta) {
                 return Err((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({ "error": meta
@@ -1583,13 +1586,13 @@ done
         assert_eq!(stored.authorization.as_deref(), Some("Bearer abc123"));
 
         // Restart reopens the session (fake is still healthy).
-        let r = server_restart(ws(), AxumPath::from("fake")).await.unwrap().0;
+        let r = server_restart(ws(), AxumPath(String::from("fake"))).await.unwrap().0;
         let one = r.get("servers").unwrap().as_array().unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].get("status").unwrap(), "connected");
 
         // Delete kills the session and removes the spec; a second delete 404s.
-        let d = server_delete(ws(), AxumPath::from("fake")).await.unwrap().0;
+        let d = server_delete(ws(), AxumPath(String::from("fake"))).await.unwrap().0;
         assert_eq!(d.get("ok").unwrap(), true);
         assert_eq!(d.get("removed").unwrap(), true);
         let r = servers_get(ws()).await.0;
@@ -1602,7 +1605,7 @@ done
             .map(|s| s.get("name").unwrap().as_str().unwrap())
             .collect();
         assert!(!names.contains(&"fake"));
-        let e = server_delete(ws(), AxumPath::from("fake")).await.unwrap_err();
+        let e = server_delete(ws(), AxumPath(String::from("fake"))).await.unwrap_err();
         assert_eq!(e.0, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&tmp);
