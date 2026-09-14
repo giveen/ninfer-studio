@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_SUCCESS, GENERIC_READ, GetLastError, HLOCAL, LocalFree,
+    BOOL, CloseHandle, ERROR_SUCCESS, GENERIC_READ, GetLastError, HANDLE_FLAG_INHERIT, HLOCAL, LocalFree,
+    SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT,
@@ -54,12 +55,10 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-    STARTUPINFOEXW, STARTUPINFOW, STARTF_USESTDHANDLES, UpdateProcThreadAttribute,
-    CREATE_NO_WINDOW,
+    CreateProcessW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW, STARTF_USESTDHANDLES, UpdateProcThreadAttribute,
 };
-
 /// `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL` — winnt.h value `0x00020012`,
 /// which windows-sys 0.59 does not export as a named constant.
 const PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL: usize = 0x0002_0012;
@@ -606,6 +605,17 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             if CreatePipe(&mut err_read, &mut err_write, &sa, 0) == 0 {
                 return false;
             }
+            // The parent keeps the read ends: strip their inheritability so
+            // only the write ends reach the child. Otherwise every
+            // grandchild inherits a write end too and the parent's EOF —
+            // hence the exec timeout path — waits on processes it never
+            // spawned.
+            if SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0) == 0 {
+                return false;
+            }
+            if SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0) == 0 {
+                return false;
+            }
             true
         }
     })();
@@ -634,7 +644,9 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
 
     // stdin: the console handle if one exists, else NUL — the control plane
     // is a GUI app with no console, where `GetStdHandle` would return
-    // INVALID_HANDLE_VALUE.
+    // INVALID_HANDLE_VALUE. The NUL handle is created inheritable (same
+    // `sa` as the pipes): with `bInheritHandles` set, a non-inheritable
+    // handle would arrive invalid in the child.
     let mut stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let mut stdin_nul: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     if stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
@@ -644,7 +656,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
                 wide_ptr(&nul_wide),
                 GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null_mut(),
+                &sa as *const _ as *mut _,
                 OPEN_EXISTING,
                 0,
                 std::ptr::null_mut(),
@@ -670,7 +682,10 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
 
     // 5. Create the process (in the job, at the label).
     let mut si = unsafe { std::mem::zeroed::<STARTUPINFOW>() };
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // `cb` is the size of the whole EX struct: with
+    // EXTENDED_STARTUPINFO_PRESENT set, CreateProcessW validates the
+    // attribute list against it, so the inner INFO size is wrong here.
+    si.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = stdin;
     si.hStdOutput = out_write;
@@ -688,7 +703,10 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             std::ptr::null(),
             std::ptr::null(),
             1, // bInheritHandles
-            (EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW) as _,
+            // CREATE_UNICODE_ENVIRONMENT: `env` is a UTF-16 block
+            // (see `env_block`) — without it CreateProcessW parses the
+            // block as ANSI and the child inherits a garbage environment.
+            (EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT) as _,
             env.as_ptr() as *const _,
             wide_ptr(&cwd_wide),
             &si_ex.StartupInfo as *const STARTUPINFOW,
