@@ -1081,7 +1081,7 @@ main()
         assert_eq!(res["output"], "approved", "{res}");
 
         // status shows connected
-        let servers = servers_get(state.clone()).await.0;
+        let servers = servers_get(AxumState(state.clone())).await.0;
         assert_eq!(servers["servers"][0]["status"], "connected", "{servers}");
 
         // delete drops the connection and the spec
