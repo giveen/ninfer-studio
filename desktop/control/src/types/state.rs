@@ -214,6 +214,7 @@ impl State {
             coder_perms: tokio::sync::RwLock::new(HashMap::new()),
             coder_approvals: tokio::sync::Mutex::new(HashMap::new()),
             coder_approval_counter: AtomicU64::new(0),
+            mcp: tokio::sync::RwLock::new(crate::mcp::McpManager::default()),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
             browser: tokio::sync::Mutex::new(crate::coder::BrowserSlot::new()),
             bg_jobs: tokio::sync::Mutex::new(HashMap::new()),
