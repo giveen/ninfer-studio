@@ -465,6 +465,16 @@ fn render_result(result: &CallToolResult) -> String {
                 .push(serde_json::to_string(r).unwrap_or_else(|_| "[resource omitted]".into())),
             ContentBlock::ResourceLink(r) => parts
                 .push(serde_json::to_string(r).unwrap_or_else(|_| "[resource link omitted]".into())),
+            // `ContentBlock` is non-exhaustive in rmcp — future content kinds
+            // are described, never dumped raw.
+            other => {
+                let v = serde_json::to_value(other).unwrap_or(Value::Null);
+                let kind = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+                parts.push(format!("[{kind} content omitted]"));
+            }
         }
     }
     let mut out = parts.join("\n");
