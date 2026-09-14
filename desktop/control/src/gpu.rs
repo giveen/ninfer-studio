@@ -246,17 +246,19 @@ mod tests {
     /// End-to-end: gpu_stats() must spawn nvidia-smi with piped stdio and
     /// surface real data. Guards the regression where spawned children
     /// inherited the server's stdout, so `wait_with_output` returned empty
-    /// output and every poll reported `available: false`. Skips on machines
-    /// without nvidia-smi (e.g. CI runners).
+    /// output and every poll reported `available: false`. Skips when
+    /// nvidia-smi is missing *or* the driver is unreachable — e.g. CI
+    /// runners, and containers where the host binary leaks onto PATH but no
+    /// GPU driver is visible inside the container.
     #[tokio::test]
     async fn gpu_stats_live_when_nvidia_smi_present() {
-        if std::process::Command::new("which")
-            .arg("nvidia-smi")
+        let driver_alive = std::process::Command::new("nvidia-smi")
+            .arg("-L")
             .output()
-            .map(|o| !o.status.success())
-            .unwrap_or(true)
-        {
-            return; // no nvidia-smi here — nothing to test against
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !driver_alive {
+            return; // no usable nvidia-smi here — nothing to test against
         }
         let g = gpu_stats().await;
         assert!(
