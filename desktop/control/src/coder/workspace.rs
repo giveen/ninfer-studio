@@ -40,9 +40,7 @@ pub async fn workspace_set(
     Json(req): Json<WorkspaceReq>,
 ) -> Json<WorkspaceResp> {
     let raw = req.path.unwrap_or_default().trim().to_string();
-    let ws;
-    let exists;
-    if !raw.is_empty() {
+    let (ws, exists) = if !raw.is_empty() {
         let ws_path = match std::fs::canonicalize(Path::new(&raw)) {
             Ok(p) => p,
             Err(_) => {
@@ -58,12 +56,11 @@ pub async fn workspace_set(
         // so strip the prefix or the store duplicates the workspace on the
         // next start.
         let plain = strip_extended_prefix(&ws_path.to_string_lossy()).to_string();
-        ws = plain;
-        exists = ws_path.is_dir();
+        let exists = ws_path.is_dir();
+        (plain, exists)
     } else {
-        ws = String::new();
-        exists = false;
-    }
+        (String::new(), false)
+    };
 
     state.config.write().await.coder_workspace = ws.clone();
 
@@ -72,7 +69,7 @@ pub async fn workspace_set(
         && is_safe_base_dir(&state.data_dir)
     {
         let path = state.data_dir.join("config.json");
-        let _ = tokio::fs::write(&path, json).await;
+        let _ = crate::atomic_write_secret(&path, json).await;
     }
 
     Json(WorkspaceResp { workspace: ws, exists })
