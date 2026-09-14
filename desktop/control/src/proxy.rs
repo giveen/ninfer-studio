@@ -240,7 +240,7 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     // for usage logging on completion-shaped endpoints only.
     let stream = futures_util::StreamExt::boxed(resp.bytes_stream());
     let stream = if should_log {
-        wrap_for_usage_logging(state.clone(), request_model, source, stream)
+        wrap_for_usage_logging(state.clone(), request_model, source, usage_streaming, usage_started, stream)
     } else {
         stream
     };
