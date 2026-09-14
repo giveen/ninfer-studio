@@ -868,7 +868,7 @@ mod tests {
             deny_paths: vec![],
         };
         assert_eq!(
-            crate::coder::common::tier_for(&perms, "mcp__github__push"),
+            crate::coder::tier_for(&perms, "mcp__github__push"),
             PermTier::Deny
         );
         // a per-tool row overrides the per-server row
@@ -878,15 +878,15 @@ mod tests {
             deny_paths: vec![],
         };
         assert_eq!(
-            crate::coder::common::tier_for(&perms, "mcp__github__push"),
+            crate::coder::tier_for(&perms, "mcp__github__push"),
             PermTier::Allow
         );
         assert_eq!(
-            crate::coder::common::tier_for(&perms, "mcp__github__other"),
+            crate::coder::tier_for(&perms, "mcp__github__other"),
             PermTier::Deny
         );
         // non-MCP names never consult the server row
-        assert_eq!(crate::coder::common::tier_for(&perms, "bash"), PermTier::Allow);
+        assert_eq!(crate::coder::tier_for(&perms, "bash"), PermTier::Allow);
     }
 
     #[tokio::test]
