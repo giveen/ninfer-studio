@@ -175,3 +175,12 @@ pub fn policy() -> &'static str {
 pub fn shell_is_bash() -> bool {
     windows::shell_is_bash()
 }
+
+/// `ExecChild` moves to another runtime thread (the background-job drain
+/// task in `coder/exec.rs` calls `tokio::spawn` on it) — keep it `Send`.
+/// Compile-time guard so a future non-`Send` field fails the build instead
+/// of the (Windows-only) drain path at runtime.
+const _EXEC_CHILD_MUST_BE_SEND: () = {
+    fn assert_send<T: Send>() {}
+    assert_send::<ExecChild>();
+};
