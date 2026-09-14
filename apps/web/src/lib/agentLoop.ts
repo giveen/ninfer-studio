@@ -208,6 +208,16 @@ export interface TurnResult {
   dropped: string[];
 }
 
+/** Declared name of one tool schema (`{ function: { name } }`) — guarded read,
+ *  null when the entry isn't that shape. Schemas arrive as `unknown[]`
+ *  (transport-agnostic `tools?: unknown[]`), so narrow instead of casting. */
+function toolNameOf(t: unknown): string | null {
+  if (!t || typeof t !== 'object' || !('function' in t)) return null;
+  const fn = t.function;
+  if (!fn || typeof fn !== 'object' || !('name' in fn)) return null;
+  return typeof fn.name === 'string' && fn.name ? fn.name : null;
+}
+
 /** Stream one assistant turn: accumulate deltas/usage/tool calls, then fall
  *  back to markup recovery when the model emitted calls as text. */
 export async function streamTurn(opts: {
@@ -247,7 +257,7 @@ export async function streamTurn(opts: {
   let dropped: string[] = [];
   if (recoverMarkup && toolCalls.length === 0 && (content.trim() || reasoning.trim())) {
     const declared = new Set(
-      (tools ?? []).map((t) => (t as { function?: { name?: string } })?.function?.name).filter((n): n is string => !!n),
+      (tools ?? []).map(toolNameOf).filter((n): n is string => n !== null),
     );
     let recovered = parseMarkupToolCalls(content);
     let fromReasoning = false;
@@ -256,12 +266,15 @@ export async function streamTurn(opts: {
       fromReasoning = true;
     }
     const usable = recovered.calls.filter((c) => declared.has(c.name));
+    // Report dropped names even when nothing was usable — otherwise a turn
+    // whose markup names only unoffered tools looks identical to a plain
+    // reply and the loop strands with raw markup as the final answer.
+    dropped = recovered.calls.filter((c) => !declared.has(c.name)).map((c) => c.name);
     if (usable.length > 0) {
       if (fromReasoning) reasoning = stripToolMarkup(reasoning, recovered.consumed);
       else content = stripToolMarkup(content, recovered.consumed);
       toolCalls = usable;
       recoveredFromMarkup = fromReasoning ? 'reasoning' : 'content';
-      dropped = recovered.calls.filter((c) => !declared.has(c.name)).map((c) => c.name);
     }
   }
   return { content, reasoning, toolCalls, finishReason, meta, recoveredFromMarkup, dropped };
@@ -394,6 +407,27 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
     }
     if (hook?.halt) return { messages, turns, stop: 'halted', finishReason, meta };
     const proceed = hook?.proceed ?? t.toolCalls.length > 0;
+    if (!proceed && !signal.aborted && t.toolCalls.length === 0 && t.dropped.length > 0) {
+      // The model emitted tool-call markup for tools that aren't offered
+      // (e.g. `bash` while Computer Use is off) — recovery parsed it but the
+      // declared-set filter dropped every call. Without a correction the run
+      // strands with raw `<tool_call>` text in the reply and the model never
+      // learns why nothing executed. Nudge it back into the loop with the
+      // available list; consumes step budget like any other continued turn,
+      // so a stubborn model ends at 'steps', never spins forever.
+      const names = [...new Set(t.dropped)];
+      const available = (tools ?? []).map(toolNameOf).filter((n): n is string => n !== null);
+      const note: ChatMessage = {
+        role: 'system',
+        content: available.length
+          ? `[System: your tool-call markup for ${names.join(', ')} was ignored — those tools are not available right now. Available tools: ${available.join(', ')}. Call one of the available tools using the native tool-call format, or answer directly in prose.]`
+          : `[System: your tool-call markup for ${names.join(', ')} was ignored — no tools are available in this conversation. Answer directly in prose.]`,
+      };
+      messages = [...messages, note];
+      opts.onAppended?.([note], turns);
+      turns++;
+      continue;
+    }
     if (!proceed) return { messages, turns, stop: 'done', finishReason, meta };
     const toolMsgs = await executeToolCalls(t.toolCalls, registry, signal);
     messages = [...messages, ...toolMsgs];

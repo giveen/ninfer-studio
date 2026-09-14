@@ -147,6 +147,36 @@ describe('runToolLoop', () => {
     expect(res.stop).toBe('done');
   });
 
+  it('nudges the model back into the loop when its markup names a tool that is not offered (undeclared bash)', async () => {
+    // The reported Chat failure: the model emits XML-ish markup for `bash`
+    // while only web_search is declared. Recovery parses it, the
+    // declared-set filter drops it, and the run must NOT strand with raw
+    // markup as the final reply — a system nudge names the available tools
+    // and the model answers on the next turn. (Angle brackets built from
+    // char codes so the markup stays data, never source structure.)
+    const LT = String.fromCharCode(60);
+    const GT = String.fromCharCode(62);
+    const markup = LT + 'tool_call' + GT + ' ' + LT + 'function=bash' + GT
+      + ' ' + LT + 'parameter=command' + GT + 'du -sh /tmp' + LT + '/parameter' + GT
+      + ' ' + LT + '/function' + GT + ' ' + LT + '/tool_call' + GT;
+    const handler = vi.fn(async () => '{"echoed":"x"}');
+    const registry: ToolRegistry = { web_search: handler };
+    const res = await runToolLoop({
+      model: 'm', system: undefined, messages: [{ role: 'user', content: 'go' }], params: PARAMS,
+      tools: [{ type: 'function', function: { name: 'web_search' } }],
+      registry, maxSteps: 5, signal: new AbortController().signal,
+      stream: scriptedStream([
+        { content: markup },
+        { content: 'I cannot run shell commands here.' },
+      ]),
+    });
+    expect(handler).not.toHaveBeenCalled();
+    const nudge = res.messages.find((m) => m.role === 'system');
+    expect(nudge?.content).toContain('bash');
+    expect(nudge?.content).toContain('web_search');
+    expect(res.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'I cannot run shell commands here.' });
+    expect(res.stop).toBe('done');
+  });
   it('onAssistantTurn can override content for the final turn (the humanize/reflection hook point)', async () => {
     const res = await runToolLoop({
       model: 'm', system: undefined, messages: [{ role: 'user', content: 'go' }], params: PARAMS,
