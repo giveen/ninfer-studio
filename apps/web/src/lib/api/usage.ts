@@ -31,6 +31,13 @@ export interface UsageTotals {
   activeDays: number;
   avgCacheHitRate: number;
   mostUsedModel: string | null;
+  /** Average prefill throughput (prompt tokens / prefill seconds) across
+   *  streamed requests in the window; null when there's no timing data yet
+   *  (pre-speed-tracking logs, or no streamed requests). */
+  avgPrefillTps: number | null;
+  /** Average generation throughput (completion tokens / decode seconds),
+   *  same semantics as `avgPrefillTps`. */
+  avgGenerationTps: number | null;
   /** Total GPU energy drawn while an engine was running, in kWh — not
    *  filtered by the source param (board power isn't attributable to
    *  local/remote traffic). */
