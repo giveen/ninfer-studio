@@ -180,7 +180,8 @@ pub fn shell_is_bash() -> bool {
 /// task in `coder/exec.rs` calls `tokio::spawn` on it) — keep it `Send`.
 /// Compile-time guard so a future non-`Send` field fails the build instead
 /// of the (Windows-only) drain path at runtime.
-const _EXEC_CHILD_MUST_BE_SEND: () = {
-    fn assert_send<T: Send>() {}
-    assert_send::<ExecChild>();
-};
+struct SendCheck<T>(T);
+impl<T: Send> SendCheck<T> {
+    const IS_SEND: () = ();
+}
+const _EXEC_CHILD_MUST_BE_SEND: () = SendCheck::<ExecChild>::IS_SEND;
