@@ -816,7 +816,6 @@ mod tests {
 
     #[test]
     fn mangle_tools_namespaces_and_dedupes() {
-        let tools: Vec<Tool> = vec![];
         // build two colliding tools by hand via serde
         let v1: Tool = serde_json::from_value(json!({
             "name": "echo",
