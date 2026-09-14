@@ -4,7 +4,7 @@
 //! repo and `glob` path matching (ripgrep's `globset` matcher), both
 //! gitignore-aware via the `ignore` crate and gated by `common::enforce_perm`.
 
-use super::common::{enforce_perm, rel_of, resolve_ws, within_ws, CODER_IGNORE};
+use super::common::{enforce_perm, perm_scope, rel_of, resolve_ws, within_ws, CODER_IGNORE};
 use crate::engine::S;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
@@ -19,7 +19,7 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if pattern.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"}))));
     }
-    enforce_perm(&state, "grep", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "grep", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
 
     let ignore_case = req.get("ignoreCase").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -92,7 +92,7 @@ pub async fn glob(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         Some(p) if !p.is_empty() => p.to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"})))),
     };
-    enforce_perm(&state, "glob", req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "glob", req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let base = if rel_root.is_empty() { ws_root.clone() } else { within_ws(&ws_root, rel_root)? };

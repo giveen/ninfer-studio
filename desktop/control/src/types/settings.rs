@@ -112,6 +112,28 @@ pub struct AppSettings {
     /// Port the remote listener binds on `0.0.0.0` when enabled. Serializes
     /// as `remoteAccessPort`.
     pub remote_access_port: u16,
+    /// Chat's Computer Use: when on, adds the same file/shell/search/basic-git
+    /// tools the Coding harness exposes (read/write/edit/apply_patch/bash/
+    /// bash_poll/grep/glob/git_commit/git_diff), scoped to `chat_computer_use_dir`
+    /// rather than Coder's workspace — for general "use my computer" tasks, not
+    /// the coding-specific harness features (subagents, todo tracking, etc.)
+    /// that stay Coder-exclusive. Serializes as `chatComputerUseEnabled`.
+    pub chat_computer_use_enabled: bool,
+    /// Directory Chat's Computer Use tools are confined to (independent of
+    /// Coder's workspace — same path-traversal confinement via `within_ws`).
+    /// Defaults to the OS temp dir (see `Default for AppSettings`) so the
+    /// feature works the instant it's switched on; the model can redirect it
+    /// elsewhere mid-conversation with the `set_directory` tool, or the user
+    /// can point it somewhere permanent in Settings. Empty => inert. Serializes
+    /// as `chatComputerUseDir`.
+    pub chat_computer_use_dir: String,
+    /// Chat's Computer Use tool tiers + denied path prefixes, JSON-serialized
+    /// (`{"tools":{...},"denyPaths":[...]}`, same shape as Coder's `PermConfig`)
+    /// rather than individual typed fields since the tool set is open-ended.
+    /// Mirrored to the control plane's scoped perms map (keyed by
+    /// `chat_computer_use_dir`) exactly like Coder mirrors its own — see
+    /// `coder::common::enforce_perm`. Serializes as `chatComputerUsePerms`.
+    pub chat_computer_use_perms: String,
     /// Currency symbol/code prefixed onto estimated cost figures in the
     /// Usage tab (e.g. "$", "€", "£") — free text, no locale or
     /// exchange-rate handling. Serializes as `currencySymbol`.
@@ -155,6 +177,15 @@ impl Default for AppSettings {
             chat_deep_research_max_angles: 3,
             chat_deep_research_max_steps: 5,
             chat_reflection_critique_max_tokens: 400,
+            chat_computer_use_enabled: false,
+            // Unlike coder_workspace (a project, deliberately left unconfigured
+            // until the user points it somewhere), Computer Use is meant to work
+            // the moment it's switched on — the OS temp dir is a sensible,
+            // always-present default drop point (/tmp on Linux/macOS, %TEMP% on
+            // Windows) that the model can redirect elsewhere with `set_directory`
+            // when the user asks (e.g. "do that in my home folder instead").
+            chat_computer_use_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            chat_computer_use_perms: String::new(),
             remote_access_enabled: false,
             remote_access_port: 1337,
             currency_symbol: "$".into(),

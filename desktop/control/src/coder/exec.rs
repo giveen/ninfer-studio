@@ -4,7 +4,7 @@
 //! blocklist, optional bubblewrap sandbox, secret-env scrubbing, and the
 //! background-job registry the client polls.
 
-use super::common::{enforce_perm, is_safe_base_dir, rel_of, resolve_ws, within_ws};
+use super::common::{enforce_perm, is_safe_base_dir, perm_scope, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
@@ -180,7 +180,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     if command.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "command required"}))));
     }
-    enforce_perm(&state, "bash", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "bash", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel_cwd = req.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let session_id = req.get("sessionId").and_then(|v| v.as_str()).unwrap_or("").to_string();

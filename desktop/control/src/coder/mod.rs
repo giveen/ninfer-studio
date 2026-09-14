@@ -163,13 +163,15 @@ mod tests {
         state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
         let ws = || AxumState(state.clone());
 
+        let no_scope = || axum::extract::Query(std::collections::HashMap::<String, String>::new());
+
         // Defaults: nothing denied.
-        let got = perms_get(ws()).await.0;
+        let got = perms_get(ws(), no_scope()).await.0;
         assert_eq!(got.get("tools").and_then(|v| v.as_object()).map(|m| m.len()), Some(0));
 
         // Push a policy: bash denied outright, anything under "secret" denied by path.
         let _ = perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
-        let got = perms_get(ws()).await.0;
+        let got = perms_get(ws(), no_scope()).await.0;
         assert_eq!(got.get("tools").and_then(|v| v.get("bash")).and_then(|v| v.as_str()), Some("deny"));
 
         // bash is denied even though safe mode alone would have allowed "echo hi".
@@ -182,6 +184,35 @@ mod tests {
         assert!(fs_read(ws(), Json(json!({"path": "secret"}))).await.is_err());
         // unrelated read-only tools are unaffected.
         assert!(grep(ws(), Json(json!({"pattern": "yes"}))).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Two callers using different `scope`s (e.g. Coder's workspace path vs
+    /// Chat's Computer Use directory) must not see or clobber each other's
+    /// tiers — the whole point of scoping `coder_perms`/`enforce_perm` by an
+    /// opaque key instead of one global slot.
+    #[tokio::test]
+    async fn perms_are_isolated_per_scope() {
+        use axum::extract::State as AxumState;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-scope-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let ws = || AxumState(state.clone());
+
+        // "coder" scope denies bash; "chat" scope leaves it at the default (allow).
+        let _ = perms_set(ws(), Json(json!({"scope": "coder", "tools": {"bash": "deny"}, "denyPaths": []}))).await;
+        let _ = perms_set(ws(), Json(json!({"scope": "chat", "tools": {}, "denyPaths": []}))).await;
+
+        assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "coder"}))).await.is_err());
+        assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "chat"}))).await.is_ok());
+
+        // Re-tightening "chat" alone must not affect "coder" (already denied) or leak across.
+        let _ = perms_set(ws(), Json(json!({"scope": "chat", "tools": {"bash": "deny"}, "denyPaths": []}))).await;
+        assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "chat"}))).await.is_err());
+        assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "coder"}))).await.is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

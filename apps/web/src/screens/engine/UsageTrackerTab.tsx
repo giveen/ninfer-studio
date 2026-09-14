@@ -34,6 +34,17 @@ const SERIES_COLORS = [
   'var(--color-mute)',
 ];
 
+/** Cost/1M tokens is routinely a fraction of a cent — a fixed 2 decimals
+ *  rounds it straight to "$0.00" and hides the number entirely. Starts at 4
+ *  decimals and grows (up to 8) only if the value would still round to
+ *  zero, so both everyday and very cheap rates stay legible. */
+function formatSmallCost(v: number): string {
+  if (v === 0) return (0).toFixed(4);
+  let decimals = 4;
+  while (decimals < 8 && Number(v.toFixed(decimals)) === 0) decimals++;
+  return v.toFixed(decimals);
+}
+
 /** Every calendar day in the last `days` days (UTC, oldest first), so the
  *  heatmap/trend show gaps as zero instead of skipping them. */
 function fillDailySeries(series: UsageDailyPoint[], days: number): UsageDailyPoint[] {
@@ -145,7 +156,7 @@ export function UsageTrackerTab() {
           value={totals && costPerKwh > 0 ? `${currencySymbol}${estCost.toFixed(2)}` : '—'}
           sub={costPerKwh === 0 ? 'set cost/kWh in Settings' : undefined}
         />
-        <Stat label="Cost / 1M tokens" value={costPerMillionTokens !== null ? `${currencySymbol}${costPerMillionTokens.toFixed(2)}` : '—'} />
+        <Stat label="Cost / 1M tokens" value={costPerMillionTokens !== null ? `${currencySymbol}${formatSmallCost(costPerMillionTokens)}` : '—'} />
       </div>
       <p className="text-[11.5px] text-faint">
         Energy reflects total GPU power draw while an engine is running — not power isolated to a single request, or a specific

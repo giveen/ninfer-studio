@@ -12,8 +12,17 @@ use crate::read_json;
 use crate::types::{AppSettings, EngineProfile, ProfileState, SavedProfile};
 
 pub(crate) async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
-    let c = state.config.read().await;
-    Json(redact_config(serde_json::to_value(&*c).unwrap()))
+    let mut c = state.config.read().await.clone();
+    // An empty `chat_computer_use_dir` means "never customized" — not
+    // "deliberately blank" (there's no UI action that clears it back to "").
+    // Resolve it to the live OS temp dir on every read rather than only at
+    // `AppSettings::default()` time, since a config.json saved before this
+    // field existed (or saved while the toggle was off) already persists an
+    // explicit "" that a load-time default can never see past.
+    if c.chat_computer_use_dir.is_empty() {
+        c.chat_computer_use_dir = std::env::temp_dir().to_string_lossy().into_owned();
+    }
+    Json(redact_config(serde_json::to_value(&c).unwrap()))
 }
 
 /// The shape a secret field takes in every client-facing response. The real
@@ -108,6 +117,15 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         && (50..=4000).contains(&v)
     {
         merged.chat_reflection_critique_max_tokens = v as u32;
+    }
+    if let Some(v) = body.get("chatComputerUseEnabled").and_then(|v| v.as_bool()) {
+        merged.chat_computer_use_enabled = v;
+    }
+    if let Some(v) = body.get("chatComputerUseDir").and_then(|v| v.as_str()) {
+        merged.chat_computer_use_dir = v.into();
+    }
+    if let Some(v) = body.get("chatComputerUsePerms").and_then(|v| v.as_str()) {
+        merged.chat_computer_use_perms = v.into();
     }
     if let Some(v) = body.get("currencySymbol").and_then(|v| v.as_str()) {
         merged.currency_symbol = v.into();

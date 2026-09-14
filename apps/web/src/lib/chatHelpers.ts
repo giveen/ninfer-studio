@@ -6,6 +6,7 @@ import { frameCompactedSummary } from './api';
 import { effectiveSystemPrompt } from './notai';
 import type { ChatMessage, ChatParams, Conversation } from './types';
 import type { CoderMemory } from './api/coder';
+import { TOOLS, type PermConfig } from './coderTools';
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
@@ -98,9 +99,28 @@ function memoryBlock(memory: CoderMemory | undefined): string {
   return blocks.join('\n\n');
 }
 
-export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory): string => {
+/** Tells the model Computer Use's current directory so it can decide to call
+ *  `set_directory` proactively (e.g. the user asks to work in their home
+ *  folder) instead of needing a `pwd`-style round trip first. Omitted when
+ *  Computer Use is off/unconfigured, matching `memoryBlock`'s pattern. */
+function computerUseBlock(dir: string): string {
+  if (!dir) return '';
+  return `# Computer Use\nCurrent working directory for read/write/edit/bash/grep/glob/git_* below: ${dir}\nIf the user asks you to work somewhere else (their home folder, a project directory, ...), call \`set_directory\` first — don't assume the current one.`;
+}
+
+/** Without this the model guesses at its own tool list from generic training
+ *  priors — and guesses wrong, both inventing tools that don't exist (e.g.
+ *  "web_extractor") and denying ones it actually has (e.g. `read` when
+ *  Computer Use is on). List exactly what this turn's request actually
+ *  attaches, since that's the only source of truth the toggles produce. */
+function toolsAvailableBlock(toolNames: string[]): string {
+  if (!toolNames.length) return '';
+  return `# Tools available\nYou have access to exactly these tools and no others this turn: ${toolNames.join(', ')}.\nDo not claim to have a tool that isn't in this list. Do not claim to lack a tool that is in this list — call it instead of guessing or refusing.`;
+}
+
+export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory, computerUseDir?: string, toolNames?: string[]): string => {
   const base = effectiveSystemPrompt(params);
-  return [base, localDateTimeBlock(), CHAT_CAPABILITIES, memoryBlock(memory)].filter(Boolean).join('\n\n');
+  return [base, localDateTimeBlock(), CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? '')].filter(Boolean).join('\n\n');
 };
 
 export const CHAT_TOOLS = [
@@ -174,6 +194,72 @@ export const CHAT_MEMORY_TOOL = {
     }
   }
 };
+
+/** Computer Use defaults to the OS temp dir (see `AppSettings::default` in
+ *  the control plane) so it's useful the instant it's switched on — this
+ *  tool is how the model honors "do that in my home folder instead"
+ *  mid-conversation rather than requiring a trip to Settings. Takes effect
+ *  immediately, including for later tool calls in the same turn. */
+export const CHAT_SET_DIRECTORY_TOOL = {
+  type: "function",
+  function: {
+    name: "set_directory",
+    description: "Change Computer Use's working directory for the rest of this conversation — the root every read/write/edit/bash/grep/glob/git_* call below resolves against. Use when the user asks to work somewhere other than the current directory (e.g. their home folder). Accepts `~` for home.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"]
+    }
+  }
+};
+
+/** Computer Use's tool permission template: full parity with Coder's own
+ *  Safety & Permissions grid (same TOOLS list) plus `set_directory`, which
+ *  only exists on the Chat side. This is the FULL set shown in Settings so
+ *  every tool name Chat's agent could ever call has a pre-configurable tier
+ *  — the runtime `tools` array Chat actually sends to the model (built in
+ *  ChatScreen.tsx) is a de-duplicated subset of this, since web_fetch/
+ *  web_search/browser/memory_update already have dedicated homes (always-on
+ *  baseline, Agent Mode, Memory) that must not appear twice. */
+export const COMPUTER_USE_TOOLS = [...TOOLS, CHAT_SET_DIRECTORY_TOOL];
+
+/** Drop later entries whose `function.name` already appeared — used when
+ *  merging tool lists from independent toggles (Agent Mode, Memory,
+ *  Computer Use) that can overlap (e.g. `browser`), so the model is never
+ *  handed two schema entries for the same tool name. First occurrence wins;
+ *  callers order the input so the more specific/dedicated toggle comes
+ *  first. */
+export function dedupeTools<T extends { function: { name: string } }>(tools: T[]): T[] {
+  const seen = new Set<string>();
+  return tools.filter((t) => {
+    if (seen.has(t.function.name)) return false;
+    seen.add(t.function.name);
+    return true;
+  });
+}
+
+/** Client-side permission gate for Computer Use tools — mirrors Coder's own
+ *  `checkPerm` (CoderScreen.tsx) minus plan-mode, which Chat has no concept
+ *  of. Returns a denial reason, `'ask'` to pause for approval, or `null` to
+ *  proceed. The control plane re-checks `deny`/`denyPaths` itself (see
+ *  `coder::common::enforce_perm`, scoped to the same directory) so a tool
+ *  routing around this client-side check (e.g. `bash` curling an endpoint
+ *  directly) still can't bypass a `deny` tier. */
+export function checkComputerUsePerm(perms: PermConfig, name: string, args: Record<string, unknown>): string | 'ask' | null {
+  if ((perms.tools[name] ?? 'allow') === 'deny') {
+    return `Denied by Computer Use permissions (${name} is set to deny).`;
+  }
+  const target = typeof args.path === 'string' ? args.path : '';
+  if (target) {
+    const hit = perms.denyPaths.find((d) => {
+      const clean = d.trim().replace(/\/+$/, '');
+      return clean !== '' && (target === clean || target.startsWith(clean + '/'));
+    });
+    if (hit) return `Denied by Computer Use permissions (path is under denied prefix "${hit.trim()}").`;
+  }
+  if ((perms.tools[name] ?? 'allow') === 'ask') return 'ask';
+  return null;
+}
 
 // Slash-command palette (type `/` in the composer to see suggestions).
 export const SLASH_COMMANDS: Array<{ cmd: string; desc: string; needsArg?: boolean }> = [

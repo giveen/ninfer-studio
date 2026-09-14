@@ -135,17 +135,34 @@ pub struct CoderPerms {
 const APPROVAL_TTL: Duration = Duration::from_secs(60);
 
 /// A human's one-time sign-off on a specific `ask`-tiered tool call, scoped to
-/// the tool and (when the tool takes one) the path prefix approved. Minted by
-/// `perms_approve`, consumed by `enforce_perm`.
+/// the caller's `scope` (see `coder_perms` on `State`), the tool, and (when
+/// the tool takes one) the path prefix approved. Minted by `perms_approve`,
+/// consumed by `enforce_perm`.
 #[derive(Debug)]
 pub struct ApprovalTicket {
+    scope: String,
     tool: String,
     rel: Option<String>,
     expires_at: Instant,
 }
 
-/// `POST /api/coder/perms/approve` — body `{tool, path?}`. Called by the web
-/// UI's approval dialog at the moment a human clicks Approve on an
+/// The perms bucket key a caller supplies via an optional `scope` request
+/// field (falls back to `workspace` when `scope` is absent, since fs/exec/
+/// grep/glob callers already send that; falls back further to a fixed
+/// default bucket when neither is present, preserving pre-scoping behavior
+/// for a caller that sends neither).
+pub(crate) fn perm_scope(req: &Value) -> String {
+    req.get("scope")
+        .and_then(|v| v.as_str())
+        .or_else(|| req.get("workspace").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
+/// `POST /api/coder/perms/approve` — body `{tool, path?, scope?}`. Called by
+/// the web UI's approval dialog at the moment a human clicks Approve on an
 /// `ask`-tiered tool call, in addition to (not instead of) resolving that
 /// dialog's own in-memory promise. Returns `{token}`, which the client then
 /// attaches to the actual tool-call request as `approvalToken`.
@@ -154,6 +171,7 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "tool required"})))),
     };
+    let scope = perm_scope(&req);
     let rel = req
         .get("path")
         .and_then(|v| v.as_str())
@@ -163,7 +181,7 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
     let now = Instant::now();
     let mut approvals = state.coder_approvals.lock().await;
     approvals.retain(|_, t| t.expires_at > now); // opportunistic cleanup
-    approvals.insert(token.clone(), ApprovalTicket { tool, rel, expires_at: now + APPROVAL_TTL });
+    approvals.insert(token.clone(), ApprovalTicket { scope, tool, rel, expires_at: now + APPROVAL_TTL });
     Ok(Json(json!({"token": token})))
 }
 
@@ -171,8 +189,13 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
 /// valid matching approval token, or when `rel` (a workspace-relative path,
 /// for tools that take one) sits under a denied prefix. Mirrors the
 /// frontend's `checkPerm`: exact match or `rel` starting with `"<prefix>/"`.
-pub(crate) async fn enforce_perm(state: &S, tool: &str, rel: Option<&str>, approval_token: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
-    let perms = state.coder_perms.read().await;
+/// `scope` selects which caller's tier bucket applies (see `perm_scope`) —
+/// two independent callers (e.g. Coder and Chat's Computer Use) using
+/// different scopes never see or affect each other's tiers.
+pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option<&str>, approval_token: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+    let all_perms = state.coder_perms.read().await;
+    let perms = all_perms.get(scope).cloned().unwrap_or_default();
+    drop(all_perms);
     if perms.tools.get(tool) == Some(&PermTier::Deny) {
         return Err((
             StatusCode::FORBIDDEN,
@@ -184,6 +207,7 @@ pub(crate) async fn enforce_perm(state: &S, tool: &str, rel: Option<&str>, appro
         let mut approvals = state.coder_approvals.lock().await;
         let matches = approval_token.and_then(|t| approvals.get(t)).is_some_and(|tk| {
             tk.expires_at > now
+                && tk.scope == scope
                 && tk.tool == tool
                 && match (&tk.rel, rel) {
                     (None, _) => true,
@@ -218,13 +242,19 @@ pub(crate) async fn enforce_perm(state: &S, tool: &str, rel: Option<&str>, appro
     Ok(())
 }
 
-pub async fn perms_get(AxumState(state): AxumState<S>) -> Json<Value> {
-    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+pub async fn perms_get(AxumState(state): AxumState<S>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+    let scope = q.get("scope").map(String::as_str).unwrap_or("default");
+    let all_perms = state.coder_perms.read().await;
+    Json(serde_json::to_value(all_perms.get(scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
 }
 
 pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
+    let scope = perm_scope(&req);
     if let Ok(parsed) = serde_json::from_value::<CoderPerms>(req) {
-        *state.coder_perms.write().await = parsed;
+        let mut all_perms = state.coder_perms.write().await;
+        all_perms.insert(scope.clone(), parsed);
+        return Json(serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})));
     }
-    Json(serde_json::to_value(&*state.coder_perms.read().await).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+    let all_perms = state.coder_perms.read().await;
+    Json(serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
 }

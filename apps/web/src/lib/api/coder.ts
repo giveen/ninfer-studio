@@ -117,11 +117,11 @@ export function coderDiff(workspace?: string): Promise<CoderDiffResult> {
   const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
   return getJSON<CoderDiffResult>(`/api/coder/diff${qs}`, 60000);
 }
-export function coderWebFetch(url: string, signal?: AbortSignal, approvalToken?: string): Promise<CoderWebFetch> {
-  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url, approvalToken }, 20_000, signal);
+export function coderWebFetch(url: string, signal?: AbortSignal, approvalToken?: string, workspace?: string): Promise<CoderWebFetch> {
+  return postJSON<CoderWebFetch>('/api/coder/web/fetch', { url, approvalToken, workspace }, 20_000, signal);
 }
-export function coderWebSearch(query: string, signal?: AbortSignal, approvalToken?: string): Promise<CoderWebSearch> {
-  return postJSON<CoderWebSearch>('/api/coder/web/search', { query, approvalToken }, 20_000, signal);
+export function coderWebSearch(query: string, signal?: AbortSignal, approvalToken?: string, workspace?: string): Promise<CoderWebSearch> {
+  return postJSON<CoderWebSearch>('/api/coder/web/search', { query, approvalToken, workspace }, 20_000, signal);
 }
 export interface CoderBrowserResult {
   ok?: boolean;
@@ -135,8 +135,8 @@ export interface CoderBrowserResult {
   idle_seconds?: number;
   error?: string;
 }
-export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal, approvalToken?: string): Promise<CoderBrowserResult> {
-  return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args, approvalToken }, 45_000, signal);
+export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal, approvalToken?: string, workspace?: string): Promise<CoderBrowserResult> {
+  return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args, approvalToken, workspace }, 45_000, signal);
 }
 export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
   return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
@@ -155,16 +155,16 @@ export function coderCommitApprovalSet(enabled: boolean): Promise<{ enabled: boo
  *  `coderPermsApprove`, `ask`) are enforced at the endpoint itself — not only
  *  by this client's own dispatcher, which an agent could otherwise route
  *  around (e.g. `bash` curling straight at an endpoint). */
-export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }): Promise<unknown> {
-  return postJSON<unknown>('/api/coder/perms', perms, 5000);
+export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }, scope?: string): Promise<unknown> {
+  return postJSON<unknown>('/api/coder/perms', { ...perms, scope }, 5000);
 }
 /** Called the moment a human approves an `ask`-tiered tool call in the UI's
  *  own dialog. Mints a short-lived, single-use token the client then attaches
  *  to the actual tool-call request as `approvalToken` — without this, the
  *  endpoint has no way to tell an approved call apart from one that skipped
  *  the dialog entirely. */
-export function coderPermsApprove(tool: string, path?: string): Promise<{ token: string }> {
-  return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path }, 5000);
+export function coderPermsApprove(tool: string, path?: string, scope?: string): Promise<{ token: string }> {
+  return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path, scope }, 5000);
 }
 export interface SandboxStatus {
   enabled: boolean;

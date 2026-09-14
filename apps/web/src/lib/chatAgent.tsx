@@ -12,9 +12,10 @@ import {
   chatReflectionEnabledGet, chatReflectionEnabledSet,
   chatDeepResearchEnabledGet, chatDeepResearchEnabledSet,
   chatMemoryGet, type CoderMemory,
-  getConfig, saveConfig,
+  getConfig, saveConfig, coderPermsSet,
 } from './api';
-import type { PermTier } from './coderTools';
+import type { PermTier, PermConfig } from './coderTools';
+import { DEFAULT_PERMS } from './coderTools';
 
 interface ChatAgentState {
   /** Tool tier: false = today's default (web_fetch/web_search only), true = adds `browser`. */
@@ -54,6 +55,23 @@ interface ChatAgentState {
   /** Reflection: token budget for the critique call itself. */
   reflectionCritiqueMaxTokens: number;
   setReflectionCritiqueMaxTokens: (v: number) => void;
+  /** Computer Use: file/shell/search/basic-git tools scoped to their own
+   *  directory (independent of Coder's workspace) — for general "use my
+   *  computer" tasks, not the coding-harness-specific features (subagents,
+   *  todo tracking, PRs) that stay Coder-exclusive. */
+  computerUseEnabled: boolean;
+  setComputerUseEnabled: (v: boolean) => void;
+  computerUseDir: string;
+  setComputerUseDir: (v: string) => void;
+  /** Mirrors `computerUseDir` for the `set_directory` tool: a multi-turn tool
+   *  loop builds its registry once per user message, so a plain closed-over
+   *  value would go stale the instant the tool changes it mid-turn — the
+   *  same problem `memoryRef` solves for `memory`. */
+  computerUseDirRef: MutableRefObject<string>;
+  /** Per-tool tiers + denied path prefixes for Computer Use's tools, mirrored
+   *  to the control plane's perms map under `computerUseDir` as the scope. */
+  computerUsePerms: PermConfig;
+  setComputerUsePerms: (v: PermConfig) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -74,6 +92,10 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [deepResearchMaxAngles, setDeepResearchMaxAnglesState] = useState(3);
   const [deepResearchMaxSteps, setDeepResearchMaxStepsState] = useState(5);
   const [reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokensState] = useState(400);
+  const [computerUseEnabled, setComputerUseEnabledState] = useState(false);
+  const [computerUseDir, setComputerUseDirState] = useState('');
+  const computerUseDirRef = useRef('');
+  const [computerUsePerms, setComputerUsePermsState] = useState<PermConfig>(DEFAULT_PERMS);
 
   const adoptMemory = useCallback((m: CoderMemory) => {
     setMemory(m);
@@ -99,6 +121,13 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
       setDeepResearchMaxAnglesState(c.chatDeepResearchMaxAngles ?? 3);
       setDeepResearchMaxStepsState(c.chatDeepResearchMaxSteps ?? 5);
       setReflectionCritiqueMaxTokensState(c.chatReflectionCritiqueMaxTokens ?? 400);
+      setComputerUseEnabledState(c.chatComputerUseEnabled ?? false);
+      setComputerUseDirState(c.chatComputerUseDir ?? '');
+      computerUseDirRef.current = c.chatComputerUseDir ?? '';
+      try {
+        const parsed = c.chatComputerUsePerms ? JSON.parse(c.chatComputerUsePerms) : null;
+        if (parsed && typeof parsed === 'object') setComputerUsePermsState({ tools: parsed.tools ?? {}, denyPaths: parsed.denyPaths ?? [] });
+      } catch { /* keep DEFAULT_PERMS on malformed stored JSON */ }
     }).catch(() => {});
   }, []);
 
@@ -148,6 +177,27 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     setReflectionCritiqueMaxTokensState(v);
     saveConfig({ chatReflectionCritiqueMaxTokens: v }).catch(() => {});
   }, []);
+  const setComputerUseEnabled = useCallback((v: boolean) => {
+    setComputerUseEnabledState(v);
+    saveConfig({ chatComputerUseEnabled: v }).catch(() => {});
+  }, []);
+  const setComputerUseDir = useCallback((v: string) => {
+    setComputerUseDirState(v);
+    computerUseDirRef.current = v;
+    saveConfig({ chatComputerUseDir: v }).catch(() => {});
+  }, []);
+  const setComputerUsePerms = useCallback((v: PermConfig) => {
+    setComputerUsePermsState(v);
+    saveConfig({ chatComputerUsePerms: JSON.stringify(v) }).catch(() => {});
+  }, []);
+  // Mirror Computer Use's tiers to the control plane so `deny` is enforced
+  // server-side too (see coderPermsSet) — same pattern Coder's own perms
+  // panel uses, but scoped to computerUseDir so the two never collide.
+  // Re-synced on every edit and on directory change.
+  useEffect(() => {
+    if (!computerUseDir) return;
+    coderPermsSet({ tools: computerUsePerms.tools, denyPaths: computerUsePerms.denyPaths }, computerUseDir).catch(() => { /* best-effort mirror */ });
+  }, [computerUseDir, computerUsePerms]);
 
   return (
     <Ctx.Provider
@@ -163,6 +213,9 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         deepResearchMaxAngles, setDeepResearchMaxAngles,
         deepResearchMaxSteps, setDeepResearchMaxSteps,
         reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
+        computerUseEnabled, setComputerUseEnabled,
+        computerUseDir, setComputerUseDir, computerUseDirRef,
+        computerUsePerms, setComputerUsePerms,
       }}
     >
       {children}

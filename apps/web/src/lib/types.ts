@@ -87,6 +87,12 @@ export interface AppSettings {
   chatDeepResearchMaxSteps?: number;
   /** Reflection: token budget for the critique call itself. */
   chatReflectionCritiqueMaxTokens?: number;
+  /** Computer Use: adds file/shell/search/basic-git tools to Chat, scoped to
+   *  its own directory (independent of Coder's workspace). */
+  chatComputerUseEnabled?: boolean;
+  chatComputerUseDir?: string;
+  /** JSON-serialized PermConfig ({tools, denyPaths}) for Computer Use's tools. */
+  chatComputerUsePerms?: string;
   /** Remote Access: serve the app on 0.0.0.0 instead of loopback-only.
    *  Live state (whether the listener is actually running, the LAN IP to
    *  open it from) comes from GET /api/remote, not this — see remote.ts. */

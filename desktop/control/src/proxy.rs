@@ -158,6 +158,22 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
+    // Usage logging should attribute a request to the actual model artifact
+    // (e.g. "qwen3_8_27b_nvfp4.ninfer") rather than the OpenAI-facing public
+    // alias (e.g. "qwen3.8-27b") both the request and the engine's own
+    // response echo back — the alias is a display/compat label (see
+    // BasicsTab's "Public model alias"), not the file actually loaded. Only
+    // known when `port` is this control plane's own managed engine; a
+    // request routed to a separately discovered/external engine has no
+    // artifact info available, so it keeps the alias (see `route_port`).
+    let request_model = {
+        let eng = state.engine.read().await;
+        if eng.port == Some(port) {
+            eng.artifact.as_deref().map(crate::types::base_name).map(str::to_string).or(request_model)
+        } else {
+            request_model
+        }
+    };
     let api_key = { state.config.read().await.api_key.clone() };
     let target = format!("http://127.0.0.1:{port}{}", uri.path());
 

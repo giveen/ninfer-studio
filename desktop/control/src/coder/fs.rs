@@ -4,7 +4,7 @@
 //! read/write/edit/patch, and base64 attachment reads — all confined to the
 //! workspace root by `common::within_ws` and gated by `common::enforce_perm`.
 
-use super::common::{enforce_perm, rel_of, resolve_ws, within_ws, CODER_IGNORE};
+use super::common::{enforce_perm, perm_scope, rel_of, resolve_ws, within_ws, CODER_IGNORE};
 use crate::engine::S;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
@@ -87,7 +87,7 @@ pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "read", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "read", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let buf = tokio::fs::read(&full)
         .await
@@ -125,7 +125,7 @@ pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "write", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "write", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let content = match req.get("content").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
@@ -149,7 +149,7 @@ pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let (old, new) = match (req.get("old").and_then(|v| v.as_str()), req.get("new").and_then(|v| v.as_str())) {
         (Some(o), Some(n)) => (o.to_string(), n.to_string()),
@@ -272,7 +272,7 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
         Some(p) if !p.trim().is_empty() => p,
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
     };
-    enforce_perm(&state, "apply_patch", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(&state, &perm_scope(&req), "apply_patch", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
     let full = within_ws(&ws_root, rel)?;
     let hunks = match req.get("edits").and_then(|v| v.as_array()) {
         Some(h) if !h.is_empty() => h.clone(),
