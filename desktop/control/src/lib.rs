@@ -415,6 +415,10 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     // both boot paths (the Tauri app and the standalone dev binary, which
     // both call `init_state`) get it without duplicating the wiring.
     tokio::spawn(power::run_power_sampler(state.clone()));
+    // Connect configured MCP servers in the background (see `mcp.rs`) — a
+    // broken server records its own per-server error and never blocks
+    // startup.
+    tokio::spawn(mcp::connect_all(state.clone()));
     state
 }
 #[cfg(test)]
