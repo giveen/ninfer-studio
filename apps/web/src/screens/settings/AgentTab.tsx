@@ -1,9 +1,12 @@
-import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus } from 'lucide-react';
+import { useState } from 'react';
+import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus, Terminal, FolderOpen } from 'lucide-react';
 import { Button, TextField, NumberField, cn, SectionCard } from '../../components/ui';
 import { MemoryModal } from '../../components/MemoryModal';
+import { DirBrowser } from '../../components/DirBrowser';
 import { useChatAgent } from '../../lib/chatAgent';
 import { chatMemorySetBank, chatMemoryDropLearning } from '../../lib/api';
 import { engineMaxConcurrency } from '../../lib/engineInfo';
+import { COMPUTER_USE_TOOLS } from '../../lib/chatHelpers';
 import type { PermTier } from '../../lib/coderTools';
 import type { StatusPayload } from '../../lib/types';
 
@@ -57,9 +60,13 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
     browserTier, setBrowserTier, memoryToolTier, setMemoryToolTier,
     deepResearchMaxAngles, setDeepResearchMaxAngles, deepResearchMaxSteps, setDeepResearchMaxSteps,
     reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
+    computerUseEnabled, setComputerUseEnabled, computerUseDir, setComputerUseDir, computerUsePerms, setComputerUsePerms,
   } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
+  const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const setComputerUseToolPerm = (tool: string, tier: PermTier) =>
+    setComputerUsePerms({ ...computerUsePerms, tools: { ...computerUsePerms.tools, [tool]: tier } });
 
   return (
     <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
@@ -86,6 +93,80 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
           </div>
         )}
       </SectionCard>
+
+      <SectionCard
+        title="Computer Use"
+        icon={<Terminal size={15} />}
+        description="Adds file, shell, search, and basic git tools to Chat, scoped to a directory of your choosing — for general 'use my computer' tasks, not coding specifically (Coder is the tuned harness for that)."
+      >
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-[12.5px] text-faint">Independent of Coder's own workspace and permissions — per-tool tiers below.</p>
+          <ToggleRow
+            on={computerUseEnabled}
+            onToggle={setComputerUseEnabled}
+            onTitle="Chat can read/write files, run shell commands, and search within the directory below"
+            offTitle="Chat has no filesystem or shell access"
+          />
+        </div>
+        {computerUseEnabled && (
+          <div className="mt-3 space-y-3 border-t border-line pt-3">
+            <div className="flex items-center gap-2">
+              <span className="shrink-0 text-[11.5px] text-faint">Directory</span>
+              <TextField value={computerUseDir} onChange={setComputerUseDir} placeholder="defaults to the OS temp dir" className="flex-1 font-mono text-[11.5px]" />
+              <Button variant="ghost" size="sm" onClick={() => setShowDirBrowser(true)}>
+                <FolderOpen size={13} /> Browse
+              </Button>
+            </div>
+            <p className="text-[12px] text-faint">
+              {computerUseDir
+                ? 'The model can redirect this itself mid-conversation with set_directory when you ask (e.g. "do that in my home folder instead") — this just sets the starting point.'
+                : 'No directory set — Computer Use tools are not offered to the model until one is set (normally the OS temp dir by default).'}
+            </p>
+            <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
+              {COMPUTER_USE_TOOLS.map((t) => {
+                const tier = computerUsePerms.tools[t.function.name] ?? 'allow';
+                return (
+                  <div key={t.function.name} className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={t.function.description}>{t.function.name}</span>
+                    {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                      <button
+                        key={v}
+                        type="button"
+                        onClick={() => setComputerUseToolPerm(t.function.name, v)}
+                        title={`${v} ${t.function.name}`}
+                        className={cn(
+                          'rounded px-2 py-0.5 text-[11px] font-medium',
+                          tier === v
+                            ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                            : 'text-faint hover:bg-panel2 hover:text-mute',
+                        )}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+            <input
+              defaultValue={computerUsePerms.denyPaths.join(' ')}
+              placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
+              title="Tool calls touching these directory-relative paths are denied"
+              onBlur={(e) => setComputerUsePerms({ ...computerUsePerms, denyPaths: e.target.value.split(/\s+/).map((s) => s.trim()).filter(Boolean) })}
+              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+              className="w-full rounded border border-line bg-inset px-2 py-1.5 font-mono text-[11.5px] outline-none placeholder:text-faint focus:border-accent/50"
+            />
+          </div>
+        )}
+      </SectionCard>
+
+      {showDirBrowser && (
+        <DirBrowser
+          initialPath={computerUseDir || '~'}
+          onPick={(p) => { setComputerUseDir(p); setShowDirBrowser(false); }}
+          onClose={() => setShowDirBrowser(false)}
+        />
+      )}
 
       <SectionCard title="Memory" icon={<Brain size={15} />} description="A persistent, cross-conversation bank of facts and preferences the model can write to.">
         <div className="flex items-center justify-between gap-3">

@@ -19,9 +19,10 @@ import {
   X,
 } from 'lucide-react';
 import { HitlDialog } from '../components/HitlDialog';
-import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
+import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation, coderRead, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderDirs, coderSearch } from '../lib/api';
+import { GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
-import { isCompactedMsg, runToolLoop, humanizePassText, type ToolRegistry } from '../lib/agentLoop';
+import { isCompactedMsg, runToolLoop, humanizePassText, type ToolHandler, type ToolRegistry } from '../lib/agentLoop';
 import { formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import type { MessageMeta } from '../lib/types';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
@@ -29,10 +30,12 @@ import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatu
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, checkComputerUsePerm, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { coderBrowser, chatMemoryAddLearning, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
+import { coderBrowser, chatMemoryAddLearning, chatMemoryGet, critiqueChatReply, regenerateChatReply, type CoderLearningKind } from '../lib/api';
+import { readRecallChunk } from '../lib/observationPack';
+import { filterToolAllowList } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
 
@@ -43,11 +46,17 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const {
     agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
     deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
+    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir,
   } = useChatAgent();
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
   // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
   const [pendingApproval, setPendingApproval] = useState<{ name: string; detail: string } | null>(null);
   const approvalResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  // Computer Use's `todo_write`: a scratch plan the model can record/update
+  // mid-conversation. No dedicated panel (unlike Coder) — just enough state
+  // for the tool to have somewhere to write, so the model isn't calling into
+  // a black hole.
+  const cuTodosRef = useRef<Array<{ content: string; status: string }>>([]);
   const requestApproval = useCallback((name: string, detail: string): Promise<boolean> => {
     setPendingApproval({ name, detail });
     return new Promise<boolean>((resolve) => {
@@ -350,24 +359,372 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       };
 
       // Chat tools as a registry for the shared runner: the same ToolRegistry
-      // contract the coder loops use. Agent Mode "research" tier adds the
-      // workspace-independent `browser` tool; the Memory toggle adds
-      // `memory_update`, routed to the global chat store (not per-workspace).
+      // contract the coder loops use. Three independent, overlapping
+      // surfaces can all define `browser`/`memory_update` (Agent Mode,
+      // Memory, and Computer Use's own fallback for when the dedicated
+      // toggle is off) — the merged `tools` schema list below is
+      // de-duplicated by name (first entry wins), and the object-spread
+      // order here is deliberately the MIRROR of that (Computer Use spreads
+      // first, the dedicated toggles last) so whichever schema actually won
+      // is backed by the matching handler, never the other one.
+      const computerUseOn = computerUseEnabled && !!computerUseDirRef.current;
+      const cuOuterCheck = async (name: string, args: Record<string, unknown>, detail: string): Promise<string | null> => {
+        const verdict = checkComputerUsePerm(computerUsePerms, name, args);
+        if (verdict === null) return null;
+        if (verdict === 'ask') {
+          const ok = await requestApproval(name, detail);
+          return ok ? null : `Denied by the user (${name}). Ask for an alternative or proceed without it.`;
+        }
+        return verdict;
+      };
+      // Always-on baseline (today's default, unchanged) — gated by Computer
+      // Use's own tiers only once that's turned on, since it's the only
+      // surface offering a permission control for these two. Hoisted out of
+      // the `registry` object literal (not inline methods on it) so
+      // `delegate`'s read-only nested loop can reuse the exact same
+      // closures without referencing `registry` before it finishes
+      // initializing (a TDZ error — `registry` isn't assigned yet while its
+      // own initializer, including the Computer Use IIFE below, is still
+      // running).
+      const webFetchHandler: ToolHandler = async (args, signal) => {
+        if (computerUseOn) {
+          const err = await cuOuterCheck('web_fetch', args, String(args.url ?? ''));
+          if (err) return JSON.stringify({ error: err });
+        }
+        return JSON.stringify(await coderWebFetch(String(args.url ?? ''), signal));
+      };
+      const webSearchHandler: ToolHandler = async (args, signal) => {
+        if (computerUseOn) {
+          const err = await cuOuterCheck('web_search', args, String(args.query ?? ''));
+          if (err) return JSON.stringify({ error: err });
+        }
+        return JSON.stringify(await coderWebSearch(String(args.query ?? ''), signal));
+      };
       const registry: ToolRegistry = {
-        web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
-        web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
+        web_fetch: webFetchHandler,
+        web_search: webSearchHandler,
+        // Computer Use: general file/shell/search/git/subagent tools, scoped
+        // to computerUseDirRef.current (independent of Coder's own
+        // workspace — see chatAgent.tsx). Gated client-side by
+        // checkComputerUsePerm and, server-side, by the same directory as
+        // the enforce_perm scope key. Reads the ref fresh in every handler
+        // (not a captured const) so `set_directory` takes effect for the
+        // rest of THIS turn too, not just the next message. Also backs
+        // `browser`/`memory_update` as a fallback for when Agent Mode /
+        // Memory (below) aren't the ones providing them.
+        ...(computerUseOn
+          ? (() => {
+              const cuCheck = cuOuterCheck;
+              const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+              // Built first (without delegate/subagent) so those two can
+              // safely reuse it as the nested loop's own registry — a
+              // subagent's tool list is exactly "everything Computer Use
+              // can do, minus spawning further subagents" (no recursion).
+              const cuRegistry: ToolRegistry = {
+                set_directory: async (args) => {
+                  const requested = String(args.path ?? '').trim();
+                  if (!requested) return JSON.stringify({ error: 'set_directory requires a non-empty `path`.' });
+                  const err = await cuCheck('set_directory', args, requested);
+                  if (err) return JSON.stringify({ error: err });
+                  try {
+                    const res = await coderDirs(requested);
+                    if (!res.exists || !res.isDir) {
+                      return JSON.stringify({ error: `${res.root || requested} does not exist or is not a directory.` });
+                    }
+                    computerUseDirRef.current = res.root;
+                    setComputerUseDir(res.root);
+                    return JSON.stringify({ ok: true, directory: res.root });
+                  } catch (e) {
+                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+                  }
+                },
+                read: async (args, signal) => {
+                  const err = await cuCheck('read', args, String(args.path ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderRead(String(args.path ?? ''), args.offset as number | undefined, args.limit as number | undefined, signal, computerUseDirRef.current));
+                },
+                write: async (args, signal) => {
+                  const err = await cuCheck('write', args, String(args.path ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderWrite(String(args.path ?? ''), String(args.content ?? ''), signal, computerUseDirRef.current));
+                },
+                edit: async (args, signal) => {
+                  const err = await cuCheck('edit', args, String(args.path ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderEdit(String(args.path ?? ''), String(args.old ?? ''), String(args.new ?? ''), Boolean(args.replaceAll), signal, computerUseDirRef.current));
+                },
+                apply_patch: async (args, signal) => {
+                  const err = await cuCheck('apply_patch', args, String(args.path ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  const edits = Array.isArray(args.edits) ? args.edits as { old: string; new: string; replaceAll?: boolean }[] : [];
+                  return JSON.stringify(await coderPatch(String(args.path ?? ''), edits, signal, computerUseDirRef.current));
+                },
+                bash: async (args, signal) => {
+                  const command = String(args.command ?? '');
+                  const err = await cuCheck('bash', args, command);
+                  if (err) return JSON.stringify({ error: err });
+                  const cuDir = computerUseDirRef.current;
+                  return JSON.stringify(await coderExec(command, undefined, args.timeoutMs as number | undefined, cuDir, args.background === true, signal, cuDir));
+                },
+                bash_poll: async (args, signal) => {
+                  try {
+                    return JSON.stringify(await coderJob(String(args.jobId ?? ''), signal));
+                  } catch (e) {
+                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+                  }
+                },
+                grep: async (args, signal) => {
+                  const err = await cuCheck('grep', args, String(args.pattern ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderGrep(String(args.pattern ?? ''), undefined, args.include as string | undefined, Boolean(args.ignoreCase), Number(args.offset) || 0, Number(args.limit) || 200, signal, computerUseDirRef.current));
+                },
+                glob: async (args, signal) => {
+                  const err = await cuCheck('glob', args, String(args.pattern ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderGlob(String(args.pattern ?? ''), undefined, Number(args.offset) || 0, Number(args.limit) || 200, signal, computerUseDirRef.current));
+                },
+                git_commit: async (args, signal) => {
+                  const message = String(args.message ?? 'Agent commit');
+                  const err = await cuCheck('git_commit', args, message);
+                  if (err) return JSON.stringify({ error: err });
+                  const fileTokens = args.files && String(args.files).trim() ? String(args.files).trim().split(/\s+/) : ['-A'];
+                  const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
+                  const cuDir = computerUseDirRef.current;
+                  return JSON.stringify(await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, cuDir, false, signal, cuDir));
+                },
+                git_diff: async (args, signal) => {
+                  const ref = String(args.ref ?? '').trim();
+                  const pathTokens = String(args.path ?? '').trim().split(/\s+/).filter(Boolean);
+                  const cmd = `git --no-pager diff ${ref ? q(ref) : ''} ${pathTokens.map(q).join(' ')}`.replace(/\s+/g, ' ').trim();
+                  const cuDir = computerUseDirRef.current;
+                  return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
+                },
+                ast_grep: async (args, signal) => {
+                  const err = await cuCheck('ast_grep', args, String(args.pattern ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  const cuDir = computerUseDirRef.current;
+                  const pattern = String(args.pattern ?? '').replace(/'/g, "'\\''");
+                  return JSON.stringify(await coderExec(`sg -p '${pattern}' -l ${args.lang}`, undefined, 15000, cuDir, false, signal, cuDir));
+                },
+                repo_search: async (args, signal) => {
+                  const err = await cuCheck('repo_search', args, String(args.query ?? ''));
+                  if (err) return JSON.stringify({ error: err });
+                  return JSON.stringify(await coderSearch(String(args.query ?? ''), typeof args.limit === 'number' ? args.limit : 15, signal, computerUseDirRef.current));
+                },
+                git_branch: async (args, signal) => {
+                  const action = String(args.action || 'list');
+                  const err = await cuCheck('git_branch', args, `${action}${args.name ? ` ${args.name}` : ''}`);
+                  if (err) return JSON.stringify({ error: err });
+                  const cuDir = computerUseDirRef.current;
+                  if (action === 'list') {
+                    const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, cuDir, false, signal, cuDir);
+                    const { current, branches } = parseBranchList(r.stdout || '');
+                    return JSON.stringify({ current, branches, ...r });
+                  }
+                  if (action === 'create' || action === 'switch') {
+                    const name = String(args.name || '').trim();
+                    if (!name) return JSON.stringify({ error: `branch name required for action '${action}'` });
+                    if (!/^[A-Za-z0-9._/-]+$/.test(name)) return JSON.stringify({ error: `invalid branch name: ${name}` });
+                    const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
+                    return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
+                  }
+                  return JSON.stringify({ error: `unknown action: ${action} (use list, create, or switch)` });
+                },
+                git_worktree: async (args, signal) => {
+                  const action = String(args.action || 'list');
+                  const err = await cuCheck('git_worktree', args, `${action}${args.path ? ` ${args.path}` : ''}`);
+                  if (err) return JSON.stringify({ error: err });
+                  const cuDir = computerUseDirRef.current;
+                  if (action === 'list') {
+                    const r = await coderExec('git worktree list', undefined, 15000, cuDir, false, signal, cuDir);
+                    const lines = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+                    return JSON.stringify({ worktrees: lines, ...r });
+                  }
+                  if (action === 'add') {
+                    const p = String(args.path || '').trim();
+                    const b = String(args.branch || '').trim();
+                    if (!p || !b) return JSON.stringify({ error: "path and branch required for action 'add'" });
+                    if (!/^[A-Za-z0-9._/-]+$/.test(b) || !/^\.\.\/[A-Za-z0-9._/-]+$/.test(p)) {
+                      return JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
+                    }
+                    const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
+                    return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
+                  }
+                  return JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
+                },
+                git_pr: async (args, signal) => {
+                  const err = await cuCheck('git_pr', args, String(args.title ?? '').slice(0, 40));
+                  if (err) return JSON.stringify({ error: err });
+                  const cuDir = computerUseDirRef.current;
+                  const gitRemoteToWeb = (url: string, base: string, head: string): string => {
+                    if (!url) return '';
+                    let host: string | undefined; let repo: string | undefined;
+                    const ssh = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
+                    if (ssh) { host = ssh[1]; repo = ssh[2]; }
+                    else {
+                      try { const u = new URL(url); host = u.host; repo = u.pathname.replace(/^\//, '').replace(/\.git$/, ''); } catch { return ''; }
+                    }
+                    return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
+                  };
+                  const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, cuDir, false, signal, cuDir);
+                  const branch = (br.stdout || '').trim();
+                  if (!branch || branch === 'HEAD') {
+                    return JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
+                  }
+                  const st = await coderExec('git status --porcelain', undefined, 10000, cuDir, false, signal, cuDir);
+                  if ((st.stdout || '').trim()) {
+                    return JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
+                  }
+                  const rm = await coderExec('git remote', undefined, 10000, cuDir, false, signal, cuDir);
+                  const remote = (rm.stdout || '').trim().split('\n')[0];
+                  if (!remote) {
+                    return JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
+                  }
+                  const base = String(args.base || '').trim()
+                    || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, cuDir, false, signal, cuDir)).stdout.trim()
+                    || 'main';
+                  const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, cuDir, false, signal, cuDir);
+                  if (push.exitCode !== 0) {
+                    return JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
+                  }
+                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, cuDir, false, signal, cuDir);
+                  if ((gh.stdout || '').trim() === 'yes') {
+                    let cmd = `gh pr create --title ${q(String(args.title ?? ''))} --body ${q(String(args.body ?? ''))}`;
+                    if (base) cmd += ` --base ${q(base)}`;
+                    const pr = await coderExec(cmd, undefined, 60000, cuDir, false, signal, cuDir);
+                    const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
+                    return JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
+                  }
+                  const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, cuDir, false, signal, cuDir);
+                  const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
+                  return JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
+                },
+                ask_user: async (args) => {
+                  return JSON.stringify({ question: args.question, status: 'awaiting_user' });
+                },
+                todo_write: async (args) => {
+                  const todos = Array.isArray(args.todos) ? args.todos as Array<{ content: string; status: string }> : [];
+                  cuTodosRef.current = todos;
+                  return JSON.stringify({ ok: true, count: todos.length });
+                },
+                obs_recall: async (args) => {
+                  return JSON.stringify(await readRecallChunk(String(args.id ?? ''), Number(args.offset) || 0));
+                },
+                // Fallback for when the dedicated Agent Mode / Memory toggle
+                // below isn't the one providing this tool (see the schema
+                // dedup note above) — same underlying implementation either
+                // way, just gated by computerUsePerms instead of
+                // browserTier/memoryToolTier.
+                browser: async (args, signal) => {
+                  const detail = String(args.action ?? 'status');
+                  const err = await cuCheck('browser', args, detail);
+                  if (err) return JSON.stringify({ error: err });
+                  const r = await coderBrowser(
+                    detail,
+                    { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
+                    signal,
+                  );
+                  return JSON.stringify(r);
+                },
+                memory_update: async (args, signal) => {
+                  const text = String(args.text || '').trim();
+                  const rawKind = String(args.kind || 'tip');
+                  const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
+                  if (!text) return JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
+                  const err = await cuCheck('memory_update', args, text);
+                  if (err) return JSON.stringify({ error: err });
+                  const m = await chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal);
+                  adoptMemory(m);
+                  return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
+                },
+                memory_recall: async (args) => {
+                  const query = String(args.query ?? '').trim().toLowerCase();
+                  if (!query) return JSON.stringify({ error: 'memory_recall requires a non-empty `query`.' });
+                  const err = await cuCheck('memory_recall', args, query);
+                  if (err) return JSON.stringify({ error: err });
+                  const kind = typeof args.kind === 'string' ? args.kind : undefined;
+                  const limit = typeof args.limit === 'number' ? Math.min(Math.max(args.limit, 1), 30) : 10;
+                  try {
+                    const m = await chatMemoryGet();
+                    const matches = m.learnings
+                      .filter((l) => (!kind || l.kind === kind) && (l.text.toLowerCase().includes(query) || (l.task ?? '').toLowerCase().includes(query)))
+                      .slice(-limit)
+                      .reverse();
+                    return JSON.stringify({ matches, total: matches.length });
+                  } catch (e) {
+                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+                  }
+                },
+              };
+              // A subagent's own tool loop: no streaming, no chat capability
+              // blocks, no memory injection — just the task and a bounded
+              // step budget. `registryFor`/`toolNames` decide how much of
+              // cuRegistry it can see; delegate/subagent are never included
+              // (they aren't in cuRegistry to begin with), so recursion is
+              // ruled out by construction rather than a depth counter.
+              const runNested = async (task: string, registryFor: ToolRegistry, toolNames: string[], maxSteps: number, model: string, roleHint: string, signal: AbortSignal): Promise<string> => {
+                const toolsFor = COMPUTER_USE_TOOLS.filter((t) => toolNames.includes(t.function.name));
+                try {
+                  const res = await runToolLoop({
+                    model,
+                    system: `You are a focused subagent working in the directory ${computerUseDirRef.current}. ${roleHint}\n\nTask: ${task}\n\nWhen finished, reply with a concise final summary — you cannot ask the user anything.`,
+                    messages: [{ role: 'user', content: task }],
+                    params,
+                    tools: toolsFor,
+                    registry: registryFor,
+                    maxSteps,
+                    signal,
+                  });
+                  if (signal.aborted || res.stop === 'aborted') return '(subagent aborted)';
+                  if (res.stop === 'steps') return '(subagent step budget reached)';
+                  const last = [...res.messages].reverse().find((m) => m.role === 'assistant');
+                  return last?.content.trim() || '(no findings)';
+                } catch (e) {
+                  return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
+                }
+              };
+              const readOnlyNames = ['read', 'grep', 'glob', 'ast_grep', 'repo_search', 'git_diff', 'web_fetch', 'web_search', 'browser'];
+              const nestedReadOnlyRegistry: ToolRegistry = {
+                web_fetch: webFetchHandler,
+                web_search: webSearchHandler,
+                read: cuRegistry.read, grep: cuRegistry.grep, glob: cuRegistry.glob,
+                ast_grep: cuRegistry.ast_grep, repo_search: cuRegistry.repo_search,
+                git_diff: cuRegistry.git_diff, browser: cuRegistry.browser,
+              };
+              return {
+                ...cuRegistry,
+                delegate: async (args, signal) => {
+                  const task = String(args.task ?? '');
+                  const err = await cuCheck('delegate', args, task.slice(0, 60));
+                  if (err) return JSON.stringify({ error: err });
+                  const names = filterToolAllowList(args.tools, new Set(readOnlyNames)) ?? readOnlyNames;
+                  const summary = await runNested(task, nestedReadOnlyRegistry, names, 6, useModel, 'You are a read-only investigator — do not write files or run mutating commands.', signal);
+                  return JSON.stringify({ summary });
+                },
+                subagent: async (args, signal) => {
+                  const task = String(args.task ?? '');
+                  const err = await cuCheck('subagent', args, task.slice(0, 60));
+                  if (err) return JSON.stringify({ error: err });
+                  const cuNames = Object.keys(cuRegistry);
+                  const names = filterToolAllowList(args.tools, new Set(cuNames)) ?? cuNames;
+                  const model = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : useModel;
+                  const summary = await runNested(task, cuRegistry, names, 20, model, 'You can read, write, and edit files and run shell commands to complete the task.', signal);
+                  return JSON.stringify({ summary });
+                },
+              } satisfies ToolRegistry;
+            })()
+          : {}),
         ...(agentResearch
           ? {
               browser: async (args, signal) => {
-                const detail = String(args.action ?? 'status');
                 if (browserTier === 'deny') {
                   return JSON.stringify({ error: 'Denied by Agent Mode settings (browser is set to deny).' });
                 }
-                if (browserTier === 'ask' && !(await requestApproval('browser', detail))) {
+                if (browserTier === 'ask' && !(await requestApproval('browser', String(args.action ?? 'status')))) {
                   return JSON.stringify({ error: 'Denied by the user (browser). Ask for an alternative or proceed without it.' });
                 }
                 const r = await coderBrowser(
-                  detail,
+                  String(args.action ?? 'status'),
                   { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
                   signal,
                 );
@@ -395,17 +752,22 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
             }
           : {}),
       };
-      const tools = [
+      // De-duplicated by name, first entry wins — agentResearch/memoryEnabled
+      // come before Computer Use so their dedicated schema (and, per the
+      // mirrored registry spread order above, their dedicated handler) is
+      // what the model actually gets when both are on.
+      const tools = dedupeTools([
         ...CHAT_TOOLS,
         ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
         ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
-      ];
+        ...(computerUseOn ? COMPUTER_USE_TOOLS : []),
+      ]);
       // The runner owns the turn messages; these events mirror each turn into
       // the conversation store so streaming stays live.
       let lastTurnMeta: MessageMeta | undefined;
       const res = await runToolLoop({
         model: useModel,
-        system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
+        system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
         messages: effectiveHistory,
         params,
         tools,
@@ -471,7 +833,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
                 const revised = await regenerateChatReply({
                   model: useModel,
-                  system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined),
+                  system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
                   history,
                   originalReply: content,
                   critique,
@@ -623,7 +985,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens, computerUseEnabled, computerUsePerms],
   );
 
   const send = useCallback(async () => {

@@ -291,7 +291,12 @@ async fn log_from_response_bytes(ctx: UsageLogCtx, buf: &[u8]) {
         }
     }
     let Some(usage) = usage_obj else { return };
-    let model = resp_model.or(ctx.model).unwrap_or_else(|| "unknown".to_string());
+    // `ctx.model` (set by `proxy::proxy`) is the actual artifact filename when
+    // known — preferred over `resp_model`, which is just the engine's own
+    // response echoing back the OpenAI-facing public alias, not the file
+    // that was loaded. Falls back to the response's alias when the artifact
+    // wasn't resolvable (e.g. a discovered/external engine — see proxy.rs).
+    let model = ctx.model.or(resp_model).unwrap_or_else(|| "unknown".to_string());
     let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
     let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
     let cached_tokens = usage
@@ -367,6 +372,39 @@ mod tests {
 
         let Json(narrow) = usage_stats(AxumState(state), Query(UsageQuery { days: Some(1), source: None })).await;
         assert_eq!(narrow["totals"]["requests"], 1);
+    }
+
+    /// `ctx.model` (the artifact filename resolved by `proxy::proxy` when the
+    /// request hit this control plane's own managed engine) must win over
+    /// whatever alias the engine's response itself echoes back in its
+    /// `model` field — otherwise Usage always shows the OpenAI-facing public
+    /// alias (e.g. "qwen3.8-27b") instead of the actual loaded artifact
+    /// (e.g. "qwen3_8_27b_nvfp4.ninfer").
+    #[tokio::test]
+    async fn logged_model_prefers_known_artifact_over_response_alias() {
+        let state = temp_state();
+        let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        log_from_response_bytes(
+            UsageLogCtx { state: state.clone(), model: Some("qwen3_8_27b_nvfp4.ninfer".into()), source: RequestSource::Local },
+            body,
+        )
+        .await;
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["model"].as_str(), Some("qwen3_8_27b_nvfp4.ninfer"));
+    }
+
+    /// When the artifact isn't known (e.g. a discovered/external engine —
+    /// see proxy.rs), the response's own alias is still logged rather than
+    /// dropping the event entirely.
+    #[tokio::test]
+    async fn logged_model_falls_back_to_response_alias_when_artifact_unknown() {
+        let state = temp_state();
+        let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        log_from_response_bytes(UsageLogCtx { state: state.clone(), model: None, source: RequestSource::Local }, body).await;
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["model"].as_str(), Some("qwen3.8-27b"));
     }
 
     #[tokio::test]

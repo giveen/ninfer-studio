@@ -9,9 +9,12 @@
 //!
 //! Caveat, surfaced in the UI rather than hidden: `nvidia-smi` reports total
 //! board power, not power attributable to a single process. Sampling only
-//! while an engine is `Running`/`External` is the closest approximation to
-//! "cost of running the model" available without per-process GPU power
-//! accounting, which the driver doesn't expose.
+//! while an engine is `Running`/`External` AND its own log is actively
+//! growing (see `run_power_sampler`) is the closest approximation to "cost
+//! of actually serving requests" available without per-process GPU power
+//! accounting, which the driver doesn't expose — a model sitting loaded but
+//! idle between requests still draws real board power, but that idle draw
+//! isn't request-driven usage and would otherwise inflate the estimate.
 
 use crate::engine::S;
 use crate::gpu::gpu_stats;
@@ -60,12 +63,39 @@ pub(crate) async fn energy_kwh_by_day(state: &S, cutoff_day: &str) -> BTreeMap<S
 /// (`lib.rs::init_state`) and runs for the life of the process. Every error
 /// path (GPU query failure, no power reading, disk write failure) just skips
 /// that tick — this must never panic or block anything else in the server.
+/// Pure decision: does this tick count as "the engine is doing something"?
+/// Yes when the log at `path` changed size since `last` was recorded for
+/// that same path — no baseline (first tick, or the path just changed
+/// because the engine restarted) means "not yet known", not "flowing".
+fn log_is_flowing(last: &Option<(String, u64)>, path: &str, len: u64) -> bool {
+    match last {
+        Some((last_path, prev_len)) => last_path == path && *prev_len != len,
+        None => false,
+    }
+}
+
 pub(crate) async fn run_power_sampler(state: S) {
     let mut by_day = read_power_log(&state).await;
+    // Tracks the engine log's size across ticks so a tick only counts when
+    // the log actually grew (or shrank via rotation — either way, activity)
+    // since the last one — the "is the engine actually doing something"
+    // signal, reset whenever the log path itself changes (a restart).
+    let mut last_log: Option<(String, u64)> = None;
     loop {
         tokio::time::sleep(SAMPLE_INTERVAL).await;
-        let running = matches!(state.engine.read().await.state, EngineState::Running | EngineState::External);
+        let (running, log_path) = {
+            let eng = state.engine.read().await;
+            (matches!(eng.state, EngineState::Running | EngineState::External), eng.log_path.clone())
+        };
         if !running {
+            continue;
+        }
+        let Some(log_path) = log_path else { continue };
+        let Ok(meta) = tokio::fs::metadata(&log_path).await else { continue };
+        let len = meta.len();
+        let flowing = log_is_flowing(&last_log, &log_path, len);
+        last_log = Some((log_path, len));
+        if !flowing {
             continue;
         }
         let g = gpu_stats().await;
@@ -87,6 +117,20 @@ pub(crate) async fn run_power_sampler(state: S) {
 mod tests {
     use super::*;
     use crate::types::State;
+
+    #[test]
+    fn no_flow_without_a_prior_baseline() {
+        assert!(!log_is_flowing(&None, "/data/engine-8080.log", 100));
+    }
+
+    #[test]
+    fn flow_only_when_the_same_log_changed_size() {
+        let last = Some(("/data/engine-8080.log".to_string(), 100));
+        assert!(!log_is_flowing(&last, "/data/engine-8080.log", 100), "unchanged size is idle, not flow");
+        assert!(log_is_flowing(&last, "/data/engine-8080.log", 150), "grew — a request was served");
+        assert!(log_is_flowing(&last, "/data/engine-8080.log", 10), "shrank via rotation — still activity");
+        assert!(!log_is_flowing(&last, "/data/engine-8081.log", 999), "a different log (restart) has no baseline yet");
+    }
     use std::sync::Arc;
 
     fn temp_state() -> S {

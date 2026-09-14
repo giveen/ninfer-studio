@@ -141,12 +141,16 @@ pub struct State {
     pub log_file: tokio::sync::Mutex<Option<tokio::fs::File>>,
     pub downloads: tokio::sync::Mutex<HashMap<String, JobRec>>,
     pub update_job: tokio::sync::Mutex<Option<JobRec>>,
-    /// Active workspace's tool permission tiers + denied path prefixes,
-    /// pushed by the web UI (`/api/coder/perms`) whenever the user edits
-    /// them or switches workspaces. Lets `coder::enforce_perm` reject a
-    /// `deny`-tiered tool or path server-side, not only in the client
-    /// dispatcher that normally decides whether to call the endpoint.
-    pub coder_perms: tokio::sync::RwLock<crate::coder::CoderPerms>,
+    /// Tool permission tiers + denied path prefixes, keyed by an opaque
+    /// `scope` string each caller supplies (Coder sends its active
+    /// workspace root; Chat's Computer Use sends its own directory) so two
+    /// independent callers never clobber each other's tiers through the one
+    /// shared control plane. Pushed by the web UI (`/api/coder/perms`)
+    /// whenever the user edits a scope's tiers or switches workspaces. Lets
+    /// `coder::enforce_perm` reject a `deny`-tiered tool or path server-side,
+    /// not only in the client dispatcher that normally decides whether to
+    /// call the endpoint.
+    pub coder_perms: tokio::sync::RwLock<HashMap<String, crate::coder::CoderPerms>>,
     /// Short-lived, single-use approval tickets for `ask`-tiered tools,
     /// minted by `/api/coder/perms/approve` the moment a human approves the
     /// UI's dialog. `enforce_perm` requires a valid matching one for an
@@ -205,7 +209,7 @@ impl State {
             log_file: tokio::sync::Mutex::new(None),
             downloads: tokio::sync::Mutex::new(HashMap::new()),
             update_job: tokio::sync::Mutex::new(None),
-            coder_perms: tokio::sync::RwLock::new(crate::coder::CoderPerms::default()),
+            coder_perms: tokio::sync::RwLock::new(HashMap::new()),
             coder_approvals: tokio::sync::Mutex::new(HashMap::new()),
             coder_approval_counter: AtomicU64::new(0),
             shell_sessions: tokio::sync::Mutex::new(HashMap::new()),
