@@ -44,10 +44,38 @@ type McpDraft = {
 
 const EMPTY_MCP_DRAFT: McpDraft = { name: '', kind: 'stdio', command: '', args: '', cwd: '', env: '', url: '', authorization: '', headers: '' };
 
-/** Space-separated `KEY=VALUE` pairs (env, headers) to a record. */
+/** Split on whitespace, keeping `'single'` / `"double"` quoted spans intact
+ *  (so paths and values with spaces survive — e.g. args like
+ *  `"C:/My Tools/server.py" --root "/data/my dir"`). Unmatched quotes swallow
+ *  the rest of the input rather than dropping it. */
+function splitShellWords(raw: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  let had = false;
+  for (const ch of raw) {
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      had = true;
+    } else if (/\s/.test(ch)) {
+      if (had || cur) { out.push(cur); cur = ''; had = false; }
+    } else {
+      cur += ch;
+      had = true;
+    }
+  }
+  if (had || cur) out.push(cur);
+  return out;
+}
+
+/** Space-separated `KEY=VALUE` pairs (env, headers) to a record. Values may
+ *  be quoted to keep spaces (`KEY="a b"`). */
 function parseKvList(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const tok of raw.split(/\s+/).map((s) => s.trim()).filter(Boolean)) {
+  for (const tok of splitShellWords(raw)) {
     const eq = tok.indexOf('=');
     if (eq <= 0) continue;
     out[tok.slice(0, eq)] = tok.slice(eq + 1);
@@ -94,7 +122,7 @@ function McpServersCard({ perms, onServerTier }: {
         ? {
             name,
             command,
-            args: draft.args.split(/\s+/).map((s) => s.trim()).filter(Boolean),
+            args: splitShellWords(draft.args),
             env: parseKvList(draft.env),
             cwd: draft.cwd.trim() || undefined,
           }

@@ -327,6 +327,14 @@ fn validate_spec(spec: &McpServerSpec) -> Result<(), (StatusCode, Json<Value>)> 
     if spec.name.trim().len() > 40 {
         return Err(err("server name too long (max 40 chars)".into()));
     }
+    // Both transports set is ambiguous (`transport()` would silently prefer
+    // stdio and ignore the url) — reject so a misconfigured server surfaces
+    // immediately instead of connecting over the wrong transport.
+    let has_cmd = spec.command.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let has_url = spec.url.as_deref().is_some_and(|u| !u.trim().is_empty());
+    if has_cmd && has_url {
+        return Err(err("server needs exactly one of a stdio command or an http(s) url, not both".into()));
+    }
     if matches!(spec.transport(), Some("http")) {
         let url = spec.url.as_deref().unwrap_or("").trim();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -1422,6 +1430,15 @@ mod tests {
         let mut s = McpServerSpec::default();
         s.name = "bad".into();
         s.url = Some("ftp://mcp.example.com".into());
+        let (st, _) = validate_spec(&s).unwrap_err();
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Both transports set is ambiguous (stdio would silently win) —
+        // rejected so the misconfiguration surfaces immediately.
+        let mut s = McpServerSpec::default();
+        s.name = "both".into();
+        s.command = Some("/bin/true".into());
+        s.url = Some("https://mcp.example.com/mcp".into());
         let (st, _) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
     }
