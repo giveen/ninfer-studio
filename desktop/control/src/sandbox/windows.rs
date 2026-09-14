@@ -531,8 +531,9 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
                     format!("sandbox root does not exist: {}", r.display()),
                 ));
             }
-            set_low_integrity_ace(r, true).map_err(|e| {
-                // Revoke whatever we already granted, then report.
+            acquire_acl(r).map_err(|e| {
+                // The local `acls` guard revokes the earlier grants as
+                // spawn() unwinds; report the failing root.
                 unsafe { CloseHandle(job) };
                 e
             })?;
