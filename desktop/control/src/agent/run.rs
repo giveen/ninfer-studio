@@ -473,8 +473,6 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
         state.engine.read().await.model_id.clone().unwrap_or_default()
     });
 
-    let (tx, _rx) = broadcast::channel(512);
-    let _ = (tx, _rx); // channel moved into spawn_run's own construction
     let id = format!(
         "run_{:x}_{}",
         now_ms(),
