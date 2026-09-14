@@ -113,43 +113,6 @@ pub fn shell_is_bash() -> bool {
     matches!(pick_shell(), Shell::Bash)
 }
 
-/// Quote one argument for a `CreateProcessW` command line (MSVCRT rules):
-/// unquoted when safe, otherwise quoted with internal `"` escaped by
-/// doubling the preceding backslashes.
-fn arg_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "\"\"".to_string();
-    }
-    if s
-        .bytes()
-        .all(|b| b != b' ' && b != b'\t' && b != b'"' && b != b'\\')
-    {
-        return s.to_string();
-    }
-    let mut out = String::from("\"");
-    let mut backslashes = 0usize;
-    for b in s.bytes() {
-        match b {
-            b'\\' => backslashes += 1,
-            b'"' => {
-                out.push_str(&"\\".repeat(2 * backslashes + 1));
-                out.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                out.push_str(&"\\".repeat(backslashes));
-                out.push(b as char);
-                backslashes = 0;
-            }
-        }
-    }
-    // A trailing backslash run is followed by the closing quote, and MSVCRT
-    // halves such runs — so double it to encode the run literally.
-    out.push_str(&"\\".repeat(2 * backslashes));
-    out.push('"');
-    out
-}
-
 /// The full `CreateProcessW` command line for one script run.
 ///
 /// `bash -lc <script>`: the script IS bash's command string — bash parses it
@@ -161,10 +124,10 @@ fn arg_quote(s: &str) -> String {
 /// would make bash treat it as one program name, not a command line).
 fn command_line(shell: &Shell, script: &str) -> String {
     match shell {
-        Shell::Bash => format!("{} -lc {}", arg_quote("bash"), arg_quote(script)),
+        Shell::Bash => format!("{} -lc {}", super::arg_quote("bash"), super::arg_quote(script)),
         // `cmd /d /s /c` runs everything between the outer quotes verbatim
         // (degraded fallback only: POSIX-specific scripts need git-bash).
-        Shell::Cmd => format!("{} /d /s /c \"{}\"", arg_quote("cmd"), script),
+        Shell::Cmd => format!("{} /d /s /c \"{}\"", super::arg_quote("cmd"), script),
     }
 }
 
@@ -778,27 +741,15 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::arg_quote;
     use super::*;
-
-    #[test]
-    fn arg_quoting_round_trips_the_msvcrt_rules() {
-        assert_eq!(arg_quote("bash"), "bash");
-        assert_eq!(arg_quote(""), "\"\"");
-        assert_eq!(arg_quote("C:\\Git\\bin\\bash"), "\"C:\\Git\\bin\\bash\"");
-        assert_eq!(arg_quote("a b"), "\"a b\"");
-        assert_eq!(arg_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
-        // Trailing run: doubled so the closing quote survives the parser.
-        assert_eq!(arg_quote("trail\\"), "\"trail\\\\\"");
-        // Run NOT followed by a quote: copied verbatim (MSVCRT only treats
-        // `\` specially before a `"`).
-        assert_eq!(arg_quote("back\\slash"), "\"back\\slash\"");
-    }
 
     #[test]
     fn command_lines_use_the_right_shell_form() {
         // Bash: the script goes to bash -lc RAW (bash parses it as the
         // command string) — arg_quote only guarantees it is ONE argv element
-        // for CreateProcessW's parser.
+        // for CreateProcessW's parser. (The arg_quote round-trip proof runs
+        // on every platform in `crate::sandbox::quoting_tests`.)
         let script = "echo 'it's'";
         assert_eq!(
             command_line(&Shell::Bash, script),
