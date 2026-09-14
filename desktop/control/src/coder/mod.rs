@@ -25,6 +25,9 @@ mod web;
 mod workspace;
 
 pub use browser::{browser, BrowserSlot};
+/// The actor's panic guard — reused by `mcp` (its sessions are `!Send` for
+/// the same reason `BrowserSlot`'s Page is).
+pub(crate) use browser::PanicGuard;
 pub use common::{perms_approve, perms_get, perms_set, ApprovalTicket, CoderPerms, PermTier};
 /// Internal permission machinery, reused by `mcp` (tool calls go through the
 /// same allow/ask/deny gate as the built-in coder tools).
