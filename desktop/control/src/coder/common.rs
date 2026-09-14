@@ -204,7 +204,9 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
 
 /// Reject when `tool` is tiered `deny`, when it's tiered `ask` without a
 /// valid matching approval token, or when `rel` (a workspace-relative path,
-/// for tools that take one) sits under a denied prefix. Mirrors the
+/// for tools that take one) sits under a denied prefix. Tiers resolve
+/// through `tier_for`, so namespaced MCP names (`mcp__<server>__<tool>`)
+/// fall back to the server-level `mcp__<server>` row. Mirrors the
 /// frontend's `checkPerm`: exact match or `rel` starting with `"<prefix>/"`.
 /// `scope` selects which caller's tier bucket applies (see `perm_scope`) —
 /// two independent callers (e.g. Coder and Chat's Computer Use) using
@@ -213,13 +215,14 @@ pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option
     let all_perms = state.coder_perms.read().await;
     let perms = all_perms.get(scope).cloned().unwrap_or_default();
     drop(all_perms);
-    if perms.tools.get(tool) == Some(&PermTier::Deny) {
+    let tier = tier_for(&perms, tool);
+    if tier == PermTier::Deny {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": format!("'{tool}' is set to deny by workspace permissions")})),
         ));
     }
-    if perms.tools.get(tool) == Some(&PermTier::Ask) {
+    if tier == PermTier::Ask {
         let now = Instant::now();
         let mut approvals = state.coder_approvals.lock().await;
         let matches = approval_token.and_then(|t| approvals.get(t)).is_some_and(|tk| {
