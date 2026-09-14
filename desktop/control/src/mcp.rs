@@ -916,4 +916,695 @@ fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
     })
 }
 
-// __PART2__
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+/// Implicit reconnects are skipped for this long after a failed attempt — a
+/// broken server (bad binary, hanging install) must not stall every catalog
+/// fetch or tool call with the full init timeout. Explicit connects
+/// (upsert, restart) bypass the backoff.
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// `meta` is dead and its last failure is still inside the backoff window.
+fn failed_recently(meta: &ConnMeta) -> bool {
+    meta.error.is_some()
+        && meta
+            .error_at
+            .map(|t| t.elapsed() < RETRY_BACKOFF)
+            .unwrap_or(false)
+}
+
+/// Write the (already updated) in-memory config back to disk. Best effort —
+/// an unsafe/readonly data dir must not break the working in-memory state.
+async fn persist_config(state: &S, cfg: &AppSettings) {
+    if !crate::coder::is_safe_base_dir(&state.data_dir) {
+        return;
+    }
+    let path = state.data_dir.join("config.json");
+    let _ = tokio::fs::create_dir_all(&state.data_dir).await;
+    let _ = crate::atomic_write_secret(&path, serde_json::to_string_pretty(cfg).unwrap()).await;
+}
+
+/// The `{servers: […]}` list view from current config + connection metadata.
+async fn servers_list(state: &S) -> Json<Value> {
+    let cfg = state.config.read().await.mcp_servers.clone();
+    let m = state.mcp.read().await;
+    let servers: Vec<Value> = cfg
+        .iter()
+        .map(|s| server_value(s, m.meta_get(&s.name).as_ref()))
+        .collect();
+    Json(json!({ "servers": servers }))
+}
+
+/// `GET /api/mcp/servers` — configured servers with live status.
+pub async fn servers_get(AxumState(state): AxumState<S>) -> Json<Value> {
+    servers_list(&state).await
+}
+
+/// `POST /api/mcp/servers` — upsert one server spec, persist it, and
+/// (re)connect. The spec is saved even when the connection fails: the
+/// response then carries the connection error (HTTP 502) and the server
+/// shows up in the list with an `error: …` status until restarted.
+pub async fn servers_upsert(
+    AxumState(state): AxumState<S>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "server name is required" })),
+            )
+        })?
+        .to_string();
+    let mut spec: McpServerSpec = serde_json::from_value(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid server spec: {e}") })),
+        )
+    })?;
+    // The UI posts the name it displays; the stored + connected key is the
+    // sanitized form (no `_` — it would break the `mcp__<server>__<tool>`
+    // grammar).
+    spec.name = sanitize_server_name(&name);
+    // `***` is the mask the list endpoint returns; keep the stored secret
+    // instead of persisting the mask over it.
+    if spec.authorization.as_deref() == Some("***") {
+        let existing = state
+            .config
+            .read()
+            .await
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == spec.name);
+        spec.authorization = existing.and_then(|s| s.authorization.clone());
+    }
+    validate_spec(&spec)?;
+
+    {
+        let mut cfg = state.config.write().await;
+        match cfg.mcp_servers.iter_mut().find(|s| s.name == spec.name) {
+            Some(s) => *s = spec.clone(),
+            None => cfg.mcp_servers.push(spec.clone()),
+        }
+        persist_config(&state, &cfg).await;
+    }
+    // Explicit connect — bypasses the backoff. The spec stays saved either
+    // way; the caller is told about the failure and the list shows it.
+    ensure_conn(&state, &spec.name).await?;
+    Ok(servers_list(&state).await)
+}
+
+/// `POST /api/mcp/servers/{name}` — remove the spec and kill the session.
+pub async fn server_delete(
+    AxumState(state): AxumState<S>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let known = state
+        .config
+        .read()
+        .await
+        .mcp_servers
+        .iter()
+        .any(|s| s.name == name);
+    if !known {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown MCP server '{name}'") })),
+        ));
+    }
+    // Kill the session (best effort — if the actor is gone, so is the
+    // session; the config removal below is the source of truth).
+    let _ = send_cmd(
+        &state,
+        McpCmd::Close {
+            server: name.clone(),
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    state.mcp.read().await.meta_remove(&name);
+    let mut cfg = state.config.write().await;
+    cfg.mcp_servers.retain(|s| s.name != name);
+    persist_config(&state, &cfg).await;
+    Ok(Json(json!({ "ok": true, "removed": true })))
+}
+
+/// `POST /api/mcp/servers/{name}/restart` — drop and reopen the session.
+pub async fn server_restart(
+    AxumState(state): AxumState<S>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    ensure_conn(&state, &name).await?;
+    // Single-element list (the UI refetches the full list right after).
+    let cfg = state.config.read().await;
+    let spec = cfg
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown MCP server '{name}'") })),
+            )
+        })?;
+    let m = state.mcp.read().await;
+    Ok(Json(json!({
+        "servers": [server_value(&spec, m.meta_get(&name).as_ref())],
+    })))
+}
+
+/// `GET /api/mcp/tools?scope=<ws>` — the namespaced tool catalog with each
+/// tool's effective tier for the given permission scope (a per-tool
+/// `mcp__<server>__<tool>` row overrides a server-level `mcp__<server>`
+/// row). Dead servers are skipped (they surface in the server list with
+/// their error); a server that just failed to connect is not retried until
+/// the backoff elapses.
+pub async fn tools_get(
+    AxumState(state): AxumState<S>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let scope = q
+        .get("scope")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    let perms = {
+        let all = state.coder_perms.read().await;
+        all.get(scope).cloned().unwrap_or_default()
+    };
+    let cfg = state.config.read().await.mcp_servers.clone();
+    let mut tools: Vec<Value> = Vec::new();
+    for spec in &cfg {
+        if spec.transport().is_none() {
+            continue;
+        }
+        // (Re)connect when needed — but not right after a failed attempt.
+        let need_conn = {
+            let m = state.mcp.read().await;
+            match m.meta_get(&spec.name) {
+                None => true,
+                Some(meta) => !meta.alive && !failed_recently(meta),
+            }
+        };
+        if need_conn {
+            let _ = ensure_conn(&state, &spec.name).await;
+        }
+        // Refresh the catalog when it is stale (a fresh connect already
+        // listed the tools).
+        let stale = {
+            let m = state.mcp.read().await;
+            m.meta_get(&spec.name)
+                .filter(|meta| meta.alive)
+                .map(|meta| meta.tools_at.map(|t| t.elapsed() > TOOLS_TTL).unwrap_or(true))
+                .unwrap_or(false)
+        };
+        if stale {
+            match send_cmd(
+                &state,
+                McpCmd::ListTools {
+                    server: spec.name.clone(),
+                },
+                LIST_TOOLS_LIMIT + Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(McpReply::ListTools {
+                    error: None,
+                    tools,
+                }) => {
+                    let m = state.mcp.read().await;
+                    let mut meta = m.meta_get(&spec.name).unwrap_or_default();
+                    meta.tools = tools;
+                    meta.tools_at = Some(Instant::now());
+                    meta.alive = true;
+                    m.meta_set(&spec.name, meta);
+                }
+                Ok(McpReply::ListTools {
+                    error: Some(e),
+                    ..
+                }) => {
+                    mark_dead(&state, &spec.name, e).await;
+                    continue;
+                }
+                Err((s, _)) => {
+                    mark_dead(&state, &spec.name, s.to_string()).await;
+                    continue;
+                }
+            }
+        }
+        let m = state.mcp.read().await;
+        let Some(meta) = m.meta_get(&spec.name) else {
+            continue;
+        };
+        if !meta.alive {
+            continue;
+        }
+        for def in &meta.tools {
+            let tier = tier_for(&perms, &def.mangled);
+            tools.push(json!({
+                "name": def.mangled,
+                "description": def.description,
+                "parameters": def.parameters,
+                "tier": tier,
+            }));
+        }
+    }
+    Json(json!({ "tools": tools }))
+}
+
+/// One `tools/call` round trip, with a single reconnect + retry when the
+/// transport dies mid-call. The caller has already ensured a live session
+/// and passed the permission gate.
+async fn call_tool(
+    state: &S,
+    name: &str,
+    arguments: Map<String, Value>,
+) -> Result<(bool, String), (StatusCode, Json<Value>)> {
+    let (server, _) = split_mcp_name(name).expect("caller checked the name shape");
+    let server = server.to_string();
+    for attempt in 0..2u32 {
+        let meta = {
+            let m = state.mcp.read().await;
+            m.meta_get(&server)
+        };
+        let Some(def) = meta
+            .and_then(|mt| mt.tools.iter().find(|d| d.mangled == name).cloned())
+        else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("unknown MCP tool '{name}'") })),
+            ));
+        };
+        match send_cmd(
+            state,
+            McpCmd::CallTool {
+                server: server.clone(),
+                original: def.original,
+                arguments: arguments.clone(),
+                timeout: CALL_TIMEOUT,
+            },
+            CALL_LIMIT,
+        )
+        .await
+        {
+            Ok(McpReply::Call {
+                ok,
+                output,
+                transport_dead: false,
+            }) => return Ok((ok, output)),
+            Ok(McpReply::Call {
+                transport_dead: true, ..
+            }) => {
+                // Transport died mid-call: mark dead and reconnect once.
+                mark_dead(
+                    state,
+                    &server,
+                    format!("transport closed during tool call (attempt {attempt})"),
+                )
+                .await;
+                if attempt == 0 {
+                    ensure_conn(state, &server).await?;
+                    continue;
+                }
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": "MCP connection dropped during the tool call and the retry failed" })),
+                ));
+            }
+            Err(e) => {
+                mark_dead(state, &server, "tool call failed".to_string()).await;
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("every branch returns or retries once")
+}
+
+/// `POST /api/mcp/call` — invoke a namespaced MCP tool. The same
+/// allow/ask/deny tiers as the built-in tools gate it (per-tool row
+/// `mcp__<server>__<tool>` overrides the server-level `mcp__<server>`
+/// row); a denied/unknown call is a 403/404, a connection failure a 502,
+/// and a completed call is `200 {ok, output}` — `ok:false` when the server
+/// itself reported the tool errored.
+pub async fn mcp_call(
+    AxumState(state): AxumState<S>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let Some((server, _)) = split_mcp_name(&name) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("'{name}' is not an MCP tool name (expected mcp__<server>__<tool>)") })),
+        ));
+    };
+    let server = server.to_string();
+    let scope = perm_scope(&body);
+    // The permission gate — same tiers as the built-in coder tools, and the
+    // approval-token check is single-use, exactly like the built-ins.
+    enforce_perm(
+        &state,
+        &scope,
+        &name,
+        None,
+        body.get("approvalToken").and_then(|v| v.as_str()),
+    )?;
+    // Arguments: absent/`null` → `{}`, a JSON object when present.
+    let arguments = match body.get("arguments") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(m)) => m.clone(),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "arguments must be a JSON object" })),
+            ));
+        }
+    };
+    {
+        let cfg = state.config.read().await;
+        if !cfg.mcp_servers.iter().any(|s| s.name == server) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown MCP server '{server}'") })),
+            ));
+        }
+    }
+    // Fail fast on a connection that just failed (a blind reconnect would
+    // burn up to the init timeout on every call).
+    {
+        let m = state.mcp.read().await;
+        if let Some(meta) = m.meta_get(&server) {
+            if !meta.alive && failed_recently(meta) {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": meta
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "MCP server not connected".to_string()) })),
+                ));
+            }
+        }
+    }
+    ensure_conn(&state, &server).await?;
+    let (ok, output) = call_tool(&state, &name, arguments).await?;
+    Ok(Json(json!({ "ok": ok, "output": output })))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_and_split_names() {
+        // Server names: alnum + '-', underscores stripped (they would break
+        // the `mcp__<server>__<tool>` separator grammar).
+        assert_eq!(sanitize_server_name("my server"), "myserv");
+        assert_eq!(sanitize_server_name("file_2"), "file2");
+        assert_eq!(sanitize_server_name("fs-v2"), "fs-v2");
+        assert_eq!(sanitize_server_name("!!!"), "");
+        // Tool names: mangled into the LLM function-name charset.
+        assert_eq!(sanitize_tool_name("get weather"), "get_weather");
+        assert_eq!(sanitize_tool_name("a/b:c.d"), "a_b_c_d");
+        assert_eq!(sanitize_tool_name(""), "tool");
+        assert_eq!(sanitize_tool_name(&"x".repeat(80)).len(), 56);
+        // Split: first `__` after the prefix is the separator.
+        assert_eq!(split_mcp_name("mcp__fs__read"), Some(("fs", "read")));
+        assert_eq!(split_mcp_name("mcp__fs__a__b"), Some(("fs", "a__b")));
+        assert_eq!(split_mcp_name("mcp__fs__"), None);
+        assert_eq!(split_mcp_name("mcp__"), None);
+        assert_eq!(split_mcp_name("plain_tool"), None);
+        // Collision mangling: a second tool mangles to the same name gets a
+        // numeric suffix; the original server-side name is kept for the call.
+        let a = sanitize_tool_name("a.b");
+        let b = sanitize_tool_name("a_b");
+        assert_eq!(a, b);
+        assert_eq!(format!("{a}_2"), format!("{b}_2"));
+    }
+
+    #[test]
+    fn validate_spec_rejects_broken_configs() {
+        let mut s = McpServerSpec::default();
+        s.name = "none".into();
+        let (st, body) = validate_spec(&s).unwrap_err();
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.0.get("error").is_some());
+
+        let mut s = McpServerSpec::default();
+        s.name = "ok".into();
+        s.command = Some("/bin/true".into());
+        assert!(validate_spec(&s).is_ok());
+
+        let mut s = McpServerSpec::default();
+        s.name = "ok".into();
+        s.url = Some("https://mcp.example.com/mcp".into());
+        assert!(validate_spec(&s).is_ok());
+
+        // Non-http(s) URLs are rejected up front.
+        let mut s = McpServerSpec::default();
+        s.name = "bad".into();
+        s.url = Some("ftp://mcp.example.com".into());
+        let (st, _) = validate_spec(&s).unwrap_err();
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// A minimal MCP stdio server in POSIX sh: answers the legacy
+    /// `initialize` handshake, lists one tool, and echoes it. `server/
+    /// discover` (the newer probe rmcp tries first) gets method-not-found,
+    /// which makes the client fall back to the legacy handshake.
+    fn write_fake_server(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("fake_mcp.sh");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"notifications/initialized"'*) ;;
+    *'"method":"server/discover"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id" ;;
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fake-mcp","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes its input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      text=$(printf '%s' "$line" | sed -n 's/.*"text"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo: %s"}]}}\n' "$id" "$text" ;;
+    *)
+      [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_end_to_end() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-mcp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = write_fake_server(&tmp);
+        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let ws = || AxumState(state.clone());
+
+        // Upsert → persisted + connected, with peer info, pid and tool count.
+        let r = servers_upsert(
+            ws(),
+            Json(json!({ "name": "fake", "command": script.to_str().unwrap() })),
+        )
+        .await
+        .unwrap()
+        .0;
+        let list = r.get("servers").unwrap().as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].get("name").unwrap(), "fake");
+        assert_eq!(list[0].get("status").unwrap(), "connected");
+        assert_eq!(list[0].get("toolCount").unwrap(), 1);
+        assert_eq!(
+            list[0].get("peer").unwrap().get("name").unwrap(),
+            "fake-mcp"
+        );
+        assert!(list[0].get("pid").unwrap().as_u64().unwrap() > 0);
+
+        // Catalog: namespaced + effective tier (default → allow).
+        let t = tools_get(
+            ws(),
+            Query(HashMap::from([("scope".into(), "default".into())])),
+        )
+        .await
+        .0;
+        let tools = t.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), "mcp__fake__echo");
+        assert_eq!(tools[0].get("tier").unwrap(), "allow");
+
+        // Unknown tool on a live server → 400 (before any perm rows exist).
+        let e = mcp_call(
+            ws(),
+            Json(json!({ "name": "mcp__fake__nope", "arguments": {} })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+
+        // Tool call round trip.
+        let c = mcp_call(
+            ws(),
+            Json(json!({ "name": "mcp__fake__echo", "arguments": { "text": "hi" } })),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(c.get("ok").unwrap(), true);
+        assert_eq!(c.get("output").unwrap(), "echo: hi");
+
+        // Permission tiers: a server-level Deny row blocks the tool; a
+        // per-tool Allow row overrides it.
+        {
+            let mut perms = crate::coder::CoderPerms::default();
+            perms
+                .tools
+                .insert("mcp__fake".into(), crate::coder::PermTier::Deny);
+            state
+                .coder_perms
+                .write()
+                .await
+                .insert("default".into(), perms);
+        }
+        let e = mcp_call(
+            ws(),
+            Json(json!({ "name": "mcp__fake__echo", "arguments": { "text": "hi" } })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::FORBIDDEN);
+        {
+            let mut all = state.coder_perms.write().await;
+            all.get_mut("default")
+                .unwrap()
+                .tools
+                .insert("mcp__fake__echo".into(), crate::coder::PermTier::Allow);
+        }
+        let c = mcp_call(
+            ws(),
+            Json(json!({ "name": "mcp__fake__echo", "arguments": { "text": "yo" } })),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(c.get("output").unwrap(), "echo: yo");
+
+        // Malformed name → 400; unknown server → 404.
+        let e = mcp_call(ws(), Json(json!({ "name": "plain", "arguments": {} })))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        let e = mcp_call(ws(), Json(json!({ "name": "mcp__nope__x", "arguments": {} })))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+
+        // A broken stdio command fails the connect (502) but the spec stays
+        // saved and listed with an error status.
+        let e = servers_upsert(
+            ws(),
+            Json(json!({ "name": "bad", "command": "sh", "args": ["-c", "exit 1"] })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_GATEWAY);
+        let r = servers_get(ws()).await.0;
+        let list = r.get("servers").unwrap().as_array().unwrap();
+        let bad = list
+            .iter()
+            .find(|s| s.get("name").unwrap() == "bad")
+            .unwrap();
+        assert!(bad.get("status").unwrap().as_str().unwrap().starts_with("error:"));
+
+        // The dead server must not leak tools into the catalog.
+        let t = tools_get(ws(), Query(HashMap::new())).await.0;
+        let names: Vec<&str> = t
+            .get("tools")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["mcp__fake__echo"]);
+
+        // Authorization round trip: the list only ever shows the mask, and
+        // re-posting the mask keeps the stored secret.
+        let _ = servers_upsert(
+            ws(),
+            Json(json!({
+                "name": "auth",
+                "url": "http://127.0.0.1:9/mcp",
+                "authorization": "Bearer abc123",
+            })),
+        )
+        .await; // connection fails fast (nothing on :9) — the spec stays saved
+        let r = servers_get(ws()).await.0;
+        let list = r.get("servers").unwrap().as_array().unwrap();
+        let auth = list.iter().find(|s| s.get("name").unwrap() == "auth").unwrap();
+        assert_eq!(auth.get("authorization").unwrap(), "***");
+        let _ = servers_upsert(
+            ws(),
+            Json(json!({
+                "name": "auth",
+                "url": "http://127.0.0.1:9/mcp",
+                "authorization": "***",
+            })),
+        )
+        .await;
+        let stored = state
+            .config
+            .read()
+            .await
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == "auth")
+            .unwrap()
+            .clone();
+        assert_eq!(stored.authorization.as_deref(), Some("Bearer abc123"));
+
+        // Restart reopens the session (fake is still healthy).
+        let r = server_restart(ws(), AxumPath::from("fake")).await.unwrap().0;
+        let one = r.get("servers").unwrap().as_array().unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].get("status").unwrap(), "connected");
+
+        // Delete kills the session and removes the spec; a second delete 404s.
+        let d = server_delete(ws(), AxumPath::from("fake")).await.unwrap().0;
+        assert_eq!(d.get("ok").unwrap(), true);
+        assert_eq!(d.get("removed").unwrap(), true);
+        let r = servers_get(ws()).await.0;
+        let names: Vec<&str> = r
+            .get("servers")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.get("name").unwrap().as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"fake"));
+        let e = server_delete(ws(), AxumPath::from("fake")).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
