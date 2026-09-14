@@ -1,0 +1,156 @@
+// Rust guideline compliant 2026-07-28
+
+//! Per-OS sandbox for the coder shell runner.
+//!
+//! One policy knob (`coderSandbox`, default on) with a per-OS mechanism:
+//!
+//! * **Linux** — bubblewrap (`bwrap`): the root filesystem is bind-mounted
+//!   read-only, the workspace (plus any extra roots) read-write, capabilities
+//!   dropped. See [`bwrap`].
+//! * **Windows** — Job Object + Mandatory Integrity Control: the child tree
+//!   lives in a job that kills it atomically, and the child runs at *low*
+//!   integrity so the OS refuses its writes to medium-integrity host objects
+//!   even where a DACL would allow them. The workspace gets a temporary
+//!   write-ACE for the low-integrity SID. See [`windows`].
+//!
+//! [`spawn`] returns an [`ExecChild`] with a uniform pipe/kill/wait
+//! interface so the runner in `coder/exec.rs` stays OS-agnostic.
+
+#[cfg(unix)]
+mod bwrap;
+#[cfg(windows)]
+mod windows;
+
+use std::io;
+use std::path::PathBuf;
+
+/// Case-insensitive substrings marking an environment variable as a
+/// credential. A `bash` command's text comes from the model, which can be
+/// steered by untrusted input (a file or web page it read) — this process's
+/// own environment must not be handed to it wholesale, or a var like
+/// `GITHUB_TOKEN` already exported in the user's own shell before launch
+/// becomes readable/leakable by an agent-run command.
+pub(crate) const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
+
+pub(crate) fn is_secret_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_ENV_PATTERNS.iter().any(|p| upper.contains(p))
+}
+
+/// Single-quote a script for a POSIX shell (`bash -lc`); embedded single
+/// quotes escaped.
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Everything the runner needs to launch one contained-or-plain shell.
+pub struct SpawnReq {
+    /// The shell script to run (POSIX syntax; on Windows it is fed to
+    /// git-bash, or to `cmd /d /s /c` when no POSIX shell is installed).
+    pub command: String,
+    /// The workspace root the sandbox exposes read-write.
+    pub workspace: PathBuf,
+    /// The directory the shell should start in (within the workspace).
+    pub cwd: PathBuf,
+    /// Contain this run (bwrap on Linux, job + low integrity on Windows).
+    pub sandboxed: bool,
+    /// Extra read-write roots beyond the workspace (settings `sandboxBinds`):
+    /// bwrap `--bind`s them; Windows grants the low-integrity write ACE there.
+    pub writable_roots: Vec<String>,
+}
+
+/// A running shell child, regardless of which mechanism spawned it.
+pub enum ExecChild {
+    Unix(tokio::process::Child),
+    #[cfg(windows)]
+    Windows(windows::WinChild),
+}
+
+impl ExecChild {
+    /// Take the stdout pipe (as a raw `File`, async-capable on both OSes).
+    pub fn take_stdout(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Unix(c) => c.stdout.take().and_then(|f| f.into_std().ok()),
+            #[cfg(windows)]
+            Self::Windows(w) => w.stdout.take(),
+        }
+    }
+
+    /// Take the stderr pipe.
+    pub fn take_stderr(&mut self) -> Option<std::fs::File> {
+        match self {
+            Self::Unix(c) => c.stderr.take().and_then(|f| f.into_std().ok()),
+            #[cfg(windows)]
+            Self::Windows(w) => w.stderr.take(),
+        }
+    }
+
+    /// Kill the whole process tree (`SIGKILL` / `TerminateJobObject`).
+    pub fn start_kill(&mut self) {
+        match self {
+            Self::Unix(c) => {
+                let _ = c.start_kill();
+            }
+            #[cfg(windows)]
+            Self::Windows(w) => w.start_kill(),
+        }
+    }
+
+    /// Wait for exit. Resolves to the exit code, or -1 when the child died
+    /// without one (e.g. signal-killed on Linux).
+    pub async fn wait(&mut self) -> Result<i32, io::Error> {
+        match self {
+            Self::Unix(c) => {
+                let st = c.wait().await?;
+                Ok(st.code().map(|c| c as i32).unwrap_or(-1))
+            }
+            #[cfg(windows)]
+            Self::Windows(w) => w.wait().await,
+        }
+    }
+}
+
+/// Spawn the shell for one run, contained or not (see module docs).
+pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
+    #[cfg(unix)]
+    {
+        bwrap::spawn(req)
+    }
+    #[cfg(windows)]
+    {
+        windows::spawn(req)
+    }
+}
+
+/// Whether the sandbox mechanism is *usable* on this machine. On Windows the
+/// mechanism is OS-native (always true); on Linux bwrap must be installed
+/// *and* able to create its namespaces (see [`bwrap::available`]).
+pub fn available() -> bool {
+    #[cfg(unix)]
+    {
+        bwrap::available()
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
+
+/// Human-facing name of the active mechanism (`"bwrap"` / `"windows-job-mic"`).
+pub fn policy() -> &'static str {
+    #[cfg(unix)]
+    {
+        "bwrap"
+    }
+    #[cfg(windows)]
+    {
+        "windows-job-mic"
+    }
+}
+
+/// Windows-only: is a POSIX shell (git-bash) on PATH? Stateful sessions (cwd
+/// tracking via a marker) require one; the `cmd` fallback is stateless.
+#[cfg(windows)]
+pub fn shell_is_bash() -> bool {
+    windows::shell_is_bash()
+}
