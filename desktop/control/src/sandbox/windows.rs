@@ -141,7 +141,9 @@ fn arg_quote(s: &str) -> String {
             }
         }
     }
-    out.push_str(&"\\".repeat(backslashes));
+    // A trailing backslash run is followed by the closing quote, and MSVCRT
+    // halves such runs — so double it to encode the run literally.
+    out.push_str(&"\\".repeat(2 * backslashes));
     out.push('"');
     out
 }
