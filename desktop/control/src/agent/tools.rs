@@ -43,6 +43,20 @@ const DELEGATE_TOOLS: &[&str] = &[
     "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "git_diff", "repo_search",
     "browser", "obs_recall", "bash_poll",
 ];
+
+/// Scout child-run system prompt — the read-only investigation contract.
+pub(crate) const SCOUT_SYSTEM: &str = r#"You are a read-only investigation worker (scout) inside NInfer Studio's Coder.
+Map the code the supervisor needs before it commits to a plan: read files,
+grep/glob/search the repo, fetch web docs, and run read-only inspection
+commands. You must NOT modify anything — no writes, edits, patches, git
+writes, or destructive commands.
+
+Work autonomously: if the task is ambiguous, pick the most reasonable
+interpretation and note it in one line.
+
+Finish with a concise plain-text report: the findings the supervisor needs
+(file:line references, exact APIs/conventions, command outputs), ordered by
+importance. No preamble, no restating the task."#;
 /// Implementation set for `subagent` child runs (mirrors WORKER_TOOL_NAMES).
 const SUBAGENT_TOOLS: &[&str] = &[
     "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser", "repo_search",
@@ -147,13 +161,17 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             if text.is_empty() {
                 return json!({ "error": "text is required" });
             }
-            let res = crate::chat::memory_set(
+            return match crate::chat::memory_set(
                 axum::extract::State(state.clone()),
                 Json(json!({ "learning": { "text": text, "kind": kind } })),
             )
-            .await;
-            return res.get("learnings").map(|l| json!({ "ok": true, "count": l.as_u64().unwrap_or(0) }))
-                .unwrap_or_else(|| json!({ "ok": false }));
+            .await
+            {
+                Ok(Json(res)) => {
+                    json!({ "ok": true, "learnings": res.get("learnings").and_then(|v| v.as_array()).map(|a| a.len()) })
+                }
+                Err((_, Json(e))) => e,
+            };
         }
         "memory_recall" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
@@ -217,13 +235,23 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     }
 
     // --- permission preflight ------------------------------------------
-    let scope = crate::coder::common::perm_scope(state, run.scope_opt()).await;
-    let tier = crate::coder::common::tier_for(state, &scope, name).await;
+    // The same scope bucket the HTTP endpoints use (scope → workspace →
+    // "default"), and the same tier table the UI pushes. Tiers default to
+    // `allow`; the UI opts tools up to `ask`/`deny` per scope.
+    let scope_val = json!({ "scope": run.scope_opt().unwrap_or_default() });
+    let scope = crate::coder::common::perm_scope(&scope_val);
+    let perms = state.coder_perms.read().await;
+    let tier = crate::coder::common::tier_for(&perms, name);
+    drop(perms);
     let mut body = args.clone();
-    if tier == "deny" {
-        return json!({ "error": format!("denied by permissions ({name})") });
+    match tier {
+        crate::coder::common::PermTier::Deny => {
+            return json!({ "error": format!("denied by permissions ({name})") });
+        }
+        crate::coder::common::PermTier::Ask => {}
+        crate::coder::common::PermTier::Allow => {}
     }
-    let token = if tier == "ask" {
+    let token = if tier == crate::coder::common::PermTier::Ask {
         match await_approval(run, name, args).await {
             Some(t) => Some(t),
             None => {
@@ -301,11 +329,12 @@ impl RunShared {
 /// runs, only without the network hop.
 async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Value {
     if let Some(rest) = mcp_name(name) {
-        // The mcp_call handler re-checks the tier server-side; scope + token
-        // come from the run (mirrors the client's mcpCall payload shape).
+        // The mcp_call handler re-checks the tier server-side against the
+        // run's scope; the name keeps its `mcp__` namespace (it derives the
+        // server from it). `arguments` is the model's args object verbatim.
         let mut req = json!({
-            "name": rest,
-            "arguments": body,
+            "name": format!("mcp__{rest}"),
+            "arguments": args,
             "scope": run.scope_opt().unwrap_or_default(),
         });
         if let Some(t) = body.get("approvalToken").cloned() {
@@ -474,7 +503,7 @@ async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
 // ---------------------------------------------------------------------------
 
 async fn delegate(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
-    spawn_child(state, parent, "delegate", "scout", args, DELEGATE_TOOLS, DELEGATE_TOOLS, 6, parent.meta.system.clone()).await
+    spawn_child(state, parent, "delegate", "scout", args, DELEGATE_TOOLS, DELEGATE_TOOLS, 6, Some(SCOUT_SYSTEM.into())).await
 }
 
 async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
