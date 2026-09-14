@@ -187,9 +187,77 @@ fn env_block() -> Vec<u16> {
 // Workspace write grants (DACL)
 // ---------------------------------------------------------------------------
 
-/// Revokes a low-integrity write ACE on `path` when dropped.
+/// Process-global refcounts of active low-integrity grants, by path.
+///
+/// Multiple sandboxed shells can run concurrently on the same workspace (a
+/// background build + a foreground command, or two background jobs). A
+/// naive "grant on spawn, revoke on child drop" makes the first child's drop
+/// delete the ACE the second child still needs — its writes would start
+/// failing with ACCESS_DENIED mid-run. The grant is therefore taken when a
+/// path's count goes 0→1 and revoked only when the LAST holder leaves.
+static ACL_GRANTS: LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u32>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Take a refcount on the low-integrity grant for `path`, adding the ACE on
+/// first use. Fails only if the FIRST grant fails (a path already granted
+/// here cannot newly fail).
+fn acquire_acl(path: &Path) -> io::Result<()> {
+    let first = {
+        let mut grants = ACL_GRANTS.lock().unwrap();
+        let count = grants.entry(path.to_path_buf()).or_insert(0);
+        let first = *count == 0;
+        *count += 1;
+        first
+    };
+    if first {
+        if let Err(e) = set_low_integrity_ace(path, true) {
+            // Roll the count back so the next run isn't left believing a
+            // grant exists when it doesn't.
+            let mut grants = ACL_GRANTS.lock().unwrap();
+            if let Some(c) = grants.get_mut(path) {
+                *c -= 1;
+                if *c == 0 {
+                    grants.remove(path);
+                }
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Release one refcount; revoke the ACE when the last holder leaves.
+fn release_acl(path: &Path) {
+    let last = {
+        let mut grants = ACL_GRANTS.lock().unwrap();
+        match grants.get_mut(path) {
+            Some(c) => {
+                *c -= 1;
+                let last = *c == 0;
+                if last {
+                    grants.remove(path);
+                }
+                last
+            }
+            None => false,
+        }
+    };
+    if last {
+        // The grant must not outlive the last child. Deleting an ACE that is
+        // already gone is a no-op we can ignore.
+        let _ = set_low_integrity_ace(path, false);
+    }
+}
+
+/// Revokes the low-integrity write grant on `path` when dropped.
 struct AclGuard {
     path: PathBuf,
+}
+
+impl Drop for AclGuard {
+    fn drop(&mut self) {
+        release_acl(&self.path);
+    }
 }
 
 /// Add (`add = true`) or remove (`add = false`) the read/write/execute ACE
