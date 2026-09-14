@@ -312,6 +312,14 @@ impl Drop for AclGuard {
 /// A child spawned via `CreateProcessW` into a job object, optionally at low
 /// integrity. Dropping it revokes the ACL grants and — via
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills anything still running.
+/// A HANDLE is a raw pointer, and raw pointers are not `Send` — wrap one so
+/// the reaper thread can own it after we detach it from [`WinChild`].
+struct SendableHandle(*mut std::ffi::c_void);
+
+// Safe: the HANDLE is detached (the struct's own copy is nulled) before it
+// moves into the blocking reaper, which is the only owner that uses/closes it.
+unsafe impl Send for SendableHandle {}
+
 pub struct WinChild {
     process: windows_sys::Win32::Foundation::HANDLE,
     job: windows_sys::Win32::Foundation::HANDLE,
@@ -350,12 +358,12 @@ impl WinChild {
         }
         if self.exit_rx.is_none() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            // A HANDLE is a raw pointer and raw pointers are not `Send` —
-            // hand it to the blocking thread through an `AtomicPtr`.
-            let process = std::sync::atomic::AtomicPtr::from_ptr(self.process);
+            // A HANDLE is a raw pointer (not `Send`) — detach it and hand it
+            // to the blocking reaper through a `Send` wrapper.
+            let process = SendableHandle(self.process);
             self.process = std::ptr::null_mut();
             tokio::task::spawn_blocking(move || {
-                let handle = process.load(std::sync::atomic::Ordering::Acquire);
+                let handle = process.0;
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
