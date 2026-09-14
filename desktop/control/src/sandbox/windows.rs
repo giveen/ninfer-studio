@@ -48,9 +48,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GENERIC_READ, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
+use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
