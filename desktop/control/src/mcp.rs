@@ -19,7 +19,7 @@
 //!     machinery (`coder::common::enforce_perm`) — a tier row for the full
 //!     tool name overrides a row for the server-level key `mcp__<server>`.
 
-use crate::coder::{enforce_perm, perm_scope, tier_for, CoderPerms, PermTier};
+use crate::coder::{enforce_perm, perm_scope, tier_for};
 use crate::engine::S;
 use crate::types::McpServerSpec;
 use axum::extract::{Path as AxumPath, Query, State as AxumState};
@@ -32,7 +32,7 @@ use rmcp::model::{
 };
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceError};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -243,6 +243,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     // against INIT_TIMEOUT. (Boxed because the two transports are different
     // types; the future is awaited here, not spawned, so no Send bound is
     // needed.)
+    let mut pid: Option<u32> = None;
     let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> =
         match spec.transport() {
             Some("stdio") => {
@@ -262,7 +263,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
                 crate::clear_appimage_env(&mut c);
                 let transport = TokioChildProcess::new(c)
                     .map_err(|e| format!("failed to spawn MCP server '{cmd}': {e}"))?;
-                let pid = transport.id();
+                pid = transport.id();
                 Box::pin(async move {
                     timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
                         .await
@@ -288,15 +289,25 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
                         }
                     }
                 }
-                let config = StreamableHttpClientTransportConfig {
-                    uri: Arc::from(url.trim().to_string()),
-                    auth_header: spec
-                        .authorization
-                        .clone()
-                        .filter(|v| !v.trim().is_empty()),
-                    custom_headers: custom,
-                    ..Default::default()
-                };
+                let mut config = StreamableHttpClientTransportConfig::with_uri(url.trim());
+                if let Some(auth) = spec
+                    .authorization
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    // rmcp sends `Authorization: Bearer <value>` (reqwest's
+                    // `bearer_auth`), so a user pasting a full header value
+                    // would end up with a doubled prefix — normalize it.
+                    let token = auth
+                        .strip_prefix("Bearer ")
+                        .or_else(|| auth.strip_prefix("bearer "))
+                        .unwrap_or(auth);
+                    config = config.auth_header(token.to_string());
+                }
+                if !custom.is_empty() {
+                    config = config.custom_headers(custom);
+                }
                 let transport = StreamableHttpClientTransport::from_config(config);
                 Box::pin(async move {
                     timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
@@ -318,7 +329,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     let peer = svc
         .peer_info()
         .and_then(|p| serde_json::to_value(p.as_ref()).ok());
-    Ok((svc, peer, None))
+    Ok((svc, peer, pid))
 }
 
 /// Refresh the cached `tools/list` for a live service.
@@ -413,13 +424,13 @@ pub(crate) async fn connect_all(state: S) {
 
 /// Serialize one configured server for the management endpoints.
 fn server_value(spec: &McpServerSpec, conn: Option<&McpConn>) -> Value {
-    let status = match conn {
-        Some(c) if c.alive() => "connected",
-        Some(c) => {
-            let last = c.error.clone().unwrap_or_else(|| "connection closed".into());
-            format!("error: {last}")
-        }
-        None => "disconnected",
+    let status: String = match conn {
+        Some(c) if c.alive() => "connected".to_string(),
+        Some(c) => format!(
+            "error: {}",
+            c.error.clone().unwrap_or_else(|| "connection closed".into())
+        ),
+        None => "disconnected".to_string(),
     };
     json!({
         "name": spec.name,
@@ -745,6 +756,17 @@ pub async fn mcp_call(
                     "output": format!(
                         "MCP tool '{name}' requested interactive multi-round input, \
                          which this client does not provide."
+                    ),
+                })));
+            }
+            // `CallToolResponse` is `#[non_exhaustive]`: a newer rmcp release
+            // may add variants. Surface them instead of silently dropping the
+            // response.
+            Ok(Ok(_)) => {
+                return Ok(Json(json!({
+                    "ok": false,
+                    "output": format!(
+                        "MCP tool '{name}' returned an unsupported response shape"
                     ),
                 })));
             }
