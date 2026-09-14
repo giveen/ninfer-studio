@@ -59,8 +59,9 @@ This project takes a pragmatic stance on third-party advisories:
   explicitly from the tray menu to stop the engine.
 - **Coding harness shell sandbox (default ON, per-OS mechanism).** `exec` runs
   a real shell (`bash -lc <command>`; on Windows, git-bash when installed, else
-  `cmd /d /s /c`) wrapped in an OS-level sandbox unless the user disables it in
-  Settings → Safety & Permissions (`coderSandbox`, default on):
+    `cmd /d /s /c`; on Windows a `bash` on PATH that is a WSL alias is ignored,
+    since it would be a Linux process) wrapped in an OS-level sandbox unless the
+    user disables it in Settings → Safety & Permissions (`coderSandbox`, default on):
   - **Linux** — bubblewrap: `/` bind-mounted read-only, the workspace (plus any
     extra `sandboxBinds` roots) read-write, a private `/tmp`, dropped
     capabilities, `--die-with-parent`. Falls back to an unsandboxed shell when
