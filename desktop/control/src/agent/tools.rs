@@ -385,16 +385,19 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         )
         .await
         .map(|j| j.0),
-        "repo_search" => search::search(
-            state.clone(),
-            Query(search::SearchQuery {
-                q: body.get("query").and_then(|v| v.as_str()).map(String::from),
-                limit: body.get("limit").and_then(|v| v.as_u64()),
-                workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
-            }),
-        )
-        .await
-        .map(|j| j.0),
+        // `search` is non-Result (it degrades to empty results) — wrap.
+        "repo_search" => Ok(
+            search::search(
+                state.clone(),
+                Query(search::SearchQuery {
+                    q: body.get("query").and_then(|v| v.as_str()).map(String::from),
+                    limit: body.get("limit").and_then(|v| v.as_u64()),
+                    workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
+                }),
+            )
+            .await
+            .0,
+        ),
         "repo_map" => search::repo_map(
             state.clone(),
             Query(search::WsQuery { workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from) }),
