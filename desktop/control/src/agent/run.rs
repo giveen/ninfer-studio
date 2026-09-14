@@ -474,7 +474,7 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
     });
 
     let (tx, _rx) = broadcast::channel(512);
-    let (stop_tx, stop_rx) = watch::channel(false);
+    let _ = (tx, _rx); // channel moved into spawn_run's own construction
     let id = format!(
         "run_{:x}_{}",
         now_ms(),
