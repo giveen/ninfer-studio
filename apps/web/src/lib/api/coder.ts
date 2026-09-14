@@ -169,7 +169,12 @@ export function coderPermsApprove(tool: string, path?: string, scope?: string): 
 export interface SandboxStatus {
   enabled: boolean;
   sandboxBinds: string[];
+  /** Legacy alias — true only when the active mechanism is bwrap AND it can run here. */
   bwrapAvailable: boolean;
+  /** Whether the active sandbox mechanism can actually run on this host. */
+  available: boolean;
+  /** Active mechanism: "bwrap" (Linux) or "windows-job-mic" (Windows). */
+  kind: string;
 }
 export function coderSandboxGet(): Promise<SandboxStatus> {
   return getJSON<SandboxStatus>('/api/coder/sandbox', 5000);

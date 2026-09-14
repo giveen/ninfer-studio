@@ -3092,7 +3092,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ninfier-control"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3113,11 +3113,12 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "ninfier-studio"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "mimalloc",
  "ninfier-control",

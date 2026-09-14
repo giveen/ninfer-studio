@@ -21,6 +21,7 @@ pub mod repo;
 pub mod routes_config;
 pub mod routes_data;
 pub mod routes_engine;
+pub mod sandbox;
 pub mod types;
 pub mod usage;
 use crate::engine::{engine_health, refresh_engine_status, S};

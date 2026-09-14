@@ -1341,16 +1341,14 @@ pub async fn mcp_call(
     // burn up to the init timeout on every call).
     {
         let m = state.mcp.read().await;
-        if let Some(meta) = m.meta_get(&server) {
-            if !meta.alive && failed_recently(&meta) {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": meta
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "MCP server not connected".to_string()) })),
-                ));
-            }
+        if let Some(meta) = m.meta_get(&server) && !meta.alive && failed_recently(&meta) {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": meta
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "MCP server not connected".to_string()) })),
+            ));
         }
     }
     ensure_conn(&state, &server).await?;

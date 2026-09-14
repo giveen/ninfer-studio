@@ -20,6 +20,10 @@ interface CoderSafetyState {
   sandbox: boolean;
   setSandbox: (v: boolean) => void;
   bwrapAvailable: boolean;
+  /** Whether the active sandbox mechanism can actually run on this host. */
+  sandboxAvailable: boolean;
+  /** Active mechanism: "bwrap" (Linux) or "windows-job-mic" (Windows). */
+  sandboxKind: string;
   commitApproval: boolean;
   setCommitApproval: (v: boolean) => void;
 }
@@ -30,11 +34,18 @@ export function CoderSafetyProvider({ children }: { children: ReactNode }) {
   const [safeMode, setSafeModeState] = useState(true);
   const [sandbox, setSandboxState] = useState(true);
   const [bwrapAvailable, setBwrapAvailable] = useState(true);
+  const [sandboxAvailable, setSandboxAvailable] = useState(true);
+  const [sandboxKind, setSandboxKind] = useState('bwrap');
   const [commitApproval, setCommitApprovalState] = useState(false);
 
   useEffect(() => {
     coderSafeModeGet().then((r) => setSafeModeState(r.enabled)).catch(() => {});
-    coderSandboxGet().then((r) => { setSandboxState(r.enabled); setBwrapAvailable(r.bwrapAvailable); }).catch(() => {});
+    coderSandboxGet().then((r) => {
+      setSandboxState(r.enabled);
+      setBwrapAvailable(r.bwrapAvailable);
+      setSandboxAvailable(r.available);
+      setSandboxKind(r.kind);
+    }).catch(() => {});
     coderCommitApprovalGet().then((r) => setCommitApprovalState(r.enabled)).catch(() => {});
   }, []);
 
@@ -44,7 +55,11 @@ export function CoderSafetyProvider({ children }: { children: ReactNode }) {
   }, []);
   const setSandbox = useCallback((v: boolean) => {
     setSandboxState(v);
-    coderSandboxSet(v).then((r) => setBwrapAvailable(r.bwrapAvailable)).catch(() => {});
+    coderSandboxSet(v).then((r) => {
+      setBwrapAvailable(r.bwrapAvailable);
+      setSandboxAvailable(r.available);
+      setSandboxKind(r.kind);
+    }).catch(() => {});
   }, []);
   const setCommitApproval = useCallback((v: boolean) => {
     setCommitApprovalState(v);
@@ -52,7 +67,7 @@ export function CoderSafetyProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ safeMode, setSafeMode, sandbox, setSandbox, bwrapAvailable, commitApproval, setCommitApproval }}>
+    <Ctx.Provider value={{ safeMode, setSafeMode, sandbox, setSandbox, bwrapAvailable, sandboxAvailable, sandboxKind, commitApproval, setCommitApproval }}>
       {children}
     </Ctx.Provider>
   );

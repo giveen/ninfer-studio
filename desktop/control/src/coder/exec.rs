@@ -1,34 +1,20 @@
 // Rust guideline compliant 2026-07-28
 
 //! Shell execution for the coder harness: `bash -lc` runner, safe-mode
-//! blocklist, optional bubblewrap sandbox, secret-env scrubbing, and the
-//! background-job registry the client polls.
+//! blocklist, per-OS sandbox (see `crate::sandbox`), secret-env scrubbing,
+//! and the background-job registry the client polls.
 
 use super::common::{enforce_perm, is_safe_base_dir, perm_scope, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
+use crate::sandbox::shell_quote;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
-
-/// Case-insensitive substrings marking an environment variable as a
-/// credential. A `bash` command's text comes from the model, which can be
-/// steered by untrusted input (a file or web page it read) — this process's
-/// own environment must not be handed to it wholesale, or a var like
-/// `GITHUB_TOKEN` already exported in the user's own shell before launch
-/// becomes readable/leakable by an agent-run command.
-const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
-
-fn is_secret_env_var(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    SECRET_ENV_PATTERNS.iter().any(|p| upper.contains(p))
-}
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
@@ -94,11 +80,6 @@ fn cap_out(s: &str) -> (String, bool) {
     }
 }
 
-/// Single-quote a path for `bash -lc` (embedded quotes escaped).
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Persist a single boolean `AppSettings` field to `config.json`, mirroring
 /// `sandbox_set`'s exact read-merge-write shape (a full save-config round
 /// trip would also work, but every coder toggle already updates its own
@@ -139,52 +120,26 @@ pub async fn commit_approval_set(AxumState(state): AxumState<S>, Json(req): Json
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem sandbox (bubblewrap) — mirrors the sidecar's `coderSandbox`.
+// Sandbox toggles — the mechanism is per-OS (see `crate::sandbox`): bubblewrap
+// on Linux, Job Object + low integrity on Windows.
 // ---------------------------------------------------------------------------
 
-/// Whether bubblewrap is *usable* on this machine. Checked once per process:
-/// not only must `bwrap` be installed, it must be able to create its
-/// namespaces — on kernels or hardened runtimes (e.g. default Docker
-/// seccomp) that forbid unprivileged user namespaces, bwrap exits 1 with
-/// "No permissions to create a new namespace" on every invocation. Probing
-/// with the same namespace flags the wrapper uses means such hosts get the
-/// same transparent fallback as hosts without bwrap, instead of every exec
-/// failing with a cryptic exit 1; `sandbox_get` also stops claiming the
-/// sandbox is available when it actually can't start.
-pub fn bwrap_available() -> bool {
-    static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-        let installed = std::process::Command::new("which")
-            .arg("bwrap")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !installed {
-            return false;
-        }
-        // Same namespace/unpriv flags as the wrapper below, minimal binds,
-        // trivial payload: if *this* can't start, neither can a real exec.
-        let mut probe = std::process::Command::new("bwrap");
-        probe
-            .arg("--ro-bind").arg("/").arg("/")
-            .arg("--tmpfs").arg("/tmp")
-            .arg("--proc").arg("/proc")
-            .arg("--dev").arg("/dev")
-            .arg("--unshare-pid")
-            .arg("--cap-drop").arg("ALL")
-            .arg("--")
-            .arg("/usr/bin/true");
-        probe.stdout(Stdio::null()).stderr(Stdio::null());
-        probe
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    });
-    *AVAILABLE
+/// The JSON every sandbox GET/SET endpoint returns: the setting, the active
+/// mechanism, and whether that mechanism can actually run on this machine.
+/// `bwrapAvailable` is kept as a legacy alias for pre-OS-aware clients.
+fn sandbox_status_json(c: &crate::types::AppSettings) -> Value {
+    json!({
+        "enabled": c.coder_sandbox,
+        "sandboxBinds": c.sandbox_binds,
+        "bwrapAvailable": crate::sandbox::available() && crate::sandbox::policy() == "bwrap",
+        "available": crate::sandbox::available(),
+        "kind": crate::sandbox::policy(),
+    })
 }
 
 pub async fn sandbox_get(AxumState(state): AxumState<S>) -> Json<Value> {
     let c = state.config.read().await;
-    Json(json!({"enabled": c.coder_sandbox, "sandboxBinds": c.sandbox_binds, "bwrapAvailable": bwrap_available()}))
+    Json(sandbox_status_json(&c))
 }
 
 pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
@@ -206,15 +161,18 @@ pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>)
         *state.config.write().await = merged;
     }
     let c = state.config.read().await;
-    Json(json!({"enabled": c.coder_sandbox, "sandboxBinds": c.sandbox_binds, "bwrapAvailable": bwrap_available()}))
+    Json(sandbox_status_json(&c))
 }
 
 /// Run a shell command via `bash -lc`. Unlike `fs_*`/`grep`/`glob`, this is
 /// **not** confined to the workspace: `within_ws` only picks the starting
-/// `cwd` (or resumes a session's), and the shell itself is unsandboxed — a
-/// `cd /`, absolute path, or symlink reaches anywhere the OS user can. Safe
-/// mode (default on) blocks a fixed set of destructive patterns before
-/// spawning, but that's a blocklist, not a security boundary. See SECURITY.md.
+/// `cwd` (or resumes a session's), and the shell can `cd /` or use absolute
+/// paths to reach anywhere the OS user can *read*. Containment comes from
+/// the per-OS sandbox (`crate::sandbox`, default on): a read-only root
+/// mount on Linux, a low-integrity child on Windows — plus safe mode
+/// (default on), which blocks a fixed set of destructive patterns before
+/// spawning. The sandbox contains the *writes*; neither it nor the
+/// blocklist is a full security boundary. See SECURITY.md.
 pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let command = req.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if command.trim().is_empty() {
@@ -274,67 +232,40 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
         rel_of(&root, &spawn_cwd)
     };
 
-    // Optional filesystem sandbox (mirrors the sidecar): wrap the shell in
-    // bubblewrap so the agent can only write inside the workspace — the rest
-    // of the host is read-only. Network stays available so builds can fetch.
-    // Falls back to an unsandboxed shell when bwrap is missing or the kernel
-    // won't let it create namespaces (see `bwrap_available`).
+    // Optional filesystem sandbox (per-OS, see `crate::sandbox`): on Linux
+    // the shell is wrapped in bubblewrap so the agent can only write inside
+    // the workspace (host read-only, network still available for builds);
+    // on Windows it runs in a Job Object at low integrity, which makes the
+    // OS refuse writes to medium-integrity host objects. Falls back to an
+    // unsandboxed shell when the mechanism can't run here (e.g. the kernel
+    // won't let bwrap create namespaces).
     let (sandboxed, sandbox_binds) = {
         let c = state.config.read().await;
-        (c.coder_sandbox && bwrap_available() && !root.as_os_str().is_empty(), c.sandbox_binds.clone())
+        (c.coder_sandbox && crate::sandbox::available() && !root.as_os_str().is_empty(), c.sandbox_binds.clone())
     };
-    let mut cmd = if sandboxed {
-        let mut c = Command::new("bwrap");
-        c.arg("--ro-bind").arg("/").arg("/");
-        // bwrap layers mounts in argument order — a later mount at a parent
-        // path hides an earlier one at a child path. `--tmpfs /tmp` MUST come
-        // before the workspace bind: a workspace under /tmp (the common case
-        // for temp/scratch dirs) would otherwise be buried under an empty
-        // tmpfs and become invisible inside the sandbox.
-        c.arg("--tmpfs").arg("/tmp");
-        c.arg("--bind").arg(&root).arg(&root);
-        c.arg("--proc").arg("/proc");
-        c.arg("--dev").arg("/dev");
-        c.arg("--unshare-pid");
-        c.arg("--die-with-parent");
-        c.arg("--cap-drop").arg("ALL");
-        for b in &sandbox_binds {
-            if !b.is_empty() {
-                c.arg("--bind").arg(b).arg(b);
-            }
-        }
-        c.arg("bash");
-        c
-    } else {
-        Command::new("bash")
-    };
-    // Inside the sandbox the child's cwd must already exist in the container.
-    // The bind-mounted root is a safe universal cwd; a workspace-relative
-    // cwd requested for a stateless command is re-applied with `cd` so the
-    // command sees the same starting directory as it would unsandboxed.
-    let (cwd_arg, run_cmd) = if sandboxed {
-        let cd = if spawn_cwd == *root {
-            String::new()
-        } else {
-            format!("cd {} 2>/dev/null || true\n", shell_quote(&spawn_cwd.to_string_lossy()))
-        };
-        (root.clone(), format!("{cd}{run_cmd}"))
-    } else {
-        (spawn_cwd.clone(), run_cmd)
-    };
-    cmd.arg("-lc")
-        .arg(&run_cmd)
-        .current_dir(&cwd_arg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, _) in std::env::vars() {
-        if is_secret_env_var(&k) {
-            cmd.env_remove(k);
-        }
+    // Stateful sessions track cwd via a shell marker — that needs a POSIX
+    // shell. On Windows without git-bash the runner falls back to `cmd`,
+    // which is stateless only.
+    #[cfg(windows)]
+    if session.is_some() && !crate::sandbox::shell_is_bash() {
+        return Ok(Json(json!({
+            "stdout": "",
+            "stderr": "stateful sessions need a POSIX shell: install Git for Windows (git-bash), or run without sessionId",
+            "exitCode": null,
+            "timedOut": false,
+            "truncated": false,
+            "cwd": result_cwd,
+            "sandboxed": sandboxed,
+        })));
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
+    let mut child = crate::sandbox::spawn(&crate::sandbox::SpawnReq {
+        command: run_cmd,
+        workspace: root,
+        cwd: spawn_cwd,
+        sandboxed,
+        writable_roots: sandbox_binds,
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("spawn failed: {e}")}))))?;
     // Background mode: hand the child to a detached drain task and return a
     // job id immediately. The client polls `job_get`; output is tail-capped.
     if req.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -360,8 +291,8 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
     // Take the pipes up front and drain both streams concurrently so a large
     // stderr can't deadlock a large stdout (and vice versa). The future only
     // borrows `child`, so a timeout can still kill and reap it below.
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+    let mut out_pipe = child.take_stdout().map(tokio::fs::File::from);
+    let mut err_pipe = child.take_stderr().map(tokio::fs::File::from);
     let out_fut = async {
         let (so, se) = tokio::join!(
             async {
@@ -381,12 +312,12 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
                 buf
             }
         );
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((so, se, status))
+        let code = child.wait().await?;
+        Ok::<_, std::io::Error>((so, se, code))
     };
     match timeout(Duration::from_millis(timeout_ms), out_fut).await {
         Err(_) => {
-            let _ = child.kill().await;
+            child.start_kill();
             let _ = child.wait().await;
             Ok(Json(json!({
                 "stdout": "",
@@ -407,7 +338,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             "cwd": result_cwd,
             "sandboxed": sandboxed,
         }))),
-        Ok(Ok((so, se, status))) => {
+        Ok(Ok((so, se, code))) => {
             let mut stdout = String::from_utf8_lossy(&so).into_owned();
             let stderr_raw = String::from_utf8_lossy(&se).into_owned();
             // Pull the session cwd out of the marker and strip it from stdout.
@@ -428,7 +359,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             Ok(Json(json!({
                 "stdout": stdout_capped,
                 "stderr": stderr_capped,
-                "exitCode": status.code(),
+                "exitCode": (code >= 0).then_some(code),
                 "timedOut": false,
                 "truncated": t_out || t_err,
                 "cwd": result_cwd,
@@ -483,9 +414,9 @@ impl BgJob {
 /// Drain a background child: stream pipes to EOF in the background while a
 /// 1s wait-poll honors kill requests and the deadline, then record capped
 /// output (+ session cwd bookkeeping, like the foreground path).
-async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Child, session: Option<String>, state: S, timeout_ms: u64, cwd_marker: String) {
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
+async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: crate::sandbox::ExecChild, session: Option<String>, state: S, timeout_ms: u64, cwd_marker: String) {
+    let mut out_pipe = child.take_stdout().map(tokio::fs::File::from);
+    let mut err_pipe = child.take_stderr().map(tokio::fs::File::from);
     let out_h = tokio::spawn(async move {
         let mut buf = Vec::new();
         if let Some(o) = &mut out_pipe {
@@ -506,14 +437,14 @@ async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Chi
     let mut timed_out = false;
     let code: Option<i32> = loop {
         if job.kill_requested() {
-            let _ = child.start_kill();
+            child.start_kill();
         }
         if !timed_out && std::time::Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.start_kill();
+            child.start_kill();
         }
         match timeout(Duration::from_secs(1), child.wait()).await {
-            Ok(Ok(status)) => break status.code(),
+            Ok(Ok(code)) => break if code >= 0 { Some(code) } else { None },
             Ok(Err(_)) => break None,
             Err(_) => continue,
         }
@@ -582,10 +513,10 @@ mod tests {
     #[test]
     fn secret_env_var_detection_is_case_insensitive_and_scoped() {
         for name in ["OPENAI_API_KEY", "github_token", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "hf_token"] {
-            assert!(is_secret_env_var(name), "expected {name} to be flagged as a secret");
+            assert!(crate::sandbox::is_secret_env_var(name), "expected {name} to be flagged as a secret");
         }
         for name in ["PATH", "HOME", "LANG", "TERM", "PWD", "SHELL", "USER"] {
-            assert!(!is_secret_env_var(name), "expected {name} to NOT be flagged as a secret");
+            assert!(!crate::sandbox::is_secret_env_var(name), "expected {name} to NOT be flagged as a secret");
         }
     }
 

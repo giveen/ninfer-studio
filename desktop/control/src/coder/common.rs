@@ -170,10 +170,10 @@ pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
     if let Some(t) = perms.tools.get(name) {
         return *t;
     }
-    if let Some((server, _)) = crate::mcp::split_mcp_name(name) {
-        if let Some(t) = perms.tools.get(&format!("{}{server}", crate::mcp::MCP_PREFIX)) {
-            return *t;
-        }
+    if let Some((server, _)) = crate::mcp::split_mcp_name(name)
+        && let Some(t) = perms.tools.get(&format!("{}{server}", crate::mcp::MCP_PREFIX))
+    {
+        return *t;
     }
     PermTier::Allow
 }
