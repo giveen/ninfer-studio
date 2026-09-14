@@ -161,6 +161,23 @@ pub(crate) fn perm_scope(req: &Value) -> String {
         .to_string()
 }
 
+/// The effective tier for `name` under `perms`: the per-tool row wins; for
+/// a namespaced MCP name (`mcp__<server>__<tool>`) a row for the server-level
+/// key `mcp__<server>` applies when no per-tool row exists (see `mcp.rs`) —
+/// one row then covers every tool a server exposes, with per-tool overrides.
+/// Non-MCP names never consult a server row. Default is `allow`.
+pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
+    if let Some(t) = perms.tools.get(name) {
+        return *t;
+    }
+    if let Some((server, _)) = crate::mcp::split_mcp_name(name) {
+        if let Some(t) = perms.tools.get(&format!("{}{server}", crate::mcp::MCP_PREFIX)) {
+            return *t;
+        }
+    }
+    PermTier::Allow
+}
+
 /// `POST /api/coder/perms/approve` — body `{tool, path?, scope?}`. Called by
 /// the web UI's approval dialog at the moment a human clicks Approve on an
 /// `ask`-tiered tool call, in addition to (not instead of) resolving that
