@@ -348,7 +348,9 @@ pub struct WinChild {
     /// One-shot exit channel fed by a blocking reaper (see [`Self::wait`]).
     exit_rx: Option<tokio::sync::mpsc::UnboundedReceiver<i32>>,
     exit_code: Option<i32>,
-    /// Low-integrity write grants, revoked on drop.
+    /// Low-integrity write grants, revoked on drop. Drop is the only
+    /// "read" of this field — the lint doesn't see through `Drop`.
+    #[allow(dead_code)]
     acls: Vec<AclGuard>,
 }
 
