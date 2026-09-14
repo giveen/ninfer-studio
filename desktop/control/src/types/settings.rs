@@ -250,6 +250,7 @@ impl Default for AppSettings {
             remote_access_port: 1337,
             currency_symbol: "$".into(),
             cost_per_kwh: 0.0,
+            mcp_servers: Vec::new(),
         }
     }
 }
