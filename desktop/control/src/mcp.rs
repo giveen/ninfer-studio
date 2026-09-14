@@ -280,6 +280,14 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
                 let url = spec.url.clone().unwrap_or_default();
                 let mut custom = HashMap::new();
                 for (k, v) in &spec.headers {
+                    // `Authorization` travels through `auth_header` — the SDK
+                    // rejects it as a reserved header in `custom_headers`, so
+                    // drop a duplicated entry here (it would also double-send
+                    // the value).
+                    let key = k.to_ascii_lowercase();
+                    if key == "authorization" {
+                        continue;
+                    }
                     match (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
                         (Ok(name), Ok(value)) => {
                             custom.insert(name, value);
