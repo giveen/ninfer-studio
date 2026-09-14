@@ -2,8 +2,13 @@ name: CI / Rust control
 
 # Tests for the Rust control plane (desktop/control): every /api/* handler,
 # the serve-arg builder fixture test, and the workspace/memory unit +
-# concurrency suites. Locked mode keeps Cargo.lock from drifting when
-# Cargo.toml changes.
+# concurrency suites, gated by `cargo clippy -D warnings`. Locked mode keeps
+# Cargo.lock from drifting when Cargo.toml changes.
+#
+# No `cargo fmt --check` gate yet: the codebase predates a repo rustfmt.toml
+# and doesn't conform to stock rustfmt output (import ordering, wrap width),
+# so enabling it now would require a large, unrelated reformat-everything
+# commit first.
 
 on:
   pull_request:
@@ -34,9 +39,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: desktop
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path desktop/Cargo.toml -p ninfier-control -- -D warnings
       - name: Run control-plane tests
         run: cargo test --locked --manifest-path desktop/Cargo.toml -p ninfier-control

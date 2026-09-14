@@ -342,7 +342,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         };
         *state.last_start.write().await = Some(last_start.clone());
         let path = state.data_dir.join("last-start.json");
-        let _ = std::fs::write(&path, serde_json::to_string(&last_start).unwrap_or_default());
+        let _ = crate::atomic_write(&path, serde_json::to_string(&last_start).unwrap_or_default()).await;
     }
 
     let (log_file_path, log) = match open_engine_log(state, port).await {

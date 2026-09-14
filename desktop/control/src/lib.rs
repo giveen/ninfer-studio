@@ -297,6 +297,33 @@ pub(crate) async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, 
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
 }
 
+/// Write `contents` to `path` atomically: write to a sibling `.tmp` file
+/// then rename over the target. A crash or power loss mid-write leaves
+/// either the old file or the new one intact — never a half-written,
+/// corrupt `config.json`/`profile.json`/`chats.json`/`last-start.json`.
+pub async fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let tmp = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.tmp"),
+        None => "tmp".to_string(),
+    });
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+/// Same as [`atomic_write`], additionally locking the file down to owner
+/// read/write (`0600`) — for `config.json`, which holds `apiKey`/`hfToken`
+/// in the clear and would otherwise inherit the umask's default (typically
+/// world-readable `0644`).
+pub async fn atomic_write_secret(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write(path, contents).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Runtime entry: load config, boot, serve
 // ---------------------------------------------------------------------------
@@ -329,30 +356,44 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     let state = Arc::new(State::new(data_dir, dist_dir, event_tx));
     // load persisted config
     let p = state.data_dir.join("config.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&p).await
-        && let Ok(mut cfg) = serde_json::from_str::<AppSettings>(&raw)
-    {
-        let defaults = AppSettings::default();
-        if cfg.models_dir.is_empty() {
-            cfg.models_dir = defaults.models_dir;
+    if let Ok(raw) = tokio::fs::read_to_string(&p).await {
+        match serde_json::from_str::<AppSettings>(&raw) {
+            Ok(mut cfg) => {
+                let defaults = AppSettings::default();
+                if cfg.models_dir.is_empty() {
+                    cfg.models_dir = defaults.models_dir;
+                }
+                if cfg.engine_port == 0 {
+                    cfg.engine_port = defaults.engine_port;
+                }
+                if cfg.hf_cli.is_empty() {
+                    cfg.hf_cli = defaults.hf_cli;
+                }
+                if cfg.ninfer_path.is_empty() {
+                    cfg.ninfer_path = defaults.ninfer_path;
+                }
+                if cfg.build_command.is_empty() {
+                    cfg.build_command = defaults.build_command;
+                }
+                // Legacy values may carry the Windows extended-length prefix
+                // (`\\?\`) from an older canonicalize; normalize so the UI
+                // (which keys workspaces by plain paths) matches on restart.
+                cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
+                *state.config.write().await = cfg;
+            }
+            Err(e) => {
+                // Falling back to defaults here means the user's settings
+                // silently vanish (ninferPath, hfToken, build command, …) —
+                // at minimum tell them, via the log, why.
+                tracing::event!(
+                    name: "config.load.failed",
+                    tracing::Level::WARN,
+                    error = %e,
+                    path = ?p,
+                    "config.json is corrupt, falling back to defaults: {{error}}",
+                );
+            }
         }
-        if cfg.engine_port == 0 {
-            cfg.engine_port = defaults.engine_port;
-        }
-        if cfg.hf_cli.is_empty() {
-            cfg.hf_cli = defaults.hf_cli;
-        }
-        if cfg.ninfer_path.is_empty() {
-            cfg.ninfer_path = defaults.ninfer_path;
-        }
-        if cfg.build_command.is_empty() {
-            cfg.build_command = defaults.build_command;
-        }
-        // Legacy values may carry the Windows extended-length prefix
-        // (`\\?\`) from an older canonicalize; normalize so the UI
-        // (which keys workspaces by plain paths) matches on restart.
-        cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
-        *state.config.write().await = cfg;
     }
     // load the last-start record (dirty indicator for the Engine tab)
     let p = state.data_dir.join("last-start.json");

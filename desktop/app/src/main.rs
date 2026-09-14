@@ -24,6 +24,7 @@ use tauri::{Manager, WindowEvent};
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+use ninfier_control::engine::S;
 use ninfier_control::types::AppEvent;
 use ninfier_control::{boot_adopt, init_state, serve_until_ready};
 use tauri_plugin_notification::NotificationExt;
@@ -36,6 +37,12 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 /// Whether an engine is currently running — drives the "engine still running"
 /// tray/notification state when the window is hidden.
 struct EngineRunning(Arc<AtomicBool>);
+
+/// Handle to the control-plane state, set once the async runtime thread has
+/// finished `init_state()` — used to stop the engine on quit so the tray
+/// "Quit" menu (and app.exit paths) don't orphan the engine child.
+#[derive(Clone, Default)]
+struct ControlState(Arc<std::sync::Mutex<Option<S>>>);
 
 #[cfg(feature = "tray")]
 /// Tray handle, managed so the event pump can update its tooltip/state.
@@ -115,7 +122,19 @@ fn main() {
                                 let _ = w.hide();
                             }
                         }
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            // Stop the engine before exiting — otherwise Quit
+                            // silently orphans a running (VRAM-heavy) engine
+                            // child with no owning process to stop it.
+                            let app = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = app.state::<ControlState>().0.lock().unwrap().clone();
+                                if let Some(state) = state {
+                                    ninfier_control::engine::stop_engine(&state, None).await;
+                                }
+                                app.exit(0);
+                            });
+                        }
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
@@ -141,6 +160,8 @@ fn main() {
             }
 
             app.manage(EngineRunning(engine_running.clone()));
+            let control_state = ControlState::default();
+            app.manage(control_state.clone());
 
             // In a bundled (release) binary, serve the UI from Tauri's resource
             // dir — where frontendDist is baked at build time — instead of the
@@ -176,6 +197,7 @@ fn main() {
                     .expect("failed to build tokio runtime");
                 rt.block_on(async move {
                     let state = init_state(Some(ev_tx)).await;
+                    *control_state.0.lock().unwrap() = Some(state.clone());
                     boot_adopt(&state).await;
                     ninfier_control::remote::boot_start(&state).await;
                     if let Err(e) = serve_until_ready(state, port, Some(ready_tx)).await {

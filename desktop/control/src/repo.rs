@@ -69,7 +69,7 @@ pub async fn start_update(state: &S, action: &str) -> Value {
         "build" => cfg.build_command.clone(),
         _ => unreachable!(),
     };
-    if cmd.is_empty() {
+    if action == "build" && cmd.is_empty() {
         return json!({ "ok": false, "message": "buildCommand is not configured" });
     }
 
@@ -108,15 +108,26 @@ pub async fn start_update(state: &S, action: &str) -> Value {
         started_at: now_ms(),
     };
 
-    let mut sh_cmd = tokio::process::Command::new("sh");
-    sh_cmd
-        .arg("-c")
-        .arg(&cmd)
+    // "pull" runs `git` directly (no shell) so a repo path with spaces or
+    // shell metacharacters can't break out of the intended command — the
+    // path comes from user-editable config, reachable via `PUT /api/config`.
+    // "build" keeps `sh -c` since `buildCommand` is meant to be a shell
+    // command the user writes themselves.
+    let mut proc_cmd = if action == "pull" {
+        let mut c = tokio::process::Command::new("git");
+        c.arg("-C").arg(&repo).arg("pull").arg("--ff-only");
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&cmd);
+        c
+    };
+    proc_cmd
         .current_dir(&repo)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    clear_appimage_env(&mut sh_cmd);
-    let Ok(mut child) = sh_cmd.spawn() else {
+    clear_appimage_env(&mut proc_cmd);
+    let Ok(mut child) = proc_cmd.spawn() else {
         return json!({ "ok": false, "message": format!("could not spawn: {cmd}") });
     };
     rec.pid = child.id();
