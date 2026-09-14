@@ -102,7 +102,7 @@ impl ExecChild {
         match self {
             Self::Unix(c) => {
                 let st = c.wait().await?;
-                Ok(st.code().map(|c| c as i32).unwrap_or(-1))
+                Ok(st.code().unwrap_or(-1))
             }
             #[cfg(windows)]
             Self::Windows(w) => w.wait().await,
