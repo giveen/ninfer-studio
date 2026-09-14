@@ -796,23 +796,105 @@ mod tests {
 
     #[test]
     fn command_lines_use_the_right_shell_form() {
-        // Bash: the script is POSIX single-quoted, then MSVCRT-quoted so
-        // CreateProcessW's argv parsing hands bash ONE argument (a
-        // single-quoted script containing spaces would otherwise be split —
-        // `'` is not a quote character for the CRT parser).
+        // Bash: the script goes to bash -lc RAW (bash parses it as the
+        // command string) — arg_quote only guarantees it is ONE argv element
+        // for CreateProcessW's parser.
         let script = "echo 'it's'";
         assert_eq!(
             command_line(&Shell::Bash, script),
-            format!("bash -lc {}", arg_quote(&shell_quote(script)))
+            format!("bash -lc {}", arg_quote(script))
         );
-        assert!(command_line(&Shell::Bash, "ls").starts_with("bash -lc "));
+        assert_eq!(command_line(&Shell::Bash, "ls"), "bash -lc ls");
         // A script with spaces must come out double-quoted (one argument):
-        assert_eq!(command_line(&Shell::Bash, "a b"), "bash -lc \"'a b'\"");
+        assert_eq!(command_line(&Shell::Bash, "a b"), "bash -lc \"a b\"");
+        // Quotes round-trip through the MSVCRT parser (2N+1 backslash rule):
+        // the script `echo \"hi\"` is encoded so bash receives those exact
+        // bytes.
+        assert_eq!(
+            command_line(&Shell::Bash, r"echo \"hi\""),
+            "bash -lc \"echo \\\"hi\\\"\""
+        );
         // Cmd: `/d /s /c` with the script wrapped in one pair of quotes.
         assert_eq!(
             command_line(&Shell::Cmd, "echo hi"),
             "cmd /d /s /c \"echo hi\""
         );
+    }
+
+    /// The inverse of [`arg_quote`]: walk the encoded string exactly as the
+    /// UCRT argv parser does (2N backslashes + `"` → N + toggle; 2N+1 → N +
+    /// literal `"`; lone backslashes verbatim) and yield the one argument.
+    /// The round-trip test below is the real proof the Windows argv shape
+    /// preserves scripts byte-for-byte.
+    fn msvcrt_parse_arg(encoded: &str) -> String {
+        let b: Vec<u8> = encoded.as_bytes().to_vec();
+        let mut out = String::new();
+        let mut i = 0usize;
+        let mut in_quotes = false;
+        // `bash -lc <encoded>`: argv[2] starts after `-lc `.
+        let start = encoded.find(' ').map(|p| p + 1).unwrap_or(0);
+        i = start;
+        while i < b.len() {
+            let mut numslash = 0usize;
+            while i + numslash < b.len() && b[i + numslash] == b'\\' {
+                numslash += 1;
+            }
+            let p = i + numslash;
+            if p < b.len() && b[p] == b'"' {
+                if numslash % 2 == 0 {
+                    // `""` inside quotes is a literal quote (UCRT special
+                    // case); arg_quote never relies on it (it always emits
+                    // an odd backslash run before a literal `"`), but the
+                    // parser model must still match reality.
+                    if in_quotes && p + 1 < b.len() && b[p + 1] == b'"' {
+                        // copy the quote, skip its partner
+                    } else {
+                        in_quotes = !in_quotes;
+                        out.push_str(&"\\".repeat(numslash / 2));
+                        i = p + 1;
+                        continue;
+                    }
+                }
+                out.push_str(&"\\".repeat(numslash / 2));
+                out.push('"');
+                i = p + 1;
+                continue;
+            }
+            out.push_str(&"\\".repeat(numslash));
+            if p >= b.len() {
+                break;
+            }
+            if !in_quotes && (b[p] == b' ' || b[p] == b'\t') {
+                break;
+            }
+            out.push(b[p] as char);
+            i = p + 1;
+        }
+        out
+    }
+
+    #[test]
+    fn arg_quoting_round_trips_through_the_ucrt_parser() {
+        for script in [
+            "ls",
+            "",
+            "echo hi",
+            "cd 'dir with space' && echo done",
+            r"echo \"literal quotes\"",
+            r"echo a\ b",
+            r"echo trail\",
+            r"echo \"x\" && echo y",
+            "grep -r \"'single' and \\\"double\\\"\" .",
+            "echo $HOME && echo `id`",
+            "printf '%s\\n' line1 line2",
+        ] {
+            let encoded = command_line(&Shell::Bash, script);
+            let parsed = msvcrt_parse_arg(&encoded);
+            assert_eq!(
+                parsed, script,
+                "bash would receive {parsed:?} instead of {script:?} (encoded: {encoded:?})"
+            );
+        }
     }
 
     #[test]
