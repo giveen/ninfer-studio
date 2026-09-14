@@ -317,7 +317,7 @@ export function SafetyTab() {
           <div className="space-y-1">
             <p className="text-[12.5px] text-faint">Wraps <code className="font-mono">bash</code> in <code className="font-mono">bwrap</code> — host filesystem is read-only, only the workspace is writable. Requires <code className="font-mono">bwrap</code> installed.</p>
             {sandbox && !bwrapAvailable && (
-              <p className="text-[12.5px] text-warn">bwrap isn&apos;t installed on this host — the agent shell is running unsandboxed despite this being ON.</p>
+              <p className="text-[12.5px] text-warn">bwrap isn&apos;t usable on this host (not installed, or the kernel refuses its namespaces) — the agent shell is running unsandboxed despite this being ON.</p>
             )}
           </div>
           <button
@@ -331,11 +331,11 @@ export function SafetyTab() {
               sandbox && bwrapAvailable
                 ? 'Agent shell is wrapped in bwrap (writes limited to the workspace)'
                 : sandbox
-                  ? 'Sandbox is enabled but bwrap is not installed — the shell is actually running unsandboxed on the host'
+                  ? 'Sandbox is enabled but bwrap is not usable on this host — the shell is actually running unsandboxed on the host'
                   : 'Agent shell runs directly on the host'
             }
           >
-            {sandbox && bwrapAvailable ? 'ON' : sandbox ? 'ON · bwrap missing' : 'OFF'}
+            {sandbox && bwrapAvailable ? 'ON' : sandbox ? 'ON · bwrap unavailable' : 'OFF'}
           </button>
         </div>
       </SectionCard>
