@@ -200,7 +200,7 @@ struct AclGuard {
 /// idempotent.
 fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     use windows_sys::Win32::Security::Authorization::{
-        DELETE_ACCESS, NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_W,
+        NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{ACL, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, PSID};
 
