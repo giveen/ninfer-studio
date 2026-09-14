@@ -34,19 +34,19 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_SUCCESS, GetLastError, HLOCAL, LocalFree,
+    BOOL, CloseHandle, ERROR_SUCCESS, GENERIC_READ, GetLastError, HLOCAL, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    SE_OBJECT_TYPE, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, FreeSid, SECURITY_ATTRIBUTES, SE_OBJECT_TYPE, SID_AND_ATTRIBUTES,
+    DACL_SECURITY_INFORMATION, FreeSid, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
     TOKEN_MANDATORY_LABEL,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GENERIC_READ, OPEN_EXISTING,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -67,6 +67,10 @@ use windows_sys::Win32::System::Threading::{
 const PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL: usize = 0x0002_0012;
 /// Low mandatory integrity level SID (`SEC_MANDATORY_LABEL` low level).
 const LOW_INTEGRITY_SID: &str = "S-1-16-4";
+/// `EXPLICIT_ACCESS_W.grfAccessMode` value that REMOVES a matching ACE
+/// (Aclapi.h `DELETE_ACCESS` = 1; windows-sys 0.59 exports only the
+/// grant-side `SET_ACCESS` = 2).
+const DELETE_ACCESS: i32 = 1;
 /// `STILL_ACTIVE` exit code — the process is still running (shouldn't happen
 /// after `WaitForSingleObject` returns).
 const STILL_ACTIVE: u32 = 0x103;
@@ -100,7 +104,7 @@ fn pick_shell() -> &'static Shell {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-            .then(Shell::Bash)
+            .then_some(Shell::Bash)
             .unwrap_or(Shell::Cmd)
     });
     &SHELL
@@ -215,14 +219,14 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     }
 
     let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: (FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE) as u32,
-        grfAccessMode: (if add { SET_ACCESS } else { DELETE_ACCESS }) as u32,
-        grfInheritance: (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u32,
+        grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        grfAccessMode: if add { SET_ACCESS } else { DELETE_ACCESS },
+        grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE as u32,
-            TrusteeForm: TRUSTEE_IS_SID as u32,
-            TrusteeType: TRUSTEE_IS_UNKNOWN as u32,
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
             ptstrName: sid as *mut u16,
         },
     };
@@ -354,7 +358,7 @@ impl WinChild {
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         process,
-                        windows_sys::Win32::Foundation::INFINITE,
+                        windows_sys::Win32::System::Threading::INFINITE,
                     );
                     let mut code: u32 = 0;
                     let _ =
@@ -593,10 +597,10 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
                 wide_ptr(&nul_wide),
                 GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 OPEN_EXISTING,
                 0,
-                std::ptr::null(),
+                std::ptr::null_mut(),
             )
         };
         if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
@@ -640,7 +644,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             (EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW) as _,
             env.as_ptr() as *const _,
             wide_ptr(&cwd_wide),
-            &si_ex,
+            &si_ex as *const _,
             &mut pi,
         )
     };
@@ -677,10 +681,8 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     }
 
     // Convert the pipe read ends to `File` (takes ownership of the handles).
-    let stdout_file =
-        unsafe { std::fs::File::from_raw_handle(out_read as *mut _ as usize as i32) };
-    let stderr_file =
-        unsafe { std::fs::File::from_raw_handle(err_read as *mut _ as usize as i32) };
+    let stdout_file = unsafe { std::fs::File::from_raw_handle(out_read) };
+    let stderr_file = unsafe { std::fs::File::from_raw_handle(err_read) };
 
     Ok(ExecChild::Windows(WinChild {
         process: pi.hProcess,
@@ -748,7 +750,7 @@ mod tests {
         assert!(text.ends_with('\0'));
         let entries: Vec<&str> = text.split('\0').filter(|e| !e.is_empty()).collect();
         assert!(
-            entries.iter().any(|e| e == "NINFIER_TEST_KEEP_XYZ=fine"),
+            entries.iter().any(|e| *e == "NINFIER_TEST_KEEP_XYZ=fine"),
             "expected the kept var in: {entries:?}"
         );
         assert!(
