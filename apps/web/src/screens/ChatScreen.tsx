@@ -35,7 +35,7 @@ import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSuppor
 import { useChatAgent } from '../lib/chatAgent';
 import { coderBrowser, chatMemoryAddLearning, chatMemoryGet, critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, mcpCall, type CoderLearningKind, type McpToolInfo } from '../lib/api';
 import { readRecallChunk } from '../lib/observationPack';
-import { filterToolAllowList, mcpToolTier, mcpToolSchema, MCP_NAME_PREFIX } from '../lib/coderTools';
+import { filterToolAllowList, mcpToolTier, mcpToolSchema } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
 
