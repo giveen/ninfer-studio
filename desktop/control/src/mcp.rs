@@ -582,7 +582,7 @@ pub async fn server_restart(
         m.conns.remove(&name);
     }
     ensure_conn(&state, &name).await?;
-    Ok(servers_get(state).await)
+    Ok(servers_get(AxumState(state.clone())).await)
 }
 
 /// `GET /api/mcp/tools?scope=<workspace>` — the merged catalog of
