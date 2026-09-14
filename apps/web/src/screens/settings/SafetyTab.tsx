@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Check, Copy, GitCommit, Globe, Shield, ShieldCheck } from 'lucide-react';
-import { cn, SectionCard } from '../../components/ui';
+import { Check, Copy, GitCommit, Globe, Plus, Plug, RefreshCw, Shield, ShieldCheck, Trash2 } from 'lucide-react';
+import { Badge, Button, cn, SectionCard, Segmented, TextField } from '../../components/ui';
 import { useCoderSafety } from '../../lib/coderSafety';
 import { loadDefaultPerms, saveDefaultPerms } from '../../lib/coderStore';
 import { TOOLS, type PermConfig, type PermTier } from '../../lib/coderTools';
 import { getRemoteAccessStatus, startRemoteAccess, stopRemoteAccess, type RemoteAccessStatus } from '../../lib/api/remote';
+import { mcpServersGet, mcpServersUpsert, mcpServerDelete, mcpServerRestart, type McpServerInfo, type McpServerSpec } from '../../lib/api/mcp';
 
 function ToggleRow({ on, onToggle, onTitle, offTitle, onLabel = 'ON', offLabel = 'OFF' }: {
   on: boolean; onToggle: (next: boolean) => void; onTitle: string; offTitle: string; onLabel?: string; offLabel?: string;
@@ -18,6 +19,245 @@ function ToggleRow({ on, onToggle, onTitle, offTitle, onLabel = 'ON', offLabel =
     >
       {on ? onLabel : offLabel}
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) servers — external tool servers owned by the
+// control plane (desktop/control/src/mcp.rs). Their tools reach the agent
+// loops as `mcp__<server>__<tool>` and ride the same allow/ask/deny tiers;
+// the per-server row shown under each entry is the `mcp__<server>` fallback
+// key (mirrors the control plane's `tier_for`).
+// ---------------------------------------------------------------------------
+
+type McpDraft = {
+  name: string;
+  kind: 'stdio' | 'http';
+  command: string;
+  args: string;
+  cwd: string;
+  env: string;
+  url: string;
+  authorization: string;
+  headers: string;
+};
+
+const EMPTY_MCP_DRAFT: McpDraft = { name: '', kind: 'stdio', command: '', args: '', cwd: '', env: '', url: '', authorization: '', headers: '' };
+
+/** Space-separated `KEY=VALUE` pairs (env, headers) to a record. */
+function parseKvList(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const tok of raw.split(/\s+/).map((s) => s.trim()).filter(Boolean)) {
+    const eq = tok.indexOf('=');
+    if (eq <= 0) continue;
+    out[tok.slice(0, eq)] = tok.slice(eq + 1);
+  }
+  return out;
+}
+
+function McpServersCard({ perms, onServerTier }: {
+  perms: PermConfig;
+  onServerTier: (server: string, tier: PermTier) => void;
+}) {
+  const [servers, setServers] = useState<McpServerInfo[]>([]);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [busyName, setBusyName] = useState<string | null>(null);
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<McpDraft>(EMPTY_MCP_DRAFT);
+
+  const refresh = () => {
+    mcpServersGet()
+      .then((r) => setServers(r.servers))
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
+  };
+  // Connections come up asynchronously after a save/restart, so keep the
+  // status column live instead of forcing a manual refresh.
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 20_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const add = async () => {
+    const name = draft.name.trim();
+    const command = draft.command.trim();
+    const url = draft.url.trim();
+    if (!name) { setErr('Server name is required.'); return; }
+    if (draft.kind === 'stdio' && !command) { setErr('A command is required for a stdio server.'); return; }
+    if (draft.kind === 'http' && !url) { setErr('A URL is required for an HTTP server.'); return; }
+    setBusy(true);
+    setErr('');
+    const spec: McpServerSpec =
+      draft.kind === 'stdio'
+        ? {
+            name,
+            command,
+            args: draft.args.split(/\s+/).map((s) => s.trim()).filter(Boolean),
+            env: parseKvList(draft.env),
+            cwd: draft.cwd.trim() || undefined,
+          }
+        : {
+            name,
+            url,
+            headers: parseKvList(draft.headers),
+            authorization: draft.authorization.trim() || undefined,
+          };
+    try {
+      await mcpServersUpsert(spec);
+      setDraft(EMPTY_MCP_DRAFT);
+      setOpen(false);
+      refresh();
+    } catch (e) {
+      // The spec is persisted server-side even when the connection fails —
+      // refetch so the list shows the entry with its error status.
+      setErr(e instanceof Error ? e.message : String(e));
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const restart = async (name: string) => {
+    setBusyName(name);
+    setErr('');
+    try {
+      await mcpServerRestart(name);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyName(null);
+      refresh();
+    }
+  };
+
+  const del = async (name: string) => {
+    setBusyName(name);
+    setErr('');
+    try {
+      await mcpServerDelete(name);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyName(null);
+      setConfirmDel(null);
+      refresh();
+    }
+  };
+
+  return (
+    <SectionCard
+      title="MCP Servers"
+      icon={<Plug size={15} />}
+      description="External tool servers (Model Context Protocol) — spawned as child processes (stdio) or addressed over HTTP. Their tools reach the agents as mcp__<server>__<tool> through the same tiers as the built-ins; the per-server row under each entry covers all of its tools until a per-tool row overrides it."
+    >
+      <div className="space-y-3">
+        {servers.length === 0 && !open && (
+          <p className="text-[12.5px] text-faint">No servers configured. Add one to extend the agents with external tools (file systems, APIs, databases…).</p>
+        )}
+        {servers.map((s) => {
+          const key = `mcp__${s.name}`;
+          const tier = perms.tools[key] ?? 'allow';
+          const failed = s.status.startsWith('error:');
+          return (
+            <div key={s.name} className="space-y-1.5 rounded border border-line px-2.5 py-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-[12px] text-ink">{s.name}</span>
+                <Badge tone="neutral">{s.transport}</Badge>
+                <Badge tone={s.status === 'connected' ? 'ok' : failed ? 'danger' : 'warn'}>
+                  {s.status === 'connected' ? `connected · ${s.toolCount} tools` : s.status}
+                </Badge>
+                {s.pid != null && <span className="text-[11px] text-faint">pid {s.pid}</span>}
+                <div className="ml-auto flex items-center gap-1">
+                  <Button variant="ghost" size="sm" onClick={() => restart(s.name)} disabled={busyName !== null}>
+                    <RefreshCw size={12} /> {busyName === s.name ? '…' : 'Restart'}
+                  </Button>
+                  {confirmDel === s.name ? (
+                    <Button variant="danger" size="sm" onClick={() => del(s.name)} disabled={busyName !== null}>
+                      <Trash2 size={12} /> Confirm
+                    </Button>
+                  ) : (
+                    <Button variant="ghost" size="sm" onClick={() => setConfirmDel(s.name)} disabled={busyName !== null} title={`Delete ${s.name}`}>
+                      <Trash2 size={12} />
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {s.status === 'connected' && s.peer?.name && (
+                <p className="text-[11px] text-faint">{s.peer.name}{s.peer.version ? ` ${s.peer.version}` : ''}</p>
+              )}
+              <div className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
+                <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={`Default tier for every ${key}__* tool — per-tool rows (Coder sidebar) override`}>{key}</span>
+                {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    onClick={() => onServerTier(key, v)}
+                    title={`${v} every tool on ${s.name}`}
+                    className={cn(
+                      'rounded px-2 py-0.5 text-[11px] font-medium',
+                      tier === v
+                        ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
+                        : 'text-faint hover:bg-panel2 hover:text-mute',
+                    )}
+                  >
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+        {err && <p className="text-[12px] text-danger">{err}</p>}
+        {open ? (
+          <div className="space-y-2 rounded border border-line px-2.5 py-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <TextField value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} placeholder="server name" className="flex-1 font-mono text-[11.5px]" />
+              <Segmented
+                value={draft.kind}
+                options={[
+                  { value: 'stdio', label: 'stdio' },
+                  { value: 'http', label: 'http' },
+                ]}
+                onChange={(v) => setDraft({ ...draft, kind: v })}
+              />
+            </div>
+            {draft.kind === 'stdio' ? (
+              <>
+                <TextField value={draft.command} onChange={(v) => setDraft({ ...draft, command: v })} placeholder="command (e.g. npx, uvx, python)" className="font-mono text-[11.5px]" />
+                <TextField value={draft.args} onChange={(v) => setDraft({ ...draft, args: v })} placeholder="args, space-separated (e.g. -y @modelcontextprotocol/server-filesystem /data)" className="font-mono text-[11.5px]" />
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                  <TextField value={draft.cwd} onChange={(v) => setDraft({ ...draft, cwd: v })} placeholder="cwd (optional)" className="font-mono text-[11.5px]" />
+                  <TextField value={draft.env} onChange={(v) => setDraft({ ...draft, env: v })} placeholder="env KEY=VALUE pairs (optional)" className="font-mono text-[11.5px]" />
+                </div>
+              </>
+            ) : (
+              <>
+                <TextField value={draft.url} onChange={(v) => setDraft({ ...draft, url: v })} placeholder="https://host/mcp" className="font-mono text-[11.5px]" />
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                  <TextField value={draft.authorization} onChange={(v) => setDraft({ ...draft, authorization: v })} placeholder="authorization (optional)" className="font-mono text-[11.5px]" />
+                  <TextField value={draft.headers} onChange={(v) => setDraft({ ...draft, headers: v })} placeholder="headers KEY=VALUE (optional)" className="font-mono text-[11.5px]" />
+                </div>
+              </>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="primary" size="sm" onClick={add} disabled={busy}>
+                {busy ? 'Connecting…' : 'Save & connect'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => { setOpen(false); setErr(''); }}>
+                Cancel
+              </Button>
+              <p className="text-[11px] text-faint">Saved even if the first connection fails — it then shows an error status and can be restarted.</p>
+            </div>
+          </div>
+        ) : (
+          <Button variant="ghost" size="sm" onClick={() => { setOpen(true); setErr(''); }}>
+            <Plus size={12} /> Add server
+          </Button>
+        )}
+      </div>
+    </SectionCard>
   );
 }
 
@@ -160,6 +400,8 @@ export function SafetyTab() {
           )}
         </div>
       </SectionCard>
+
+      <McpServersCard perms={perms} onServerTier={setToolPerm} />
 
       <SectionCard
         title="Default permissions template"
