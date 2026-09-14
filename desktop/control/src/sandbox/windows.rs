@@ -696,8 +696,8 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     let stderr_file = unsafe { std::fs::File::from_raw_handle(err_read) };
 
     Ok(ExecChild::Windows(WinChild {
-        process: pi.hProcess,
-        job,
+        process: SendableHandle(pi.hProcess),
+        job: SendableHandle(job),
         stdout: Some(stdout_file),
         stderr: Some(stderr_file),
         exit_rx: None,
