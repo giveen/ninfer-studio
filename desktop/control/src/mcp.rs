@@ -468,9 +468,15 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
             _ => unreachable!("connect called with a spec that has no transport"),
         };
     let svc = fut.await?;
-    let peer = svc
-        .peer_info()
-        .and_then(|p| serde_json::to_value(p.as_ref()).ok());
+    let peer: Option<Value> = svc.peer_info().and_then(|p| {
+        let v = serde_json::to_value(p.as_ref()).ok()?;
+        // The stored info is the whole handshake result — the UI only wants
+        // the server's self-identification (`serverInfo`), not the
+        // capabilities/version negotiation. Fall back to the full value if
+        // a future shape doesn't carry `serverInfo`.
+        let inner = v.get("serverInfo").cloned().filter(|s| s.is_object());
+        Some(inner.unwrap_or(v))
+    });
     Ok((svc, peer, pid))
 }
 
@@ -1008,9 +1014,16 @@ pub async fn servers_upsert(
         spec.authorization = existing;
     }
     validate_spec(&spec)?;
-
-    {
-        let mut cfg = state.config.write().await;
+    // `validate_spec` is deliberately lenient (hand-edited configs without a
+    // transport are tolerated at load time and show as disconnected); the
+    // upsert endpoint is strict — a spec with neither a command nor a url is
+    // rejected before it is saved.
+    if spec.transport().is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "server needs a stdio command or an http(s) url" })),
+        ));
+    }
         match cfg.mcp_servers.iter_mut().find(|s| s.name == spec.name) {
             Some(s) => *s = spec.clone(),
             None => cfg.mcp_servers.push(spec.clone()),
@@ -1342,7 +1355,7 @@ mod tests {
     fn sanitize_and_split_names() {
         // Server names: alnum + '-', underscores stripped (they would break
         // the `mcp__<server>__<tool>` separator grammar).
-        assert_eq!(sanitize_server_name("my server"), "myserv");
+        assert_eq!(sanitize_server_name("my server"), "myserver");
         assert_eq!(sanitize_server_name("file_2"), "file2");
         assert_eq!(sanitize_server_name("fs-v2"), "fs-v2");
         assert_eq!(sanitize_server_name("!!!"), "");
@@ -1367,11 +1380,26 @@ mod tests {
 
     #[test]
     fn validate_spec_rejects_broken_configs() {
+        // Lenient on purpose: hand-edited configs without a transport are
+        // tolerated at load time (they show as disconnected); upsert is the
+        // strict gate for that (see `mcp_stdio_end_to_end`).
         let mut s = McpServerSpec::default();
         s.name = "none".into();
+        assert!(validate_spec(&s).is_ok());
+
+        // But the name must survive sanitization.
+        let mut s = McpServerSpec::default();
+        s.name = "!!!".into();
         let (st, body) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(body.0.get("error").is_some());
+
+        // And an over-long name is rejected.
+        let mut s = McpServerSpec::default();
+        s.name = "x".repeat(41);
+        s.command = Some("/bin/true".into());
+        let (st, _) = validate_spec(&s).unwrap_err();
+        assert_eq!(st, StatusCode::BAD_REQUEST);
 
         let mut s = McpServerSpec::default();
         s.name = "ok".into();
@@ -1453,6 +1481,13 @@ done
             "fake-mcp"
         );
         assert!(list[0].get("pid").unwrap().as_u64().unwrap() > 0);
+
+        // A spec with neither transport is rejected up front (400) and not
+        // saved.
+        let e = servers_upsert(ws(), Json(json!({ "name": "notr" }))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        let r = servers_get(ws()).await.0;
+        assert_eq!(r.get("servers").unwrap().as_array().unwrap().len(), 1);
 
         // Catalog: namespaced + effective tier (default → allow).
         let t = tools_get(
