@@ -90,7 +90,7 @@ type Reply = Value;
 /// failed task panics, and the session must always be droppable).
 /// `pub(crate)` so the other `!Send` actor (the MCP client in `mcp.rs`)
 /// reuses the same guard instead of reinventing it.
-pub(crate) struct PanicGuard<F>(F);
+pub(crate) struct PanicGuard<F>(pub F);
 
 impl<F: std::future::Future<Output = ()>> std::future::Future for PanicGuard<F> {
     type Output = ();
