@@ -380,6 +380,37 @@ fn default_max_steps() -> usize {
     12
 }
 
+/// Shared run construction + spawn — used by the `start` endpoint and by
+/// `delegate`/`subagent` child runs (tools.rs). The run is registered
+/// before the loop task starts, so a client can attach within the same
+/// tick the run begins.
+pub fn spawn_run(state: S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
+    let (tx, _rx) = broadcast::channel(512);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let shared = Arc::new(RunShared {
+        meta,
+        live: Mutex::new(live),
+        tx,
+        approvals: Mutex::new(HashMap::new()),
+        question_tx: Mutex::new(None),
+        recall: Mutex::new(HashMap::new()),
+        packed_cache: Mutex::new(HashMap::new()),
+        stop_tx,
+        stop_rx,
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3600))
+            .build()
+            .unwrap_or_default(),
+    });
+    state
+        .agent_runs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(shared.meta.id.clone(), shared.clone());
+    tokio::spawn(engine_loop::run(state, shared.clone()));
+    shared
+}
+
 /// `POST /api/agent/runs` — start a run. Returns `{id, status}`; follow the
 /// run via `GET /api/agent/runs/{id}/events` (SSE) or poll the snapshot.
 pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) -> Response {
