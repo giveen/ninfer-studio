@@ -57,14 +57,32 @@ This project takes a pragmatic stance on third-party advisories:
   locations regardless.
 - Closing the window hides to the tray and keeps the engine alive by design — quit
   explicitly from the tray menu to stop the engine.
-- **Coding harness confinement is asymmetric by design.** The `fs/*`, `grep`, and
-  `glob` endpoints (`desktop/control/src/coder/`) lexically confine every path to
-  the configured workspace. `exec`, however, runs a real `bash -lc <command>` whose
-  *starting* directory is confined but whose shell is not sandboxed (no chroot/
-  namespace/seccomp) — `cd /`, an absolute path, or a symlink reaches anywhere the
-  OS user can. Safe mode (on by default) blocks a fixed set of destructive patterns
-  before spawning, but that's a blocklist, not a security boundary — it does not
-  make `exec` workspace-confined the way the file tools are.
+- **Coding harness shell sandbox (default ON, per-OS mechanism).** `exec` runs
+  a real shell (`bash -lc <command>`; on Windows, git-bash when installed, else
+  `cmd /d /s /c`) wrapped in an OS-level sandbox unless the user disables it in
+  Settings → Safety & Permissions (`coderSandbox`, default on):
+  - **Linux** — bubblewrap: `/` bind-mounted read-only, the workspace (plus any
+    extra `sandboxBinds` roots) read-write, a private `/tmp`, dropped
+    capabilities, `--die-with-parent`. Falls back to an unsandboxed shell when
+    bwrap is missing or the kernel refuses its namespaces — the sandbox status
+    endpoint reports that state and the UI surfaces it, so the fallback is never
+    silent.
+  - **Windows** — the child is created at **low integrity** (`S-1-16-4`) inside
+    a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, assigned atomically at
+    `CreateProcessW`). The integrity policy refuses the child's writes to
+    medium-integrity host objects — files, the registry, other processes — even
+    where the DACL would allow them; the job kills the whole process tree on
+    timeout, kill, or abandonment. The workspace (plus `sandboxBinds` roots) is
+    made writable by a temporary write-ACE for the low-integrity SID, revoked
+    when the run ends. Caveat: pre-existing files created by medium-integrity
+    processes keep their label — the sandbox can read but not overwrite them
+    until a run touches them (new files it creates are low-labeled and stay
+    writable).
+  In neither mode is the sandbox a network boundary (builds still fetch), and
+  credential-looking environment variables (`*KEY*`, `*SECRET*`, `*TOKEN*`,
+  `*PASSWORD*`) are scrubbed from the child's environment on both OSes. Safe
+  mode (on by default) is a separate, complementary blocklist of destructive
+  command patterns — it is not a security boundary.
 - **`web_fetch` only reaches public hosts.** The URL an agent (or content it reads)
   passes to `web_fetch` is resolved and checked against loopback/RFC1918/link-local/
   CGNAT/multicast ranges — including through redirects — before any request is
@@ -77,8 +95,8 @@ This project takes a pragmatic stance on third-party advisories:
   connections, so JS redirects and in-page `fetch()` calls on a loaded page
   cannot reach internal services either. Note that the browser executes the
   page's JavaScript in-process (V8 via deno_core, on a per-session driver
-  thread); the threat model is intentionally the same as `exec`, where the
-  agent already has an unsandboxed shell. The page session is torn down
+  thread); the threat model is intentionally the same as `exec` — an
+  agent-controlled code-execution surface either way. The page session is torn down
   automatically after 10 minutes of inactivity.
 - **Remote Access (`remoteAccessEnabled`, Settings → Safety & Permissions) is
   intentionally unauthenticated.** Turning it on binds a second listener on
