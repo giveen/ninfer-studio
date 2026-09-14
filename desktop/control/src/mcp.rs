@@ -38,7 +38,6 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -244,7 +243,10 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     // types; the future is awaited here, not spawned, so no Send bound is
     // needed.)
     let mut pid: Option<u32> = None;
-    let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> =
+    // `spec.transport()` returns `Option<&str>` — `&str` cannot be matched
+    // exhaustively, so the wildcard arm catches any future transport kind the
+    // same way `None` (no transport configured) does.
+    let fut: Pin<Box<dyn std::future::Future<Output = Result<McpService, String>>>> =
         match spec.transport() {
             Some("stdio") => {
                 let cmd = spec.command.clone().unwrap_or_default();
@@ -331,7 +333,7 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
             }
             // `None` means "neither command nor url" — validate_spec and the
             // ensure_conn callers both reject that before we get here.
-            None => unreachable!("connect called with a spec that has no transport"),
+            _ => unreachable!("connect called with a spec that has no transport"),
         };
     let svc = fut.await?;
     let peer = svc
@@ -743,7 +745,9 @@ pub async fn mcp_call(
             (svc, original)
         };
 
-        let params = CallToolRequestParams::new(original.as_str()).with_arguments(arguments.clone());
+            // `CallToolRequestParams::new` wants a `Cow<'static, str>` —
+            // `original` is an owned String, so hand it over by value.
+            let params = CallToolRequestParams::new(original).with_arguments(arguments.clone());
         match timeout(CALL_TIMEOUT, svc.call_tool_once(params)).await {
             Ok(Ok(CallToolResponse::Complete(result))) => {
                 let failed = result.is_error == Some(true);
