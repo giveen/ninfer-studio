@@ -75,7 +75,9 @@ This project takes a pragmatic stance on third-party advisories:
     where the DACL would allow them; the job kills the whole process tree on
     timeout, kill, or abandonment. The workspace (plus `sandboxBinds` roots) is
     made writable by a temporary write-ACE for the low-integrity SID, revoked
-    when the run ends. Caveat: pre-existing files created by medium-integrity
+    when the run ends (on a hard crash the ACE can persist until the next run
+    over that path — it only grants write to low-integrity code, which is
+    untrusted territory regardless). Caveat: pre-existing files created by medium-integrity
     processes keep their label — the sandbox can read but not overwrite them
     until a run touches them (new files it creates are low-labeled and stay
     writable).
