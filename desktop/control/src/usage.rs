@@ -249,6 +249,8 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
             "activeDays": days_seen.len(),
             "avgCacheHitRate": cache_hit_rate,
             "mostUsedModel": most_used_model,
+            "avgPrefillTps": avg_prefill_tps,
+            "avgGenerationTps": avg_generation_tps,
             "energyKwh": energy_total_kwh,
         },
         "dailySeries": daily_series,
