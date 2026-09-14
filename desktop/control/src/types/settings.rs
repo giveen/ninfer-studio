@@ -192,11 +192,14 @@ impl McpServerSpec {
     /// written (both or neither of `command`/`url` set — the upsert endpoint
     /// rejects those, this is the load-time fallback for hand-edited configs).
     pub(crate) fn transport(&self) -> Option<&str> {
-        match (self.command.as_deref(), self.url.as_deref()) {
-            (Some(c), _) if !c.trim().is_empty() => Some("stdio"),
-            (_, Some(u)) if u.trim().is_empty() => Some("http"),
-            (None, Some(_)) => Some("http"),
-            _ => None,
+        let cmd = self.command.as_deref().unwrap_or("").trim();
+        let url = self.url.as_deref().unwrap_or("").trim();
+        if !cmd.is_empty() {
+            Some("stdio")
+        } else if !url.is_empty() {
+            Some("http")
+        } else {
+            None
         }
     }
 }
