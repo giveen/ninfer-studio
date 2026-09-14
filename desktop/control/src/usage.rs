@@ -71,25 +71,21 @@ fn usage_log_path(state: &S) -> PathBuf {
 /// lock map `coder::memory`/`chat::memory` use (keyed "usage" here) so
 /// concurrent requests can't interleave partial lines.
 async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
-    let (prefill_ms, total_ms) = (evt.prefill_ms, evt.total_ms);
-    let line = json!({
-        "ts": evt.ts_ms,
-        "day": day_string(evt.ts_ms),
-        "model": evt.model,
-        "source": evt.source.as_str(),
-        "promptTokens": evt.prompt_tokens,
-        "completionTokens": evt.completion_tokens,
-        "cachedTokens": evt.cached_tokens,
-    })
-    .to_string();
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".into(), json!(evt.ts_ms));
+    obj.insert("day".into(), json!(day_string(evt.ts_ms)));
+    obj.insert("model".into(), json!(evt.model));
+    obj.insert("source".into(), json!(evt.source.as_str()));
+    obj.insert("promptTokens".into(), json!(evt.prompt_tokens));
+    obj.insert("completionTokens".into(), json!(evt.completion_tokens));
+    obj.insert("cachedTokens".into(), json!(evt.cached_tokens));
     // Timing is optional and only present for streamed responses — omit the
     // keys entirely when absent so the log line shape stays clean.
-    let mut v: Value = serde_json::from_str(&line).unwrap();
-    if let Some(ms) = prefill_ms {
-        v["prefillMs"] = json!(ms);
-        v["totalMs"] = json!(total_ms.unwrap_or(ms));
+    if let (Some(prefill), Some(total)) = (evt.prefill_ms, evt.total_ms) {
+        obj.insert("prefillMs".into(), json!(prefill));
+        obj.insert("totalMs".into(), json!(total));
     }
-    let line = v.to_string();
+    let line = Value::Object(obj).to_string();
     let lock = mem_lock(state, "usage");
     let _guard = lock.lock().await;
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
