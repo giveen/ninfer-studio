@@ -762,7 +762,7 @@ mod tests {
         // the script `echo \"hi\"` is encoded so bash receives those exact
         // bytes.
         assert_eq!(
-            command_line(&Shell::Bash, r"echo \"hi\""),
+            command_line(&Shell::Bash, r#"echo \"hi\""#),
             "bash -lc \"echo \\\"hi\\\"\""
         );
         // Cmd: `/d /s /c` with the script wrapped in one pair of quotes.
