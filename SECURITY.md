@@ -51,12 +51,14 @@ This project takes a pragmatic stance on third-party advisories:
 - The control plane (`desktop/control`) is the only process that touches the engine;
   in the desktop app it runs inside the Tauri core, so the engine's parent is the app
   itself (single-process supervision, no orphaned engines).
-- The engine API proxy injects the API key server-side; keep `data/config.json`
-  (which holds settings, not secrets) out of shared locations.
+- The engine API proxy injects the API key server-side. `data/config.json` holds
+  real secrets (`apiKey`, `hfToken`) in the clear, not just settings — the control
+  plane writes it `0600` (owner read/write only) and it must stay out of shared
+  locations regardless.
 - Closing the window hides to the tray and keeps the engine alive by design — quit
   explicitly from the tray menu to stop the engine.
 - **Coding harness confinement is asymmetric by design.** The `fs/*`, `grep`, and
-  `glob` endpoints (`desktop/control/src/coder.rs`) lexically confine every path to
+  `glob` endpoints (`desktop/control/src/coder/`) lexically confine every path to
   the configured workspace. `exec`, however, runs a real `bash -lc <command>` whose
   *starting* directory is confined but whose shell is not sandboxed (no chroot/
   namespace/seccomp) — `cd /`, an absolute path, or a symlink reaches anywhere the

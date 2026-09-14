@@ -154,7 +154,7 @@ pub(crate) async fn persist_config(state: &S, cfg: &AppSettings) -> Result<(), (
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
     }
-    if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(cfg).unwrap()).await {
+    if let Err(e) = crate::atomic_write_secret(&path, serde_json::to_string_pretty(cfg).unwrap()).await {
         tracing::event!(
             name: "config.persist.failed",
             tracing::Level::ERROR,
@@ -222,7 +222,7 @@ pub(crate) async fn profile_state_set(
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
     }
-    if let Err(e) = tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
+    if let Err(e) = crate::atomic_write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
         tracing::event!(
             name: "profile_state.persist.failed",
             tracing::Level::ERROR,
@@ -287,7 +287,7 @@ pub(crate) async fn conversations_set(
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
     }
-    if let Err(e) = tokio::fs::write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
+    if let Err(e) = crate::atomic_write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
         tracing::event!(
             name: "conversations.persist.failed",
             tracing::Level::ERROR,

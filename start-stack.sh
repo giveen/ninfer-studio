@@ -12,10 +12,29 @@
 #   CODER_WORKSPACE  Coder workspace (optional; seeds config)
 #   ARTIFACT         .ninfer artifact to auto-start (optional)
 #   ENGINE_PORT      engine port     (default: 8080)
+#   --force          push config into an already-running control plane
+#                    (e.g. the Tauri app) instead of refusing to start
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTROL_BIN="$ROOT/desktop/target/debug/ninfier-control"
 ENGINE_PORT="${ENGINE_PORT:-8080}"
+FORCE=0
+for arg in "$@"; do
+  [ "$arg" = "--force" ] && FORCE=1
+done
+
+# A control plane already listening on :8787 (most commonly the Tauri app,
+# which runs the same control plane in-process) means the code below would
+# silently push our config into someone else's live process and report
+# "ready" — refuse unless the caller explicitly opts in.
+if curl -s -o /dev/null http://127.0.0.1:8787/health; then
+  if [ "$FORCE" -ne 1 ]; then
+    echo "[stack] a control plane is already listening on :8787 (e.g. the Tauri app) — refusing to commandeer it. Pass --force to push config into it anyway." >&2
+    exit 1
+  fi
+  echo "[stack] --force: a control plane is already on :8787 — pushing config into it" >&2
+fi
+
 LOG=/tmp/ninfier-stack.log
 exec > "$LOG" 2>&1
 echo "[stack] starting at $(date -Is)"

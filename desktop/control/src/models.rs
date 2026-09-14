@@ -55,6 +55,15 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
     if repo.is_empty() || file.is_empty() {
         return json!({ "ok": false, "message": "repo and file are required" });
     }
+    {
+        let downloads = state.downloads.lock().await;
+        let already_running = downloads
+            .values()
+            .any(|r| !r.done && r.repo.as_deref() == Some(repo) && r.file.as_deref() == Some(file));
+        if already_running {
+            return json!({ "ok": false, "message": format!("a download for {repo}/{file} is already running") });
+        }
+    }
     let cfg = state.config.read().await.clone();
     let dir = body
         .get("localDir")
@@ -159,12 +168,13 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
         let st = state.clone();
         let idm = id.clone();
         let dir_m = dir.clone();
+        let file_m = file.to_string();
         tokio::spawn(async move {
             let mut last = 0u64;
             let mut last_t = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                let cur = largest_file_size_under(std::path::Path::new(&dir_m));
+                let cur = download_progress_bytes(&dir_m, &file_m);
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(last_t).as_secs_f64();
                 let finished = {
@@ -234,26 +244,21 @@ fn parse_size(s: &str) -> Option<u64> {
     Some((v * mult) as u64)
 }
 
-/// Largest file size anywhere under `root` — the in-progress staging blob is
-/// the largest file during a download, so this yields downloaded bytes.
-fn largest_file_size_under(root: &std::path::Path) -> u64 {
-    let mut max = 0u64;
-    fn walk(dir: &std::path::Path, max: &mut u64) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, max);
-                } else if let Ok(m) = e.metadata()
-                    && m.len() > *max
-                {
-                    *max = m.len();
-                }
-            }
-        }
+/// Bytes downloaded so far for `file` under `dir` — stats only the two paths
+/// `hf download --local-dir` can actually be writing to (the in-progress
+/// staging blob under its `.cache/huggingface/download/` scratch dir, or the
+/// finished file once moved into place) instead of walking the whole
+/// directory tree, which would also pick up unrelated multi-GB sibling
+/// artifacts already downloaded there.
+fn download_progress_bytes(dir: &str, file: &str) -> u64 {
+    let root = std::path::Path::new(dir);
+    if let Ok(m) = std::fs::metadata(root.join(file)) {
+        return m.len();
     }
-    walk(root, &mut max);
-    max
+    let staging = root
+        .join(".cache/huggingface/download")
+        .join(format!("{file}.incomplete"));
+    std::fs::metadata(staging).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Resolve the total download size via `hf download --dry-run --json` (no
@@ -268,7 +273,12 @@ async fn fetch_download_size(cli: &str, repo: &str, file: &str, dir: &str) -> Op
         .arg("--dry-run")
         .arg("--json");
     clear_appimage_env(&mut cmd);
-    let out = cmd.output().await.ok()?;
+    // A hung `hf` (bad network, stuck auth prompt) must not hang the whole
+    // download request forever.
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
     let arr = v.as_array()?;
     let first = arr.first()?;

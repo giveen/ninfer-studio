@@ -1,10 +1,10 @@
 name: CI / Web
 
-# Type-check + production build of the React app, plus the API-surface
-# registration gate (every /api/* path the UI calls must be registered by
-# the Rust control plane). Runs on pull requests that touch the web app or
-# the control-plane router (including forks) and on direct pushes to main,
-# so the lockfile and TS surfaces can't silently drift.
+# Type-check + production build of the React app, the vitest unit suite,
+# plus the API-surface registration gate (every /api/* path the UI calls
+# must be registered by the Rust control plane). Runs on pull requests that
+# touch the web app or the control-plane router (including forks) and on
+# direct pushes to main, so the lockfile and TS surfaces can't silently drift.
 
 on:
   pull_request:
@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   web:
-    name: tsc + vite build
+    name: tsc + vite build + tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -51,5 +51,9 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Type-check + build (apps/web)
         run: pnpm --filter @ninfier/web build
+      - name: Unit tests (apps/web)
+        run: pnpm --filter @ninfier/web test
       - name: API surface registration (UI endpoints vs control plane)
         run: node scripts/api-parity.mjs
+      - name: Version parity (apps/web vs root)
+        run: node scripts/check-web-version.mjs

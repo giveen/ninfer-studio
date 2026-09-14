@@ -31,7 +31,16 @@ fn is_secret_env_var(name: &str) -> bool {
 }
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-const CWD_MARKER: &str = "<ninfx_cwd>";
+
+/// A per-invocation cwd marker (never a fixed string) — a command whose own
+/// output happens to contain a *fixed* marker would corrupt the session's
+/// tracked cwd; a marker unique to this call can't collide with real output.
+fn make_cwd_marker() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("<ninfx_cwd_{t:x}_{n:x}>")
+}
 
 /// Shell commands that can cause irreversible data loss or system damage,
 /// mirrored 1:1 from the sidecar's `detectDestructive`.
@@ -102,7 +111,7 @@ pub(crate) async fn persist_bool_setting(state: &S, set: impl FnOnce(&mut crate:
     if is_safe_base_dir(&state.data_dir) {
         let path = state.data_dir.join("config.json");
         let _ = tokio::fs::create_dir_all(&state.data_dir).await;
-        let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
+        let _ = crate::atomic_write_secret(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
     }
     *state.config.write().await = merged;
 }
@@ -161,7 +170,7 @@ pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>)
         if is_safe_base_dir(&state.data_dir) {
             let path = state.data_dir.join("config.json");
             let _ = tokio::fs::create_dir_all(&state.data_dir).await;
-            let _ = tokio::fs::write(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
+            let _ = crate::atomic_write_secret(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
         }
         *state.config.write().await = merged;
     }
@@ -205,6 +214,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
 
     // Stateful sessions: run from the session's last cwd and capture the new
     // one via a marker (no long-lived shell process to orphan).
+    let cwd_marker = make_cwd_marker();
     let (spawn_cwd, run_cmd, session) = if !session_id.is_empty() {
         let base = state
             .shell_sessions
@@ -214,7 +224,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             .cloned()
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
         let wrapped = format!(
-            "cd {} 2>/dev/null || true\n{}\nprintf '\\n{CWD_MARKER}%s{CWD_MARKER}\\n' \"$PWD\"",
+            "cd {} 2>/dev/null || true\n{}\nprintf '\\n{cwd_marker}%s{cwd_marker}\\n' \"$PWD\"",
             shell_quote(&base),
             command
         );
@@ -311,8 +321,8 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             jobs.insert(id.clone(), job.clone());
         }
         let sid = session.clone();
-        tokio::spawn(drain_bg_job(job, child, sid, state.clone(), timeout_ms));
-        return Ok(Json(json!({"jobId": id, "started": true})));
+        tokio::spawn(drain_bg_job(job, child, sid, state.clone(), timeout_ms, cwd_marker.clone()));
+        return Ok(Json(json!({"jobId": id, "started": true, "sandboxed": sandboxed})));
     }
 
     // Take the pipes up front and drain both streams concurrently so a large
@@ -353,6 +363,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
                 "timedOut": true,
                 "truncated": false,
                 "cwd": result_cwd,
+                "sandboxed": sandboxed,
             })))
         }
         Ok(Err(e)) => Ok(Json(json!({
@@ -362,16 +373,17 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             "timedOut": false,
             "truncated": false,
             "cwd": result_cwd,
+            "sandboxed": sandboxed,
         }))),
         Ok(Ok((so, se, status))) => {
             let mut stdout = String::from_utf8_lossy(&so).into_owned();
             let stderr_raw = String::from_utf8_lossy(&se).into_owned();
             // Pull the session cwd out of the marker and strip it from stdout.
             if let Some(sid) = &session
-                && let Some(first) = stdout.find(CWD_MARKER)
+                && let Some(first) = stdout.find(&cwd_marker)
             {
-                let rest = &stdout[first + CWD_MARKER.len()..];
-                if let Some(end) = rest.find(CWD_MARKER) {
+                let rest = &stdout[first + cwd_marker.len()..];
+                if let Some(end) = rest.find(&cwd_marker) {
                     let new_cwd = rest[..end].trim().to_string();
                     if !new_cwd.is_empty() {
                         state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
@@ -388,6 +400,7 @@ pub async fn exec(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
                 "timedOut": false,
                 "truncated": t_out || t_err,
                 "cwd": result_cwd,
+                "sandboxed": sandboxed,
             })))
         }
     }
@@ -438,7 +451,7 @@ impl BgJob {
 /// Drain a background child: stream pipes to EOF in the background while a
 /// 1s wait-poll honors kill requests and the deadline, then record capped
 /// output (+ session cwd bookkeeping, like the foreground path).
-async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Child, session: Option<String>, state: S, timeout_ms: u64) {
+async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Child, session: Option<String>, state: S, timeout_ms: u64, cwd_marker: String) {
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
     let out_h = tokio::spawn(async move {
@@ -481,10 +494,10 @@ async fn drain_bg_job(job: std::sync::Arc<BgJob>, mut child: tokio::process::Chi
     let killed = st.killed;
     let mut stdout = String::from_utf8_lossy(&so).into_owned();
     if let Some(sid) = &session
-        && let Some(first) = stdout.find(CWD_MARKER)
+        && let Some(first) = stdout.find(&cwd_marker)
     {
-        let rest = &stdout[first + CWD_MARKER.len()..];
-        if let Some(end) = rest.find(CWD_MARKER) {
+        let rest = &stdout[first + cwd_marker.len()..];
+        if let Some(end) = rest.find(&cwd_marker) {
             let new_cwd = rest[..end].trim().to_string();
             if !new_cwd.is_empty() {
                 state.shell_sessions.lock().await.insert(sid.clone(), new_cwd);
