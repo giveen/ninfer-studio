@@ -223,7 +223,7 @@ pub async fn search(
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     #[serde(default)]
-    workspace: Option<String>,
+    pub workspace: Option<String>,
 }
 
 pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
