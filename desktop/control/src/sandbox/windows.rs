@@ -26,9 +26,7 @@
 //! matches the model codex runs on Windows.
 
 use super::{is_secret_env_var, shell_quote, ExecChild, SpawnReq};
-use std::ffi::OsStr;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
