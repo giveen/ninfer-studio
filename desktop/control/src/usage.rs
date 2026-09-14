@@ -209,6 +209,16 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
 
     let most_used_model = by_model.iter().max_by_key(|(_, tok)| **tok).map(|(m, _)| m.clone());
     let cache_hit_rate = if prompt_total > 0 { cached_total as f64 / prompt_total as f64 } else { 0.0 };
+    let avg_prefill_tps = if speed_prefill_secs > 0.0 {
+        Some(speed_prompt_tokens as f64 / speed_prefill_secs)
+    } else {
+        None
+    };
+    let avg_generation_tps = if speed_decode_secs > 0.0 {
+        Some(speed_completion_tokens as f64 / speed_decode_secs)
+    } else {
+        None
+    };
 
     let daily_series: Vec<Value> = by_day
         .iter()
