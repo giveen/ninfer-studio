@@ -401,7 +401,7 @@ async fn log_from_response_bytes(
         .unwrap_or(0);
     let _ = log_usage_event(
         &ctx.state,
-        UsageEvent { ts_ms: now_ms(), model, source: ctx.source, prompt_tokens, completion_tokens, cached_tokens },
+        UsageEvent { ts_ms: now_ms(), model, source: ctx.source, prompt_tokens, completion_tokens, cached_tokens, prefill_ms, total_ms },
     )
     .await;
 }
