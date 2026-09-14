@@ -369,22 +369,16 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
 // Child handle
 // ---------------------------------------------------------------------------
 
-/// A HANDLE is a raw pointer, and raw pointers are not `Send` — wrap one so
-/// [`WinChild`] can cross threads (the background-job drain task owns the
-/// child on another runtime worker thread).
-///
-/// Safe: each handle is used through its owning `WinChild` only; the process
-/// handle is detached (nulled here, owned by the reaper) before it moves.
-struct SendableHandle(*mut std::ffi::c_void);
-
-unsafe impl Send for SendableHandle {}
-
 /// A child spawned via `CreateProcessW` into a job object, optionally at low
 /// integrity. Dropping it revokes the ACL grants and — via
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — kills anything still running.
+///
+/// The handles live in `std::os::windows::io::OwnedHandle` (`Send + Sync`,
+/// closes on drop) so the child can cross threads; the exit reaper works on
+/// the raw handle *value* and never closes one.
 pub struct WinChild {
-    process: SendableHandle,
-    job: SendableHandle,
+    process: Option<std::os::windows::io::OwnedHandle>,
+    job: std::os::windows::io::OwnedHandle,
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
     /// One-shot exit channel fed by a blocking reaper (see [`Self::wait`]).
@@ -392,6 +386,12 @@ pub struct WinChild {
     exit_code: Option<i32>,
     /// Low-integrity write grants, revoked on drop.
     acls: Vec<AclGuard>,
+}
+
+/// Convert a raw handle value back to the pointer form the Win32 APIs take
+/// (through `u32`, so `INVALID_HANDLE_VALUE` keeps its 32-bit shape).
+fn as_handle(raw: std::raw::HANDLE) -> *mut std::ffi::c_void {
+    raw as u32 as *mut _
 }
 
 impl WinChild {
@@ -406,7 +406,7 @@ impl WinChild {
     /// Kill the whole tree (shell + grandchildren) via the job object.
     pub fn start_kill(&mut self) {
         unsafe {
-            let _ = TerminateJobObject(self.job.0, 1);
+            let _ = TerminateJobObject(as_handle(self.job.as_raw_handle()), 1);
         }
     }
 
@@ -420,12 +420,18 @@ impl WinChild {
         }
         if self.exit_rx.is_none() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            // A HANDLE is a raw pointer (not `Send`) — detach it and hand it
-            // to the blocking reaper through a `Send` wrapper.
-            let process = self.process;
-            self.process = SendableHandle(std::ptr::null_mut());
+            // The reaper gets the handle VALUE (an `i32` — `Send`); the
+            // `OwnedHandle` field keeps the handle valid (and closes it) for
+            // as long as this struct lives. If this struct is dropped first,
+            // the reaper's wait simply unblocks and its exit-code query is a
+            // harmless no-op.
+            let raw = self
+                .process
+                .as_ref()
+                .map(|h| h.as_raw_handle())
+                .unwrap_or(0);
             tokio::task::spawn_blocking(move || {
-                let handle = process.0;
+                let handle = as_handle(raw);
                 let code = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
@@ -436,7 +442,6 @@ impl WinChild {
                         windows_sys::Win32::System::Threading::GetExitCodeProcess(
                             handle, &mut code,
                         );
-                    let _ = CloseHandle(handle);
                     if code == STILL_ACTIVE { -1 } else { code as i32 }
                 };
                 let _ = tx.send(code);
@@ -457,15 +462,12 @@ impl WinChild {
 
 impl Drop for WinChild {
     fn drop(&mut self) {
+        // Kill any survivors (no-op if already exited). The `OwnedHandle`
+        // fields then close their handles right after this body — closing
+        // the job object is the last line of containment (`KILL_ON_JOB_CLOSE`)
+        // if the exec future is abandoned without a wait/kill.
         unsafe {
-            // Kill any survivors (no-op if already exited), then release the
-            // job — `KILL_ON_JOB_CLOSE` is the last line of containment if
-            // the exec future is abandoned without a wait/kill.
-            let _ = TerminateJobObject(self.job.0, 1);
-            let _ = CloseHandle(self.job.0);
-            if !self.process.0.is_null() {
-                let _ = CloseHandle(self.process.0);
-            }
+            let _ = TerminateJobObject(as_handle(self.job.as_raw_handle()), 1);
         }
         // `acls` drop here → revoke the low-integrity write grants.
     }
@@ -757,8 +759,10 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     let stderr_file = unsafe { std::fs::File::from_raw_handle(err_read) };
 
     Ok(ExecChild::Windows(WinChild {
-        process: SendableHandle(pi.hProcess),
-        job: SendableHandle(job),
+        process: Some(std::os::windows::io::OwnedHandle::new(
+            pi.hProcess as usize as std::raw::HANDLE,
+        )),
+        job: std::os::windows::io::OwnedHandle::new(job as usize as std::raw::HANDLE),
         stdout: Some(stdout_file),
         stderr: Some(stderr_file),
         exit_rx: None,
