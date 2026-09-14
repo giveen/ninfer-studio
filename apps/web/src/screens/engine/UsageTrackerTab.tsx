@@ -152,6 +152,8 @@ export function UsageTrackerTab() {
         <Stat label="Requests" value={totals ? totals.requests.toLocaleString() : '—'} />
         <Stat label="Active days" value={totals ? totals.activeDays.toLocaleString() : '—'} />
         <Stat label="Avg cache hit rate" value={cacheHitPct} />
+        <Stat label="Avg prefill" value={fmtTps(totals?.avgPrefillTps)} sub="prompt tok/s, streamed" />
+        <Stat label="Avg generation" value={fmtTps(totals?.avgGenerationTps)} sub="completion tok/s, streamed" />
         <Stat label="Most used model" value={totals?.mostUsedModel ?? '—'} />
         <Stat label="Energy used" value={totals ? `${totals.energyKwh.toFixed(2)} kWh` : '—'} />
         <Stat
