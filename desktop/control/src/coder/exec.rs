@@ -1,34 +1,20 @@
 // Rust guideline compliant 2026-07-28
 
 //! Shell execution for the coder harness: `bash -lc` runner, safe-mode
-//! blocklist, optional bubblewrap sandbox, secret-env scrubbing, and the
-//! background-job registry the client polls.
+//! blocklist, per-OS sandbox (see `crate::sandbox`), secret-env scrubbing,
+//! and the background-job registry the client polls.
 
 use super::common::{enforce_perm, is_safe_base_dir, perm_scope, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
+use crate::sandbox::shell_quote;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
-
-/// Case-insensitive substrings marking an environment variable as a
-/// credential. A `bash` command's text comes from the model, which can be
-/// steered by untrusted input (a file or web page it read) — this process's
-/// own environment must not be handed to it wholesale, or a var like
-/// `GITHUB_TOKEN` already exported in the user's own shell before launch
-/// becomes readable/leakable by an agent-run command.
-const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
-
-fn is_secret_env_var(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    SECRET_ENV_PATTERNS.iter().any(|p| upper.contains(p))
-}
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
@@ -94,11 +80,6 @@ fn cap_out(s: &str) -> (String, bool) {
     }
 }
 
-/// Single-quote a path for `bash -lc` (embedded quotes escaped).
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Persist a single boolean `AppSettings` field to `config.json`, mirroring
 /// `sandbox_set`'s exact read-merge-write shape (a full save-config round
 /// trip would also work, but every coder toggle already updates its own
@@ -139,52 +120,26 @@ pub async fn commit_approval_set(AxumState(state): AxumState<S>, Json(req): Json
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem sandbox (bubblewrap) — mirrors the sidecar's `coderSandbox`.
+// Sandbox toggles — the mechanism is per-OS (see `crate::sandbox`): bubblewrap
+// on Linux, Job Object + low integrity on Windows.
 // ---------------------------------------------------------------------------
 
-/// Whether bubblewrap is *usable* on this machine. Checked once per process:
-/// not only must `bwrap` be installed, it must be able to create its
-/// namespaces — on kernels or hardened runtimes (e.g. default Docker
-/// seccomp) that forbid unprivileged user namespaces, bwrap exits 1 with
-/// "No permissions to create a new namespace" on every invocation. Probing
-/// with the same namespace flags the wrapper uses means such hosts get the
-/// same transparent fallback as hosts without bwrap, instead of every exec
-/// failing with a cryptic exit 1; `sandbox_get` also stops claiming the
-/// sandbox is available when it actually can't start.
-pub fn bwrap_available() -> bool {
-    static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-        let installed = std::process::Command::new("which")
-            .arg("bwrap")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !installed {
-            return false;
-        }
-        // Same namespace/unpriv flags as the wrapper below, minimal binds,
-        // trivial payload: if *this* can't start, neither can a real exec.
-        let mut probe = std::process::Command::new("bwrap");
-        probe
-            .arg("--ro-bind").arg("/").arg("/")
-            .arg("--tmpfs").arg("/tmp")
-            .arg("--proc").arg("/proc")
-            .arg("--dev").arg("/dev")
-            .arg("--unshare-pid")
-            .arg("--cap-drop").arg("ALL")
-            .arg("--")
-            .arg("/usr/bin/true");
-        probe.stdout(Stdio::null()).stderr(Stdio::null());
-        probe
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    });
-    *AVAILABLE
+/// The JSON every sandbox GET/SET endpoint returns: the setting, the active
+/// mechanism, and whether that mechanism can actually run on this machine.
+/// `bwrapAvailable` is kept as a legacy alias for pre-OS-aware clients.
+fn sandbox_status_json(c: &crate::types::AppSettings) -> Value {
+    json!({
+        "enabled": c.coder_sandbox,
+        "sandboxBinds": c.sandbox_binds,
+        "bwrapAvailable": crate::sandbox::available() && crate::sandbox::policy() == "bwrap",
+        "available": crate::sandbox::available(),
+        "kind": crate::sandbox::policy(),
+    })
 }
 
 pub async fn sandbox_get(AxumState(state): AxumState<S>) -> Json<Value> {
     let c = state.config.read().await;
-    Json(json!({"enabled": c.coder_sandbox, "sandboxBinds": c.sandbox_binds, "bwrapAvailable": bwrap_available()}))
+    Json(sandbox_status_json(&c))
 }
 
 pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
@@ -206,7 +161,7 @@ pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>)
         *state.config.write().await = merged;
     }
     let c = state.config.read().await;
-    Json(json!({"enabled": c.coder_sandbox, "sandboxBinds": c.sandbox_binds, "bwrapAvailable": bwrap_available()}))
+    Json(sandbox_status_json(&c))
 }
 
 /// Run a shell command via `bash -lc`. Unlike `fs_*`/`grep`/`glob`, this is
