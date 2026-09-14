@@ -784,11 +784,6 @@ mod tests {
         (state, tmp)
     }
 
-    fn state_with_server(state: &S, spec: McpServerSpec) {
-        tokio::task::block_in_place; // no-op guard: we're in #[tokio::test]
-        let _ = state;
-    }
-
     #[test]
     fn sanitize_server_name_drops_underscores_and_junk() {
         assert_eq!(sanitize_server_name("my server!"), "myserver");
