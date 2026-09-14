@@ -6,7 +6,7 @@ import { frameCompactedSummary } from './api';
 import { effectiveSystemPrompt } from './notai';
 import type { ChatMessage, ChatParams, Conversation } from './types';
 import type { CoderMemory } from './api/coder';
-import { TOOLS, type PermConfig } from './coderTools';
+import { TOOLS, mcpToolTier, type PermConfig } from './coderTools';
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
