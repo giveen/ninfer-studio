@@ -9,6 +9,11 @@ workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
+# `process` enables tokio's `ChildStdout/Stderr::into_std()` (AsyncFd-backed
+# pipes), which the sandbox layer uses to hand stdout/stderr to a blocking
+# thread. Not needed on Windows — the sandbox owns raw pipes there.
+[target.'cfg(not(windows))'.dependencies]
+tokio = { workspace = true, features = ["process"] }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.7", features = ["fs", "cors"] }
 tower = { version = "0.5", features = ["util"] }
