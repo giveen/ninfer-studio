@@ -544,8 +544,9 @@ pub async fn servers_upsert(
     Ok(servers_get(state).await)
 }
 
-/// `DELETE /api/mcp/servers/{name}` — drop the connection and remove the
-/// spec from the persisted config.
+/// `POST /api/mcp/servers/{name}` — drop the connection and remove the
+/// spec from the persisted config. (POST rather than DELETE: the control
+/// plane's CORS allow-list only carries GET/POST.)
 pub async fn server_delete(
     AxumState(state): AxumState<S>,
     AxumPath(name): AxumPath<String>,
