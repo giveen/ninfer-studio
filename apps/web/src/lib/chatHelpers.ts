@@ -118,7 +118,7 @@ function toolsAvailableBlock(toolNames: string[]): string {
 
 export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory, computerUseDir?: string, toolNames?: string[]): string => {
   const base = effectiveSystemPrompt(params);
-  return [base, localDateTimeBlock(), CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? '')].filter(Boolean).join('\n\n');
+  return [base, CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? ''), localDateTimeBlock()].filter(Boolean).join('\n\n');
 };
 
 export const CHAT_TOOLS = [
@@ -229,11 +229,12 @@ export const COMPUTER_USE_TOOLS = [...TOOLS, CHAT_SET_DIRECTORY_TOOL];
  *  first. */
 export function dedupeTools<T extends { function: { name: string } }>(tools: T[]): T[] {
   const seen = new Set<string>();
-  return tools.filter((t) => {
+  const unique = tools.filter((t) => {
     if (seen.has(t.function.name)) return false;
     seen.add(t.function.name);
     return true;
   });
+  return unique.sort((a, b) => a.function.name.localeCompare(b.function.name));
 }
 
 /** Client-side permission gate for Computer Use tools — mirrors Coder's own

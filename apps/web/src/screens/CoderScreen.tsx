@@ -732,7 +732,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
   const refreshRepoMap = useCallback(async () => {
     let sys = CODER_SYSTEM;
-    sys += `\n\n${localDateTimeBlock()}`;
     try {
       const rMap = await coderRepoMap();
       if (rMap && rMap.map) {
@@ -873,6 +872,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const lensBlock = coderLensBlock(coderParamsRef.current.reviewLens);
     if (lensBlock) sys += `\n\n# Review lens\n${lensBlock}\n`;
 
+    sys += `\n\n${localDateTimeBlock()}`;
     dynamicSystemRef.current = sys;
   }, []);
 
