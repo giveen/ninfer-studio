@@ -308,7 +308,6 @@ export class RunStream {
           return;
         }
       }
-      void snap;
       if (this.done) return;
     }
   }
