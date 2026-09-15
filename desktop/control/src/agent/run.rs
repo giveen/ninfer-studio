@@ -468,10 +468,13 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
         }
     };
 
-    let model = body.model.filter(|m| !m.is_empty()).unwrap_or_else(|| {
+    let model = body.model.filter(|m| !m.is_empty()).unwrap_or_default();
+    let model = if model.is_empty() {
         // Primary engine's model; "" → the engine's own default model.
         state.engine.read().await.model_id.clone().unwrap_or_default()
-    });
+    } else {
+        model
+    };
 
     let id = format!(
         "run_{:x}_{}",
@@ -532,7 +535,8 @@ pub async fn list(AxumState(state): AxumState<S>) -> Response {
             "parent": snap.parent,
             "pendingApprovals": snap.pending_approvals.len(),
         })
-    });
+    })
+    .collect();
     out.sort_by(|a, b| {
         let a = a.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
         let b = b.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -546,7 +550,7 @@ pub async fn list(AxumState(state): AxumState<S>) -> Response {
 pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     match runs.get(&id) {
-        Some(r) => Json(Value::Object(serde_json::to_value(r.snapshot()).unwrap())).into_response(),
+        Some(r) => Json(serde_json::to_value(r.snapshot()).unwrap()).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response(),
     }
 }
@@ -704,7 +708,7 @@ impl futures_util::Stream for SseStream {
             // Ensure a recv future is in flight (it registers the waker with
             // the channel and wakes us on the next send).
             if self.recv.is_none() {
-                let Some(rx) = self.rx.take() else {
+                let Some(mut rx) = self.rx.take() else {
                     // No receiver left (channel closed and consumed).
                     return Poll::Ready(None);
                 };
