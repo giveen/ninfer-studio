@@ -478,7 +478,7 @@ fn pack_one(shared: &RunShared, m: &Value, content: &str) -> Option<Value> {
     let Ok(mut res) = serde_json::from_str::<Value>(content) else {
         return None;
     };
-    let obj = res.as_object()?;
+    let obj = res.as_object_mut()?;
     if obj.get("_summarized").and_then(|v| v.as_bool()) == Some(true) {
         return None; // already a compact receipt
     }
