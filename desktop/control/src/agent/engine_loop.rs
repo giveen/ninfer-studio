@@ -11,14 +11,15 @@
 //! stop request `select!`s against every engine/tool await so it cancels
 //! in-flight reads rather than just the next loop iteration.
 
-use crate::agent::run::{now_ms, AgentEvent, RunShared, RunStatus};
+use crate::agent::run::{now_ms, AgentEvent, HookDecision, HookMode, RunShared, RunStatus};
 use crate::agent::tools;
 use crate::engine::S;
 use futures_util::{future::join_all, StreamExt};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 /// Sentinel [`stream_turn`] returns when a stop request won the race against
 /// the engine read — the run was already marked terminal by `stop_run`.
@@ -39,6 +40,10 @@ const PACK_FULL_SENDS: usize = 2;
 const PACK_EXCERPT_BYTES: usize = 1024;
 /// Already bounded/paged results (or the recall path itself) — never pack.
 const PACK_EXCLUDED: &[&str] = &["grep", "glob", "repo_search", "obs_recall"];
+/// How long a client-hook pause waits for the attached screen before the
+/// loop falls back to its default (done on a tool-less turn, continue on a
+/// tool turn) — an absent client must never wedge a run.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A tool call recovered from markup text (native calls get engine ids).
 #[derive(Debug, Clone)]
