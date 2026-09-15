@@ -41,6 +41,8 @@ import { SidebarSection } from '../components/coder/CoderSidebar';
 import { CheckpointsPanel } from '../components/coder/CheckpointsPanel';
 import { useCoderCheckpoints } from '../hooks/useCoderCheckpoints';
 import { useCoderToolHandlers, isGitCommitCommand } from '../hooks/useCoderToolHandlers';
+import { useCoderFileTree } from '../hooks/useCoderFileTree';
+import { useCoderUndo } from '../hooks/useCoderUndo';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -864,161 +866,38 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     dynamicSystemRef.current = sys;
   }, []);
 
-  // ---- File Tree panel: browse + system-prompt follow bindings ----
-  // See the wsAppliedDirRef/treeSeqRef note above — a tree response only applies
-  // if it is the newest fetch and the control is confirmed at this workspace.
-  const loadTree = useCallback(async () => {
-    if (!activeWsDir) return;
-    const seq = ++treeSeqRef.current;
-    setTreeLoading(true);
-    try {
-      const t = await coderTree(6, '.');
-      if (seq === treeSeqRef.current && wsAppliedDirRef.current === activeWsDir) {
-        setTreeNodes(t.nodes ?? []);
-      }
-    } catch { if (seq === treeSeqRef.current) setTreeNodes([]); }
-    finally { if (seq === treeSeqRef.current) setTreeLoading(false); }
-  }, [activeWsDir]);
-
-  const onExpandDir = useCallback(async (node: FileNode) => {
-    const willOpen = !treeExpanded[node.path];
-    setTreeExpanded((e) => ({ ...e, [node.path]: willOpen }));
-    if (willOpen && !(treeChildren[node.path] ?? node.children)) {
-      try {
-        const t = await coderTree(6, node.path);
-        setTreeChildren((prev) => ({ ...prev, [node.path]: t.nodes ?? [] }));
-      } catch { /* ignore — leave unexpanded */ }
-    }
-  }, [treeExpanded, treeChildren]);
-
-  const toggleBind = useCallback((path: string) => {
-    if (!activeWs || !activeConv) return;
-    setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
-      const c = wsd?.conversations[activeConv];
-      if (!wsd || !c) return prev;
-      const cur = c.boundPaths ?? [];
-      const next = cur.includes(path) ? cur.filter((p) => p !== path) : [...cur, path];
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...c, boundPaths: next } } } } };
-    });
-    void refreshRepoMap();
-  }, [activeWs, activeConv, refreshRepoMap]);
-
-  const clearBinds = useCallback(() => {
-    if (!activeWs || !activeConv) return;
-    setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
-      const c = wsd?.conversations[activeConv];
-      if (!wsd || !c) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...c, boundPaths: [] } } } } };
-    });
-    void refreshRepoMap();
-  }, [activeWs, activeConv, refreshRepoMap]);
-
-  // Load/refresh the tree whenever the active (possibly worktree-bound) directory
-  // changes, or the control-plane re-point is flushed after a held mid-run switch
-  // (#11's wsFlushed — the merged successor of #8's wsSynced counter).
-  useEffect(() => { if (treeOpen) void loadTree(); }, [activeWsDir, wsFlushed, treeOpen, loadTree]);
-  /** Undo the last commit (soft reset — changes stay in the worktree). Recoverable via reflog. */
-  const undoLastCommit = useCallback(async () => {
-    if (running || !activeWsDir || git.commits.length === 0) return;
-    const top = git.commits[0];
-    if (!window.confirm(`Undo commit ${top.hash.slice(0, 7)} "${top.subject}"?\n\nChanges stay in the worktree (git reset --soft).`)) return;
-    addLog({ type: 'bash', label: 'undo', detail: top.hash.slice(0, 7) });
-    try {
-      const r = await coderExec('git reset --soft HEAD~1', undefined, 30000, activeWsDir, false, undefined, activeWsDir);
-      if (r.exitCode !== 0) {
-        addLog({ type: 'error', label: 'undo', detail: (r.stderr || r.stdout || 'undo failed').slice(0, 300) });
-      }
-    } catch (e) {
-      addLog({ type: 'error', label: 'undo', detail: e instanceof Error ? e.message : String(e) });
-    } finally {
-      git.loadCommits();
-      refreshRepoMap();
-    }
-  }, [running, activeWsDir, git, refreshRepoMap]);
-  const [showBranchMenu, setShowBranchMenu] = useState(false);
-  const branchMenuRef = useRef<HTMLDivElement>(null);
   const {
-    showCheckpoints,
-    setShowCheckpoints,
-    createCheckpoint,
-    restoreCheckpoint,
-    deleteCheckpoint,
-  } = useCoderCheckpoints({
+    treeNodes,
+    treeLoading,
+    treeExpanded,
+    treeChildren,
+    loadTree,
+    onExpandDir,
+    toggleBind,
+    clearBinds,
+  } = useCoderFileTree({
     activeWs,
     activeConv,
     activeWsDir,
-    messages,
-    ledger,
-    todos,
-    running,
+    treeOpen,
+    wsFlushed,
+    wsAppliedDirRef,
     setStore,
-    setMessages,
-    setLedger,
-    applyTodos,
-    addLog,
-    loadGitCommits: git.loadCommits,
     refreshRepoMap,
   });
-  const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
   /** undoFileEdit is defined before the tabs hook (which needs it as its
    *  onUndoEdit); this ref keeps the refresh path one-way (no cyclic dep). */
   const tabsRefreshRef = useRef<() => void>(() => {});
 
-  /** File-grained undo: revert the active file to its state before the most recent
-   * commit that touched it (creating a recoverable undo commit). If the file has
-   * only uncommitted changes, they're discarded; if it was created in that
-   * commit, it's removed. */
-  const undoFileEdit = useCallback(async (path: string) => {
-    if (running || !activeWsDir) return;
-    const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
-    const p = q(path);
-    const refresh = async () => {
-      git.loadCommits();
-      refreshRepoMap();
-      // Re-fetch open tabs (adopt the new disk content or flag a conflict).
-      tabsRefreshRef.current();
-    };
-    if (!window.confirm(`Undo the last edit to ${path}?\n\nReverts this file to its previous committed state (a new undo commit is created).`)) return;
-    addLog({ type: 'bash', label: 'undo-file', detail: path });
-    // Find the most recent commit that touched this file.
-    const last = await coderExec(`git log -1 --format=%H -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
-    const hash = (last.stdout || '').trim();
-    if (!hash) {
-      // No commit touched it — discard uncommitted working changes (if any).
-      const dis = await coderExec(`git checkout -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
-      if (dis.exitCode !== 0) {
-        addLog({ type: 'error', label: 'undo-file', detail: `no commit and cannot discard changes for ${path}` });
-        return;
-      }
-      addLog({ type: 'bash', label: 'undo-file', detail: `discarded working changes to ${path}` });
-      await refresh();
-      return;
-    }
-    // Root commit has no parent → no prior version to revert to.
-    const parentOk = await coderExec(`git rev-parse ${hash}^`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
-    if (parentOk.exitCode !== 0) {
-      addLog({ type: 'error', label: 'undo-file', detail: `cannot undo root-commit change to ${path} (no prior version)` });
-      return;
-    }
-    // Did the file exist before this commit? If not, it was created here → delete it.
-    const existed = await coderExec(`git cat-file -e ${hash}^:${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
-    const res = existed.exitCode === 0
-      ? await coderExec(`git checkout ${hash}^ -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir)
-      : await coderExec(`git rm -f -- ${p}`, undefined, 15000, activeWsDir, false, undefined, activeWsDir);
-    if (res.exitCode !== 0) {
-      addLog({ type: 'error', label: 'undo-file', detail: (res.stderr || res.stdout || 'undo failed').slice(0, 300) });
-      return;
-    }
-    const c = await coderExec(`git add -A -- ${p} && git commit -m ${q(`undo: revert ${path}`)}`, undefined, 30000, activeWsDir, false, undefined, activeWsDir);
-    if (c.exitCode !== 0) {
-      addLog({ type: 'error', label: 'undo-file', detail: (c.stderr || c.stdout || 'commit failed').slice(0, 300) });
-    } else {
-      addLog({ type: 'bash', label: 'undo-file', detail: `reverted last edit to ${path}` });
-    }
-    await refresh();
-  }, [running, activeWsDir, git, refreshRepoMap]);
+  const { undoLastCommit, undoFileEdit } = useCoderUndo({
+    activeWsDir,
+    running,
+    gitCommits: git.commits,
+    loadGitCommits: git.loadCommits,
+    refreshRepoMap,
+    tabsRefreshRef,
+    addLog,
+  });
 
   // ---- File tabs (VS Code-style center column: Chat + open file tabs) ----
   const tabs = useFileTabs({
