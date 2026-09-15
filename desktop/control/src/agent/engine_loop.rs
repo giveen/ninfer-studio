@@ -1057,7 +1057,7 @@ mod tests {
     async fn packing_replaces_old_large_tool_results_only() {
         let tmp = std::env::temp_dir().join(format!("ninfier-packtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let state = fresh_state(tmp.clone(), tmp.join("ws"));
+        let _state = fresh_state(tmp.clone(), tmp.join("ws"));
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let shared = Arc::new(crate::agent::run::RunShared {
