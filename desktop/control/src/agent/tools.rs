@@ -38,14 +38,8 @@ const CHAT_TOOLS: &[&str] = &[
     "delegate",
 ];
 
-/// Read-only set for `delegate` child runs (mirrors the client's
-/// READONLY_TOOL_NAMES, server-dispatchable subset).
-const DELEGATE_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "git_diff", "repo_search",
-    "browser", "obs_recall", "bash_poll",
-];
-
-/// Scout child-run system prompt — the read-only investigation contract.
+/// Scout child-run system prompt — the read-only investigation contract
+/// (fallback when the parent run has no system of its own).
 pub(crate) const SCOUT_SYSTEM: &str = r#"You are a read-only investigation worker (scout) inside NInfer Studio's Coder.
 Map the code the supervisor needs before it commits to a plan: read files,
 grep/glob/search the repo, fetch web docs, and run read-only inspection
@@ -58,6 +52,24 @@ interpretation and note it in one line.
 Finish with a concise plain-text report: the findings the supervisor needs
 (file:line references, exact APIs/conventions, command outputs), ordered by
 importance. No preamble, no restating the task."#;
+
+/// Scout filter set — a model-supplied `tools` list is intersected with the
+/// client's READONLY_TOOL_NAMES (the server can dispatch every one of them).
+const SCOUT_FILTER_TOOLS: &[&str] = &[
+    "todo_write", "read", "grep", "glob", "ast_grep", "web_fetch", "web_search",
+    "git_diff", "ask_user", "bash_poll", "delegate", "repo_search", "obs_recall",
+    "memory_recall",
+];
+/// Coder-run scout default tool set — the client's runSubagent default when
+/// the model supplies no allow-list.
+const SCOUT_DEFAULT_TOOLS: &[&str] = &[
+    "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser",
+];
+/// Chat-run scout default + filter set (ChatScreen's `readOnlyNames`).
+const SCOUT_CHAT_TOOLS: &[&str] = &[
+    "read", "grep", "glob", "ast_grep", "repo_search", "git_diff", "web_fetch",
+    "web_search", "browser",
+];
 /// Implementation set for `subagent` child runs (mirrors WORKER_TOOL_NAMES).
 const SUBAGENT_TOOLS: &[&str] = &[
     "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser", "repo_search",
@@ -75,14 +87,13 @@ pub(crate) const WORKER_SYSTEM: &str = r#"You are a focused implementation subag
 - When the task is complete, STOP calling tools and reply with a concise summary: what you changed, the files touched, and any build/test commands you ran.
 - Stay strictly scoped to the assigned task."#;
 
-/// Fresh-context brainstorm before any code is written (the client's
-/// ideation pass, ported verbatim).
-const IDEATION_SYSTEM: &str = r#"You are a design brainstorm for a coding task. Do NOT write any code yet.
-Given the task below, propose 3-5 genuinely distinct candidate implementation approaches.
-For each approach: one line naming the approach, then 1-2 lines on its trade-offs or pitfalls.
-Do not recommend one yet — the implementer picks. Be concrete and technical, no filler.
-
-Task:"#;
+/// Fresh-context brainstorm before any code is written — the client's
+/// ideation pass, ported verbatim (system + `TASK:` prompt, temp 0.4, 1024
+/// tokens).
+const IDEATION_SYSTEM: &str = r#"You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task.
+Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches
+(different algorithms/data structures/designs -- not variations of one idea),
+noting a pitfall for each. Prose only, no code blocks, under 250 words."#;
 
 /// Critic rubric (the client's `CRITIC_SYSTEM`, ported verbatim): review a
 /// working-tree-vs-HEAD diff against the task and emit a VERDICT line.
