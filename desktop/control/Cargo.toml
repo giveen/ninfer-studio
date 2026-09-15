@@ -43,10 +43,10 @@ dirs = "7"
 # unifies with the one above, so no duplicate TLS stack.
 rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 diffy = "0.3"
-tree-sitter = "0.22"
-tree-sitter-javascript = "0.21"
-tree-sitter-typescript = "0.21"
-tree-sitter-rust = "0.21"
+tree-sitter = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
 petgraph = "0.6"
 
 # Windows-only: the coder sandbox runs the shell at low integrity inside a

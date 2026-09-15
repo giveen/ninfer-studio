@@ -245,9 +245,9 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             
             let lang = match ext {
-                "rs" => tree_sitter_rust::language(),
-                "ts" | "tsx" => tree_sitter_typescript::language_typescript(),
-                "js" | "jsx" => tree_sitter_javascript::language(),
+                "rs" => tree_sitter_rust::LANGUAGE.into(),
+                "ts" | "tsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                "js" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
                 _ => continue,
             };
             
