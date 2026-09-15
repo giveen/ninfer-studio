@@ -243,7 +243,7 @@ export class RunStream {
       }
       try {
         await this.consume();
-      } catch (e: unknown) {
+      } catch {
         if (this.done) return;
         // Stream cut mid-run: the run is (presumably) still going — resync.
         this.onDrop('resync');
