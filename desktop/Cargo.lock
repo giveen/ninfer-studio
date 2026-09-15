@@ -3092,7 +3092,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "ninfier-control"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "ninfier-studio"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "mimalloc",
  "ninfier-control",
