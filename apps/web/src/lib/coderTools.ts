@@ -390,10 +390,14 @@ export const TOOLS = [
       parameters: {
         type: "object",
         properties: {
+          component: { type: "string", description: "The architectural component this applies to (e.g., auth, api, ui)" },
+          scope: { type: "string", description: "The scope of the learning (e.g., any, production, prototype)" },
+          target_key: { type: "string", description: "A unique key for the constraint (e.g., auth_method, db_engine). Used to supersede older rules with the same key." },
+          value: { type: "string", description: "The value for the target_key (e.g., oauth2, postgresql)" },
           text: { type: "string", description: "One concise, self-contained learning (imperative, e.g. 'Run `pnpm test` (not npm) — this repo uses pnpm.')." },
           kind: { type: "string", enum: ["success", "tip", "avoid"], description: "success = a working approach/fix; tip = a convention/fact/command; avoid = a mistake or anti-pattern." }
         },
-        required: ["text", "kind"]
+        required: ["component", "scope", "target_key", "value", "text", "kind"]
       }
     }
   },

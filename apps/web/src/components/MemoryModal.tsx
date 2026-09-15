@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { X, BookmarkPlus, Trash2, Save, RefreshCw, Sparkles } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { X, BookmarkPlus, Trash2, RefreshCw } from 'lucide-react';
 import { Button, cn } from './ui';
 import type { CoderLearning, CoderMemory, CoderLearningKind } from '../lib/api';
 
@@ -8,19 +8,12 @@ interface MemoryModalProps {
   onClose: () => void;
   /** Header title — defaults to "Repository Memory" (Coder's per-workspace store). */
   title?: string;
-  /** Current bank + learnings (read-only snapshot from the parent). */
+  /** Current learnings (read-only snapshot from the parent). */
   memory: CoderMemory;
-  /** Persist an edited bank (markdown). */
-  onSaveBank: (bank: string) => Promise<void> | void;
   /** Drop one learning by id. */
   onDropLearning: (id: string) => Promise<void> | void;
   /** Called after any mutation so the parent can refresh its snapshot. */
   onChanged?: () => void;
-  /** Distill the full learning history into a proposed bank draft (does not
-   *  save it — the result replaces the textarea draft for review). Omit to
-   *  hide the "Reflect" button (e.g. the Chat memory store, which has no
-   *  per-workspace learnings model). */
-  onReflect?: () => Promise<string>;
 }
 
 const KIND_META: Record<CoderLearningKind, { label: string; cls: string }> = {
@@ -35,45 +28,13 @@ function fmtTs(ts: string): string {
   return d.toLocaleString();
 }
 
-export function MemoryModal({ open, onClose, title = 'Repository Memory', memory, onSaveBank, onDropLearning, onChanged, onReflect }: MemoryModalProps) {
-  const [bank, setBank] = useState(memory.bank);
-  const [saving, setSaving] = useState(false);
+export function MemoryModal({ open, onClose, title = 'Repository Memory', memory, onDropLearning, onChanged }: MemoryModalProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [reflecting, setReflecting] = useState(false);
-
-  // Re-seed the draft from the snapshot whenever the modal opens.
-  useEffect(() => {
-    if (open) setBank(memory.bank);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
 
   // Newest learnings first for display.
   const ordered = useMemo(() => [...(memory.learnings ?? [])].reverse(), [memory.learnings]);
 
   if (!open) return null;
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await onSaveBank(bank);
-      onChanged?.();
-    } catch {
-      /* surface nothing fatal; the modal stays open for a retry */
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const reflect = async () => {
-    if (!onReflect || reflecting) return;
-    setReflecting(true);
-    try {
-      const draft = await onReflect();
-      setBank(draft); // draft only — the user still has to hit Save to persist it
-    } finally {
-      setReflecting(false);
-    }
-  };
 
   const drop = async (id: string) => {
     setBusyId(id);
@@ -93,7 +54,7 @@ export function MemoryModal({ open, onClose, title = 'Repository Memory', memory
           <BookmarkPlus size={15} className="text-accent" />
           <div className="text-sm font-semibold">{title}</div>
           <span className="rounded bg-panel2 px-1.5 py-0.5 text-[11px] text-mute">
-            {memory.learnings.length} learning{memory.learnings.length === 1 ? '' : 's'}
+            {memory.learnings.length} active constraint{memory.learnings.length === 1 ? '' : 's'}
           </span>
           <button
             type="button"
@@ -108,44 +69,12 @@ export function MemoryModal({ open, onClose, title = 'Repository Memory', memory
         {/* Body */}
         <div className="min-h-0 flex-1 overflow-auto p-3 space-y-4">
           <section>
-            <div className="mb-1 flex items-center justify-between">
-              <label className="text-[12px] font-semibold text-ink">Memory Bank (markdown)</label>
-              <span className="text-[11px] text-faint">
-                Curated conventions the agent reads at the start of every run.
-              </span>
-            </div>
-            <textarea
-              value={bank}
-              onChange={(e) => setBank(e.target.value)}
-              spellCheck={false}
-              placeholder={'# Project conventions\n- Run `pnpm test`, not npm — this repo uses pnpm.\n- Web handlers live in apps/web/src/lib/api.ts.'}
-              className="h-48 w-full resize-y rounded border border-line bg-inset p-2 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-accent/50"
-            />
-            <div className="mt-1 flex justify-end gap-2">
-              {onReflect && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={reflect}
-                  disabled={reflecting || saving}
-                  title="Distill the full learning history (not just what's shown below) into this draft — review and Save to keep it"
-                >
-                  <Sparkles size={13} className={reflecting ? 'animate-pulse' : ''} /> {reflecting ? 'Reflecting…' : 'Reflect'}
-                </Button>
-              )}
-              <Button variant="primary" size="sm" onClick={save} disabled={saving}>
-                <Save size={13} /> {saving ? 'Saving…' : 'Save bank'}
-              </Button>
-            </div>
-          </section>
-
-          <section>
             <div className="mb-1 text-[12px] font-semibold text-ink">
               Learnings from prior runs
             </div>
             {ordered.length === 0 ? (
               <div className="rounded border border-dashed border-line p-4 text-center text-[12px] text-faint">
-                No learnings yet. They are extracted automatically by the critic (when Critic mode is on),
+                No learnings yet. They are extracted automatically by the intent continuity extractor,
                 or recorded on the fly via the agent's <code className="font-mono">memory_update</code> tool.
               </div>
             ) : (
@@ -162,7 +91,13 @@ export function MemoryModal({ open, onClose, title = 'Repository Memory', memory
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="text-[12px] leading-snug text-ink">{l.text}</div>
-                        <div className="mt-0.5 text-[10.5px] text-faint">
+                        <div className="mt-1 flex flex-wrap gap-2 text-[10.5px] text-mute font-mono">
+                          {l.component && <span>component: <span className="text-faint">{l.component}</span></span>}
+                          {l.scope && <span>scope: <span className="text-faint">{l.scope}</span></span>}
+                          {l.target_key && <span>key: <span className="text-faint">{l.target_key}</span></span>}
+                          {l.value && <span>value: <span className="text-faint">{l.value}</span></span>}
+                        </div>
+                        <div className="mt-1 text-[10.5px] text-faint">
                           {l.provenance ?? 'unknown'}
                           {l.task ? ` · ${l.task}` : ''} · {fmtTs(l.ts)}
                         </div>

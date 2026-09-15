@@ -82,8 +82,8 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [reflectionEnabled, setReflectionEnabledState] = useState(false);
   const [deepResearchEnabled, setDeepResearchEnabledState] = useState(false);
 
-  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
-  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
+  const [memory, setMemory] = useState<CoderMemory>({ learnings: [] });
+  const memoryRef = useRef<CoderMemory>({ learnings: [] });
   const [memoryModalOpen, setMemoryModalOpen] = useState(false);
 
   const [reflectionModel, setReflectionModelState] = useState('');
