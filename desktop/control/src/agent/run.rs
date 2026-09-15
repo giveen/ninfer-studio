@@ -711,7 +711,7 @@ impl futures_util::Stream for SseStream {
                 self.recv = Some(Box::pin(rx.recv()));
             }
             let fut = self.recv.as_mut().unwrap();
-            match Future::poll(fut.as_mut(), cx) {
+            match std::future::Future::poll(fut.as_mut(), cx) {
                 Poll::Ready(Ok(ev)) => {
                     self.recv = None;
                     let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
