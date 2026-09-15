@@ -774,7 +774,7 @@ mod tests {
 
     fn fresh() -> S {
         let tmp = std::env::temp_dir().join(format!("ninfier-agent-{}-{}", std::process::id(), now_ms()));
-        Arc::new(State::new(tmp, tmp, None))
+        Arc::new(State::new(tmp.clone(), tmp, None))
     }
 
     #[tokio::test]
