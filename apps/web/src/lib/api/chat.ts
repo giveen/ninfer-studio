@@ -361,6 +361,7 @@ export function summarizeConversation(opts: {
   onDelta?: (text: string) => void;
   signal?: AbortSignal;
   maxTokens?: number;
+  useLocalCompactor?: boolean;
 }): Promise<string> {
   const instruction: ChatMessage = { role: 'user', content: COMPACTION_INSTRUCTION };
   // Thinking off for the condensation pass; bound the output so it can't run away.
@@ -370,7 +371,20 @@ export function summarizeConversation(opts: {
     preserveThinking: false,
     maxTokens: opts.maxTokens ?? 2048,
   };
-  const body = buildChatRequest(opts.model, opts.systemPrompt, [...opts.history, instruction], summaryParams);
+
+  let targetModel = opts.model;
+  let targetBaseUrl = opts.baseUrl;
+  let targetApiKey = opts.apiKey;
+
+  // Local AI Context Summarizer: If useLocalCompactor is active, route the compaction pass
+  // to the zero-cost local NInfer engine instead of sending thousands of compaction tokens to paid cloud APIs.
+  if (opts.useLocalCompactor !== false && opts.baseUrl) {
+    targetModel = 'ninfer';
+    targetBaseUrl = undefined;
+    targetApiKey = undefined;
+  }
+
+  const body = buildChatRequest(targetModel, opts.systemPrompt, [...opts.history, instruction], summaryParams);
   const signal = opts.signal ?? AbortSignal.timeout(180_000);
   return new Promise<string>((resolve, reject) => {
     let acc = '';
@@ -379,19 +393,12 @@ export function summarizeConversation(opts: {
         acc += d;
         opts.onDelta?.(d);
       },
-      // streamChat resolves onDone (rather than rejecting) even on abort, so a
-      // partial mid-generation summary would otherwise look like a successful
-      // compaction and get applied as the conversation's new context
-      // checkpoint — silently truncating history instead of just cancelling.
-      // Reject here so every caller's existing "compaction failed" handling
-      // (which already treats a thrown error as best-effort/no-op) catches
-      // this instead of a corrupted checkpoint being written.
       onDone: () => {
         if (signal.aborted) { reject(new DOMException('Compaction aborted', 'AbortError')); return; }
         resolve(acc.trim());
       },
       onError: (m) => reject(new Error(m)),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
+    }, { baseUrl: targetBaseUrl, apiKey: targetApiKey });
   });
 }
 

@@ -190,6 +190,9 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("cloudPruneContext").and_then(|v| v.as_bool()) {
         merged.cloud_prune_context = v;
     }
+    if let Some(v) = body.get("cloudUseLocalCompactor").and_then(|v| v.as_bool()) {
+        merged.cloud_use_local_compactor = v;
+    }
     if let Some(v) = body.get("cloudUseForPrimary").and_then(|v| v.as_bool()) {
         merged.cloud_use_for_primary = v;
     }

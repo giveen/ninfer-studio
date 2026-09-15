@@ -118,6 +118,7 @@ export interface AppSettings {
   cloudFallbackToLocal?: boolean;
   cloudSmartTiering?: boolean;
   cloudPruneContext?: boolean;
+  cloudUseLocalCompactor?: boolean;
   cloudUseForPrimary?: boolean;
   cloudUseForSubagent?: boolean;
 }

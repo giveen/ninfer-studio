@@ -281,9 +281,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         : [];
       const summary = await summarizeConversation({
         model: useModel,
+        baseUrl,
+        apiKey,
         systemPrompt: params.systemPrompt,
         history: [...prior, ...conv.messages],
         signal: ac.signal,
+        useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
       });
       if (!summary) throw new Error('compaction produced no summary');
       const compacted: Conversation = { ...conv, compactedSummary: summary, compactedCount: conv.messages.length };

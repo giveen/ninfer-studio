@@ -351,6 +351,12 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                     hint="Prune bloated historical tool outputs (>1500 chars) in older turns before shipping prompts to paid Cloud APIs, saving up to 70% in input tokens."
                   />
                   <Toggle
+                    checked={settings.cloudUseLocalCompactor !== false}
+                    onChange={(v) => onUpdate({ cloudUseLocalCompactor: v })}
+                    label="Local Engine Context Compaction"
+                    hint="Use your zero-cost local NInfer model to summarize long history into a checkpoint before clearing & feeding the compressed context to cloud models."
+                  />
+                  <Toggle
                     checked={!!settings.cloudSmartTiering}
                     onChange={(v) => onUpdate({ cloudSmartTiering: v })}
                     label="Task-Based Model Tiering"

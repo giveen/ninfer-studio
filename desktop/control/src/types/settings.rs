@@ -188,6 +188,9 @@ pub struct AppSettings {
     /// Prune bloated historical tool outputs before shipping prompts to cloud APIs to save tokens.
     #[serde(default = "default_true")]
     pub cloud_prune_context: bool,
+    /// Use local NInfer model to summarize long conversation history before sending slimmed context to cloud models.
+    #[serde(default = "default_true")]
+    pub cloud_use_local_compactor: bool,
     /// Automatically use cloud provider for primary main agent turns.
     #[serde(default)]
     pub cloud_use_for_primary: bool,
@@ -307,6 +310,7 @@ impl Default for AppSettings {
             cloud_fallback_to_local: false,
             cloud_smart_tiering: false,
             cloud_prune_context: true,
+            cloud_use_local_compactor: true,
             cloud_use_for_primary: false,
             cloud_use_for_subagent: false,
         }
