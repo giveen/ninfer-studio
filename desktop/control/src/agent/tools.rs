@@ -400,7 +400,17 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
 
     // endpoint-dispatchable; everything else must be in the tool-set's table.
     let family = if run.meta.tool_set == "chat" { CHAT_TOOLS } else { CODER_TOOLS };
-    if mcp_name(name).is_none() && family.iter().all(|f| *f != name) {
+    
+    let config = state.config.read().await;
+    let mut allowed_family: Vec<&str> = family.to_vec();
+    if !config.coder_udiff_edit_enabled {
+        allowed_family.retain(|&t| t != "udiff_edit");
+    }
+    if !config.coder_repo_map_enabled {
+        allowed_family.retain(|&t| t != "repo_map");
+    }
+
+    if mcp_name(name).is_none() && allowed_family.iter().all(|f| *f != name) {
         return json!({ "error": format!("unknown tool: {name}") });
     }
 

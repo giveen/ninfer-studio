@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { FolderCog, GitBranch, Hammer, Save, Zap } from 'lucide-react';
 import { getConfig, saveConfig, startEngineUpdate } from '../../lib/api';
 import type { AppSettings, StatusPayload } from '../../lib/types';
-import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField } from '../../components/ui';
+import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField, Toggle } from '../../components/ui';
 
 export function EngineTab({ status }: { status: StatusPayload | null }) {
   const [form, setForm] = useState<AppSettings | null>(null);
@@ -56,6 +56,8 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         defaultRequestParams: form.defaultRequestParams ?? '',
         currencySymbol: form.currencySymbol,
         costPerKwh: Number(form.costPerKwh) || 0,
+        coder_udiff_edit_enabled: form.coder_udiff_edit_enabled ?? true,
+        coder_repo_map_enabled: form.coder_repo_map_enabled ?? true,
       });
       setForm(c);
       setApiKeyDraft('');
@@ -227,6 +229,24 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
           </Field>
           <Field label="Default request params" hint={'JSON object merged into every proxied request as defaults (client fields win). e.g. {"chat_template_kwargs":{"preserve_thinking":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.'}>
             <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />
+          </Field>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Agent capabilities"
+        description="Toggle experimental tools."
+      >
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field label="Enable udiff_edit" hint="Allow the agent to use the udiff_edit tool to apply diffs.">
+            <div>
+              <Toggle checked={form.coder_udiff_edit_enabled ?? true} onChange={(v) => set('coder_udiff_edit_enabled', v)} />
+            </div>
+          </Field>
+          <Field label="Enable repo_map" hint="Allow the agent to generate and use tree-sitter based repository maps.">
+            <div>
+              <Toggle checked={form.coder_repo_map_enabled ?? true} onChange={(v) => set('coder_repo_map_enabled', v)} />
+            </div>
           </Field>
         </div>
       </SectionCard>

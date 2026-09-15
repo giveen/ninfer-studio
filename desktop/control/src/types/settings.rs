@@ -61,6 +61,10 @@ pub struct AppSettings {
     /// Coding harness: require explicit human sign-off on the working-tree
     /// diff before the agent may commit. Serializes as `coderCommitApproval`.
     pub coder_commit_approval: bool,
+    #[serde(default = "default_true")]
+    pub coder_udiff_edit_enabled: bool,
+    #[serde(default = "default_true")]
+    pub coder_repo_map_enabled: bool,
     /// Chat's Agent Mode tier: off (web_fetch/web_search only, the original
     /// default) or on (adds the workspace-independent `browser` tool).
     /// Serializes as `chatAgentResearch`.
@@ -227,6 +231,8 @@ impl Default for AppSettings {
             coder_workspace: String::new(),
             coder_safe_mode: true,
             coder_commit_approval: false,
+            coder_udiff_edit_enabled: true,
+            coder_repo_map_enabled: true,
             chat_agent_research: false,
             chat_memory_enabled: false,
             chat_reflection_enabled: false,
@@ -274,6 +280,8 @@ impl fmt::Debug for AppSettings {
             .field("default_request_params", &self.default_request_params)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("coder_workspace", &self.coder_workspace)
+            .field("coder_udiff_edit_enabled", &self.coder_udiff_edit_enabled)
+            .field("coder_repo_map_enabled", &self.coder_repo_map_enabled)
             .field("currency_symbol", &self.currency_symbol)
             .field("cost_per_kwh", &self.cost_per_kwh)
             .finish()
