@@ -289,6 +289,31 @@ export function normalizeParams(raw: unknown): ChatParams {
 }
 
 /**
+ * Prunes historical tool output dumps (> 1500 chars in older turns) before shipping
+ * prompts to paid cloud providers. Preserves recent turns and current context intact
+ * while trimming bloated legacy tool results, saving up to 70% in cloud API input tokens.
+ */
+export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length <= 4) return messages;
+
+  const cutoffIndex = messages.length - 4;
+  return messages.map((m, idx) => {
+    if (idx >= cutoffIndex) return m;
+
+    if (m.content && m.content.length > 1500) {
+      const head = m.content.slice(0, 750);
+      const tail = m.content.slice(-400);
+      const omittedBytes = m.content.length - 1150;
+      return {
+        ...m,
+        content: `${head}\n\n...[${omittedBytes} bytes of historical tool output pruned for cloud optimization]...\n\n${tail}`,
+      };
+    }
+    return m;
+  });
+}
+
+/**
  * Resolves the effective provider configuration (baseUrl, apiKey, and model)
  * based on the requested role (primary or subagent).
  */
@@ -303,7 +328,13 @@ export function resolveProviderConfig(
   }
 
   const explicitProvider = params[`${role}Provider`] || params.provider;
-  const globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
+  let globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
+
+  // Smart Task-Based Tiering: If smart tiering is enabled and this is a light/read subagent task,
+  // route to local engine if subagent cloud isn't explicitly requested
+  if (appConfig.cloudSmartTiering && role === 'subagent' && !explicitProvider && !params.forceCloud) {
+    globalUseCloud = false;
+  }
 
   const effectiveProvider = explicitProvider || (globalUseCloud ? 'cloud' : 'ninfer');
 

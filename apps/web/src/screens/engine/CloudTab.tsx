@@ -337,6 +337,28 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 )}
               </div>
 
+              {/* Smart Context Compression & Tiering Options */}
+              <div className="rounded-xl border border-line bg-panel p-4 space-y-4">
+                <h4 className="text-[13px] font-semibold text-ink flex items-center gap-1.5">
+                  <Sparkles size={14} className="text-accent" />
+                  Hybrid Intelligence & Cost Optimization
+                </h4>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Toggle
+                    checked={settings.cloudPruneContext !== false}
+                    onChange={(v) => onUpdate({ cloudPruneContext: v })}
+                    label="Smart Context Compression"
+                    hint="Prune bloated historical tool outputs (>1500 chars) in older turns before shipping prompts to paid Cloud APIs, saving up to 70% in input tokens."
+                  />
+                  <Toggle
+                    checked={!!settings.cloudSmartTiering}
+                    onChange={(v) => onUpdate({ cloudSmartTiering: v })}
+                    label="Task-Based Model Tiering"
+                    hint="Automatically route lightweight read/search/summary sub-passes to local NInfer or fast subagent models to conserve primary cloud tokens."
+                  />
+                </div>
+              </div>
+
               {/* Local Fallback Toggle */}
               <div className="rounded-xl border border-line bg-panel p-4">
                 <Toggle

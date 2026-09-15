@@ -112,7 +112,7 @@ export async function streamChat(
   body: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
-  opts?: { baseUrl?: string; apiKey?: string }
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
 ): Promise<void> {
   const t0 = performance.now();
   const meta: MessageMeta = {};
@@ -121,15 +121,6 @@ export async function streamChat(
   // Accumulate streamed tool calls (native OpenAI function calling).
   const toolAcc: Array<{ id: string; type: string; name: string; arguments: string }> = [];
 
-  // Defensive split-boundary guard: `content` should never contain a literal
-  // think tag (docs: reasoning is returned separately as reasoning_content).
-  // Occasionally the model emits "</think>" as ordinary text right at the
-  // reasoning/answer boundary and it leaks into a content delta. Buffer
-  // content and, if a close tag turns up, redirect everything through it to
-  // reasoning instead of showing raw "</think>" text mid-reply — matching the
-  // engine's own non-streaming rule (content = text after the last </think>).
-  // A tag can also split across two chunks, so hold back a short tail
-  // (shorter than either tag) until we're sure it isn't a partial match.
   const THINK_CLOSE = '</think>';
   const TAG_HOLDBACK = THINK_CLOSE.length - 1;
   let contentBuf = '';
@@ -175,7 +166,10 @@ export async function streamChat(
     if (opts?.apiKey) {
       headers['x-ninfer-api-key'] = opts.apiKey;
     }
-    
+    if (opts?.extraHeaders) {
+      headers['x-ninfer-extra-headers'] = opts.extraHeaders;
+    }
+
     const r = await fetch(endpoint, {
       method: 'POST',
       headers,
@@ -190,6 +184,11 @@ export async function streamChat(
         detail = j?.error?.message || j?.error?.code || detail;
       } catch {
         if (text) detail = text.slice(0, 400);
+      }
+      if (opts?.baseUrl && opts?.allowFallback !== false && (r.status === 429 || r.status >= 500)) {
+        cb.onReasoningDelta?.(`\n⚠️ *Cloud API error (${detail}). Falling back to local engine...*\n\n`);
+        const fallbackBody = { ...body, model: 'ninfer' };
+        return streamChat(fallbackBody, signal, cb, { allowFallback: false });
       }
       cb.onError?.(`engine request failed: ${detail}`);
       return;

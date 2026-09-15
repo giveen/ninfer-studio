@@ -182,6 +182,12 @@ pub struct AppSettings {
     /// Fallback to local engine on cloud rate limits (429) or server errors (5xx).
     #[serde(default)]
     pub cloud_fallback_to_local: bool,
+    /// Smart task-based model tiering: route light utility tasks to local/fast subagent models.
+    #[serde(default)]
+    pub cloud_smart_tiering: bool,
+    /// Prune bloated historical tool outputs before shipping prompts to cloud APIs to save tokens.
+    #[serde(default = "default_true")]
+    pub cloud_prune_context: bool,
     /// Automatically use cloud provider for primary main agent turns.
     #[serde(default)]
     pub cloud_use_for_primary: bool,
@@ -299,6 +305,8 @@ impl Default for AppSettings {
             cloud_provider_subagent_model: String::new(),
             cloud_provider_extra_headers: String::new(),
             cloud_fallback_to_local: false,
+            cloud_smart_tiering: false,
+            cloud_prune_context: true,
             cloud_use_for_primary: false,
             cloud_use_for_subagent: false,
         }

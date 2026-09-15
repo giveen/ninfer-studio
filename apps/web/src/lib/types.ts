@@ -116,6 +116,8 @@ export interface AppSettings {
   cloudProviderSubagentModel?: string;
   cloudProviderExtraHeaders?: string;
   cloudFallbackToLocal?: boolean;
+  cloudSmartTiering?: boolean;
+  cloudPruneContext?: boolean;
   cloudUseForPrimary?: boolean;
   cloudUseForSubagent?: boolean;
 }

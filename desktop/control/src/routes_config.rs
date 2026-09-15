@@ -184,6 +184,12 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("cloudFallbackToLocal").and_then(|v| v.as_bool()) {
         merged.cloud_fallback_to_local = v;
     }
+    if let Some(v) = body.get("cloudSmartTiering").and_then(|v| v.as_bool()) {
+        merged.cloud_smart_tiering = v;
+    }
+    if let Some(v) = body.get("cloudPruneContext").and_then(|v| v.as_bool()) {
+        merged.cloud_prune_context = v;
+    }
     if let Some(v) = body.get("cloudUseForPrimary").and_then(|v| v.as_bool()) {
         merged.cloud_use_for_primary = v;
     }
