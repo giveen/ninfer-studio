@@ -20,7 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mimalloc = "0.1"
 base64 = "0.23"
-reqwest = { version = "0.13", features = ["stream", "json", "rustls"], default-features = false }
+reqwest = { version = "0.13", features = ["stream", "json", "default-tls"], default-features = false }
 ignore = "0.4"
 globset = "0.4"
 # SSE frame bytes for the agent run event stream (axum re-exports it, but
