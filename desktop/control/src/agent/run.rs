@@ -509,7 +509,7 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
     };
     // Registered + spawned before this response goes out (see spawn_run),
     // so a client can attach to the SSE stream immediately.
-    let shared = spawn_run(state, meta, live);
+    let shared = spawn_run(&state, meta, live);
     Json(json!({ "id": id, "status": "running" })).into_response()
 }
 
