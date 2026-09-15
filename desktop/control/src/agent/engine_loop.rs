@@ -1175,15 +1175,12 @@ mod tests {
                     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
                     let mut buf = vec![0u8; 65536];
                     let mut body = String::new();
-                    let mut header_end = 0usize;
                     loop {
                         match sock.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                let got = String::from_utf8_lossy(&buf[..n]);
-                                body.push_str(&got);
-                                if let Some(p) = body.find("\r\n\r\n") {
-                                    header_end = p + 4;
+                                body.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if body.contains("\r\n\r\n") {
                                     break;
                                 }
                             }
