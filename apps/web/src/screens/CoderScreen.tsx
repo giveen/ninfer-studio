@@ -43,6 +43,7 @@ import { useCoderCheckpoints } from '../hooks/useCoderCheckpoints';
 import { useCoderToolHandlers, isGitCommitCommand } from '../hooks/useCoderToolHandlers';
 import { useCoderFileTree } from '../hooks/useCoderFileTree';
 import { useCoderUndo } from '../hooks/useCoderUndo';
+import { useCoderBranchManager } from '../hooks/useCoderBranchManager';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -932,36 +933,22 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     void tabs.refreshOpenTabs();
   }, [tabs.refreshOpenTabs, wsFlushed]);
 
-  /** Prompt for a name, create the branch, and switch to it. */
-  const handleCreateBranch = useCallback(async () => {
-    if (!activeWs || running) return;
-    const name = window.prompt('New branch name:');
-    if (!name) return;
-    const ok = await git.createBranch(name);
-    if (ok) { refreshRepoMap(); loadTree(); tabsRefreshRef.current(); }
-  }, [activeWs, running, git, refreshRepoMap, loadTree]);
-  /** Switch to an existing branch from the branch menu. */
-  const handleSwitchBranch = useCallback(async (name: string) => {
-    setShowBranchMenu(false);
-    if (!activeWs || running || name === git.currentBranch) return;
-    const ok = await git.switchBranch(name);
-    if (ok) { refreshRepoMap(); loadTree(); tabsRefreshRef.current(); }
-  }, [activeWs, running, git, refreshRepoMap, loadTree]);
-  // Close the branch menu on an outside click or Escape — it's a dropdown,
-  // not a modal, so it shouldn't linger over the transcript.
-  useEffect(() => {
-    if (!showBranchMenu) return;
-    const onDown = (e: MouseEvent) => {
-      if (branchMenuRef.current && !branchMenuRef.current.contains(e.target as Node)) setShowBranchMenu(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowBranchMenu(false); };
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [showBranchMenu]);
+  const {
+    showBranchMenu,
+    setShowBranchMenu,
+    branchMenuRef,
+    handleCreateBranch,
+    handleSwitchBranch,
+  } = useCoderBranchManager({
+    activeWs,
+    running,
+    gitCurrentBranch: git.currentBranch,
+    createBranch: git.createBranch,
+    switchBranch: git.switchBranch,
+    refreshRepoMap,
+    loadTree,
+    tabsRefreshRef,
+  });
 
   // ---- Permissions (per-workspace tiers + denied path prefixes) ----
   const perms: PermConfig = store.workspaces[activeWs]?.perms ?? DEFAULT_PERMS;
