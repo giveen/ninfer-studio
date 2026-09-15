@@ -713,8 +713,8 @@ pub fn router() -> Router<S> {
         .route("/runs/{id}", get(get))
         .route("/runs/{id}/events", get(events))
         .route("/runs/{id}/stop", post(stop))
-        .route("/runs/{id}/approvals/{aid}", post(approve))
-        .route("/runs/{id}/questions/{qid}", post(answer))
+        .route("/runs/{id}/approvals/{aid}", post_route(approve))
+        .route("/runs/{id}/questions/{qid}", post_route(answer))
 }
 
 // ---------------------------------------------------------------------------
