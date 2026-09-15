@@ -332,7 +332,14 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const maxConcurrency = engineMaxConcurrency(status);
       if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
         const question = [...history].reverse().find((m) => m.role === 'user')?.content ?? '';
-        if (question.trim()) {
+        const isTrivial = (q: string): boolean => {
+          const t = q.trim().toLowerCase().replace(/[^\w\s]/g, '');
+          const trivialSet = new Set(['hello', 'hi', 'hey', 'yo', 'greetings', 'howdy', 'thanks', 'thank you', 'ok', 'okay', 'help', 'good morning', 'good afternoon', 'good evening']);
+          if (trivialSet.has(t)) return true;
+          if (t.length < 15 && !t.includes(' ')) return true;
+          return false;
+        };
+        if (question.trim() && !isTrivial(question)) {
           const maxAngles = Math.min(maxConcurrency, deepResearchMaxAngles);
           setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
           try {
