@@ -709,7 +709,7 @@ impl futures_util::Stream for SseStream {
 /// Router for the whole `/api/agent` surface.
 pub fn router() -> Router<S> {
     Router::new()
-        .route("/runs", post_route(start).get_route(list))
+        .route("/runs", post_route(start).get(list))
         .route("/runs/{id}", get_route(get))
         .route("/runs/{id}/events", get_route(events))
         .route("/runs/{id}/stop", post_route(stop))
