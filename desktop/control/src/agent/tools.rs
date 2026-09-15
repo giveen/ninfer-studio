@@ -643,7 +643,7 @@ async fn spawn_child(
         last_meta: None,
     };
 
-    let child = crate::agent::run::spawn_run(state.clone(), meta, live);
+    let child = crate::agent::run::spawn_run(state, meta, live);
     let run_id = child.meta.id.clone();
 
     // Wait for the child's terminal Done event (or 30 min).
