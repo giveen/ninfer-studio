@@ -722,7 +722,7 @@ pub fn router() -> Router<S> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-pub(crate) fn test_run(state: &S, kind: &str, tool_names: &[&str], scope: Option<String>) -> Arc<RunShared> {
+pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Option<String>) -> Arc<RunShared> {
     let (tx, _rx) = broadcast::channel(64);
     let (stop_tx, stop_rx) = watch::channel(false);
     let meta = RunMeta {
