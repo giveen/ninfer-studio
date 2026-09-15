@@ -407,7 +407,7 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .insert(shared.meta.id.clone(), shared.clone());
-    tokio::spawn(engine_loop::run(state, shared.clone()));
+    tokio::spawn(engine_loop::run(state.clone(), shared.clone()));
     shared
 }
 
