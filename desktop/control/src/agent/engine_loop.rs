@@ -1368,6 +1368,8 @@ mod tests {
             packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
+            hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
+            hook_wait: std::sync::Mutex::new(None),
             client: reqwest::Client::new(),
         });
 
@@ -1517,6 +1519,8 @@ mod tests {
             packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
+            hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
+            hook_wait: std::sync::Mutex::new(None),
             client: reqwest::Client::new(),
         });
         state
@@ -1615,6 +1619,8 @@ mod tests {
             packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
+            hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
+            hook_wait: std::sync::Mutex::new(None),
             client: reqwest::Client::new(),
         });
 
