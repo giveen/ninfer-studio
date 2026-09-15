@@ -318,7 +318,7 @@ pub fn parse_markup_tool_calls(text: &str) -> (Vec<Tc>, Vec<String>) {
     let mut consumed: Vec<String> = Vec::new();
 
     // One item may yield a call; push (call, raw) pairs as we find them.
-    let mut push_items = |items: &Vec<Value>, raw: &str, calls: &mut Vec<Tc>, consumed: &mut Vec<String>| {
+    let push_items = |items: &Vec<Value>, raw: &str, calls: &mut Vec<Tc>, consumed: &mut Vec<String>| {
         for o in items {
             if let Some((name, arguments)) = coerce(o) {
                 calls.push(Tc {
