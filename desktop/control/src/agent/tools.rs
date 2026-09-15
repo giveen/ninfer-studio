@@ -27,12 +27,12 @@ use tokio::sync::oneshot;
 /// Tools the server can dispatch in-process (per tool-set). Anything else
 /// gets the same "unknown tool" error the client's registry returned.
 const CODER_TOOLS: &[&str] = &[
-    "read", "write", "edit", "apply_patch", "grep", "glob", "tree", "bash", "bash_poll",
+    "read", "write", "edit", "apply_patch", "udiff_edit", "grep", "glob", "tree", "bash", "bash_poll",
     "git_diff", "git_commit", "ast_grep", "repo_search", "repo_map", "web_fetch", "web_search",
     "browser", "memory", "obs_recall", "delegate", "subagent",
 ];
 const CHAT_TOOLS: &[&str] = &[
-    "read", "write", "edit", "apply_patch", "grep", "glob", "tree", "bash", "bash_poll",
+    "read", "write", "edit", "apply_patch", "udiff_edit", "grep", "glob", "tree", "bash", "bash_poll",
     "git_diff", "ast_grep", "repo_search", "web_fetch", "web_search", "browser",
     "set_directory", "memory_update", "memory_recall", "ask_user", "todo_write", "obs_recall",
     "delegate",
@@ -73,7 +73,7 @@ const SCOUT_CHAT_TOOLS: &[&str] = &[
 /// Implementation set for `subagent` child runs (mirrors WORKER_TOOL_NAMES).
 const SUBAGENT_TOOLS: &[&str] = &[
     "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser", "repo_search",
-    "write", "edit", "apply_patch", "bash", "bash_poll", "git_diff", "delegate",
+    "write", "edit", "apply_patch", "udiff_edit", "bash", "bash_poll", "git_diff", "delegate",
 ];
 
 /// Worker child-run system prompt — the verbatim port of the client's
@@ -296,7 +296,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // MCP tools are disabled, and bash is locked to inspection commands — so
     // a surviving plan run stays read-only even with no client attached.
     if run.meta.plan {
-        const MUTATING: &[&str] = &["write", "edit", "apply_patch", "git_commit", "git_branch", "git_worktree", "subagent"];
+        const MUTATING: &[&str] = &["write", "edit", "apply_patch", "udiff_edit", "git_commit", "git_branch", "git_worktree", "subagent"];
         if name == "bash" {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
             if !is_read_only_command(cmd) {
@@ -420,7 +420,7 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
         return;
     };
     match name {
-        "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "tree" | "memory" => {
+        "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree" | "memory" => {
             if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) {
                 body["workspace"] = json!(scope);
             }
@@ -477,6 +477,7 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         "write" => fs::fs_write(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "edit" => fs::fs_edit(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "apply_patch" => fs::fs_patch(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "udiff_edit" => fs::fs_udiff(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "grep" => grep::grep(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "glob" => grep::glob(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "tree" => {
@@ -597,7 +598,7 @@ async fn await_approval(run: &Arc<RunShared>, name: &str, args: &Value) -> Optio
 fn rel_detail(name: &str, args: &Value) -> Option<String> {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     match name {
-        "read" | "write" | "edit" | "apply_patch" | "memory" => get("path"),
+        "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "memory" => get("path"),
         "grep" | "glob" => get("pattern"),
         "web_fetch" | "browser" => get("url"),
         "web_search" | "repo_search" => get("query"),

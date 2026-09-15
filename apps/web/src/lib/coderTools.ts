@@ -105,6 +105,24 @@ export const TOOLS = [
   {
     type: "function",
     function: {
+      name: "udiff_edit",
+      description: "Apply a unified diff format patch to a file. Used as an alternative to apply_patch. The diff string should be in standard unified diff format (with ---, +++, and @@ headers).",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          diff: {
+            type: "string",
+            description: "The full unified diff text to apply."
+          }
+        },
+        required: ["path", "diff"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "bash",
       description: "Run a shell command in the workspace. Pass background:true for long builds/tests — returns a jobId immediately; poll it with bash_poll until done.",
       parameters: {
@@ -423,7 +441,7 @@ export type PermTier = 'allow' | 'ask' | 'deny';
 export interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; approvedCommands?: string[]; }
 export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
-export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
+export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 export const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */
@@ -434,7 +452,7 @@ export const READONLY_TOOL_NAMES = new Set(['todo_write', 'read', 'grep', 'glob'
  *  (unlike `delegate`, which is read-only-only, `subagent`'s whole point is
  *  writing/running things, so it must NOT be filtered against
  *  READONLY_TOOL_NAMES — that would silently strip write/edit/bash). */
-export const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'repo_search', 'write', 'edit', 'apply_patch', 'bash', 'bash_poll', 'git_diff', 'delegate']);
+export const WORKER_TOOL_NAMES = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'repo_search', 'write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'bash_poll', 'git_diff', 'delegate']);
 
 /** Filter a model-supplied tool allow-list against `allowed`, falling back to
  *  `undefined` (caller's default set) when nothing survives the filter — an

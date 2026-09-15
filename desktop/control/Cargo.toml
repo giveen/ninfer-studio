@@ -1,6 +1,6 @@
 [package]
 name = "ninfier-control"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2024"
 description = "NInfer Studio control plane: engine process supervision, model management, GPU stats, SSE-safe engine API proxy, static hosting. Framework-agnostic (no Tauri imports)."
 
@@ -20,7 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 mimalloc = "0.1"
 base64 = "0.23"
-reqwest = { version = "0.13", features = ["stream", "json", "rustls"], default-features = false }
+reqwest = { version = "0.13", features = ["stream", "json", "default-tls"], default-features = false }
 ignore = "0.4"
 globset = "0.4"
 # SSE frame bytes for the agent run event stream (axum re-exports it, but
@@ -42,6 +42,12 @@ dirs = "7"
 # false` skips the server/macro half we never use; its reqwest (0.13.x)
 # unifies with the one above, so no duplicate TLS stack.
 rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+diffy = "0.3"
+tree-sitter = "0.27"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.24"
+petgraph = "0.6"
 
 # Windows-only: the coder sandbox runs the shell at low integrity inside a
 # Job Object (see src/sandbox/windows.rs). Target-scoped so Linux builds

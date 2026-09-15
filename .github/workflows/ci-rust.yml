@@ -67,6 +67,8 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: desktop
+      - name: Set Windows CFLAGS for aws-lc-sys C11 atomics
+        run: echo "CFLAGS=/std:c11 /experimental:c11atomics" >> $env:GITHUB_ENV
       - name: Check control plane for Windows
         # --tests: the sandbox layer keeps its pure-logic unit tests (arg
         # quoting, env scrubbing, command-line shapes) in-crate; a plain
