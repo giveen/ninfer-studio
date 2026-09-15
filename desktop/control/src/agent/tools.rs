@@ -597,35 +597,138 @@ async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
 // Child runs: delegate (read-only) / subagent (implementation worker)
 // ---------------------------------------------------------------------------
 
-async fn delegate(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
-    spawn_child(state, parent, "delegate", "scout", args, DELEGATE_TOOLS, DELEGATE_TOOLS, 6, Some(SCOUT_SYSTEM.into())).await
+async fn delegate(state: &S, run: &Arc<RunShared>, args: &Value) -> Value {
+    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if task.is_empty() {
+        return json!({ "error": "task is required" });
+    }
+    // The client's exact scout seed (the task is wrapped the same way).
+    let prompt = format!("Task: {task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.");
+    spawn_child(state, run, "delegate", "scout", &prompt, DELEGATE_TOOLS, 6, args).await
 }
 
 async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
-    spawn_child(state, parent, "subagent", "worker", args, SUBAGENT_TOOLS, SUBAGENT_TOOLS, 24, Some(WORKER_SYSTEM.into())).await
+    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if task.is_empty() {
+        return json!({ "error": "task is required" });
+    }
+    let wmodel = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|m| !m.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| parent.meta.model.clone());
+
+    // Baseline tree for the net diff across every worker attempt (the blob
+    // tree of the working tree, captured before the first worker runs).
+    let pre = git_tree(parent.scope_opt()).await;
+    // Fresh-context brainstorm before any code is written (best-effort — an
+    // empty result just means the worker proceeds without ideation notes).
+    let ideation = crate::agent::engine_loop::chat_once(
+        &parent.client,
+        state,
+        &wmodel,
+        IDEATION_SYSTEM,
+        &task,
+        Some(0.7),
+        Some(500),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+
+    // Worker → critic fix loop (the client's MAX_WORKER_CRIT=2 retries).
+    // `critic_approved` is tri-state: None = the critic never actually
+    // reviewed anything (spec off, or every attempt had an empty diff) —
+    // distinct from an explicit rejection.
+    let critic = parent
+        .meta
+        .critic
+        .clone()
+        .filter(|c| {
+            c.get("model")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+        });
+    let mut prompt = format!("TASK (implement now):\n{task}");
+    if !ideation.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nCandidate approaches to consider (from an ideation pass -- pick one, don't just list them):\n{ideation}"
+        ));
+    }
+    let mut summary = String::new();
+    let mut res_ok = false;
+    let mut exhausted = false;
+    let mut critic_approved: Option<bool> = None;
+    let mut critique = String::new();
+    let mut prev_critique = String::new();
+    let mut diff = String::new();
+    const MAX_WORKER_CRIT: u32 = 2;
+    for attempt in 0..=MAX_WORKER_CRIT {
+        if attempt > 0 {
+            prompt = format!("TASK (implement now):\n{task}\n\n## Critic review of your previous attempt (address every issue listed before re-attempting):\n{critique}");
+        }
+        let res = spawn_child(state, parent, "subagent", "worker", &prompt, SUBAGENT_TOOLS, 12, args).await;
+        summary = res["summary"].as_str().unwrap_or_default().to_string();
+        res_ok = res["ok"].as_bool().unwrap_or(false);
+        exhausted = res["stop"].as_str() == Some("steps");
+        // Net diff across attempts (git write-tree before/after) — the critic
+        // reviews the working-tree diff, not the worker's self-report.
+        diff = net_diff(parent.scope_opt(), pre.as_deref()).await.unwrap_or_default();
+        // No critic spec (or an empty diff) → no review gate for this attempt.
+        let Some(spec) = critic.as_ref().filter(|_| !diff.trim().is_empty()) else {
+            break;
+        };
+        match run_critic(state, parent, spec, &diff, &task).await {
+            Ok((approved, issues, learnings)) => {
+                persist_learnings(state, parent, &learnings, if approved { "critic:approve" } else { "critic:reject" }, &task).await;
+                critic_approved = Some(approved);
+                if approved || attempt == MAX_WORKER_CRIT || issues == prev_critique {
+                    // Approved, budget spent, or the same issues raised again
+                    // — the worker is not converging, stop retries early.
+                    break;
+                }
+                prev_critique = issues.clone();
+                critique = issues;
+            }
+            // Fail-open: a critic error never blocks the run.
+            Err(_) => break,
+        }
+    }
+    if exhausted {
+        summary = format!(
+            "(worker subagent reached its step budget before finishing — partial work may be present){}\n\nLast partial output:\n{summary}",
+            if summary.is_empty() { "" } else { "\n" }
+        );
+    }
+    // The worker's own `ok` only means "ran without error/budget exhaustion" —
+    // it says nothing about review. Fold in the critic's verdict so a caller
+    // reading `ok` can't mistake "rejected and we gave up" for success.
+    let ok = res_ok && critic_approved != Some(false);
+    json!({ "summary": summary, "diff": diff, "ok": ok, "criticApproved": critic_approved })
 }
 
 /// Spawn a child run (server-side `delegate`/`subagent`) and wait for its
 /// terminal state. The child is a first-class run — it shows up in the
-/// registry and any client can attach to watch it.
+/// registry and any client can attach to watch it. `prompt` is the seed user
+/// message; the child's tool allow-list / maxSteps / model come from the
+/// caller's args (model-supplied lists filtered against `allowed`).
 async fn spawn_child(
     state: &S,
     parent: &Arc<RunShared>,
     tool: &str,
     kind: &str,
-    args: &Value,
+    prompt: &str,
     allowed: &[&str],
-    default_set: &[&str],
     default_steps: usize,
-    system: Option<String>,
+    args: &Value,
 ) -> Value {
-    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if task.is_empty() {
-        return json!({ "error": "task is required" });
-    }
-
     // Model-supplied allow-list filtered against the role's set (mirrors the
-    // client's filterToolAllowList: nothing survives → the default set).
+    // client's filterToolAllowList: nothing survives → the role's set).
     let allowed_set: HashSet<&str> = allowed.iter().copied().collect();
     let requested: Vec<String> = args
         .get("tools")
@@ -634,7 +737,7 @@ async fn spawn_child(
         .unwrap_or_default();
     let filtered: Vec<String> = requested.into_iter().filter(|t| allowed_set.contains(t.as_str())).collect();
     let tool_names: Vec<String> = if filtered.is_empty() {
-        default_set.iter().map(|s| s.to_string()).collect()
+        allowed.iter().map(|s| s.to_string()).collect()
     } else {
         filtered
     };
@@ -672,9 +775,9 @@ async fn spawn_child(
     let meta = crate::agent::run::RunMeta {
         id: id.clone(),
         kind: kind.into(),
-        label: format!("{tool}: {}", task.chars().take(60).collect::<String>()),
+        label: format!("{tool}: {}", prompt.chars().take(60).collect::<String>()),
         model,
-        system,
+        system: if kind == "worker" { Some(WORKER_SYSTEM.to_string()) } else { Some(SCOUT_SYSTEM.to_string()) },
         max_steps,
         created_at: now_ms(),
         tool_set: parent.meta.tool_set.clone(),
@@ -682,10 +785,12 @@ async fn spawn_child(
         tools_spec: Value::Array(tools_spec),
         params: parent.meta.params.clone(),
         parent: Some(parent.meta.id.clone()),
+        plan: false,
+        critic: None,
     };
     let live = crate::agent::run::RunLive {
         status: RunStatus::Running,
-        messages: vec![json!({ "role": "user", "content": task })],
+        messages: vec![json!({ "role": "user", "content": prompt })],
         turns: 0,
         updated_at: now_ms(),
         finish_reason: None,
@@ -698,10 +803,18 @@ async fn spawn_child(
         scope: parent.scope_opt(),
         usage: Default::default(),
         last_meta: None,
+        todo_rev: 0,
+        todo_base_rev: 0,
     };
 
     let child = crate::agent::run::spawn_run(state, meta, live);
     let run_id = child.meta.id.clone();
+    // Tell attached clients the child exists (they can attach to it live).
+    let _ = parent.tx.send(AgentEvent::ChildRun {
+        id: run_id.clone(),
+        kind: kind.to_string(),
+        task: prompt.chars().take(100).collect(),
+    });
 
     // Wait for the child's terminal Done event (or 30 min).
     let mut rx = child.tx.subscribe();
@@ -741,8 +854,134 @@ async fn spawn_child(
         "ok": true,
         "runId": run_id,
         "turns": snap.turns,
+        "stop": snap.stop,
         "summary": last,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Worker critic + git diff plumbing (the client's runCritic / diff capture)
+// ---------------------------------------------------------------------------
+
+async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Option<String> {
+    let mut c = tokio::process::Command::new("git");
+    c.args(argv);
+    if let Some(s) = scope {
+        c.current_dir(s);
+    }
+    c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output())
+        .await
+        .ok()??;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The blob tree of the working tree (`git write-tree`) — the baseline for
+/// the net worker diff.
+fn git_tree_now(scope: Option<&str>) -> impl std::future::Future<Output = Option<String>> + Send {
+    async move {
+        git_run(scope, &["write-tree"], 10)
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+async fn git_tree(scope: Option<&str>) -> Option<String> {
+    git_tree_now(scope).await
+}
+
+/// Net diff across the worker attempts (`git diff preTree postTree`, capped
+/// at 60k chars — the same capture the client made).
+async fn net_diff(scope: Option<&str>, pre: Option<&str>) -> Option<String> {
+    let post = git_tree(scope).await?;
+    let pre = pre.filter(|p| *p != &post)?;
+    git_run(scope, &["--no-pager", "diff", pre, &post], 60)
+        .await
+        .map(|s| s.chars().take(60_000).collect())
+}
+
+/// One critic pass: review the diff against the task, parse the VERDICT line
+/// + LEARNING/AVOID lines. Fail-open at the call site (an error never blocks
+/// the run — the client's critic errored into an approval).
+async fn run_critic(
+    state: &S,
+    parent: &Arc<RunShared>,
+    spec: &Value,
+    diff: &str,
+    task: &str,
+) -> Result<(bool, String, Vec<(String, String)>), String> {
+    let model = spec["model"].as_str().unwrap_or("").trim().to_string();
+    let system = spec
+        .get("system")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| CRITIC_SYSTEM.to_string());
+    let prompt = format!(
+        "TASK:\n{}\n\nDIFF (working tree vs HEAD):\n```diff\n{}\n```\n\nReview the diff against the task.",
+        task.chars().take(2000).collect::<String>(),
+        diff.chars().take(24_000).collect::<String>()
+    );
+    let content = crate::agent::engine_loop::chat_once(
+        &parent.client,
+        state,
+        &model,
+        &system,
+        &prompt,
+        None,
+        Some(2048),
+        std::time::Duration::from_secs(90),
+    )
+    .await?;
+    let approved = re_verdict().is_match(&content);
+    // Pull learnings out of the raw text first so they don't bleed into
+    // `issues` (the rest of the reply, verdict line stripped).
+    let mut learnings: Vec<(String, String)> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        let learn = line.strip_prefix("LEARNING:").map(str::trim);
+        let avoid = line.strip_prefix("AVOID:").map(str::trim);
+        match (learn, avoid) {
+            (Some(t), _) if !t.is_empty() => learnings.push(("success".into(), t.to_string())),
+            (None, Some(t)) if !t.is_empty() => learnings.push(("avoid".into(), t.to_string())),
+            _ => kept.push(raw.to_string()),
+        }
+    }
+    let issues = kept
+        .join("\n")
+        .replace(&re_verdict().find(&kept.join("\n")).map(|m| m.as_str()).unwrap_or_default().to_string(), "")
+        .trim()
+        .to_string();
+    Ok((approved, issues, learnings))
+}
+
+static RE_VERDICT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+fn re_verdict() -> &'static Regex {
+    // Case-insensitive via regex flags — the client tested /VERDICT:\s*APPROVED/i.
+    RE_VERDICT.get_or_init(|| Regex::new(?is"VERDICT:\s*APPROVED").expect("static regex"))
+}
+
+/// Persist critic/agent learnings to the per-repo memory store (in-process
+/// call of the same handler the HTTP route uses). A failure on one learning
+/// never breaks the run loop.
+async fn persist_learnings(state: &S, run: &Arc<RunShared>, learnings: &[(String, String)], provenance: &str, task: &str) {
+    for (kind, text) in learnings {
+        let mut body = json!({
+            "learning": { "text": text, "kind": kind },
+            "provenance": provenance,
+            "task": task,
+        });
+        if let Some(scope) = run.scope_opt() {
+            body["workspace"] = json!(scope);
+        }
+        let _ = crate::coder::memory::memory_set(axum::extract::State(state.clone()), axum::Json(body)).await;
+    }
 }
 
 /// Quote a shell argument the same way the client's `q()` did.
