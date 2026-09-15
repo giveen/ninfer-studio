@@ -291,11 +291,11 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
                     let tag_name = query.capture_names()[capture.index as usize];
                     if let Ok(text) = node.utf8_text(content.as_bytes()) {
                         if tag_name == "def" {
-                            if let Some(parent) = node.parent() {
-                                if let Ok(parent_text) = parent.utf8_text(content.as_bytes()) {
-                                    let sig = parent_text.lines().next().unwrap_or("").trim().to_string();
-                                    local_defs.push((text.to_string(), sig));
-                                }
+                            if let Some(parent) = node.parent()
+                                && let Ok(parent_text) = parent.utf8_text(content.as_bytes())
+                            {
+                                let sig = parent_text.lines().next().unwrap_or("").trim().to_string();
+                                local_defs.push((text.to_string(), sig));
                             }
                         } else if tag_name == "ref" {
                             ref_counts.entry(text.to_string()).or_default().insert(rel_path.clone());
@@ -315,7 +315,7 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
             (file.clone(), score)
         }).collect();
         
-        file_scores.sort_by(|a, b| b.1.cmp(&a.1));
+        file_scores.sort_by_key(|a| std::cmp::Reverse(a.1));
         
         let mut map_out = String::new();
         let mut chars_used = 0;
