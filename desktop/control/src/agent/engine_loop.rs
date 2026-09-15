@@ -810,23 +810,57 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             compacted_context(&live.messages).to_vec()
         };
         let context = pack_transcript(&shared, &context);
-        let req = build_request(&meta.model, meta.system.as_deref(), &context, &meta.params, &meta.tools_spec);
+        // Per-turn system: the run's base system + the live task list (coder
+        // runs — the list must survive compaction and reflect user edits made
+        // mid-run). Capturing `todo_base_rev` here anchors the stale-write
+        // guard: it is the list this response was generated from.
+        let system = {
+            let mut live = lock_live(&shared);
+            live.todo_base_rev = live.todo_rev;
+            let mut sys = meta.system.clone().unwrap_or_default();
+            if meta.kind == "coder" {
+                if let Some(t) = live.todo.as_ref().filter(|t| !t.is_null()) {
+                    sys.push_str(&todo_system_block(t));
+                }
+            }
+            sys
+        };
+        let req = build_request(&meta.model, Some(&system), &context, &meta.params, &meta.tools_spec);
         let raw = serde_json::to_vec(&req).unwrap_or_default();
+        /// Token estimate of this request for the client's compaction gate.
+        let est_tokens = (raw.len() as f64 / CHARS_PER_TOKEN).round() as u64;
 
         let _ = shared.tx.send(AgentEvent::TurnStarted { turns });
-        let turn = match stream_turn(&state, &shared, &raw).await {
-            Ok(t) => t,
-            Err(e) if e == STOP_ERR => {
-                // stop_run already marked the run terminal — just unwind.
-                return;
-            }
-            Err(e) => {
-                if !shared.status().is_terminal() {
-                    shared.mark_terminal(RunStatus::Error, None, Some(e));
+        // Stream the turn, retrying transient engine failures with growing
+        // backoff (the webview loop did the same: 3 attempts, 800ms·n).
+        let mut turn = None;
+        for attempt in 1..=3u32 {
+            match stream_turn(&state, &shared, &raw).await {
+                Ok(t) => {
+                    turn = Some(t);
+                    break;
                 }
-                return;
+                Err(e) if e == STOP_ERR => {
+                    // stop_run already marked the run terminal — just unwind.
+                    return;
+                }
+                Err(e) => {
+                    if attempt < 3 {
+                        let mut stop_rx = shared.stop_rx.clone();
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(800 * attempt as u64)) => {}
+                            _ = stop_rx.changed() => return, // stop won the race
+                        };
+                        continue;
+                    }
+                    if !shared.status().is_terminal() {
+                        shared.mark_terminal(RunStatus::Error, None, Some(e));
+                    }
+                    return;
+                }
             }
-        };
+        }
+        let turn = turn.expect("Ok branch set it, errors returned");
 
         // Append the assistant message (raw reasoning; content with any
         // consumed markup stripped) and record the turn's accounting.
@@ -862,8 +896,17 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 finish_err(&shared, "engine returned an empty reply (no content, no tool calls)");
                 return;
             }
-            finish(&shared, "done");
-            return;
+            match await_turn_hook(&shared, &turn, turns, est_tokens).await {
+                HookOutcome::Finish => {
+                    finish(&shared, "done");
+                    return;
+                }
+                HookOutcome::Continue => {
+                    turns += 1;
+                    continue;
+                }
+                HookOutcome::Aborted => return, // already marked Stopped
+            }
         }
 
         for tc in &turn.tool_calls {
@@ -920,6 +963,16 @@ Use only the tools listed above."
                 ),
             }));
         }
+        // Tool-call turn end: a client-hook screen may still want its gate
+        // (e.g. the compaction pass before the next engine call).
+        match await_turn_hook(&shared, &turn, turns, est_tokens).await {
+            HookOutcome::Finish => {
+                finish(&shared, "done");
+                return;
+            }
+            HookOutcome::Aborted => return,
+            HookOutcome::Continue => {}
+        }
         turns += 1;
     }
 }
@@ -928,6 +981,211 @@ fn finish_err(shared: &Arc<RunShared>, message: &str) {
     if !shared.status().is_terminal() {
         shared.mark_terminal(RunStatus::Error, None, Some(message.to_string()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Turn hooks + one-shot passes
+// ---------------------------------------------------------------------------
+
+/// How the loop proceeds after a turn-hook decision.
+enum HookOutcome {
+    /// The turn stands; the run ends.
+    Finish,
+    /// Keep looping (client asked for another turn, or timeout default on a
+    /// tool turn).
+    Continue,
+    /// Run aborted — already marked terminal by `stop_run`.
+    Aborted,
+}
+
+/// Turn-end hook. `auto` mode never pauses (tool-less turn ends the run).
+/// `client` mode pauses at every turn end: the attached screen runs its
+/// per-turn passes (humanize rewrite, compaction gate, …) and POSTs a
+/// decision to `/runs/{id}/hooks/{hid}`. A client that never answers gets
+/// the webview default after [`HOOK_TIMEOUT`]: done on a tool-less turn,
+/// continue on a tool turn.
+async fn await_turn_hook(shared: &Arc<RunShared>, turn: &Turn, turns: usize, est_tokens: u64) -> HookOutcome {
+    let had_tool_calls = !turn.tool_calls.is_empty();
+    if *shared.hook_mode.lock().unwrap_or_else(|p| p.into_inner()) != HookMode::Client {
+        return if had_tool_calls { HookOutcome::Continue } else { HookOutcome::Finish };
+    }
+    let hid = format!("hk_{:x}_{turns}", now_ms());
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut live = lock_live(shared);
+        live.pending_hook = Some(hid.clone());
+        *shared.hook_wait.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+    shared.set_status(RunStatus::AwaitingHook);
+    let _ = shared.tx.send(AgentEvent::HookRequested {
+        id: hid.clone(),
+        turns,
+        finish_reason: turn.finish_reason.clone(),
+        had_tool_calls,
+        est_tokens,
+    });
+
+    let mut stop_rx = shared.stop_rx.clone();
+    let decision = tokio::select! {
+        d = rx => match d {
+            Ok(d) => d,
+            // Delivery failed (the run stopped mid-pause).
+            Err(_) => HookDecision::Abort,
+        },
+        _ = stop_rx.changed() => HookDecision::Abort,
+        _ = tokio::time::sleep(HOOK_TIMEOUT) => {
+            if had_tool_calls {
+                HookDecision::Continue { content: None, note: None, transcript: None }
+            } else {
+                HookDecision::Done
+            }
+        }
+    };
+    shared.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+    lock_live(shared).pending_hook = None;
+    let _ = shared.tx.send(AgentEvent::HookResolved { id: hid, action: decision.action_name().to_string() });
+
+    match decision {
+        HookDecision::Done => {
+            shared.set_status(RunStatus::Running);
+            HookOutcome::Finish
+        }
+        HookDecision::Replace { content } => {
+            replace_last_assistant_content(shared, &content);
+            shared.set_status(RunStatus::Running);
+            HookOutcome::Finish
+        }
+        HookDecision::Continue { content, note, transcript } => {
+            if let Some(t) = transcript {
+                lock_live(shared).messages = t;
+            }
+            if let Some(c) = content {
+                replace_last_assistant_content(shared, &c);
+            }
+            if let Some(n) = note {
+                shared.append(json!({ "role": "user", "content": n }));
+            }
+            shared.set_status(RunStatus::Running);
+            HookOutcome::Continue
+        }
+        HookDecision::Abort => {
+            shared.stop_run();
+            HookOutcome::Aborted
+        }
+    }
+}
+
+/// Swap the content of the run's most recent assistant message (the
+/// humanize-rewrite decision).
+fn replace_last_assistant_content(shared: &Arc<RunShared>, content: &str) {
+    let mut live = lock_live(shared);
+    if let Some(m) = live
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+    {
+        m["content"] = json!(content);
+    }
+    live.updated_at = now_ms();
+}
+
+/// Render the run's live task list as a system-prompt block (the client's
+/// `todoSystemBlock`, ported). An empty list still gets a block — the
+/// transcript may carry an older non-empty plan, and without the marker the
+/// next turn could resume stale work.
+pub(crate) fn todo_system_block(todos: &Value) -> String {
+    let items = todos.as_array().cloned().unwrap_or_default();
+    let lines: Vec<String> = if items.is_empty() {
+        vec!["(no active tasks — the task list was cleared; do not resume work from an earlier plan unless the user asks or re-adds a task)".into()]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let content = t.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+                let mark = match t.get("status").and_then(|v| v.as_str()) {
+                    Some("completed") => "x",
+                    Some("in_progress") => "~",
+                    _ => " ",
+                };
+                format!("{}. [{mark}] {content}", i + 1)
+            })
+            .collect()
+    };
+    format!(
+        "\n\n# Current task list (live — kept in sync via the todo_write tool; the user can edit it — treat it as the source of truth for progress)\n{}\n",
+        lines.join("\n")
+    )
+}
+
+/// One-shot engine chat for the auxiliary passes (worker ideation, critic
+/// review): stream `/v1/chat/completions` and return the final content. No
+/// usage tap, no events — these are best-effort helper calls.
+pub(crate) async fn chat_once(
+    client: &reqwest::Client,
+    state: &S,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+        "stream": true,
+    });
+    if let Some(t) = temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(m) = max_tokens {
+        body["max_completion_tokens"] = json!(m);
+    }
+    let raw = serde_json::to_vec(&body).unwrap_or_default();
+    let port = crate::proxy::route_port(state, &raw).await?;
+    let api_key = state.config.read().await.api_key.clone();
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+
+    let mut req = client.post(&url).header("content-type", "application/json").body(raw);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key.as_str());
+    }
+    let resp = req.timeout(timeout).send().await.map_err(|e| format!("engine request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("engine returned HTTP {}", resp.status()));
+    }
+
+    let mut content = String::new();
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                return Ok(content);
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(d) = v["choices"].get(0).and_then(|c| c["delta"].get("content")).and_then(|x| x.as_str()) else {
+                continue;
+            };
+            content.push_str(d);
+        }
+    }
+    Ok(content)
 }
 
 // ---------------------------------------------------------------------------
