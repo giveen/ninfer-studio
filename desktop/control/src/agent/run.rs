@@ -469,7 +469,9 @@ fn default_tool_set() -> String {
     "chat".into()
 }
 fn default_max_steps() -> usize {
-    12
+    // The client's DEFAULT_MAX_AGENT_STEPS — runs the screens start pass it
+    // explicitly; this is the fallback for direct API callers.
+    60
 }
 
 /// Shared run construction + spawn — used by the `start` endpoint and by
@@ -590,7 +592,6 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         scope: body.scope.clone(),
         usage: RunUsage::default(),
         last_meta: None,
-        pending_hook: None,
         todo_rev: 0,
         todo_base_rev: 0,
     };
@@ -841,7 +842,7 @@ impl futures_util::Stream for SseMpsc {
 /// humanize/verify/critic/compact passes while the loop itself is
 /// server-owned. A paused run times out back to plain `done` (see
 /// `engine_loop::client_hook`), so an absent client can never wedge a run.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct HookModeBody {
     mode: String,
 }
@@ -866,7 +867,7 @@ pub(crate) async fn set_hook_mode(
 /// `POST /api/agent/runs/{id}/hooks/{hid}` — the client's turn-hook
 /// decision. Body: `{action: "done"|"replace"|"continue"|"abort",
 /// content?, note?, transcript?}`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct HookDecisionBody {
     action: String,
     #[serde(default)]
@@ -888,6 +889,14 @@ pub(crate) async fn hook_decision(
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
     };
+    // The id must be the pending one — a stale decision from an earlier pause
+    // must not resolve the current one (two clients racing, a late reply).
+    {
+        let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+        if live.pending_hook.as_deref() != Some(hid.as_str()) {
+            return (StatusCode::CONFLICT, Json(json!({"error": "no pending hook decision with that id"}))).into_response();
+        }
+    }
     // The pending decision's id is whatever the loop posted; a stale/second
     // decision just finds nothing waiting and is a no-op.
     let decision = match body.action.as_str() {
@@ -1033,6 +1042,8 @@ pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Optio
         packed_cache: Mutex::new(HashMap::new()),
         stop_tx,
         stop_rx,
+        hook_mode: Mutex::new(HookMode::Auto),
+        hook_wait: Mutex::new(None),
         client: reqwest::Client::new(),
     })
 }
