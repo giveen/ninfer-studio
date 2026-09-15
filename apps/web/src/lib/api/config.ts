@@ -96,24 +96,71 @@ export function useStatus(intervalMs = 2500): { status: StatusPayload | null; er
 }
 
 /** Auto-detect models available on an OpenAI-compatible cloud provider endpoint (/v1/models). */
-export async function fetchCloudModels(baseUrl?: string, apiKey?: string): Promise<string[]> {
-  const base = (baseUrl?.trim() || 'https://api.openai.com/v1').replace(/\/+$/, '');
-  const url = base.endsWith('/models') ? base : `${base}/models`;
-  const headers: Record<string, string> = {};
-  if (apiKey?.trim() && apiKey !== '******** (saved)') {
-    headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+export async function fetchCloudModels(baseUrl?: string, apiKey?: string, extraHeaders?: string): Promise<string[]> {
+  const test = await testCloudConnection(baseUrl, apiKey, extraHeaders);
+  if (!test.ok) {
+    throw new Error(test.error || 'Failed to connect to cloud provider');
   }
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Cloud models request failed (${res.status}): ${text.slice(0, 100) || res.statusText}`);
+  return test.models;
+}
+
+export interface CloudTestResult {
+  ok: boolean;
+  latencyMs: number;
+  models: string[];
+  error?: string;
+}
+
+export async function testCloudConnection(baseUrl?: string, apiKey?: string, extraHeaders?: string): Promise<CloudTestResult> {
+  const t0 = performance.now();
+  try {
+    const base = (baseUrl?.trim() || 'https://api.openai.com/v1').replace(/\/+$/, '');
+    const url = base.endsWith('/models') ? base : `${base}/models`;
+    const headers: Record<string, string> = {};
+    if (apiKey?.trim() && apiKey !== '******** (saved)') {
+      headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+    }
+    if (extraHeaders?.trim()) {
+      try {
+        const parsed = JSON.parse(extraHeaders);
+        if (parsed && typeof parsed === 'object') {
+          Object.assign(headers, parsed);
+        }
+      } catch {
+        /* ignore invalid custom json headers */
+      }
+    }
+    const res = await fetch(url, { headers });
+    const latencyMs = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      return {
+        ok: false,
+        latencyMs,
+        models: [],
+        error: `HTTP ${res.status}: ${text.slice(0, 200) || res.statusText}`,
+      };
+    }
+    const data = await res.json();
+    let models: string[] = [];
+    if (Array.isArray(data?.data)) {
+      models = data.data
+        .map((m: any) => (typeof m === 'string' ? m : m?.id))
+        .filter((id: any): id is string => typeof id === 'string' && id.length > 0)
+        .sort();
+    }
+    return {
+      ok: true,
+      latencyMs,
+      models,
+    };
+  } catch (e) {
+    const latencyMs = Math.round(performance.now() - t0);
+    return {
+      ok: false,
+      latencyMs,
+      models: [],
+      error: e instanceof Error ? e.message : String(e),
+    };
   }
-  const data = await res.json();
-  if (Array.isArray(data?.data)) {
-    return data.data
-      .map((m: any) => (typeof m === 'string' ? m : m?.id))
-      .filter((id: any): id is string => typeof id === 'string' && id.length > 0)
-      .sort();
-  }
-  return [];
 }

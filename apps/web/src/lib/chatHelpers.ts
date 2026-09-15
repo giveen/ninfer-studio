@@ -308,10 +308,12 @@ export function resolveProviderConfig(
   const effectiveProvider = explicitProvider || (globalUseCloud ? 'cloud' : 'ninfer');
 
   if (effectiveProvider === 'cloud') {
+    const roleModel = role === 'primary' ? appConfig.cloudProviderPrimaryModel : appConfig.cloudProviderSubagentModel;
+    const fallbackDefault = role === 'primary' ? 'gpt-4o' : 'gpt-4o-mini';
     return {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
-      model: params[`${role}CloudModel`] || params.cloudModel || appConfig.cloudProviderDefaultModel || 'gpt-4o',
+      model: params[`${role}CloudModel`] || params.cloudModel || roleModel || appConfig.cloudProviderDefaultModel || fallbackDefault,
     };
   }
 

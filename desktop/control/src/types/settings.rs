@@ -170,6 +170,18 @@ pub struct AppSettings {
     /// Default cloud model selected by the user.
     #[serde(default)]
     pub cloud_provider_default_model: String,
+    /// Default model for primary agent turns.
+    #[serde(default)]
+    pub cloud_provider_primary_model: String,
+    /// Default model for subagent worker turns.
+    #[serde(default)]
+    pub cloud_provider_subagent_model: String,
+    /// JSON string of extra headers (e.g. for OpenRouter or custom proxies).
+    #[serde(default)]
+    pub cloud_provider_extra_headers: String,
+    /// Fallback to local engine on cloud rate limits (429) or server errors (5xx).
+    #[serde(default)]
+    pub cloud_fallback_to_local: bool,
     /// Automatically use cloud provider for primary main agent turns.
     #[serde(default)]
     pub cloud_use_for_primary: bool,
@@ -283,6 +295,10 @@ impl Default for AppSettings {
             cloud_provider_base_url: String::new(),
             cloud_provider_api_key: String::new(),
             cloud_provider_default_model: String::new(),
+            cloud_provider_primary_model: String::new(),
+            cloud_provider_subagent_model: String::new(),
+            cloud_provider_extra_headers: String::new(),
+            cloud_fallback_to_local: false,
             cloud_use_for_primary: false,
             cloud_use_for_subagent: false,
         }

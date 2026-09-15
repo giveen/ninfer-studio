@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Cloud, RefreshCw } from 'lucide-react';
+import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles } from 'lucide-react';
 import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
-import { fetchCloudModels } from '../../lib/api';
+import { testCloudConnection, type CloudTestResult } from '../../lib/api';
 
 interface CloudTabProps {
   settings: AppSettings | null;
@@ -19,20 +19,78 @@ const COMMON_OPENAI_MODELS = [
   'o1-mini',
   'o1-preview',
   'o3-mini',
+  'anthropic/claude-3.5-sonnet',
+  'deepseek-chat',
+  'deepseek-reasoner',
+  'llama-3.3-70b-versatile',
+];
+
+interface ProviderPreset {
+  id: string;
+  name: string;
+  baseUrl: string;
+  defaultPrimary: string;
+  defaultSubagent: string;
+  hint: string;
+  extraHeaders?: string;
+}
+
+const PRESETS: ProviderPreset[] = [
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    defaultPrimary: 'gpt-4o',
+    defaultSubagent: 'gpt-4o-mini',
+    hint: 'Official OpenAI API endpoint',
+  },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    defaultPrimary: 'anthropic/claude-3.5-sonnet',
+    defaultSubagent: 'openai/gpt-4o-mini',
+    hint: 'Unified access to Claude, GPT-4, DeepSeek & open models',
+    extraHeaders: JSON.stringify({ 'HTTP-Referer': 'https://ninfier.studio', 'X-Title': 'NInfer Studio' }, null, 2),
+  },
+  {
+    id: 'groq',
+    name: 'Groq',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    defaultPrimary: 'llama-3.3-70b-versatile',
+    defaultSubagent: 'llama-3.1-8b-instant',
+    hint: 'Ultra-fast LPU inference',
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    defaultPrimary: 'deepseek-chat',
+    defaultSubagent: 'deepseek-chat',
+    hint: 'Official DeepSeek V3/R1 API',
+  },
+  {
+    id: 'together',
+    name: 'Together AI',
+    baseUrl: 'https://api.together.xyz/v1',
+    defaultPrimary: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    defaultSubagent: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
+    hint: 'Together AI cloud inference',
+  },
 ];
 
 export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [apiDraft, setApiDraft] = useState('');
   const [models, setModels] = useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string>('');
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<CloudTestResult | null>(null);
+  const [showHeaders, setShowHeaders] = useState(false);
 
   useEffect(() => {
-    if (settings?.cloudProviderDefaultModel) {
-      setSelectedModel(settings.cloudProviderDefaultModel);
+    if (settings?.cloudProviderExtraHeaders) {
+      setShowHeaders(true);
     }
-  }, [settings?.cloudProviderDefaultModel]);
+  }, [settings?.cloudProviderExtraHeaders]);
 
   if (!settings) return null;
 
@@ -41,44 +99,45 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     onUpdate({ cloudProviderApiKey: v || undefined });
   };
 
-  const handleDetectModels = async () => {
-    setLoadingModels(true);
-    setFetchError(null);
+  const applyPreset = (preset: ProviderPreset) => {
+    onUpdate({
+      cloudProviderBaseUrl: preset.baseUrl,
+      cloudProviderPrimaryModel: preset.defaultPrimary,
+      cloudProviderSubagentModel: preset.defaultSubagent,
+      cloudProviderDefaultModel: preset.defaultPrimary,
+      cloudProviderExtraHeaders: preset.extraHeaders || '',
+    });
+    if (preset.extraHeaders) setShowHeaders(true);
+  };
+
+  const handleTestConnection = async () => {
+    setTesting(true);
+    setTestResult(null);
     try {
       const baseUrl = settings.cloudProviderBaseUrl || 'https://api.openai.com/v1';
       const key = apiDraft.trim() || settings.cloudProviderApiKey || '';
-      const detected = await fetchCloudModels(baseUrl, key);
-      setModels(detected);
-      if (detected.length > 0) {
-        const defaultPick = selectedModel && detected.includes(selectedModel)
-          ? selectedModel
-          : detected.includes('gpt-4o-mini')
-          ? 'gpt-4o-mini'
-          : detected.includes('gpt-4o')
-          ? 'gpt-4o'
-          : detected[0];
-        setSelectedModel(defaultPick);
-        onUpdate({ cloudProviderDefaultModel: defaultPick });
+      const headers = settings.cloudProviderExtraHeaders;
+      const res = await testCloudConnection(baseUrl, key, headers);
+      setTestResult(res);
+      if (res.ok && res.models.length > 0) {
+        setModels(res.models);
       }
-    } catch (e) {
-      setFetchError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoadingModels(false);
+      setTesting(false);
     }
   };
 
-  const currentDefault = selectedModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';
-  const combinedList = Array.from(new Set([...COMMON_OPENAI_MODELS, ...models, ...(currentDefault ? [currentDefault] : [])]));
-  const modelOptions = combinedList.map((m) => ({
-    value: m,
-    label: m,
-  }));
+  const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
+  const subagentModel = settings.cloudProviderSubagentModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';
+
+  const combinedList = Array.from(new Set([...COMMON_OPENAI_MODELS, ...models, primaryModel, subagentModel]));
+  const modelOptions = combinedList.map((m) => ({ value: m, label: m }));
 
   return (
     <div className="space-y-4">
       <SectionCard
         title="Cloud AI Providers"
-        description="Enable this to use external cloud AI providers in the Chat and Code harnesses instead of local models."
+        description="Connect external OpenAI-compatible APIs (OpenAI, OpenRouter, Groq, DeepSeek, Together AI) to use cloud models in Chat and Coder."
         icon={<Cloud size={15} />}
       >
         <div className="space-y-5">
@@ -86,26 +145,40 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
             checked={!!settings.cloudProviderEnabled}
             onChange={(v) => onUpdate({ cloudProviderEnabled: v })}
             label="Enable custom cloud provider"
-            hint="When enabled, you can switch between ninfer and cloud providers in the Chat and Code parameter settings."
+            hint="When enabled, you can switch between ninfer and cloud providers or set global cloud routing."
           />
 
           {settings.cloudProviderEnabled && (
-            <div className="space-y-4">
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 pt-1 border-t border-line/50">
-                <Toggle
-                  checked={!!settings.cloudUseForPrimary}
-                  onChange={(v) => onUpdate({ cloudUseForPrimary: v })}
-                  label="Cloud as Main Agent"
-                  hint="Automatically use the cloud provider for primary chat and code agents."
-                />
-                <Toggle
-                  checked={!!settings.cloudUseForSubagent}
-                  onChange={(v) => onUpdate({ cloudUseForSubagent: v })}
-                  label="Cloud as Subagent"
-                  hint="Automatically use the cloud provider for background subagent workers."
-                />
+            <div className="space-y-5 pt-1 border-t border-line/50">
+              {/* Presets Quick-Select */}
+              <div className="space-y-2">
+                <label className="text-[12px] font-semibold text-ink flex items-center gap-1.5">
+                  <Sparkles size={13} className="text-accent" />
+                  Provider Presets
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {PRESETS.map((p) => {
+                    const isActive = settings.cloudProviderBaseUrl === p.baseUrl;
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => applyPreset(p)}
+                        className={`rounded-lg border px-3 py-1.5 text-[12px] font-medium transition-all ${
+                          isActive
+                            ? 'border-accent bg-accent/10 text-accent shadow-sm'
+                            : 'border-line bg-panel hover:bg-panel2 text-mute hover:text-ink'
+                        }`}
+                        title={p.hint}
+                      >
+                        {p.name}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
+              {/* Endpoint & Key */}
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2">
                 <Field label="Base URL" hint="The API endpoint URL for the cloud provider (e.g., https://api.openai.com/v1).">
                   <TextField
@@ -132,56 +205,151 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 </Field>
               </div>
 
-              <div className="rounded-lg border border-line bg-panel p-3.5 space-y-3">
+              {/* Extra Headers Toggle / Drawer */}
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => setShowHeaders(!showHeaders)}
+                  className="text-[11.5px] font-medium text-accent hover:underline flex items-center gap-1"
+                >
+                  <Sliders size={12} />
+                  {showHeaders ? 'Hide Custom Headers' : '+ Add Custom HTTP Headers (JSON)'}
+                </button>
+                {showHeaders && (
+                  <Field label="Custom HTTP Headers (JSON)" hint='JSON key-value object appended to cloud requests (e.g. {"HTTP-Referer": "https://ninfier.studio"}).'>
+                    <textarea
+                      value={settings.cloudProviderExtraHeaders || ''}
+                      onChange={(e) => onUpdate({ cloudProviderExtraHeaders: e.target.value })}
+                      placeholder='{\n  "HTTP-Referer": "https://ninfier.studio",\n  "X-Title": "NInfer Studio"\n}'
+                      rows={3}
+                      className="w-full rounded-lg border border-line bg-inset px-3 py-2 font-mono text-[11.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                    />
+                  </Field>
+                )}
+              </div>
+
+              {/* Global Agent Routing Toggles */}
+              <div className="rounded-xl border border-line bg-panel p-4 space-y-3">
+                <h4 className="text-[13px] font-semibold text-ink">Global Execution Routing</h4>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Toggle
+                    checked={!!settings.cloudUseForPrimary}
+                    onChange={(v) => onUpdate({ cloudUseForPrimary: v })}
+                    label="Cloud as Main Agent"
+                    hint="Automatically use cloud provider for primary chat and code agents."
+                  />
+                  <Toggle
+                    checked={!!settings.cloudUseForSubagent}
+                    onChange={(v) => onUpdate({ cloudUseForSubagent: v })}
+                    label="Cloud as Subagent"
+                    hint="Automatically use cloud provider for background subagent workers."
+                  />
+                </div>
+              </div>
+
+              {/* Role-Specific Default Models */}
+              <div className="rounded-xl border border-line bg-panel p-4 space-y-4">
+                <div>
+                  <h4 className="text-[13px] font-semibold text-ink">Default Models per Role</h4>
+                  <p className="text-[11.5px] text-faint">
+                    Assign distinct models for your Main Agent (reasoning/coding) vs. Subagent Workers (speed/cost).
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active.">
+                    <div className="space-y-1.5">
+                      <SelectField
+                        value={primaryModel}
+                        onChange={(v) => onUpdate({ cloudProviderPrimaryModel: v, cloudProviderDefaultModel: v })}
+                        options={modelOptions}
+                      />
+                      <TextField
+                        value={settings.cloudProviderPrimaryModel || ''}
+                        onChange={(v) => onUpdate({ cloudProviderPrimaryModel: v })}
+                        placeholder="Custom model name..."
+                        className="text-[12px]"
+                      />
+                    </div>
+                  </Field>
+
+                  <Field label="Subagent Cloud Model" hint="Used for Scout probes, background workers, and Critic passes.">
+                    <div className="space-y-1.5">
+                      <SelectField
+                        value={subagentModel}
+                        onChange={(v) => onUpdate({ cloudProviderSubagentModel: v })}
+                        options={modelOptions}
+                      />
+                      <TextField
+                        value={settings.cloudProviderSubagentModel || ''}
+                        onChange={(v) => onUpdate({ cloudProviderSubagentModel: v })}
+                        placeholder="Custom model name..."
+                        className="text-[12px]"
+                      />
+                    </div>
+                  </Field>
+                </div>
+              </div>
+
+              {/* Test Connection & Latency Benchmark */}
+              <div className="rounded-xl border border-line bg-panel p-4 space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <h4 className="text-[13px] font-medium text-ink">Default Cloud Model</h4>
+                    <h4 className="text-[13px] font-semibold text-ink flex items-center gap-1.5">
+                      <Zap size={14} className="text-accent" />
+                      Test Connection & Latency Benchmark
+                    </h4>
                     <p className="text-[11.5px] text-faint">
-                      Auto-detect models from your provider or select from the dropdown list to set your default cloud model.
+                      Probe the endpoint, verify your API key, measure round-trip ping, and auto-detect models.
                     </p>
                   </div>
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={handleDetectModels}
-                    disabled={loadingModels}
-                    title="Probe the provider's /v1/models endpoint to auto-detect available model names"
+                    onClick={handleTestConnection}
+                    disabled={testing}
+                    className="border border-line/60"
                   >
-                    <RefreshCw size={13} className={loadingModels ? 'animate-spin' : ''} />
-                    {loadingModels ? 'Detecting…' : 'Auto-detect models'}
+                    <RefreshCw size={13} className={testing ? 'animate-spin' : ''} />
+                    {testing ? 'Benchmarking…' : 'Run Benchmark'}
                   </Button>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="flex-1 min-w-[200px]">
-                    <SelectField
-                      value={currentDefault}
-                      onChange={(v) => {
-                        setSelectedModel(v);
-                        onUpdate({ cloudProviderDefaultModel: v });
-                      }}
-                      options={modelOptions}
-                    />
+                {testResult && (
+                  <div
+                    className={`rounded-lg border p-3 text-[12px] ${
+                      testResult.ok ? 'border-ok/30 bg-ok/5 text-ok' : 'border-danger/30 bg-danger/5 text-danger'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 font-medium">
+                      {testResult.ok ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+                      <span>{testResult.ok ? 'Connection Successful' : 'Connection Failed'}</span>
+                      <span className="ml-auto text-[11px] opacity-80">{testResult.latencyMs}ms latency</span>
+                    </div>
+                    {testResult.ok ? (
+                      <p className="mt-1 text-[11px] opacity-90">
+                        Detected {testResult.models.length} model{testResult.models.length === 1 ? '' : 's'} on provider endpoint.
+                      </p>
+                    ) : (
+                      <p className="mt-1 text-[11px] font-mono opacity-90">{testResult.error}</p>
+                    )}
                   </div>
-                  <div className="w-56">
-                    <TextField
-                      value={selectedModel}
-                      onChange={(v) => {
-                        setSelectedModel(v);
-                        onUpdate({ cloudProviderDefaultModel: v });
-                      }}
-                      placeholder="Or type custom model..."
-                      className="text-[12px]"
-                    />
-                  </div>
-                </div>
-
-                {fetchError && <p className="text-[11.5px] text-danger">{fetchError}</p>}
-                {models.length > 0 && (
-                  <p className="text-[11px] text-ok">
-                    Detected {models.length} model{models.length === 1 ? '' : 's'} from provider.
-                  </p>
                 )}
+              </div>
+
+              {/* Local Fallback Toggle */}
+              <div className="rounded-xl border border-line bg-panel p-4">
+                <Toggle
+                  checked={!!settings.cloudFallbackToLocal}
+                  onChange={(v) => onUpdate({ cloudFallbackToLocal: v })}
+                  label={
+                    <span className="flex items-center gap-1.5">
+                      <ShieldAlert size={14} className="text-warn" />
+                      Fallback to Local Engine on Rate Limits / Outage
+                    </span>
+                  }
+                  hint="If the cloud API returns 429 Rate Limit or 5xx server errors, automatically fallback to the local ninfer engine to prevent interrupting agent loops."
+                />
               </div>
             </div>
           )}

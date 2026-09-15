@@ -112,6 +112,10 @@ export interface AppSettings {
   cloudProviderBaseUrl?: string;
   cloudProviderApiKey?: string;
   cloudProviderDefaultModel?: string;
+  cloudProviderPrimaryModel?: string;
+  cloudProviderSubagentModel?: string;
+  cloudProviderExtraHeaders?: string;
+  cloudFallbackToLocal?: boolean;
   cloudUseForPrimary?: boolean;
   cloudUseForSubagent?: boolean;
 }
