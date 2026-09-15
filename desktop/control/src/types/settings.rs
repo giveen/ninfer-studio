@@ -8,6 +8,10 @@ pub(crate) fn redacted(s: &str) -> &'static str {
     if s.is_empty() { "" } else { "***" }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
