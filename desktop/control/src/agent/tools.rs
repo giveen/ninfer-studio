@@ -16,7 +16,7 @@
 use crate::agent::run::{now_ms, AgentEvent, ApprovalDecision, PendingApproval, PendingQuestion, RunShared, RunStatus};
 use crate::coder::{browser, exec, fs, grep, memory, search, web};
 use crate::engine::S;
-use axum::extract::{Path as AxumPath, Query};
+use axum::extract::{Path as AxumPath, Query, State as AxumState};
 use axum::Json;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -442,6 +442,10 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         Err((_, Json(v))) => v,
     }
 }
+// NOTE: every handler above is called in-process with its axum extractors
+// constructed by hand — `AxumState(state.clone())` mirrors what axum would
+// inject. Forgetting the `State(...)` wrapper is the classic compile error
+// here (`expected State<Arc<State>>, found Arc<State>`).
 
 /// Pause the run on an `ask`-tier tool and wait for a client's decision.
 /// Returns the one-shot approval token on approval, `None` on denial or
