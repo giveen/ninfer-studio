@@ -614,15 +614,34 @@ async fn delegate(state: &S, run: &Arc<RunShared>, args: &Value) -> Value {
     if task.is_empty() {
         return json!({ "error": "task is required" });
     }
+    // Per-family scout semantics (CoderScreen's runSubagent vs ChatScreen's
+    // runNested — different seeds, different default tool sets).
+    if run.meta.tool_set == "chat" {
+        let prompt = format!("Task: {task}\n\nWhen finished, reply with a concise final summary — you cannot ask the user anything.");
+        return spawn_child(state, run, "delegate", "scout", &prompt, SCOUT_CHAT_TOOLS, SCOUT_CHAT_TOOLS, 6, args).await;
+    }
     // The client's exact scout seed (the task is wrapped the same way).
     let prompt = format!("Task: {task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.");
-    spawn_child(state, run, "delegate", "scout", &prompt, DELEGATE_TOOLS, 6, args).await
+    spawn_child(state, run, "delegate", "scout", &prompt, SCOUT_DEFAULT_TOOLS, SCOUT_FILTER_TOOLS, 6, args).await
 }
 
 async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
     let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if task.is_empty() {
         return json!({ "error": "task is required" });
+    }
+    // Chat (CU) runs: ChatScreen's subagent — a plain nested run over the
+    // run's own tool set (no ideation, critic, or git diff: the CU directory
+    // is not a repo).
+    if parent.meta.tool_set == "chat" {
+        let defaults: Vec<&str> = parent
+            .meta
+            .tool_names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !matches!(n, "delegate" | "subagent" | "ask_user" | "todo_write"))
+            .collect();
+        return spawn_child(state, parent, "subagent", "worker", &task, &defaults[..], &defaults[..], 20, args).await;
     }
     let wmodel = args
         .get("model")
@@ -641,10 +660,10 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         state,
         &wmodel,
         IDEATION_SYSTEM,
-        &task,
-        Some(0.7),
-        Some(500),
-        std::time::Duration::from_secs(30),
+        &format!("TASK:\n{task}"),
+        Some(0.4),
+        Some(1024),
+        std::time::Duration::from_secs(120),
     )
     .await
     .unwrap_or_default()
@@ -682,7 +701,10 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
     const MAX_WORKER_CRIT: u32 = 2;
     for attempt in 0..=MAX_WORKER_CRIT {
         if attempt > 0 {
-            prompt = format!("TASK (implement now):\n{task}\n\n## Critic review of your previous attempt (address every issue listed before re-attempting):\n{critique}");
+            // The client's exact retry prompt.
+            prompt = format!(
+                "TASK (revise your previous implementation):\n{task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n{critique}"
+            );
         }
         let res = spawn_child(state, parent, "subagent", "worker", &prompt, SUBAGENT_TOOLS, 12, args).await;
         summary = res["summary"].as_str().unwrap_or_default().to_string();
@@ -693,22 +715,34 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         diff = net_diff(parent.scope_opt().as_deref(), pre.as_deref()).await.unwrap_or_default();
         // No critic spec (or an empty diff) → no review gate for this attempt.
         let Some(spec) = critic.as_ref().filter(|_| !diff.trim().is_empty()) else {
+            res_ok = true; // unreviewed attempt stands (the client's gate is off)
             break;
         };
         match run_critic(state, parent, spec, &diff, &task).await {
             Ok((approved, issues, learnings)) => {
-                persist_learnings(state, parent, &learnings, if approved { "critic:approve" } else { "critic:reject" }, &task).await;
+                if !learnings.is_empty() {
+                    persist_learnings(state, parent, &learnings, if approved { "critic:approve" } else { "critic:reject" }, &task).await;
+                }
                 critic_approved = Some(approved);
-                if approved || attempt == MAX_WORKER_CRIT || issues == prev_critique {
-                    // Approved, budget spent, or the same issues raised again
-                    // — the worker is not converging, stop retries early.
+                if approved || attempt == MAX_WORKER_CRIT {
+                    break;
+                }
+                // Stuck detection (the client's): the same non-empty issues
+                // twice means the worker isn't converging — stop burning the
+                // remaining retries on a repeat.
+                let issues_t = issues.trim();
+                if attempt > 0 && !issues_t.is_empty() && issues_t.eq_ignore_ascii_case(prev_critique.trim()) {
                     break;
                 }
                 prev_critique = issues.clone();
                 critique = issues;
             }
-            // Fail-open: a critic error never blocks the run.
-            Err(_) => break,
+            // Fail-open (the client's): a critic error reads as approved.
+            Err(e) => {
+                eprintln!("[agent] run {} critic error: {e}", parent.meta.id);
+                critic_approved = Some(true);
+                break;
+            }
         }
     }
     if exhausted {
@@ -727,21 +761,23 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
 /// Spawn a child run (server-side `delegate`/`subagent`) and wait for its
 /// terminal state. The child is a first-class run — it shows up in the
 /// registry and any client can attach to watch it. `prompt` is the seed user
-/// message; the child's tool allow-list / maxSteps / model come from the
-/// caller's args (model-supplied lists filtered against `allowed`).
+/// message; the model's `tools` allow-list is filtered against `filter_tools`
+/// (nothing survives → `default_tools`), and maxSteps/model come from args.
 async fn spawn_child(
     state: &S,
     parent: &Arc<RunShared>,
     tool: &str,
     kind: &str,
     prompt: &str,
-    allowed: &[&str],
+    default_tools: &[&str],
+    filter_tools: &[&str],
     default_steps: usize,
     args: &Value,
 ) -> Value {
-    // Model-supplied allow-list filtered against the role's set (mirrors the
-    // client's filterToolAllowList: nothing survives → the role's set).
-    let allowed_set: HashSet<&str> = allowed.iter().copied().collect();
+    // Model-supplied allow-list filtered against the role's filter set
+    // (mirrors the client's filterToolAllowList: nothing survives → the
+    // role's DEFAULT set — which is not always the same list).
+    let allowed_set: HashSet<&str> = filter_tools.iter().copied().collect();
     let requested: Vec<String> = args
         .get("tools")
         .and_then(|v| v.as_array())
@@ -749,7 +785,7 @@ async fn spawn_child(
         .unwrap_or_default();
     let filtered: Vec<String> = requested.into_iter().filter(|t| allowed_set.contains(t.as_str())).collect();
     let tool_names: Vec<String> = if filtered.is_empty() {
-        allowed.iter().map(|s| s.to_string()).collect()
+        default_tools.iter().map(|s| s.to_string()).collect()
     } else {
         filtered
     };
@@ -789,13 +825,41 @@ async fn spawn_child(
         kind: kind.into(),
         label: format!("{tool}: {}", prompt.chars().take(60).collect::<String>()),
         model,
-        system: if kind == "worker" { Some(WORKER_SYSTEM.to_string()) } else { Some(SCOUT_SYSTEM.to_string()) },
+        system: {
+            if kind == "worker" && parent.meta.tool_set != "chat" {
+                Some(WORKER_SYSTEM.to_string())
+            } else if kind == "worker" {
+                Some(
+                    "You can read, write, and edit files and run shell commands to complete the task."
+                        .to_string(),
+                )
+            } else if parent.meta.tool_set == "chat" {
+                let dir = parent.scope_opt().unwrap_or_else(|| "~".to_string());
+                Some(format!(
+                    "You are a focused subagent working in the directory {dir}. You are a read-only investigator — do not write files or run mutating commands."
+                ))
+            } else {
+                // Coder scouts run under the parent's (coder) system, like the
+                // client's runSubagent (dynamicSystemRef.current).
+                parent.meta.system.clone().unwrap_or_else(|| SCOUT_SYSTEM.to_string())
+            }
+        },
         max_steps,
         created_at: now_ms(),
         tool_set: parent.meta.tool_set.clone(),
         tool_names,
         tools_spec: Value::Array(tools_spec),
-        params: parent.meta.params.clone(),
+        params: {
+            let mut p = parent.meta.params.clone();
+            // The client's per-kind maxTokens (worker 4096, scout 2048); chat
+            // runs keep the chat screen's own params untouched.
+            if parent.meta.tool_set != "chat" {
+                if let Value::Object(o) = &mut p {
+                    o.insert("maxTokens".to_string(), json!(if kind == "worker" { 4096 } else { 2048 }));
+                }
+            }
+            p
+        },
         parent: Some(parent.meta.id.clone()),
         plan: false,
         critic: None,
