@@ -14,15 +14,15 @@
 
 // Rust guideline compliant 2026-07-28
 
-mod browser;
-mod common;
-mod exec;
-mod fs;
-mod grep;
-mod memory;
-mod search;
-mod web;
-mod workspace;
+pub(crate) mod browser;
+pub(crate) mod common;
+pub(crate) mod exec;
+pub(crate) mod fs;
+pub(crate) mod grep;
+pub(crate) mod memory;
+pub(crate) mod search;
+pub(crate) mod web;
+pub(crate) mod workspace;
 
 pub use browser::{browser, BrowserSlot};
 /// The actor's panic guard — reused by `mcp` (its sessions are `!Send` for

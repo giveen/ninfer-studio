@@ -114,18 +114,56 @@ pub fn build_request(
             .map(|a| !a.is_empty())
             .unwrap_or(false);
         if has_attachments {
-            let mut content: Vec<Value> = vec![json!({
-                "type": "text",
-                "text": m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            })];
+            let mut content: Vec<Value> = Vec::new();
+            let text = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            // Mirrors the client's mapping (api/chat.ts): non-empty prose
+            // first, then one part per attachment.
+            if !text.trim().is_empty() {
+                content.push(json!({ "type": "text", "text": text.to_string() }));
+            }
             if let Some(atts) = m.get("attachments").and_then(|v| v.as_array()) {
                 for a in atts {
-                    let p = a.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-                    let body = a.get("body").and_then(|v| v.as_str()).unwrap_or_default();
-                    content.push(json!({
-                        "type": "text",
-                        "text": format!("\n\n[Attached file: {p}]\n```\n{body}\n```\n"),
-                    }));
+                    match a.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+                        "image" => {
+                            if let Some(url) = a.get("dataUrl").and_then(|v| v.as_str()) {
+                                content.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                            }
+                        }
+                        "video" => {
+                            if let Some(url) = a.get("dataUrl").and_then(|v| v.as_str()) {
+                                content.push(json!({ "type": "video_url", "video_url": { "url": url } }));
+                            }
+                        }
+                        _ => {
+                            let p = a
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| a.get("name").and_then(|v| v.as_str()))
+                                .unwrap_or_default();
+                            let body = a
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| a.get("body").and_then(|v| v.as_str()))
+                                .unwrap_or_default();
+                            // Backtick-run-aware fence, like the client: the
+                            // fence must exceed the longest run in the body.
+                            let mut run = 0;
+                            let mut cur = 0;
+                            for ch in body.chars() {
+                                if ch == '`' {
+                                    cur += 1;
+                                    run = run.max(cur);
+                                } else {
+                                    cur = 0;
+                                }
+                            }
+                            let fence = "`".repeat(run.max(2) + 1);
+                            content.push(json!({
+                                "type": "text",
+                                "text": format!("\n\n[Attached file: {p}]\n{fence}\n{body}\n{fence}\n"),
+                            }));
+                        }
+                    }
                 }
             }
             msgs.push(json!({ "role": "user", "content": content }));
@@ -1244,7 +1282,6 @@ mod tests {
         assert_eq!(req2["messages"].as_array().unwrap().len(), 1);
         assert!(req2.get("tools").is_none());
     }
-
     #[test]
     fn build_request_att_becomes_content_parts() {
         let m = json!({
@@ -1257,6 +1294,20 @@ mod tests {
         assert_eq!(content[0]["text"], "look");
         assert!(content[1]["text"].as_str().unwrap().contains("[Attached file: /tmp/a.txt]"));
         assert_eq!(req["messages"][0]["role"], "user");
+        // The client's ChatAttachment shape (kind/dataUrl/content keys).
+        let m2 = json!({
+            "role": "user",
+            "content": "",
+            "attachments": [
+                { "kind": "file", "name": "b.md", "content": "hi ```x```" },
+                { "kind": "image", "name": "p.png", "dataUrl": "data:image/png;base64,AAA" },
+            ],
+        });
+        let req2 = build_request("m", None, std::slice::from_ref(&m2), &json!({}), &json!([]));
+        let c2 = req2["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(c2.len(), 2);
+        assert!(c2[0]["text"].as_str().unwrap().contains("````\n"));
+        assert_eq!(c2[1]["image_url"]["url"], "data:image/png;base64,AAA");
     }
 
     #[test]
@@ -1374,6 +1425,7 @@ mod tests {
             stop_rx,
             hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
             hook_wait: std::sync::Mutex::new(None),
+            gate_state: Default::default(),
             client: reqwest::Client::new(),
         });
 
@@ -1437,6 +1489,7 @@ mod tests {
         {
             let mut eng = state.engine.write().await;
             eng.port = Some(port);
+            eng.model_id = Some("mock-model".to_string());
             eng.state = crate::types::EngineState::Running;
         }
 
@@ -1529,6 +1582,7 @@ mod tests {
             stop_rx,
             hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
             hook_wait: std::sync::Mutex::new(None),
+            gate_state: Default::default(),
             client: reqwest::Client::new(),
         });
         state
@@ -1633,6 +1687,7 @@ mod tests {
             stop_rx,
             hook_mode: std::sync::Mutex::new(crate::agent::run::HookMode::Auto),
             hook_wait: std::sync::Mutex::new(None),
+            gate_state: Default::default(),
             client: reqwest::Client::new(),
         });
 

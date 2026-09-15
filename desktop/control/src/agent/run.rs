@@ -80,6 +80,10 @@ pub enum AgentEvent {
     Done { stop: Option<String>, status: RunStatus },
     /// Loop error message (the run has moved to `error` status).
     Error { message: String },
+    /// A risky shell command paused the run (risky gate); a client should
+    /// show its allow/deny dialog.
+    GateRequested { id: String, kind: GateKind, command: String, reason: Option<String> },
+    GateResolved { id: String, kind: GateKind, decision: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -91,6 +95,8 @@ pub enum RunStatus {
     /// Paused at a turn end for a client's turn-hook decision (humanize /
     /// verify-critic gates / compaction).
     AwaitingHook,
+    /// Paused on a risky/commit gate for a client's allow/deny decision.
+    AwaitingGate,
     Done,
     Stopped,
     Error,
@@ -123,6 +129,58 @@ pub struct PendingQuestion {
 pub enum ApprovalDecision {
     Approved { token: Option<String> },
     Denied,
+}
+/// Which human gate paused the run: a risky shell command, or a git commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Risky,
+    Commit,
+}
+
+/// A pending risky/commit pause, surfaced on the snapshot so a polling
+/// client can show its dialog without holding an SSE subscription.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingGate {
+    pub id: String,
+    pub kind: GateKind,
+    pub command: String,
+    pub reason: Option<String>,
+}
+
+/// What the waiting dispatch is handed when a client resolves a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDecision {
+    Once,
+    /// Run it and remember the (normalized) command for the rest of the run.
+    Remember,
+    /// Don't run it — the tool returns a denial error to the model.
+    Deny,
+}
+
+/// Per-run human-gate config (the client's risky/commit gates, ported).
+/// Cloned from the parent for child runs; `approved` grows on `remember`.
+#[derive(Debug, Clone, Default)]
+pub struct GateOpts {
+    pub risky: bool,
+    pub commit: bool,
+    pub approved: Vec<String>,
+}
+
+/// Gate config + at most one in-flight pause. One field (not two) so the
+/// half-dozen RunShared construction sites grow by a single line.
+#[derive(Debug, Default)]
+pub struct GateState {
+    pub opts: GateOpts,
+    pub slot: Option<GateSlot>,
+}
+
+/// An in-flight gate pause: what the client must decide, and the channel
+/// the decision wakes.
+#[derive(Debug)]
+pub struct GateSlot {
+    pub pending: PendingGate,
+    pub tx: oneshot::Sender<GateDecision>,
 }
 
 /// Turn-hook mode: `auto` = the loop decides turn ends by itself (the
@@ -198,6 +256,8 @@ pub struct RunSnapshot {
     pub hook_mode: String,
     /// The id of a pending hook decision, if paused.
     pub pending_hook: Option<String>,
+    /// A pending risky/commit gate pause, if any (the polling client's dialog).
+    pub pending_gate: Option<PendingGate>,
     /// Plan mode: read-only investigation run (bash locked to inspection
     /// commands, MCP + mutating tools denied at dispatch).
     pub plan: bool,
@@ -289,6 +349,8 @@ pub struct RunShared {
     pub hook_mode: Mutex<HookMode>,
     /// Resolver for a waiting turn-hook decision (mode == client).
     pub hook_wait: Mutex<Option<oneshot::Sender<HookDecision>>>,
+    /// Risky/commit human gates: config + at most one in-flight pause.
+    pub gate_state: Mutex<GateState>,
     pub client: reqwest::Client,
 }
 
@@ -353,6 +415,7 @@ impl RunShared {
                 HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
+            pending_gate: self.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot.as_ref().map(|s| s.pending.clone()),
             plan: meta.plan,
             todo_rev: live.todo_rev,
         }
@@ -430,7 +493,7 @@ impl RunShared {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct StartBody {
     #[serde(default = "default_kind")]
     kind: String,
@@ -460,6 +523,17 @@ pub(crate) struct StartBody {
     plan: bool,
     /// Worker critic spec `{model, system?}` for subagent runs.
     critic: Option<Value>,
+    /// Risky-command gate (the client's detectRisky HITL, ported): pause on
+    /// risky-but-allowed shell commands for a once/remember/deny decision.
+    #[serde(default)]
+    risky_gate: bool,
+    /// Commit-approval gate: pause on `git commit` shell commands.
+    #[serde(default)]
+    commit_gate: bool,
+    /// Pre-approved (normalized) commands for the risky gate.
+    #[serde(default)]
+    approved_commands: Vec<String>,
+    hook_mode: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -493,6 +567,7 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
         stop_rx,
         hook_mode: Mutex::new(HookMode::Auto),
         hook_wait: Mutex::new(None),
+        gate_state: Default::default(),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3600))
             .build()
@@ -625,8 +700,19 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         critic,
     };
     // Registered + spawned before this response goes out (see spawn_run),
-    // so a client can attach to the SSE stream immediately.
-    let _shared = spawn_run(&state, meta, live);
+    // so a client can attach to the SSE stream immediately. A requested
+    // client hook mode is applied synchronously here — before the loop task
+    // is first scheduled — so turn one can't finish in auto mode first.
+    let shared = spawn_run(&state, meta, live);
+    if body.hook_mode.as_deref() == Some("client") {
+        *shared.hook_mode.lock().unwrap_or_else(|p| p.into_inner()) = HookMode::Client;
+    }
+    if body.risky_gate || body.commit_gate || !body.approved_commands.is_empty() {
+        let mut gs = shared.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+        gs.opts.risky = body.risky_gate;
+        gs.opts.commit = body.commit_gate;
+        gs.opts.approved = body.approved_commands.iter().map(|c| normalize_command(c)).collect();
+    }
     Json(json!({ "id": id, "status": "running" })).into_response()
 }
 
@@ -725,6 +811,73 @@ pub(crate) struct ApproveBody {
     decision: String,
     #[serde(default)]
     token: Option<String>,
+}
+
+/// `POST /api/agent/runs/{id}/gates/{gid}` — resolve a pending risky/commit
+/// gate. Body: `{decision: "once"|"remember"|"deny"}` for a risky gate
+/// (`remember` runs it and records the normalized command for the rest of
+/// the run), `{decision: "approve"|"deny"}` for a commit gate. Unlike
+/// approvals, no one-shot token is involved — the dialog itself is the
+/// human gesture, and the command never leaves this machine.
+pub(crate) async fn gate_decide(
+    AxumState(state): AxumState<S>,
+    Path((id, gid)): Path<(String, String)>,
+    Json(body): Json<GateDecideBody>,
+) -> Response {
+    let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(r) = runs.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+    };
+    let mut gs = r.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(slot) = gs.slot.take() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "no pending gate with that id"}))).into_response();
+    };
+    if slot.pending.id != gid {
+        gs.slot = Some(slot);
+        return (StatusCode::CONFLICT, Json(json!({"error": "no pending gate with that id"}))).into_response();
+    }
+    let decision = match (slot.pending.kind, body.decision.as_str()) {
+        (GateKind::Risky, "once") => GateDecision::Once,
+        (GateKind::Risky, "remember") => GateDecision::Remember,
+        (_, "deny") => GateDecision::Deny,
+        (GateKind::Commit, "approve") => GateDecision::Once,
+        _ => {
+            gs.slot = Some(slot);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "decision must be once|remember|deny (risky) or approve|deny (commit)"})),
+            )
+                .into_response();
+        }
+    };
+    if decision == GateDecision::Remember {
+        let norm = normalize_command(&slot.pending.command);
+        if !gs.opts.approved.iter().any(|a| a == &norm) {
+            gs.opts.approved.push(norm);
+        }
+    }
+    let kind = slot.pending.kind;
+    let id_out = slot.pending.id.clone();
+    let name = match decision {
+        GateDecision::Once => "once",
+        GateDecision::Remember => "remember",
+        GateDecision::Deny => "deny",
+    };
+    let _ = slot.tx.send(decision);
+    drop(gs);
+    r.set_status(RunStatus::Running);
+    let _ = r.tx.send(AgentEvent::GateResolved { id: id_out, kind, decision: name.to_string() });
+    Json(json!({ "ok": true, "decision": name })).into_response()
+}
+#[derive(Debug, Deserialize)]
+pub(crate) struct GateDecideBody {
+    pub(crate) decision: String,
+}
+
+/// Normalize a shell command for approved-command matching (the client's
+/// `normalizeCommand`, ported): collapse whitespace, trim.
+pub(crate) fn normalize_command(cmd: &str) -> String {
+    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// `POST /api/agent/runs/{id}/questions/{qid}` — answer a pending
@@ -957,7 +1110,7 @@ pub(crate) async fn todo_set(AxumState(state): AxumState<S>, Path(id): Path<Stri
     };
     let items = clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
     let mut live = lock(&r.live);
-    live.todo = Value::Array(items.clone());
+    live.todo = Some(Value::Array(items.clone()));
     live.todo_rev += 1;
     let rev = live.todo_rev;
     drop(live);
@@ -974,6 +1127,7 @@ pub(crate) fn router() -> Router<S> {
         .route("/runs/{id}/todo", post_route(todo_set))
         .route("/runs/{id}/stop", post_route(stop))
         .route("/runs/{id}/approvals/{aid}", post_route(approve))
+        .route("/runs/{id}/gates/{gid}", post_route(gate_decide))
         .route("/runs/{id}/questions/{qid}", post_route(answer))
         .route("/runs/{id}/hook", post_route(set_hook_mode))
         .route("/runs/{id}/hooks/{hid}", post_route(hook_decision))
@@ -1044,6 +1198,7 @@ pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Optio
         stop_rx,
         hook_mode: Mutex::new(HookMode::Auto),
         hook_wait: Mutex::new(None),
+        gate_state: Default::default(),
         client: reqwest::Client::new(),
     })
 }
@@ -1054,7 +1209,9 @@ mod tests {
     use crate::types::State;
 
     fn fresh() -> S {
-        let tmp = std::env::temp_dir().join(format!("ninfier-agent-{}-{}", std::process::id(), now_ms()));
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ninfier-agent-{}-{}-{n}", std::process::id(), now_ms()));
         Arc::new(State::new(tmp.clone(), tmp, None))
     }
 
@@ -1102,5 +1259,29 @@ mod tests {
         let err = r.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(err.contains("unknown tool"), "{r}");
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
+    }
+
+    /// The web client sends camelCase (StartRunBody); the server must read
+    /// it — a silent case mismatch here once gave every UI-started run 60
+    /// steps, no tools, and no gates.
+    #[test]
+    fn start_body_accepts_camel_case_wire() {
+        let b: StartBody = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "kind": "worker", "label": "w", "model": "m", "system": "s",
+            "maxSteps": 12, "toolSet": "coder", "toolNames": ["read"],
+            "tools": [], "params": {"maxTokens": 1}, "scope": "/tmp",
+            "parent": null, "plan": true, "critic": null,
+            "hookMode": "client", "riskyGate": true, "commitGate": true,
+            "approvedCommands": ["git push"]
+        }))
+        .unwrap();
+        assert_eq!(b.max_steps, 12);
+        assert_eq!(b.tool_set, "coder");
+        assert_eq!(b.tool_names, Some(vec!["read".to_string()]));
+        assert_eq!(b.hook_mode.as_deref(), Some("client"));
+        assert!(b.risky_gate && b.commit_gate);
+        assert_eq!(b.approved_commands, vec!["git push".to_string()]);
+        assert!(b.plan);
     }
 }

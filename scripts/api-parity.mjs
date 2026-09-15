@@ -31,8 +31,10 @@ const read = (p) => readFileSync(join(root, p), 'utf8');
 // to this gate and drift stops being caught.
 function uiEndpoints() {
   const dir = 'apps/web/src/lib/api';
-  const files = readdirSync(join(root, dir)).filter((f) => f.endsWith('.ts'));
-  const src = files.map((f) => read(join(dir, f))).join('\n');
+  const files = readdirSync(join(root, dir)).filter((f) => f.endsWith('.ts')).map((f) => join(dir, f));
+  // Server-run adapter lives beside the domain modules, not inside them.
+  files.push('apps/web/src/lib/agentRuns.ts');
+  const src = files.map((f) => read(f)).join('\n');
   const paths = new Set();
   const re = /['"`]([^'"`$]*\/api\/[^'"`$?]*)/g;
   for (const m of src.matchAll(re)) {
@@ -41,15 +43,28 @@ function uiEndpoints() {
     p = p.replace(/\$\{[^}]*\}/g, '*');
     if (p.startsWith('/api/')) paths.add(p);
   }
+  // Backtick templates contain `$` so the pass above skips them — same
+  // extraction with `${...}` → `*`.
+  const reTpl = /`([^`]*\/api\/[^`?]*)`/g;
+  for (const m of src.matchAll(reTpl)) {
+    let p = m[1].trim().replace(/\$\{[^}]*\}/g, '*');
+    if (p.startsWith('/api/')) paths.add(p);
+  }
   return [...paths].sort();
 }
 
 // --- Collect routes each backend registers ---------------------------------
 function rustRoutes() {
-  const src = read('desktop/control/src/lib.rs');
   const routes = new Set();
-  for (const m of src.matchAll(/\.route\("([^"]+)"/g)) {
+  const lib = read('desktop/control/src/lib.rs');
+  for (const m of lib.matchAll(/\.route\("([^"]+)"/g)) {
     routes.add(m[1].replace(/\{[^}]*\}/g, '*'));
+  }
+  // /api/agent is a nested router (agent/run.rs); its routes register there,
+  // prefixed by the nest point in lib.rs.
+  const runs = read('desktop/control/src/agent/run.rs');
+  for (const m of runs.matchAll(/\.route\("([^"]+)"/g)) {
+    routes.add(('/api/agent' + m[1]).replace(/\{[^}]*\}/g, '*'));
   }
   return [...routes];
 }

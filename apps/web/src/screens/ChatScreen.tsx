@@ -19,23 +19,23 @@ import {
   X,
 } from 'lucide-react';
 import { HitlDialog } from '../components/HitlDialog';
-import { coderWebFetch, coderWebSearch, frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation, coderRead, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderDirs, coderSearch } from '../lib/api';
+import { frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
-import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
-import { isCompactedMsg, runToolLoop, humanizePassText, type ToolHandler, type ToolRegistry } from '../lib/agentLoop';
+import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, type VoiceProfile } from '../lib/notai';
+import { isCompactedMsg, humanizePassText } from '../lib/agentLoop';
+import { agentRunsApi, RunStream, type RunEvent, type RunMessageWire, type RunSnapshot } from '../lib/agentRuns';
 import { formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import type { MessageMeta } from '../lib/types';
 import { setLatestRequestMetrics } from '../lib/liveMetrics';
-import type { ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
+import type { AgentToolCall, ChatAttachment, ChatMessage, ChatParams, Conversation, EngineStatus, SavedChatParams, StatusPayload } from '../lib/types';
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, checkComputerUsePerm, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
-import { knownResponsesSupport, paramsSupportedByResponses, probeResponsesSupport, streamResponses } from '../lib/api/responses';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { coderBrowser, chatMemoryAddLearning, chatMemoryGet, critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, mcpCall, type CoderLearningKind, type McpToolInfo } from '../lib/api';
-import { readRecallChunk } from '../lib/observationPack';
-import { filterToolAllowList, mcpToolTier, mcpToolSchema } from '../lib/coderTools';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, type McpToolInfo } from '../lib/api';
+import { mcpToolTier, mcpToolSchema } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
 
@@ -44,7 +44,7 @@ import { engineMaxConcurrency } from '../lib/engineInfo';
 // ---------------------------------------------------------------------------
 function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; onNavigate: (s: 'chat' | 'engine' | 'models' | 'settings') => void }) {
   const {
-    agentResearch, memoryEnabled, memoryRef, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
+    agentResearch, memoryEnabled, memoryRef, adoptMemory, loadMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
     deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
     computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir,
   } = useChatAgent();
@@ -375,433 +375,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         );
       };
 
-      // Chat tools as a registry for the shared runner: the same ToolRegistry
-      // contract the coder loops use. Three independent, overlapping
-      // surfaces can all define `browser`/`memory_update` (Agent Mode,
-      // Memory, and Computer Use's own fallback for when the dedicated
-      // toggle is off) — the merged `tools` schema list below is
-      // de-duplicated by name (first entry wins), and the object-spread
-      // order here is deliberately the MIRROR of that (Computer Use spreads
-      // first, the dedicated toggles last) so whichever schema actually won
-      // is backed by the matching handler, never the other one.
+      // Tool schemas offered to the server run (dispatched in-process by the
+      // control plane). Three independent, overlapping surfaces can all
+      // define `browser`/`memory_update` (Agent Mode, Memory, and Computer
+      // Use) — de-duplicated by name, first entry wins, so the dedicated
+      // toggles come before Computer Use and their schema is what the model
+      // actually gets when both are on.
       const computerUseOn = computerUseEnabled && !!computerUseDirRef.current;
-      const cuOuterCheck = async (name: string, args: Record<string, unknown>, detail: string): Promise<string | null> => {
-        const verdict = checkComputerUsePerm(computerUsePerms, name, args);
-        if (verdict === null) return null;
-        if (verdict === 'ask') {
-          const ok = await requestApproval(name, detail);
-          return ok ? null : `Denied by the user (${name}). Ask for an alternative or proceed without it.`;
-        }
-        return verdict;
-      };
-      // One MCP tool (mcp__<server>__<tool>) — the control plane executes it
-      // (desktop/control/src/mcp.rs) and re-checks the tier server-side
-      // (per-tool row over the mcp__<server> row). Unlike the CU built-ins
-      // above, an `ask` approval here mints a real token, so an ask-tiered
-      // MCP tool can't 403 at the endpoint after the human approved.
-      const mcpToolHandler = (toolName: string): ToolHandler => async (args, signal) => {
-        const detail = JSON.stringify(args).slice(0, 160);
-        const verdict = checkComputerUsePerm(computerUsePerms, toolName, args);
-        if (typeof verdict === 'string' && verdict !== 'ask') return JSON.stringify({ error: verdict });
-        let token: string | undefined;
-        if (verdict === 'ask') {
-          const ok = await requestApproval(toolName, detail);
-          if (!ok) return JSON.stringify({ error: `Denied by the user (${toolName}). Ask for an alternative or proceed without it.` });
-          try {
-            token = (await coderPermsApprove(toolName, undefined, computerUseDirRef.current)).token;
-          } catch { /* no token — the endpoint's ask re-check will reject; surfaced to the model */ }
-        }
-        const res = await mcpCall({ name: toolName, arguments: args, scope: computerUseDirRef.current, approvalToken: token }, signal);
-        return res.ok ? res.output : JSON.stringify({ error: res.output });
-      };
-      // Always-on baseline (today's default, unchanged) — gated by Computer
-      // Use's own tiers only once that's turned on, since it's the only
-      // surface offering a permission control for these two. Hoisted out of
-      // the `registry` object literal (not inline methods on it) so
-      // `delegate`'s read-only nested loop can reuse the exact same
-      // closures without referencing `registry` before it finishes
-      // initializing (a TDZ error — `registry` isn't assigned yet while its
-      // own initializer, including the Computer Use IIFE below, is still
-      // running).
-      const webFetchHandler: ToolHandler = async (args, signal) => {
-        if (computerUseOn) {
-          const err = await cuOuterCheck('web_fetch', args, String(args.url ?? ''));
-          if (err) return JSON.stringify({ error: err });
-        }
-        return JSON.stringify(await coderWebFetch(String(args.url ?? ''), signal));
-      };
-      const webSearchHandler: ToolHandler = async (args, signal) => {
-        if (computerUseOn) {
-          const err = await cuOuterCheck('web_search', args, String(args.query ?? ''));
-          if (err) return JSON.stringify({ error: err });
-        }
-        return JSON.stringify(await coderWebSearch(String(args.query ?? ''), signal));
-      };
-      const registry: ToolRegistry = {
-        web_fetch: webFetchHandler,
-        web_search: webSearchHandler,
-        // Computer Use: general file/shell/search/git/subagent tools, scoped
-        // to computerUseDirRef.current (independent of Coder's own
-        // workspace — see chatAgent.tsx). Gated client-side by
-        // checkComputerUsePerm and, server-side, by the same directory as
-        // the enforce_perm scope key. Reads the ref fresh in every handler
-        // (not a captured const) so `set_directory` takes effect for the
-        // rest of THIS turn too, not just the next message. Also backs
-        // `browser`/`memory_update` as a fallback for when Agent Mode /
-        // Memory (below) aren't the ones providing them.
-        ...(computerUseOn
-          ? (() => {
-              const cuCheck = cuOuterCheck;
-              const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-              // Built first (without delegate/subagent) so those two can
-              // safely reuse it as the nested loop's own registry — a
-              // subagent's tool list is exactly "everything Computer Use
-              // can do, minus spawning further subagents" (no recursion).
-              const cuRegistry: ToolRegistry = {
-                set_directory: async (args) => {
-                  const requested = String(args.path ?? '').trim();
-                  if (!requested) return JSON.stringify({ error: 'set_directory requires a non-empty `path`.' });
-                  const err = await cuCheck('set_directory', args, requested);
-                  if (err) return JSON.stringify({ error: err });
-                  try {
-                    const res = await coderDirs(requested);
-                    if (!res.exists || !res.isDir) {
-                      return JSON.stringify({ error: `${res.root || requested} does not exist or is not a directory.` });
-                    }
-                    computerUseDirRef.current = res.root;
-                    setComputerUseDir(res.root);
-                    return JSON.stringify({ ok: true, directory: res.root });
-                  } catch (e) {
-                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-                  }
-                },
-                read: async (args, signal) => {
-                  const err = await cuCheck('read', args, String(args.path ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderRead(String(args.path ?? ''), args.offset as number | undefined, args.limit as number | undefined, signal, computerUseDirRef.current));
-                },
-                write: async (args, signal) => {
-                  const err = await cuCheck('write', args, String(args.path ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderWrite(String(args.path ?? ''), String(args.content ?? ''), signal, computerUseDirRef.current));
-                },
-                edit: async (args, signal) => {
-                  const err = await cuCheck('edit', args, String(args.path ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderEdit(String(args.path ?? ''), String(args.old ?? ''), String(args.new ?? ''), Boolean(args.replaceAll), signal, computerUseDirRef.current));
-                },
-                apply_patch: async (args, signal) => {
-                  const err = await cuCheck('apply_patch', args, String(args.path ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  const edits = Array.isArray(args.edits) ? args.edits as { old: string; new: string; replaceAll?: boolean }[] : [];
-                  return JSON.stringify(await coderPatch(String(args.path ?? ''), edits, signal, computerUseDirRef.current));
-                },
-                bash: async (args, signal) => {
-                  const command = String(args.command ?? '');
-                  const err = await cuCheck('bash', args, command);
-                  if (err) return JSON.stringify({ error: err });
-                  const cuDir = computerUseDirRef.current;
-                  return JSON.stringify(await coderExec(command, undefined, args.timeoutMs as number | undefined, cuDir, args.background === true, signal, cuDir));
-                },
-                bash_poll: async (args, signal) => {
-                  try {
-                    return JSON.stringify(await coderJob(String(args.jobId ?? ''), signal));
-                  } catch (e) {
-                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-                  }
-                },
-                grep: async (args, signal) => {
-                  const err = await cuCheck('grep', args, String(args.pattern ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderGrep(String(args.pattern ?? ''), undefined, args.include as string | undefined, Boolean(args.ignoreCase), Number(args.offset) || 0, Number(args.limit) || 200, signal, computerUseDirRef.current));
-                },
-                glob: async (args, signal) => {
-                  const err = await cuCheck('glob', args, String(args.pattern ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderGlob(String(args.pattern ?? ''), undefined, Number(args.offset) || 0, Number(args.limit) || 200, signal, computerUseDirRef.current));
-                },
-                git_commit: async (args, signal) => {
-                  const message = String(args.message ?? 'Agent commit');
-                  const err = await cuCheck('git_commit', args, message);
-                  if (err) return JSON.stringify({ error: err });
-                  const fileTokens = args.files && String(args.files).trim() ? String(args.files).trim().split(/\s+/) : ['-A'];
-                  const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
-                  const cuDir = computerUseDirRef.current;
-                  return JSON.stringify(await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, cuDir, false, signal, cuDir));
-                },
-                git_diff: async (args, signal) => {
-                  const ref = String(args.ref ?? '').trim();
-                  const pathTokens = String(args.path ?? '').trim().split(/\s+/).filter(Boolean);
-                  const cmd = `git --no-pager diff ${ref ? q(ref) : ''} ${pathTokens.map(q).join(' ')}`.replace(/\s+/g, ' ').trim();
-                  const cuDir = computerUseDirRef.current;
-                  return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
-                },
-                ast_grep: async (args, signal) => {
-                  const err = await cuCheck('ast_grep', args, String(args.pattern ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  const cuDir = computerUseDirRef.current;
-                  const pattern = String(args.pattern ?? '').replace(/'/g, "'\\''");
-                  return JSON.stringify(await coderExec(`sg -p '${pattern}' -l ${args.lang}`, undefined, 15000, cuDir, false, signal, cuDir));
-                },
-                repo_search: async (args, signal) => {
-                  const err = await cuCheck('repo_search', args, String(args.query ?? ''));
-                  if (err) return JSON.stringify({ error: err });
-                  return JSON.stringify(await coderSearch(String(args.query ?? ''), typeof args.limit === 'number' ? args.limit : 15, signal, computerUseDirRef.current));
-                },
-                git_branch: async (args, signal) => {
-                  const action = String(args.action || 'list');
-                  const err = await cuCheck('git_branch', args, `${action}${args.name ? ` ${args.name}` : ''}`);
-                  if (err) return JSON.stringify({ error: err });
-                  const cuDir = computerUseDirRef.current;
-                  if (action === 'list') {
-                    const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, cuDir, false, signal, cuDir);
-                    const { current, branches } = parseBranchList(r.stdout || '');
-                    return JSON.stringify({ current, branches, ...r });
-                  }
-                  if (action === 'create' || action === 'switch') {
-                    const name = String(args.name || '').trim();
-                    if (!name) return JSON.stringify({ error: `branch name required for action '${action}'` });
-                    if (!/^[A-Za-z0-9._/-]+$/.test(name)) return JSON.stringify({ error: `invalid branch name: ${name}` });
-                    const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
-                    return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
-                  }
-                  return JSON.stringify({ error: `unknown action: ${action} (use list, create, or switch)` });
-                },
-                git_worktree: async (args, signal) => {
-                  const action = String(args.action || 'list');
-                  const err = await cuCheck('git_worktree', args, `${action}${args.path ? ` ${args.path}` : ''}`);
-                  if (err) return JSON.stringify({ error: err });
-                  const cuDir = computerUseDirRef.current;
-                  if (action === 'list') {
-                    const r = await coderExec('git worktree list', undefined, 15000, cuDir, false, signal, cuDir);
-                    const lines = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
-                    return JSON.stringify({ worktrees: lines, ...r });
-                  }
-                  if (action === 'add') {
-                    const p = String(args.path || '').trim();
-                    const b = String(args.branch || '').trim();
-                    if (!p || !b) return JSON.stringify({ error: "path and branch required for action 'add'" });
-                    if (!/^[A-Za-z0-9._/-]+$/.test(b) || !/^\.\.\/[A-Za-z0-9._/-]+$/.test(p)) {
-                      return JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
-                    }
-                    const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
-                    return JSON.stringify(await coderExec(cmd, undefined, 30000, cuDir, false, signal, cuDir));
-                  }
-                  return JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
-                },
-                git_pr: async (args, signal) => {
-                  const err = await cuCheck('git_pr', args, String(args.title ?? '').slice(0, 40));
-                  if (err) return JSON.stringify({ error: err });
-                  const cuDir = computerUseDirRef.current;
-                  const gitRemoteToWeb = (url: string, base: string, head: string): string => {
-                    if (!url) return '';
-                    let host: string | undefined; let repo: string | undefined;
-                    const ssh = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
-                    if (ssh) { host = ssh[1]; repo = ssh[2]; }
-                    else {
-                      try { const u = new URL(url); host = u.host; repo = u.pathname.replace(/^\//, '').replace(/\.git$/, ''); } catch { return ''; }
-                    }
-                    return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
-                  };
-                  const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, cuDir, false, signal, cuDir);
-                  const branch = (br.stdout || '').trim();
-                  if (!branch || branch === 'HEAD') {
-                    return JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
-                  }
-                  const st = await coderExec('git status --porcelain', undefined, 10000, cuDir, false, signal, cuDir);
-                  if ((st.stdout || '').trim()) {
-                    return JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
-                  }
-                  const rm = await coderExec('git remote', undefined, 10000, cuDir, false, signal, cuDir);
-                  const remote = (rm.stdout || '').trim().split('\n')[0];
-                  if (!remote) {
-                    return JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
-                  }
-                  const base = String(args.base || '').trim()
-                    || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, cuDir, false, signal, cuDir)).stdout.trim()
-                    || 'main';
-                  const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, cuDir, false, signal, cuDir);
-                  if (push.exitCode !== 0) {
-                    return JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
-                  }
-                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, cuDir, false, signal, cuDir);
-                  if ((gh.stdout || '').trim() === 'yes') {
-                    let cmd = `gh pr create --title ${q(String(args.title ?? ''))} --body ${q(String(args.body ?? ''))}`;
-                    if (base) cmd += ` --base ${q(base)}`;
-                    const pr = await coderExec(cmd, undefined, 60000, cuDir, false, signal, cuDir);
-                    const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
-                    return JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
-                  }
-                  const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, cuDir, false, signal, cuDir);
-                  const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
-                  return JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
-                },
-                ask_user: async (args) => {
-                  return JSON.stringify({ question: args.question, status: 'awaiting_user' });
-                },
-                todo_write: async (args) => {
-                  const todos = Array.isArray(args.todos) ? args.todos as Array<{ content: string; status: string }> : [];
-                  cuTodosRef.current = todos;
-                  return JSON.stringify({ ok: true, count: todos.length });
-                },
-                obs_recall: async (args) => {
-                  return JSON.stringify(await readRecallChunk(String(args.id ?? ''), Number(args.offset) || 0));
-                },
-                // Fallback for when the dedicated Agent Mode / Memory toggle
-                // below isn't the one providing this tool (see the schema
-                // dedup note above) — same underlying implementation either
-                // way, just gated by computerUsePerms instead of
-                // browserTier/memoryToolTier.
-                browser: async (args, signal) => {
-                  const detail = String(args.action ?? 'status');
-                  const err = await cuCheck('browser', args, detail);
-                  if (err) return JSON.stringify({ error: err });
-                  const r = await coderBrowser(
-                    detail,
-                    { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
-                    signal,
-                  );
-                  return JSON.stringify(r);
-                },
-                memory_update: async (args, signal) => {
-                  const text = String(args.text || '').trim();
-                  const rawKind = String(args.kind || 'tip');
-                  const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
-                  if (!text) return JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
-                  const err = await cuCheck('memory_update', args, text);
-                  if (err) return JSON.stringify({ error: err });
-                  const m = await chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal);
-                  adoptMemory(m);
-                  return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
-                },
-                memory_recall: async (args) => {
-                  const query = String(args.query ?? '').trim().toLowerCase();
-                  if (!query) return JSON.stringify({ error: 'memory_recall requires a non-empty `query`.' });
-                  const err = await cuCheck('memory_recall', args, query);
-                  if (err) return JSON.stringify({ error: err });
-                  const kind = typeof args.kind === 'string' ? args.kind : undefined;
-                  const limit = typeof args.limit === 'number' ? Math.min(Math.max(args.limit, 1), 30) : 10;
-                  try {
-                    const m = await chatMemoryGet();
-                    const matches = m.learnings
-                      .filter((l) => (!kind || l.kind === kind) && (l.text.toLowerCase().includes(query) || (l.task ?? '').toLowerCase().includes(query)))
-                      .slice(-limit)
-                      .reverse();
-                    return JSON.stringify({ matches, total: matches.length });
-                  } catch (e) {
-                    return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-                  }
-                },
-              };
-              // A subagent's own tool loop: no streaming, no chat capability
-              // blocks, no memory injection — just the task and a bounded
-              // step budget. `registryFor`/`toolNames` decide how much of
-              // cuRegistry it can see; delegate/subagent are never included
-              // (they aren't in cuRegistry to begin with), so recursion is
-              // ruled out by construction rather than a depth counter.
-              const runNested = async (task: string, registryFor: ToolRegistry, toolNames: string[], maxSteps: number, model: string, roleHint: string, signal: AbortSignal): Promise<string> => {
-                const toolsFor = COMPUTER_USE_TOOLS.filter((t) => toolNames.includes(t.function.name));
-                try {
-                  const res = await runToolLoop({
-                    model,
-                    system: `You are a focused subagent working in the directory ${computerUseDirRef.current}. ${roleHint}\n\nTask: ${task}\n\nWhen finished, reply with a concise final summary — you cannot ask the user anything.`,
-                    messages: [{ role: 'user', content: task }],
-                    params,
-                    tools: toolsFor,
-                    registry: registryFor,
-                    maxSteps,
-                    signal,
-                  });
-                  if (signal.aborted || res.stop === 'aborted') return '(subagent aborted)';
-                  if (res.stop === 'steps') return '(subagent step budget reached)';
-                  const last = [...res.messages].reverse().find((m) => m.role === 'assistant');
-                  return last?.content.trim() || '(no findings)';
-                } catch (e) {
-                  return `(subagent failed: ${e instanceof Error ? e.message : String(e)})`;
-                }
-              };
-              const readOnlyNames = ['read', 'grep', 'glob', 'ast_grep', 'repo_search', 'git_diff', 'web_fetch', 'web_search', 'browser'];
-              const nestedReadOnlyRegistry: ToolRegistry = {
-                web_fetch: webFetchHandler,
-                web_search: webSearchHandler,
-                read: cuRegistry.read, grep: cuRegistry.grep, glob: cuRegistry.glob,
-                ast_grep: cuRegistry.ast_grep, repo_search: cuRegistry.repo_search,
-                git_diff: cuRegistry.git_diff, browser: cuRegistry.browser,
-              };
-              return {
-                ...cuRegistry,
-                delegate: async (args, signal) => {
-                  const task = String(args.task ?? '');
-                  const err = await cuCheck('delegate', args, task.slice(0, 60));
-                  if (err) return JSON.stringify({ error: err });
-                  const names = filterToolAllowList(args.tools, new Set(readOnlyNames)) ?? readOnlyNames;
-                  const summary = await runNested(task, nestedReadOnlyRegistry, names, 6, useModel, 'You are a read-only investigator — do not write files or run mutating commands.', signal);
-                  return JSON.stringify({ summary });
-                },
-                subagent: async (args, signal) => {
-                  const task = String(args.task ?? '');
-                  const err = await cuCheck('subagent', args, task.slice(0, 60));
-                  if (err) return JSON.stringify({ error: err });
-                  const cuNames = Object.keys(cuRegistry);
-                  const names = filterToolAllowList(args.tools, new Set(cuNames)) ?? cuNames;
-                  const model = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : useModel;
-                  const summary = await runNested(task, cuRegistry, names, 20, model, 'You can read, write, and edit files and run shell commands to complete the task.', signal);
-                  return JSON.stringify({ summary });
-                },
-              } satisfies ToolRegistry;
-            })()
-          : {}),
-        ...(agentResearch
-          ? {
-              browser: async (args, signal) => {
-                if (browserTier === 'deny') {
-                  return JSON.stringify({ error: 'Denied by Agent Mode settings (browser is set to deny).' });
-                }
-                if (browserTier === 'ask' && !(await requestApproval('browser', String(args.action ?? 'status')))) {
-                  return JSON.stringify({ error: 'Denied by the user (browser). Ask for an alternative or proceed without it.' });
-                }
-                const r = await coderBrowser(
-                  String(args.action ?? 'status'),
-                  { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
-                  signal,
-                );
-                return JSON.stringify(r);
-              },
-            }
-          : {}),
-        ...(memoryEnabled
-          ? {
-              memory_update: async (args, signal) => {
-                const text = String(args.text || '').trim();
-                const rawKind = String(args.kind || 'tip');
-                const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
-                if (!text) return JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
-                if (memoryToolTier === 'deny') {
-                  return JSON.stringify({ error: 'Denied by Agent Mode settings (memory_update is set to deny).' });
-                }
-                if (memoryToolTier === 'ask' && !(await requestApproval('memory_update', text))) {
-                  return JSON.stringify({ error: 'Denied by the user (memory_update). Ask for an alternative or proceed without it.' });
-                }
-                const m = await chatMemoryAddLearning({ text, kind, provenance: 'tool' }, signal);
-                adoptMemory(m);
-                return JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
-              },
-            }
-          : {}),
-        // MCP tools — Computer Use gated like every other mutating tool
-        // (their schemas land in `tools` only when it's on, below).
-        ...(computerUseOn
-          ? Object.fromEntries(
-              mcpToolsRef.current
-                .filter((t) => mcpToolTier(computerUsePerms, t.name) !== 'deny')
-                .map((t) => [t.name, mcpToolHandler(t.name)] as const)
-            )
-          : {}),
-      };
       // De-duplicated by name, first entry wins — agentResearch/memoryEnabled
-      // come before Computer Use so their dedicated schema (and, per the
-      // mirrored registry spread order above, their dedicated handler) is
-      // what the model actually gets when both are on.
+      // come before Computer Use.
       const tools = dedupeTools([
         ...CHAT_TOOLS,
         ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
@@ -815,121 +397,211 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               .map(mcpToolSchema)
           : []),
       ]);
-      // The runner owns the turn messages; these events mirror each turn into
-      // the conversation store so streaming stays live.
-      let lastTurnMeta: MessageMeta | undefined;
-      const res = await runToolLoop({
-        model: useModel,
-        system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
-        messages: effectiveHistory,
-        params,
-        tools,
-        registry,
-        maxSteps: 12,
-        signal: ac.signal,
-        // Route through the engine's /v1/responses transport when it's
-        // available AND this turn's sampling params are fully expressible
-        // there (see responses.ts) — never silently drop a knob the user
-        // set (top_k/min_p/penalties/seed aren't accepted on that endpoint
-        // on this engine build). Falls back to the proven Chat Completions
-        // path (streamTurn's own default) otherwise.
-        stream: knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : undefined,
-        onTurnStart: (turn) => {
-          if (turn === 0 || ac.signal.aborted) return;
-          const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
-          liveTargetId = next.id;
-          setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, next] })));
-        },
-        onDelta: (kind, text) => {
-          if (kind === 'content') patchTarget((m) => ({ ...m, content: m.content + text }));
-          else patchTarget((m) => ({ ...m, reasoning: (m.reasoning || '') + text }));
-        },
-        onStreamError: (msg) => {
-          patchTarget((m) => ({ ...m, error: true, content: m.content || msg, meta: { finishReason: 'error' } }));
-        },
-        onAppended: (appended) => {
-          const [first, ...rest] = appended;
-          if (first && first.role === 'assistant') {
-            patchTarget((m) => ({
-              ...m,
-              content: first.content,
-              reasoning: first.reasoning ?? m.reasoning,
-              tool_calls: first.tool_calls,
-              model: useModel,
-              meta: lastTurnMeta ?? m.meta,
-            }));
-          } else if (first) {
-            setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, first] })));
-          }
-          if (rest.length) {
-            setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, ...rest] })));
-          }
-        },
-        onAssistantTurn: async (msg, info) => {
-          lastTurnMeta = info.meta;
-          setLatestRequestMetrics(info.meta, useModel);
-          // Both passes below only apply to the final content-only turn (no
-          // pending tool calls) — an intermediate tool-call turn is left
-          // untouched either way.
-          if (ac.signal.aborted || (msg.tool_calls?.length ?? 0) > 0 || !msg.content.trim()) return;
-
-          let content = msg.content;
-
-          // Reflection: Generate → Reflect → Refine, bounded to one
-          // regenerate (never a loop). Best-effort — any failure at either
-          // step keeps the original reply and never strands the turn.
-          if (reflectionEnabled) {
-            setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
-            try {
-              const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
-              if (critique && !ac.signal.aborted) {
-                setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
-                const revised = await regenerateChatReply({
-                  model: useModel,
-                  system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
-                  history,
-                  originalReply: content,
-                  critique,
-                  params,
-                  signal: ac.signal,
-                });
-                if (revised && !ac.signal.aborted) content = revised;
-              }
-            } catch (reflectionError) {
-              console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
-            } finally {
-              if (!ac.signal.aborted) setNotice(null);
-            }
-          }
-
-          // Not-Ai auto-rewrite: plain content replies run the deterministic
-          // tell-gate (best-effort — any failure keeps the reply so far and
-          // never strands the streaming state).
-          if (!params.humanize) return content !== msg.content ? { content } : undefined;
+      // Server-side run: the control plane owns stream → tool-call → recurse
+      // (tools dispatch in-process through the same endpoints the old client
+      // registry called, with tiers enforced from the mirrored perms). This
+      // client starts the run and attaches over SSE — closing the window no
+      // longer kills it; re-attaching resyncs from the snapshot.
+      const toAgentCalls = (tcs: unknown): AgentToolCall[] => {
+        if (!Array.isArray(tcs)) return [];
+        return tcs.map((tc) => {
+          const o = tc as Record<string, unknown>;
+          const fn = (o.function ?? o) as Record<string, unknown>;
+          const args = fn.arguments ?? o.arguments ?? {};
+          return { id: String(o.id ?? ''), name: String(fn.name ?? o.name ?? ''), arguments: typeof args === 'string' ? args : JSON.stringify(args) };
+        });
+      };
+      const seedMessages: RunMessageWire[] = effectiveHistory.map((m) => {
+        const w: RunMessageWire = { role: m.role, content: m.content };
+        if (m.reasoning) w.reasoning = m.reasoning;
+        if (m.tool_calls?.length) w.tool_calls = m.tool_calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }));
+        if (m.tool_call_id) w.tool_call_id = m.tool_call_id;
+        if (m.name) w.name = m.name;
+        if (m.attachments?.length) w.attachments = m.attachments;
+        return w;
+      });
+      // Turn-hook pause (hookMode client): intermediate tool turns continue
+      // untouched; the final content turn runs the reflection + humanize
+      // passes below, then its verdict replaces the turn's reply.
+      const handleRunHook = async (runId: string, hookId: string, hadToolCalls: boolean) => {
+        const decide = (body: { action: 'done' | 'replace' | 'continue' | 'abort'; content?: string }) =>
+          agentRunsApi.decideHook(runId, hookId, body).catch(() => {});
+        if (ac.signal.aborted) { await decide({ action: 'abort' }); return; }
+        // Intermediate tool-call turns pass through untouched (mirrors the
+        // old onAssistantTurn early return); only content turns get passes.
+        if (hadToolCalls) { await decide({ action: 'continue' }); return; }
+        let content = '';
+        try {
+          const cur = await agentRunsApi.get(runId);
+          const last = [...cur.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
+          content = (last?.content ?? '') as string;
+        } catch { /* fall through with empty content → continue */ }
+        if (!content.trim()) { await decide({ action: 'continue' }); return; }
+        const original = content;
+        if (reflectionEnabled) {
+          setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
           try {
-            const humanized = await humanizePassText(content, {
-              voice: effectiveVoice(params),
-              signal: ac.signal,
-              rewrite: (current) => humanizeRewriteText({
+            const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
+            if (critique && !ac.signal.aborted) {
+              setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
+              const revised = await regenerateChatReply({
                 model: useModel,
-                baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
-                priorMessages: history,
-                originalText: current,
+                system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+                history,
+                originalReply: content,
+                critique,
                 params,
                 signal: ac.signal,
-              }),
-            });
-            if (!ac.signal.aborted && humanized.trim() !== content.trim()) return { content: humanized };
-          } catch (humanizeError) {
-            console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
+              });
+              if (revised && !ac.signal.aborted) content = revised;
+            }
+          } catch (reflectionError) {
+            console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
+          } finally {
+            if (!ac.signal.aborted) setNotice(null);
           }
-          return content !== msg.content ? { content } : undefined;
-        },
-      });
+        }
+        if (!params.humanize) {
+          if (content !== original) patchTarget((m) => ({ ...m, content }));
+          await decide(content !== original ? { action: 'replace', content } : { action: 'done' });
+          return;
+        }
+        try {
+          const humanized = await humanizePassText(content, {
+            voice: effectiveVoice(params),
+            signal: ac.signal,
+            rewrite: (current) => humanizeRewriteText({
+              model: useModel,
+              baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
+              priorMessages: history,
+              originalText: current,
+              params,
+              signal: ac.signal,
+            }),
+          });
+          if (!ac.signal.aborted && humanized.trim() !== content.trim()) content = humanized;
+        } catch (humanizeError) {
+          console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
+        }
+        if (content !== original) patchTarget((m) => ({ ...m, content }));
+        await decide(content !== original ? { action: 'replace', content } : { action: 'done' });
+      };
+      // Ask-tier pause: the existing dialog mints the one-shot token, exactly
+      // like the old MCP-tool handler did.
+      const handleRunApproval = async (runId: string, a: { id: string; tool: string; rel: string | null; args: string }) => {
+        const ok = await requestApproval(a.tool, a.rel ?? a.args.slice(0, 160));
+        let token: string | undefined;
+        if (ok) {
+          try {
+            token = (await coderPermsApprove(a.tool, undefined, computerUseDirRef.current)).token;
+          } catch { /* no token — the endpoint's ask re-check will reject; surfaced to the model */ }
+        }
+        await agentRunsApi.approve(runId, a.id, ok ? 'approve' : 'deny', token).catch(() => {});
+      };
+      let snap: RunSnapshot | null = null;
+      try {
+        const started = await agentRunsApi.start({
+          messages: seedMessages,
+          kind: 'chat',
+          label: 'chat turn',
+          model: useModel,
+          system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+          maxSteps: 12,
+          toolSet: 'chat',
+          toolNames: tools.map((t) => t.function.name),
+          tools,
+          params: params as unknown as Record<string, unknown>,
+          scope: computerUseOn ? computerUseDirRef.current : null,
+          hookMode: 'client',
+        });
+        const runId = started.id;
+        const stream = new RunStream(
+          runId,
+          () => {},
+          (ev) => {
+            if (ac.signal.aborted) return;
+            switch (ev.type) {
+              case 'turn_started': {
+                if ((ev.turns as number) === 0) return;
+                const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+                liveTargetId = next.id;
+                setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, next] })));
+                break;
+              }
+              case 'delta': {
+                const text = ev.text as string;
+                if ((ev.kind as string) === 'content') patchTarget((m) => ({ ...m, content: m.content + text }));
+                else patchTarget((m) => ({ ...m, reasoning: (m.reasoning || '') + text }));
+                break;
+              }
+              case 'appended': {
+                const msg = ev.message as Record<string, unknown>;
+                if (msg.role === 'assistant') {
+                  const content = typeof msg.content === 'string' ? msg.content : '';
+                  const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : undefined;
+                  const calls = toAgentCalls(msg.tool_calls);
+                  patchTarget((m) => ({
+                    ...m,
+                    content,
+                    reasoning: reasoning ?? m.reasoning,
+                    tool_calls: calls.length ? calls : undefined,
+                    model: useModel,
+                  }));
+                } else {
+                  const tm: ChatMessage = {
+                    role: msg.role as ChatMessage['role'],
+                    content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+                    ...(typeof msg.tool_call_id === 'string' ? { tool_call_id: msg.tool_call_id } : {}),
+                    ...(typeof msg.name === 'string' ? { name: msg.name } : {}),
+                  };
+                  setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, tm] })));
+                }
+                break;
+              }
+              case 'approval_requested':
+                void handleRunApproval(runId, ev as unknown as { id: string; tool: string; rel: string | null; args: string });
+                break;
+              case 'user_question_requested':
+                // Chat never offered ask_user and the nested prompt forbids
+                // questions — answer empty so the run keeps moving.
+                void agentRunsApi.answer(runId, ev.id as string, '').catch(() => {});
+                break;
+              case 'hook_requested':
+                void handleRunHook(runId, ev.id as string, (ev.had_tool_calls as boolean) ?? false);
+                break;
+              case 'error':
+                patchTarget((m) => ({ ...m, error: true, content: m.content || (ev.message as string) || 'Run failed', meta: { finishReason: 'error' } }));
+                break;
+              default:
+                break;
+            }
+          },
+          () => {},
+        );
+        ac.signal.addEventListener('abort', () => {
+          stream.close();
+          agentRunsApi.stop(runId).catch(() => {});
+        }, { once: true });
+        await stream.attach();
+        snap = await agentRunsApi.get(runId);
+        if (snap.lastMeta) setLatestRequestMetrics(snap.lastMeta as unknown as MessageMeta, useModel);
+        // Memory tools dispatch server-side against the same global bank —
+        // resync the UI snapshot the old registry updated inline.
+        if (memoryEnabled && !ac.signal.aborted) await loadMemory();
+      } catch (loopError) {
+        if (!ac.signal.aborted) {
+          patchTarget((m) => ({
+            ...m,
+            error: true,
+            content: m.content || (loopError instanceof Error ? loopError.message : String(loopError)),
+            meta: { finishReason: 'error' },
+          }));
+        }
+      }
 
       // Tool-step budget: the runner stops after 12 tool cycles without a
       // final reply, same guard the old depth>=12 recursion carried.
-      if (res.stop === 'steps' && !ac.signal.aborted) {
+      if (snap?.stop === 'steps' && !ac.signal.aborted) {
         patchTarget((m) => ({
           ...m,
           content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
@@ -1038,7 +710,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         }
       }
     },
-    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens, computerUseEnabled, computerUsePerms],
+    [engineUp, model, runningModel, params, onNavigate, status, agentResearch, memoryEnabled, adoptMemory, loadMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier, requestApproval, deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens, computerUseEnabled, computerUsePerms],
   );
 
   const send = useCallback(async () => {

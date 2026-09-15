@@ -32,7 +32,7 @@ import { API_BASE, getJSON, postJSON } from './api/core';
 // Wire types
 // ---------------------------------------------------------------------------
 
-export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'done' | 'stopped' | 'error';
+export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'awaiting_gate' | 'done' | 'stopped' | 'error';
 
 export interface PendingApprovalWire {
   id: string;
@@ -74,7 +74,8 @@ export interface RunSnapshot {
   stop: string | null;
   pendingApprovals: PendingApprovalWire[];
   userQuestion: { id: string; question: string } | null;
-  todo: unknown;
+  /** A pending risky/commit gate pause (the polling client's dialog). */
+  pendingGate: { id: string; kind: 'risky' | 'commit'; command: string; reason: string | null } | null;
   scope: string | null;
   usage: RunUsageWire;
   lastMeta: Record<string, unknown> | null;
@@ -117,8 +118,16 @@ export interface StartRunBody {
   scope?: string | null;
   /** Child runs set this (the parent run's id). */
   parent?: string | null;
+  /** 'client' pauses at each turn end for this screen's rewrite/gate
+   *  decision (reflection, humanize); omit for uninterrupted runs. */
+  hookMode?: 'client' | 'auto';
+  /** Risky-command gate: pause bash on risky-but-allowed commands. */
+  riskyGate?: boolean;
+  /** Commit-approval gate: pause bash on `git commit` commands. */
+  commitGate?: boolean;
+  /** Pre-approved (normalized) commands for the risky gate. */
+  approvedCommands?: string[];
 }
-
 export interface RunEvent {
   type:
     | 'state'
@@ -130,8 +139,12 @@ export interface RunEvent {
     | 'approval_requested'
     | 'approval_resolved'
     | 'user_question_requested'
-    | 'user_question_answered'
     | 'todo'
+    | 'hook_requested'
+    | 'hook_resolved'
+    | 'gate_requested'
+    | 'gate_resolved'
+    | 'child_run'
     | 'status'
     | 'done'
     | 'error';
@@ -171,8 +184,35 @@ export const agentRunsApi = {
       5000,
     );
   },
+  /** Turn-hook mode: 'client' pauses at each turn end (hook_requested) for
+   *  the screen's rewrite/gate decision, 'auto' finishes turns unpaused.
+   *  Prefer StartRunBody.hookMode — this is for runs already started. */
+  setHookMode(id: string, mode: 'client' | 'auto'): Promise<{ ok: boolean }> {
+    return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/hook`, { mode }, 5000);
+  },
+  /** Resolve a pending turn-hook pause. `content` replaces the turn's reply
+   *  (replace), or rides along with the gate note (continue). */
+  decideHook(
+    id: string,
+    hookId: string,
+    body: { action: 'done' | 'replace' | 'continue' | 'abort'; content?: string; note?: string; transcript?: unknown[] },
+  ): Promise<{ ok: boolean }> {
+    return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/hooks/${encodeURIComponent(hookId)}`, body, 5000);
+  },
+  /** Resolve a pending risky/commit gate. Risky: once|remember|deny;
+   *  commit: approve|deny. */
+  decideGate(
+    id: string,
+    gateId: string,
+    decision: 'once' | 'remember' | 'deny' | 'approve',
+  ): Promise<{ ok: boolean; decision: string }> {
+    return postJSON(
+      `/api/agent/runs/${encodeURIComponent(id)}/gates/${encodeURIComponent(gateId)}`,
+      { decision },
+      5000,
+    );
+  },
 };
-
 // ---------------------------------------------------------------------------
 // SSE attach
 // ---------------------------------------------------------------------------
@@ -298,7 +338,7 @@ export class RunStream {
         if (ev.type === 'state') {
           if (!sawStateFrame) {
             sawStateFrame = true;
-            this.onSnapshot((ev as { snapshot: RunSnapshot }).snapshot);
+            this.onSnapshot((ev as unknown as { snapshot: RunSnapshot }).snapshot);
           }
           continue;
         }

@@ -13,7 +13,7 @@
 //! mints the usual one-shot token via `/api/coder/perms/approve`, which we
 //! inject and `enforce_perm` consumes — the existing security model.
 
-use crate::agent::run::{now_ms, AgentEvent, ApprovalDecision, PendingApproval, PendingQuestion, RunShared, RunStatus};
+use crate::agent::run::{now_ms, AgentEvent, ApprovalDecision, GateDecision, GateKind, GateSlot, PendingApproval, PendingGate, PendingQuestion, RunShared, RunStatus};
 use regex::Regex;
 use crate::coder::{browser, exec, fs, grep, memory, search, web};
 use crate::engine::S;
@@ -353,13 +353,52 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
         None
     };
 
+    // --- risky / commit human gates --------------------------------------
+    // The CoderScreen HITL gates, ported: pause for a once/remember/deny
+    // (risky) or approve/deny (commit) decision instead of executing. Runs
+    // without the flags behave exactly as before.
+    if name == "bash" {
+        let command = body.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (risky_on, commit_on) = {
+            let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+            (gs.opts.risky, gs.opts.commit)
+        };
+        if risky_on && !command.trim().is_empty() {
+            let approved = {
+                let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+                is_approved_command(&command, &gs.opts.approved)
+            };
+            if !approved {
+                if let Some(reason) = detect_risky(&command) {
+                    match await_gate(run, GateKind::Risky, command.clone(), Some(reason.to_string())).await {
+                        GateDecision::Deny => {
+                            return json!({
+                                "error": format!("Risky command denied by the user: {reason}. Use a safer alternative or ask.")
+                            });
+                        }
+                        GateDecision::Once | GateDecision::Remember => {}
+                    }
+                }
+            }
+        }
+        if commit_on && is_git_commit_command(&command) {
+            match await_gate(run, GateKind::Commit, command.clone(), None).await {
+                GateDecision::Deny => {
+                    return json!({
+                        "error": "Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made."
+                    });
+                }
+                GateDecision::Once | GateDecision::Remember => {}
+            }
+        }
+    }
+
     // --- scope injection + dispatch -------------------------------------
     inject_scope(run, name, &mut body);
     if let Some(t) = token {
         body["approvalToken"] = json!(t);
     }
 
-    // MCP tools are namespaced (`mcp__<server>__<tool>`) and always
     // endpoint-dispatchable; everything else must be in the tool-set's table.
     let family = if run.meta.tool_set == "chat" { CHAT_TOOLS } else { CODER_TOOLS };
     if mcp_name(name).is_none() && family.iter().all(|f| *f != name) {
@@ -606,6 +645,114 @@ async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Risky-command + commit-approval gates (the CoderScreen HITL gates, ported)
+// ---------------------------------------------------------------------------
+
+static RISKY_PATTERNS_SRC: &[(&str, &str)] = &[
+    (r"(?i)\bgit\s+push\b(?s:.*?)(--force|-f\b|--delete)\b", "force-pushes or deletes remote refs"),
+    (r"(?i)\bgit\s+push\b", "pushes commits to a remote"),
+    (r"(?i)\b(npm|pnpm|yarn)\s+publish\b", "publishes a package to a registry"),
+    (r"(?i)\bcargo\s+publish\b", "publishes a crate"),
+    (r"(?i)\btwine\s+upload\b", "uploads a release to PyPI"),
+    (r"(?i)\bgh\s+(pr|release|api)\b", "creates a GitHub release/PR via gh"),
+    (r"(?i)\b(sudo|su|doas)\b", "runs a command as another user (root)"),
+    // No lookahead in Rust regex: `ssh` followed by a non-dash,
+    // non-word char (or end) — matches `ssh host`, not `ssh-keygen`.
+    (r"(?i)\bssh(?:[^-\w]|$)", "opens an SSH connection to a remote host"),
+    (r"(?i)\b(scp|rsync|sftp)\b", "transfers files to/from a remote host"),
+    (r"(?i)\b(docker|podman)\b", "runs containers"),
+    (r"(?i)\b(kubectl|helm|terraform\s+apply|ansible)\b", "applies infrastructure changes"),
+    (r"(?i)\b(aws|gcloud|az)\b(?s:.*?)\b(ec2|s3|deploy|apply|create|delete|update|push)\b", "mutates cloud resources"),
+    (r"(?i)\b(apt|apt-get|yum|dnf|apk)\b\s+(install|remove|upgrade|update)\b", "changes system packages"),
+    (r"(?i)\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b", "installs a global package"),
+];
+
+static RISKY_PATTERNS: std::sync::LazyLock<Vec<(Regex, &'static str)>> = std::sync::LazyLock::new(|| {
+    RISKY_PATTERNS_SRC
+        .iter()
+        .map(|(re, why)| (Regex::new(re).expect("static risky pattern"), *why))
+        .collect()
+});
+
+/// First matching risky reason, or `None` (the client's `detectRisky`).
+pub(crate) fn detect_risky(cmd: &str) -> Option<&'static str> {
+    RISKY_PATTERNS.iter().find(|(re, _)| re.is_match(cmd)).map(|(_, why)| *why)
+}
+
+/// Cheap guard for the commit-approval gate (the client's
+/// `isGitCommitCommand`, ported).
+pub(crate) fn is_git_commit_command(cmd: &str) -> bool {
+    let c = cmd.trim_start();
+    let c = ["sudo ", "env ", "time ", "setsid ", "nice "]
+        .iter()
+        .find_map(|p| c.strip_prefix(p))
+        .unwrap_or(c)
+        .trim_start();
+    let Some(rest) = c.strip_prefix("git") else {
+        return false;
+    };
+    if !rest.chars().next().is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '-')) {
+        return false;
+    }
+    Regex::new(r"\bcommit\b").expect("static").is_match(c)
+}
+
+/// Approved-command matching (the client's `isApprovedCommand`, ported):
+pub(crate) fn is_approved_command(cmd: &str, approved: &[String]) -> bool {
+    let c = crate::agent::run::normalize_command(cmd);
+    approved.iter().any(|a| {
+        let na = crate::agent::run::normalize_command(a);
+        c == na || c.starts_with(&format!("{na} "))
+    })
+}
+
+/// Pause the run on a risky/commit gate and wait for a client's decision.
+/// Returns how to proceed; `Deny` on denial, stop, or a second concurrent
+/// pause on the same run (dispatch is sequential, so that means a bug —
+/// fail closed rather than orphan a waiter).
+async fn await_gate(run: &Arc<RunShared>, kind: GateKind, command: String, reason: Option<String>) -> GateDecision {
+    let gid = format!("gate_{:x}_{}", now_ms(), std::process::id());
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+        if gs.slot.is_some() {
+            return GateDecision::Deny;
+        }
+        gs.slot = Some(GateSlot {
+            pending: PendingGate { id: gid.clone(), kind, command: command.clone(), reason: reason.clone() },
+            tx,
+        });
+    }
+    run.set_status(RunStatus::AwaitingGate);
+    let _ = run.tx.send(AgentEvent::GateRequested { id: gid.clone(), kind, command, reason });
+    let decision = tokio::select! {
+        d = rx => d.unwrap_or(GateDecision::Deny),
+        _ = run.wait_stop() => {
+            run.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot = None;
+            return GateDecision::Deny;
+        }
+    };
+    decision
+}
+
+/// Ancestor-chain length of a run (client-started runs: 0). Mirrors the
+/// client's `depth > 5` subagent guard so a model can't nest
+/// delegate/subagent runs without bound.
+fn run_depth(state: &S, run: &Arc<RunShared>) -> usize {
+    let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
+    let mut depth = 0;
+    let mut cur = run.meta.parent.clone();
+    while let Some(pid) = cur {
+        depth += 1;
+        if depth > 8 {
+            break;
+        }
+        cur = runs.get(&pid).and_then(|r| r.meta.parent.clone());
+    }
+    depth
+}
+
+// ---------------------------------------------------------------------------
 // Child runs: delegate (read-only) / subagent (implementation worker)
 // ---------------------------------------------------------------------------
 
@@ -613,6 +760,11 @@ async fn delegate(state: &S, run: &Arc<RunShared>, args: &Value) -> Value {
     let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if task.is_empty() {
         return json!({ "error": "task is required" });
+    }
+    // The client's `depth > 5` subagent guard, ported: ancestor-chain length
+    // stands in for the threaded depth counter.
+    if run_depth(state, run) > 5 {
+        return json!({ "error": "maximum subagent depth 5 exceeded" });
     }
     // Per-family scout semantics (CoderScreen's runSubagent vs ChatScreen's
     // runNested — different seeds, different default tool sets).
@@ -630,16 +782,16 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
     if task.is_empty() {
         return json!({ "error": "task is required" });
     }
-    // Chat (CU) runs: ChatScreen's subagent — a plain nested run over the
-    // run's own tool set (no ideation, critic, or git diff: the CU directory
-    // is not a repo).
+    if run_depth(state, parent) > 5 {
+        return json!({ "error": "maximum subagent depth 5 exceeded" });
+    }
     if parent.meta.tool_set == "chat" {
         let defaults: Vec<&str> = parent
             .meta
             .tool_names
             .iter()
             .map(String::as_str)
-            .filter(|n| !matches!(n, "delegate" | "subagent" | "ask_user" | "todo_write"))
+            .filter(|n| !matches!(*n, "delegate" | "subagent" | "ask_user" | "todo_write"))
             .collect();
         return spawn_child(state, parent, "subagent", "worker", &task, &defaults[..], &defaults[..], 20, args).await;
     }
@@ -706,7 +858,7 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
                 "TASK (revise your previous implementation):\n{task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n{critique}"
             );
         }
-        let res = spawn_child(state, parent, "subagent", "worker", &prompt, SUBAGENT_TOOLS, 12, args).await;
+        let res = spawn_child(state, parent, "subagent", "worker", &prompt, SUBAGENT_TOOLS, SUBAGENT_TOOLS, 12, args).await;
         summary = res["summary"].as_str().unwrap_or_default().to_string();
         res_ok = res["ok"].as_bool().unwrap_or(false);
         exhausted = res["stop"].as_str() == Some("steps");
@@ -841,7 +993,7 @@ async fn spawn_child(
             } else {
                 // Coder scouts run under the parent's (coder) system, like the
                 // client's runSubagent (dynamicSystemRef.current).
-                parent.meta.system.clone().unwrap_or_else(|| SCOUT_SYSTEM.to_string())
+                Some(parent.meta.system.clone().unwrap_or_else(|| SCOUT_SYSTEM.to_string()))
             }
         },
         max_steps,
@@ -884,6 +1036,12 @@ async fn spawn_child(
     };
 
     let child = crate::agent::run::spawn_run(state, meta, live);
+    // Human gates follow the run family (the client's worker/scout inherited
+    // the supervisor's dialogs the same way, via closure).
+    {
+        let opts = parent.gate_state.lock().unwrap_or_else(|p| p.into_inner()).opts.clone();
+        child.gate_state.lock().unwrap_or_else(|p| p.into_inner()).opts = opts;
+    }
     let run_id = child.meta.id.clone();
     // Tell attached clients the child exists (they can attach to it live).
     let _ = parent.tx.send(AgentEvent::ChildRun {
@@ -1141,4 +1299,191 @@ pub(crate) fn is_read_only_command(cmd: &str) -> bool {
         return toks.get(1).is_some_and(|s| READONLY_GIT.contains(s));
     }
     READONLY_BASH.contains(&first)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::State;
+
+    fn fresh_state() -> S {
+        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ninfier-agent-tools-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        Arc::new(State::new(tmp.clone(), tmp, None))
+    }
+
+    /// Drive one pause/resume round-trip: the run pauses with a pending
+    /// approval, the "client" resolves it, the waiter gets the outcome.
+    async fn round_trip(decision: ApprovalDecision) -> (Option<String>, crate::agent::run::RunSnapshot) {
+        let state = fresh_state();
+        let shared = crate::agent::run::test_run(&state, "coder", &["bash"], None);
+        let args = serde_json::json!({"command": "rm -rf /"});
+        let s2 = shared.clone();
+        let waiter = tokio::spawn(async move { await_approval(&s2, "bash", &args).await });
+        let aid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = shared.snapshot();
+                if snap.status == RunStatus::AwaitingApproval && !snap.pending_approvals.is_empty() {
+                    return snap.pending_approvals[0].id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should pause with a pending approval");
+        let tx = shared
+            .approvals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&aid)
+            .expect("approval sender");
+        tx.send(decision).expect("waiter alive");
+        let out = waiter.await.expect("waiter joins");
+        let snap = shared.snapshot();
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
+        (out, snap)
+    }
+
+    #[tokio::test]
+    async fn approval_pause_approves_with_token() {
+        let (out, snap) = round_trip(ApprovalDecision::Approved { token: Some("tok123".into()) }).await;
+        assert_eq!(out.as_deref(), Some("tok123"));
+        assert!(snap.pending_approvals.is_empty());
+    }
+
+
+    #[test]
+    fn risky_patterns_mirror_client() {
+        assert_eq!(detect_risky("git push --force origin main"), Some("force-pushes or deletes remote refs"));
+        assert_eq!(detect_risky("git push"), Some("pushes commits to a remote"));
+        assert_eq!(detect_risky("npm publish"), Some("publishes a package to a registry"));
+        assert_eq!(detect_risky("cargo publish"), Some("publishes a crate"));
+        assert_eq!(detect_risky("twine upload dist/*"), Some("uploads a release to PyPI"));
+        assert_eq!(detect_risky("gh release create v1"), Some("creates a GitHub release/PR via gh"));
+        assert_eq!(detect_risky("sudo rm -rf /"), Some("runs a command as another user (root)"));
+        assert_eq!(detect_risky("ssh user@host"), Some("opens an SSH connection to a remote host"));
+        assert_eq!(detect_risky("ssh-keygen -t ed25519"), None);
+        assert_eq!(detect_risky("scp a b"), Some("transfers files to/from a remote host"));
+        assert_eq!(detect_risky("docker ps"), Some("runs containers"));
+        assert_eq!(detect_risky("kubectl apply -f x"), Some("applies infrastructure changes"));
+        assert_eq!(detect_risky("aws s3 rm s3://b/k"), Some("mutates cloud resources"));
+        assert_eq!(detect_risky("apt install foo"), Some("changes system packages"));
+        assert_eq!(detect_risky("npm install -g foo"), Some("installs a global package"));
+        assert_eq!(detect_risky("ls -la"), None);
+        assert_eq!(detect_risky("cargo test"), None);
+    }
+
+    #[test]
+    fn commit_guard_mirrors_client() {
+        assert!(is_git_commit_command("git commit -m x"));
+        assert!(is_git_commit_command("sudo git commit"));
+        assert!(!is_git_commit_command("git status"));
+        assert!(!is_git_commit_command("gitcommit"));
+        assert!(!is_git_commit_command("echo commit"));
+    }
+
+    #[test]
+    fn approved_match_mirrors_client() {
+        let ap = vec!["git push".to_string()];
+        assert!(is_approved_command("git  push", &ap));
+        assert!(is_approved_command("git push origin", &ap));
+        assert!(!is_approved_command("git pushy", &ap));
+        assert!(!is_approved_command("git push", &[]));
+    }
+
+    /// A risky command pauses the run (AwaitingGate + snapshot pending
+    /// gate) and a deny resolves it to a model denial error — nothing
+    /// executes.
+    #[tokio::test]
+    async fn gate_risky_pause_denies_without_executing() {
+        let state = fresh_state();
+        let shared = crate::agent::run::test_run(&state, "coder", &["bash"], None);
+        {
+            let mut gs = shared.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+            gs.opts.risky = true;
+        }
+        state
+            .agent_runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(shared.meta.id.clone(), shared.clone());
+        let st2 = state.clone();
+        let s2 = shared.clone();
+        let args = serde_json::json!({"command": "git push --force"});
+        let waiter = tokio::spawn(async move { dispatch(&st2, &s2, "bash", &args).await });
+        let gid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = shared.snapshot();
+                if snap.status == RunStatus::AwaitingGate && snap.pending_gate.is_some() {
+                    return snap.pending_gate.as_ref().unwrap().id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should pause on the risky gate");
+        let resp = crate::agent::run::gate_decide(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((shared.meta.id.clone(), gid)),
+            axum::Json(crate::agent::run::GateDecideBody { decision: "deny".into() }),
+        )
+        .await;
+        drop(resp);
+        let out = waiter.await.expect("waiter joins");
+        assert!(out.get("error").and_then(|v| v.as_str()).unwrap_or("").contains("denied by the user"));
+        assert!(shared.snapshot().pending_gate.is_none());
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
+    }
+
+    /// `once` proceeds past the gate (the command itself runs — `docker
+    /// --version` is harmless and exits fast either way).
+    #[tokio::test]
+    async fn gate_risky_once_proceeds() {
+        let state = fresh_state();
+        let shared = crate::agent::run::test_run(&state, "coder", &["bash"], None);
+        {
+            let mut gs = shared.gate_state.lock().unwrap_or_else(|p| p.into_inner());
+            gs.opts.risky = true;
+        }
+        state
+            .agent_runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(shared.meta.id.clone(), shared.clone());
+        let st2 = state.clone();
+        let s2 = shared.clone();
+        let args = serde_json::json!({"command": "docker --version"});
+        let waiter = tokio::spawn(async move { dispatch(&st2, &s2, "bash", &args).await });
+        let gid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snap = shared.snapshot();
+                if snap.pending_gate.is_some() {
+                    return snap.pending_gate.as_ref().unwrap().id.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should pause on the risky gate");
+        crate::agent::run::gate_decide(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((shared.meta.id.clone(), gid)),
+            axum::Json(crate::agent::run::GateDecideBody { decision: "once".into() }),
+        )
+        .await;
+        let out = waiter.await.expect("waiter joins");
+        assert!(out.get("error").and_then(|v| v.as_str()).is_none_or(|e| !e.contains("denied by the user")), "{out}");
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
+    }
+    async fn approval_pause_denies_to_none() {
+        let (out, snap) = round_trip(ApprovalDecision::Denied).await;
+        assert_eq!(out, None);
+        assert!(snap.pending_approvals.is_empty());
+    }
 }

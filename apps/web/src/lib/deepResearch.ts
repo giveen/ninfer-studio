@@ -2,13 +2,14 @@
 // orchestrator-workers shape as Coder's Scout pre-pass (CoderScreen.tsx's
 // SCOUT_PROBES/runSubagent), simplified for Chat's workspace-independent
 // tool set. A quick planning call breaks the question into up to
-// `maxAngles` independent angles; each angle runs its own small,
-// tool-restricted runToolLoop in parallel; the findings are combined into
+// `maxAngles` independent angles; each angle runs as its own small,
+// tool-restricted server-side run in parallel (the control plane owns the
+// loop now — runs survive window close); the findings are combined into
 // one report string the caller injects as context for the final answer.
 
-import { runToolLoop, type ToolRegistry } from './agentLoop';
-import { buildChatRequest, streamChat, coderWebFetch, coderWebSearch, coderBrowser } from './api';
+import { buildChatRequest, streamChat } from './api';
 import { CHAT_TOOLS, CHAT_BROWSER_TOOL } from './chatHelpers';
+import { agentRunsApi, isTerminalStatus } from './agentRuns';
 import type { ChatParams } from './types';
 
 const RESEARCH_PLANNER_SYSTEM = (maxAngles: number) => `You are planning a deep-research pass for a user's question. Break the question into up to ${maxAngles} independent research angles — each answerable on its own, together covering the question well. If the question doesn't need multiple angles, return fewer (even just 1).
@@ -61,38 +62,53 @@ async function planResearchAngles(opts: {
 
 const RESEARCH_ANGLE_SYSTEM = 'You are researching one specific angle of a larger question. Use the available tools to investigate, then reply with a concise findings report: the key facts, with source URLs where relevant. Do not answer the original overall question directly — just report findings for this angle.';
 
-/** Research one angle with a small, tool-restricted runToolLoop
+/** Research one angle as a small, tool-restricted server-side run
  *  (web_fetch/web_search/browser only, a short step budget) — the "worker"
  *  side of the fan-out. Best-effort: a failure/abort/empty result becomes a
  *  clearly-labeled placeholder finding rather than throwing, so one bad
- *  angle can't sink the whole Promise.all. */
+ *  angle can't sink the whole Promise.all. Ask-tier approvals auto-deny
+ *  (the old client registry never permission-checked these tools, so
+ *  allow-with-denial-on-ask preserves its effective behavior without a UI).
+ *  Abort stops the server run. */
 async function runResearchAngle(opts: { model: string; angle: string; maxSteps: number; signal: AbortSignal }): Promise<string> {
-  const registry: ToolRegistry = {
-    web_fetch: (args, signal) => coderWebFetch(String(args.url ?? ''), signal).then((r) => JSON.stringify(r)),
-    web_search: (args, signal) => coderWebSearch(String(args.query ?? ''), signal).then((r) => JSON.stringify(r)),
-    browser: (args, signal) =>
-      coderBrowser(
-        String(args.action ?? 'status'),
-        { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>,
-        signal,
-      ).then((r) => JSON.stringify(r)),
-  };
-  const angleParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 1024 };
+  let id: string | null = null;
+  const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
   try {
-    const res = await runToolLoop({
+    const started = await agentRunsApi.start({
+      messages: [{ role: 'user', content: opts.angle }],
+      kind: 'research',
+      label: `research: ${opts.angle.slice(0, 60)}`,
       model: opts.model,
       system: RESEARCH_ANGLE_SYSTEM,
-      messages: [{ role: 'user', content: opts.angle }],
-      params: angleParams,
-      tools: [...CHAT_TOOLS, CHAT_BROWSER_TOOL],
-      registry,
       maxSteps: opts.maxSteps,
-      signal: opts.signal,
+      toolSet: 'chat',
+      toolNames: ['web_fetch', 'web_search', 'browser'],
+      tools: [...CHAT_TOOLS, CHAT_BROWSER_TOOL],
+      params: { thinking: false, maxTokens: 1024 },
     });
-    if (res.stop === 'aborted') return '(aborted)';
-    const last = [...res.messages].reverse().find((m) => m.role === 'assistant');
-    return last?.content.trim() || '(no findings)';
+    id = started.id;
+    if (opts.signal.aborted) { stop(); return '(aborted)'; }
+    opts.signal.addEventListener('abort', stop, { once: true });
+    try {
+      for (;;) {
+        if (opts.signal.aborted) { stop(); return '(aborted)'; }
+        const snap = await agentRunsApi.get(id);
+        if (isTerminalStatus(snap.status)) {
+          if (snap.stop === 'aborted') return '(aborted)';
+          if (snap.status === 'error') return `(research failed: ${snap.error ?? 'unknown error'})`;
+          const last = [...snap.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
+          return last?.content?.trim() || '(no findings)';
+        }
+        for (const a of snap.pendingApprovals ?? []) {
+          await agentRunsApi.approve(id, a.id, 'deny').catch(() => {});
+        }
+        await new Promise((r) => setTimeout(r, 750));
+      }
+    } finally {
+      opts.signal.removeEventListener('abort', stop);
+    }
   } catch (e) {
+    stop();
     return `(research failed: ${e instanceof Error ? e.message : String(e)})`;
   }
 }
