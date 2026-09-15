@@ -34,8 +34,8 @@ import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, type McpToolInfo } from '../lib/api';
-import { mcpToolTier, mcpToolSchema } from '../lib/coderTools';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, type McpToolInfo } from '../lib/api';
+import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
 
@@ -87,6 +87,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [convs, setConvs] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
+  const [appConfig, setAppConfig] = useState<any>(null);
+  useEffect(() => {
+    getConfig().then(setAppConfig).catch(() => {});
+  }, []);
   const [presets, setPresets] = useState<SavedChatParams[]>([]);
   const [convSearch, setConvSearch] = useState('');
   const [atBottom, setAtBottom] = useState(true);
@@ -388,7 +392,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         ...CHAT_TOOLS,
         ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
         ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
-        ...(computerUseOn ? COMPUTER_USE_TOOLS : []),
+        ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, appConfig) : []),
         // MCP tools ride on Computer Use — they're external, potentially
         // mutating actions, so they never ship without its permission gate.
         ...(computerUseOn

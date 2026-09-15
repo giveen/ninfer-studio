@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { FolderCog, GitBranch, Hammer, Save, Zap } from 'lucide-react';
 import { getConfig, saveConfig, startEngineUpdate } from '../../lib/api';
 import type { AppSettings, StatusPayload } from '../../lib/types';
-import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField } from '../../components/ui';
+import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField, Toggle } from '../../components/ui';
 
 export function EngineTab({ status }: { status: StatusPayload | null }) {
   const [form, setForm] = useState<AppSettings | null>(null);
@@ -37,7 +37,7 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
     );
   }
 
-  const set = (k: keyof AppSettings, v: string | number) => setForm({ ...form, [k]: v });
+  const set = (k: keyof AppSettings, v: string | number | boolean) => setForm({ ...form, [k]: v });
 
   const save = async () => {
     setError(null);
@@ -56,6 +56,8 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         defaultRequestParams: form.defaultRequestParams ?? '',
         currencySymbol: form.currencySymbol,
         costPerKwh: Number(form.costPerKwh) || 0,
+        coderUdiffEditEnabled: form.coderUdiffEditEnabled ?? true,
+        coderRepoMapEnabled: form.coderRepoMapEnabled ?? true,
       });
       setForm(c);
       setApiKeyDraft('');
@@ -227,6 +229,24 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
           </Field>
           <Field label="Default request params" hint={'JSON object merged into every proxied request as defaults (client fields win). e.g. {"chat_template_kwargs":{"preserve_thinking":true}}. Applies to external clients hitting the endpoint too — they inherit these without per-tool config.'}>
             <TextField value={form.defaultRequestParams ?? ''} onChange={(v) => set('defaultRequestParams', v)} placeholder='{"chat_template_kwargs":{"preserve_thinking":true}}' className="font-mono text-[12px]" />
+          </Field>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Agent capabilities"
+        description="Toggle experimental tools."
+      >
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field label="Enable udiff_edit" hint="Allow the agent to use the udiff_edit tool to apply diffs.">
+            <div>
+              <Toggle checked={form.coderUdiffEditEnabled ?? true} onChange={(v) => set('coderUdiffEditEnabled', v)} />
+            </div>
+          </Field>
+          <Field label="Enable repo_map" hint="Allow the agent to generate and use tree-sitter based repository maps.">
+            <div>
+              <Toggle checked={form.coderRepoMapEnabled ?? true} onChange={(v) => set('coderRepoMapEnabled', v)} />
+            </div>
           </Field>
         </div>
       </SectionCard>

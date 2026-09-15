@@ -442,6 +442,18 @@ export interface PermConfig { tools: Record<string, PermTier>; denyPaths: string
 export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
 export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
+
+import type { AppSettings } from './types';
+export function filterToolsByConfig(tools: any[], config: any): any[] {
+  let filtered = tools;
+  if (config && config.coderUdiffEditEnabled === false) {
+    filtered = filtered.filter((t) => t.function.name !== 'udiff_edit');
+  }
+  if (config && config.coderRepoMapEnabled === false) {
+    filtered = filtered.filter((t) => t.function.name !== 'repo_map');
+  }
+  return filtered;
+}
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 export const DEFAULT_MAX_AGENT_STEPS = 60;
 /** Tool names the read-only scout and plan mode may use. */

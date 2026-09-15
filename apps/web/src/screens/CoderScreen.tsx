@@ -35,7 +35,7 @@ import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EX
 import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
 import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
-import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
+import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, filterToolsByConfig, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
 import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
@@ -130,6 +130,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
+  const [appConfig, setAppConfig] = useState<any>(null);
+  useEffect(() => {
+    getConfig().then(setAppConfig).catch(() => {});
+  }, []);
   // When the agent pauses via ask_user, this holds the question and the run halts
   // until the user answers (release blocker #5 — human-in-the-loop).
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
@@ -2203,7 +2207,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const SCOUT_CAPABLE = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'obs_recall']);
     const names = [...allowed].filter((n) => SCOUT_CAPABLE.has(n));
     if (!names.includes('delegate')) names.push('delegate');
-    const tools = TOOLS.filter((t) => names.includes(t.function.name));
+    const rawTools = TOOLS.filter((t) => names.includes(t.function.name));
+    const tools = filterToolAllowList(filterToolsByConfig(rawTools, appConfig), allowed);
     // Server-side scout run: the control plane owns the loop and dispatches
     // in-process (tiers enforced from the mirrored perms). Ask-tier tools
     // pause the run — the same dialogs the old readOnly registry showed,
