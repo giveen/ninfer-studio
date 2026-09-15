@@ -34,7 +34,7 @@ import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, type McpToolInfo } from '../lib/api';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, type McpToolInfo } from '../lib/api';
 import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';

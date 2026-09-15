@@ -37,7 +37,7 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
     );
   }
 
-  const set = (k: keyof AppSettings, v: string | number) => setForm({ ...form, [k]: v });
+  const set = (k: keyof AppSettings, v: string | number | boolean) => setForm({ ...form, [k]: v });
 
   const save = async () => {
     setError(null);
@@ -56,8 +56,8 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         defaultRequestParams: form.defaultRequestParams ?? '',
         currencySymbol: form.currencySymbol,
         costPerKwh: Number(form.costPerKwh) || 0,
-        coder_udiff_edit_enabled: form.coder_udiff_edit_enabled ?? true,
-        coder_repo_map_enabled: form.coder_repo_map_enabled ?? true,
+        coderUdiffEditEnabled: form.coderUdiffEditEnabled ?? true,
+        coderRepoMapEnabled: form.coderRepoMapEnabled ?? true,
       });
       setForm(c);
       setApiKeyDraft('');
@@ -240,12 +240,12 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Field label="Enable udiff_edit" hint="Allow the agent to use the udiff_edit tool to apply diffs.">
             <div>
-              <Toggle checked={form.coder_udiff_edit_enabled ?? true} onChange={(v) => set('coder_udiff_edit_enabled', v)} />
+              <Toggle checked={form.coderUdiffEditEnabled ?? true} onChange={(v) => set('coderUdiffEditEnabled', v)} />
             </div>
           </Field>
           <Field label="Enable repo_map" hint="Allow the agent to generate and use tree-sitter based repository maps.">
             <div>
-              <Toggle checked={form.coder_repo_map_enabled ?? true} onChange={(v) => set('coder_repo_map_enabled', v)} />
+              <Toggle checked={form.coderRepoMapEnabled ?? true} onChange={(v) => set('coderRepoMapEnabled', v)} />
             </div>
           </Field>
         </div>

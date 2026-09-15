@@ -444,13 +444,15 @@ export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
 
 import type { AppSettings } from './types';
-export function filterToolsByConfig(tools: any[], config?: AppSettings | null) {
-  if (!config) return tools;
-  return tools.filter((t) => {
-    if (t.function.name === 'udiff_edit' && config.coder_udiff_edit_enabled === false) return false;
-    if (t.function.name === 'repo_map' && config.coder_repo_map_enabled === false) return false;
-    return true;
-  });
+export function filterToolsByConfig(tools: any[], config: any): any[] {
+  let filtered = tools;
+  if (config && config.coderUdiffEditEnabled === false) {
+    filtered = filtered.filter((t) => t.function.name !== 'udiff_edit');
+  }
+  if (config && config.coderRepoMapEnabled === false) {
+    filtered = filtered.filter((t) => t.function.name !== 'repo_map');
+  }
+  return filtered;
 }
 /** Hard ceiling on agent turns per run, user-adjustable (coderParams.maxAgentSteps). */
 export const DEFAULT_MAX_AGENT_STEPS = 60;
