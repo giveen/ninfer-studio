@@ -647,7 +647,7 @@ pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> R
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
     };
     let rx = r.tx.subscribe();
-    let stream = SseStream { rx, started: false, run: r.clone() };
+    let stream = SseStream { run: r.clone(), rx: Some(rx), recv: None, started: false };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
