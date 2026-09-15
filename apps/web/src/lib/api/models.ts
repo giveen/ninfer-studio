@@ -11,3 +11,19 @@ export function downloadModel(repo: string, file: string, localDir?: string) {
     localDir,
   });
 }
+
+export function upgradeModel(file: string) {
+  return postJSON<{ ok: boolean; message?: string }>('/api/models/upgrade', {
+    file,
+  });
+}
+
+export function convertModel(modelPath: string, recipe: string, name: string, outName: string, extraArgs: string) {
+  return postJSON<{ ok: boolean; id?: string; message?: string }>('/api/models/convert', {
+    modelPath,
+    recipe,
+    name,
+    outName,
+    extraArgs,
+  });
+}

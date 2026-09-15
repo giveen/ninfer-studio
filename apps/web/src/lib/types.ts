@@ -43,6 +43,7 @@ export interface ModelArtifact {
   model: string | null;
   weights: string | null;
   repo: string | null;
+  version?: number;
 }
 
 interface CatalogEntry {

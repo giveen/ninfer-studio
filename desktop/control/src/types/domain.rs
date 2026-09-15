@@ -143,6 +143,7 @@ pub struct ModelArtifact {
     pub model: Option<String>,
     pub weights: Option<String>,
     pub repo: Option<String>,
+    pub version: u32,
 }
 
 /// A background job the UI polls for progress: either an HF model download

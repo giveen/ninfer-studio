@@ -129,6 +129,8 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/logs", get(routes_data::logs))
         .route("/api/models", get(routes_data::api_models))
         .route("/api/models/download", post(routes_data::models_download))
+        .route("/api/models/upgrade", post(routes_data::models_upgrade))
+        .route("/api/models/convert", post(routes_data::models_convert))
         .route("/api/engine/update", post(routes_engine::engine_update))
         .route("/api/engine/args", post(routes_engine::engine_args))
         .route("/api/gpu", get(routes_data::gpu))

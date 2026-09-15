@@ -135,6 +135,26 @@ async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Res
             "message": "select a downloaded .ninfer artifact first"
         }));
     };
+
+    let artifact_path = std::path::Path::new(&artifact);
+
+    // Check for v2 artifacts which are no longer supported by ninfer-serve
+    if let Ok(mut f) = std::fs::File::open(artifact_path) {
+        use std::io::Read;
+        let mut magic = [0u8; 8];
+        if f.read_exact(&mut magic).is_ok() {
+            if magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0") {
+                let version = magic[7] as u32;
+                if version < 3 {
+                    return Err(json!({
+                        "ok": false,
+                        "message": "Artifact is v2, but ninfer-serve requires v3. Please go to the Models tab to upgrade your artifact."
+                    }));
+                }
+            }
+        }
+    }
+
     if tokio::fs::metadata(&artifact).await.is_err() {
         return Err(json!({
             "ok": false,

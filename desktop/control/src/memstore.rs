@@ -62,9 +62,21 @@ pub async fn read_learnings(dir: &Path) -> Vec<Value> {
         } else {
             let mut found_idx = None;
             for s in &shadowed {
-                if s.0 == comp && s.1 == scope && levenshtein(&s.2, key) <= 2 {
-                    found_idx = Some(s.3);
-                    break;
+                if s.0 == comp && s.1 == scope {
+                    let k1 = &s.2;
+                    let k2 = key;
+                    // Require exact match for short keys or CLI flags to prevent shadowing
+                    let is_match = if k1.len() < 10 || k2.len() < 10 || k1.starts_with('-') || k2.starts_with('-') {
+                        k1 == k2
+                    } else {
+                        // Scale threshold by length: ~1 edit per 8 characters
+                        levenshtein(k1, k2) <= (k1.len().min(k2.len()) / 8)
+                    };
+                    
+                    if is_match {
+                        found_idx = Some(s.3);
+                        break;
+                    }
                 }
             }
 

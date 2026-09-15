@@ -62,6 +62,9 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
                 ...artifacts.map((a) => ({ value: a.path, label: `${a.file}${a.weights ? ` · ${a.weights}` : ''}` })),
               ]}
             />
+            {artifacts.find(a => a.path === artifact)?.version !== undefined && artifacts.find(a => a.path === artifact)!.version! < 3 && (
+              <p className="mt-1 text-[11px] text-danger">⚠️ This artifact is v2. ninfer-serve requires v3. Please upgrade it in the Models tab.</p>
+            )}
           </Field>
           <Field label="Public model alias" hint="Override the OpenAI public alias. The loaded artifact is unchanged — this only relabels /v1/models.">
             <TextField value={profile.modelId || ''} onChange={(v) => setU('modelId', v || undefined)} placeholder="artifact identity" />
