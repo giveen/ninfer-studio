@@ -310,6 +310,39 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
     Ok(Json(json!({"path": rel, "replacements": total})))
 }
 
+pub async fn fs_udiff(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
+    let rel = match req.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+    };
+    enforce_perm(&state, &perm_scope(&req), "udiff_edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    let full = within_ws(&ws_root, rel)?;
+    
+    let diff = match req.get("diff").and_then(|v| v.as_str()) {
+        Some(d) if !d.trim().is_empty() => d,
+        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "diff string required"})))),
+    };
+    
+    let file_text = tokio::fs::read_to_string(&full)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
+        
+    let patch = diffy::Patch::from_str(diff).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("invalid unified diff format: {e}")})))
+    })?;
+    
+    let applied = diffy::apply(&file_text, &patch).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("failed to apply patch: {e}")})))
+    })?;
+    
+    tokio::fs::write(&full, &applied)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
+        
+    Ok(Json(json!({"path": rel, "replacements": 1})))
+}
+
 /// Base64 file read for image/file attachments (mirrors `/api/coder/fs/b64`).
 pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const MAX_ATTACH_BYTES: usize = 50 * 1024 * 1024;

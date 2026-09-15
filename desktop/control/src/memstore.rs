@@ -206,6 +206,7 @@ pub async fn apply_memory_update(state: &S, dir: &Path, req: &Value) -> Result<V
         f.write_all(line.as_bytes())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("append failed: {e}")}))))?;
+        let _ = f.sync_all().await;
     }
     if let Some(drop_id) = req.get("dropLearningId").and_then(|v| v.as_str()) {
         let keep: Vec<Value> = read_learnings(dir)

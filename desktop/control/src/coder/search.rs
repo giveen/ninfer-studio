@@ -230,48 +230,114 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
     let ws = resolve_ws(&state, params.workspace.as_deref()).await?;
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut map = String::new();
+        use std::collections::{HashMap, HashSet};
+        use tree_sitter::{Parser, Query, QueryCursor};
+
+        let mut parser = Parser::new();
         let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
-        let re = regex::Regex::new(r"^(?:\s*)(?:export\s+|pub\s+|async\s+)*(?:class|interface|type|function|const|let|var|fn|struct|enum|impl|trait)\s+([a-zA-Z0-9_]+)").unwrap();
+        
+        let mut ref_counts: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut file_defs: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
-        let mut file_count = 0;
         for entry in walker.flatten() {
-            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
-                continue;
-            }
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) { continue; }
             let path = entry.path();
-            // basic extension filter to avoid minified js or assets
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy();
-                if !["ts", "tsx", "js", "jsx", "rs", "py", "go", "c", "cpp", "h", "java"].contains(&ext_str.as_ref()) {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
-                let mut file_sigs = String::new();
-                for line in content.lines() {
-                    if let Some(_caps) = re.captures(line)
-                        && file_sigs.len() < 1000
-                    {
-                        file_sigs.push_str(&format!("  {}\n", line.trim()));
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            
+            let lang = match ext {
+                "rs" => tree_sitter_rust::language(),
+                "ts" | "tsx" => tree_sitter_typescript::language_typescript(),
+                "js" | "jsx" => tree_sitter_javascript::language(),
+                _ => continue,
+            };
+            
+            let query_str = match ext {
+                "rs" => r#"
+                    (function_item name: (identifier) @def)
+                    (struct_item name: (type_identifier) @def)
+                    (enum_item name: (type_identifier) @def)
+                    (trait_item name: (type_identifier) @def)
+                    (impl_item type: (type_identifier) @def)
+                    (identifier) @ref
+                    (type_identifier) @ref
+                "#,
+                "ts" | "tsx" | "js" | "jsx" => r#"
+                    (function_declaration name: (identifier) @def)
+                    (class_declaration name: (identifier) @def)
+                    (interface_declaration name: (type_identifier) @def)
+                    (type_alias_declaration name: (type_identifier) @def)
+                    (variable_declarator name: (identifier) @def)
+                    (identifier) @ref
+                    (type_identifier) @ref
+                    (property_identifier) @ref
+                "#,
+                _ => continue,
+            };
+            
+            let Ok(content) = std::fs::read_to_string(path) else { continue };
+            parser.set_language(&lang).unwrap();
+            let Some(tree) = parser.parse(&content, None) else { continue };
+            
+            let Ok(query) = Query::new(&lang, query_str) else { continue };
+            let mut cursor = QueryCursor::new();
+            let matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+            
+            let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
+            let mut local_defs = Vec::new();
+            
+            for m in matches {
+                for capture in m.captures {
+                    let node = capture.node;
+                    let tag_name = query.capture_names()[capture.index as usize];
+                    if let Ok(text) = node.utf8_text(content.as_bytes()) {
+                        if tag_name == "def" {
+                            if let Some(parent) = node.parent() {
+                                if let Ok(parent_text) = parent.utf8_text(content.as_bytes()) {
+                                    let sig = parent_text.lines().next().unwrap_or("").trim().to_string();
+                                    local_defs.push((text.to_string(), sig));
+                                }
+                            }
+                        } else if tag_name == "ref" {
+                            ref_counts.entry(text.to_string()).or_default().insert(rel_path.clone());
+                        }
                     }
                 }
-                if !file_sigs.is_empty() {
-                    map.push_str(&format!("{}\n{}\n", rel_path, file_sigs));
-                    file_count += 1;
-                    if file_count > 200 { break; } // limit to avoid massive payloads
-                }
+            }
+            if !local_defs.is_empty() {
+                file_defs.insert(rel_path, local_defs);
             }
         }
-        if map.len() > 15000 {
-            map.truncate(15000);
-            map.push_str("\n... (repo map truncated)");
+
+        let mut file_scores: Vec<(String, usize)> = file_defs.keys().map(|file| {
+            let score = file_defs[file].iter().map(|(sym, _)| {
+                ref_counts.get(sym).map(|set| set.len()).unwrap_or(0)
+            }).sum();
+            (file.clone(), score)
+        }).collect();
+        
+        file_scores.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        let mut map_out = String::new();
+        let mut chars_used = 0;
+        let char_limit = 20000;
+        
+        for (file, _score) in file_scores {
+            let defs = &file_defs[&file];
+            let mut file_block = format!("{}:\n", file);
+            let mut seen = HashSet::new();
+            for (_, sig) in defs {
+                if seen.insert(sig.clone()) {
+                    file_block.push_str(&format!("  {}\n", sig));
+                }
+            }
+            if chars_used + file_block.len() > char_limit {
+                map_out.push_str("... (remaining files omitted due to budget)\n");
+                break;
+            }
+            map_out.push_str(&file_block);
+            chars_used += file_block.len();
         }
-        json!({"map": map})
+        json!({"map": map_out})
     }).await.unwrap_or_else(|_| json!({"error": "task panicked"}));
 
     Ok(Json(result))

@@ -1,6 +1,6 @@
 [package]
 name = "ninfier-control"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2024"
 description = "NInfer Studio control plane: engine process supervision, model management, GPU stats, SSE-safe engine API proxy, static hosting. Framework-agnostic (no Tauri imports)."
 
@@ -42,6 +42,12 @@ dirs = "7"
 # false` skips the server/macro half we never use; its reqwest (0.13.x)
 # unifies with the one above, so no duplicate TLS stack.
 rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+diffy = "0.3"
+tree-sitter = "0.22"
+tree-sitter-javascript = "0.21"
+tree-sitter-typescript = "0.21"
+tree-sitter-rust = "0.21"
+petgraph = "0.6"
 
 # Windows-only: the coder sandbox runs the shell at low integrity inside a
 # Job Object (see src/sandbox/windows.rs). Target-scoped so Linux builds
