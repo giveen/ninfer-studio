@@ -887,11 +887,6 @@ async fn git_tree(scope: Option<&str>) -> Option<String> {
             .await
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-    }
-}
-
-async fn git_tree(scope: Option<&str>) -> Option<String> {
-    git_tree_now(scope).await
 }
 
 /// Net diff across the worker attempts (`git diff preTree postTree`, capped
