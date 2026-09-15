@@ -285,8 +285,8 @@ mod tests {
         // 1. Add first learning
         apply_memory_update(&state, &tmp, &json!({"learning": {"text": "npm", "kind": "tip", "component": "general", "scope": "repo", "target_key": "packageManager"}})).await.unwrap();
         
-        // 2. Add second learning with fuzzy matched key
-        let r = apply_memory_update(&state, &tmp, &json!({"learning": {"text": "pnpm", "kind": "tip", "component": "general", "scope": "repo", "target_key": "package_manager"}})).await.unwrap();
+        // 2. Add second learning with fuzzy matched key (dist 1, len 14)
+        let r = apply_memory_update(&state, &tmp, &json!({"learning": {"text": "pnpm", "kind": "tip", "component": "general", "scope": "repo", "target_key": "packagemanager"}})).await.unwrap();
         
         let learnings = r.get("learnings").and_then(|v| v.as_array()).unwrap();
         assert_eq!(learnings.len(), 1, "The second learning should have shadowed the first");
