@@ -881,7 +881,7 @@ async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Optio
 
 /// The blob tree of the working tree (`git write-tree`) — the baseline for
 /// the net worker diff.
-fn git_tree_now(scope: Option<&str>) -> impl std::future::Future<Output = Option<String>> + Send {
+async fn git_tree(scope: Option<&str>) -> Option<String> {
     async move {
         git_run(scope, &["write-tree"], 10)
             .await
