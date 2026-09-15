@@ -58,8 +58,21 @@ pub enum AgentEvent {
     UserQuestionAnswered { id: String, answer: String },
     /// Paused at a turn end for a client's turn-hook decision (the run is
     /// in `awaiting_hook` status; the pending decision's id is here).
-    HookRequested { id: String },
+    HookRequested {
+        id: String,
+        /// Turns completed so far (the turn just finished).
+        turns: usize,
+        finish_reason: Option<String>,
+        /// Whether the turn just finished made tool calls.
+        had_tool_calls: bool,
+        /// The client's compaction gate needs a token estimate of the next
+        /// request (the server's last request size / ~4 chars-per-token).
+        est_tokens: u64,
+    },
     HookResolved { id: String, action: String },
+    /// A child run (`delegate`/`subagent`) was spawned; clients can attach
+    /// to it for live progress.
+    ChildRun { id: String, kind: String, task: String },
     /// The `todo_write` tool updated the run's todo list.
     Todo { items: Value },
     Status { status: RunStatus },
@@ -185,6 +198,11 @@ pub struct RunSnapshot {
     pub hook_mode: String,
     /// The id of a pending hook decision, if paused.
     pub pending_hook: Option<String>,
+    /// Plan mode: read-only investigation run (bash locked to inspection
+    /// commands, MCP + mutating tools denied at dispatch).
+    pub plan: bool,
+    /// Revision of the run's task list (stale-write guard for todo_write).
+    pub todo_rev: u64,
 }
 
 /// Mutable, loop-owned part of a run. The loop is the single writer;
@@ -211,6 +229,13 @@ pub struct RunLive {
     pub last_meta: Option<Value>,
     /// The id of a pending turn-hook decision (set while `status == AwaitingHook`).
     pub pending_hook: Option<String>,
+    /// Task-list revision: bumped by an accepted `todo_write` or a user edit.
+    /// A `todo_write` whose snapshot predates the bump is stale and discarded
+    /// (the client's mid-run edit guard).
+    pub todo_rev: u64,
+    /// The rev captured at the start of the in-flight turn — the list the
+    /// current response was generated from.
+    pub todo_base_rev: u64,
 }
 
 /// Immutable run description, fixed at start.
@@ -233,6 +258,12 @@ pub struct RunMeta {
     /// Sampling params (temperature, topP, reasoningEffort, maxTokens, …).
     pub params: Value,
     pub parent: Option<String>,
+    /// Read-only plan-mode run (bash locked to inspection commands).
+    pub plan: bool,
+    /// Worker critic spec `{model, system?}` for `subagent` runs — when set,
+    /// the server runs the worker → critic fix loop in-process and reports
+    /// `criticApproved` in the tool result.
+    pub critic: Option<Value>,
 }
 
 /// Shared handle to one run. `Arc`ed into the loop task and every
@@ -322,6 +353,8 @@ impl RunShared {
                 HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
+            plan: meta.plan,
+            todo_rev: live.todo_rev,
         }
     }
 
@@ -552,7 +585,23 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         scope: body.scope.clone(),
         usage: RunUsage::default(),
         last_meta: None,
+        pending_hook: None,
+        todo_rev: 0,
+        todo_base_rev: 0,
     };
+    // Worker critic spec (subagent runs only): `{model, system?}`.
+    let critic = body
+        .critic
+        .as_ref()
+        .filter(|c| c.get("model").and_then(|m| m.as_str()).map(str::trim).map(|m| !m.is_empty()).unwrap_or(false))
+        .map(|c| {
+            let mut o = serde_json::Map::new();
+            o.insert("model".into(), c["model"].clone());
+            if c.get("system").and_then(|s| s.as_str()).is_some_and(|s| !s.trim().is_empty()) {
+                o.insert("system".into(), c["system"].clone());
+            }
+            Value::Object(o)
+        });
     let meta = RunMeta {
         id: id.clone(),
         kind: body.kind,
@@ -566,6 +615,8 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         tools_spec: body.tools,
         params: body.params,
         parent: body.parent,
+        plan: body.plan,
+        critic,
     };
     // Registered + spawned before this response goes out (see spawn_run),
     // so a client can attach to the SSE stream immediately.
