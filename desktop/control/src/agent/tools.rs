@@ -142,16 +142,33 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             let Some(text) = text else {
                 return json!({ "error": format!("unknown observation id: {id}") });
             };
-            const CHUNK: usize = 16_384;
-            let end = (offset + CHUNK).min(text.len());
-            // Back off to a char boundary.
-            let mut end = end;
-            while !text.is_char_boundary(end) {
-                end -= 1;
+            // The webview's recall page budget: ≤4000 bytes / ≤200 lines.
+            const MAX_BYTES: usize = 4000;
+            const MAX_LINES: usize = 200;
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                return json!({ "error": format!("offset {offset} out of range (0-{})", text.len()) });
             }
+            let bytes = text.as_bytes();
+            let available = bytes.len() - offset;
+            let mut end = available.min(MAX_BYTES);
+            let mut newlines = 0usize;
+            let mut i = 0usize;
+            while i < end {
+                if bytes[offset + i] == b'\n' {
+                    newlines += 1;
+                    if newlines == MAX_LINES {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let end = offset + end;
+            // `end` lands on a newline (never a UTF-8 continuation byte) or
+            // the end of the text — both char boundaries.
             let next = if end < text.len() { Some(end) } else { None };
-            let chunk = text.get(offset..end).unwrap_or("");
-            return json!({ "chunk": chunk, "nextOffset": next, "eof": next.is_none() });
+            let chunk = &text[offset..end];
+            return json!({ "text": chunk, "nextOffset": next, "eof": next.is_none() });
         }
         "delegate" => return delegate(state, run, args).await,
         "subagent" => return subagent(state, run, args).await,
