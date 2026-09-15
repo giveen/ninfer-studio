@@ -916,11 +916,53 @@ pub(crate) async fn hook_decision(
 }
 
 /// Router for the whole `/api/agent` surface.
+/// Validate + normalize a `todo_write` items array (mirrors the client's
+/// guard: `content` must be a non-empty string, `status` one of the three
+/// known values — malformed items are dropped, never stringified).
+pub(crate) fn clean_todo_items(raw: &Value) -> Vec<Value> {
+    let Some(arr) = raw.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in arr {
+        let Some(content) = t.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let status = match t.get("status").and_then(|v| v.as_str()) {
+            Some("in_progress") | Some("completed") => t["status"].clone(),
+            _ => Value::String("pending".into()),
+        };
+        out.push(json!({ "content": content, "status": status }));
+    }
+    out
+}
+
+/// User-edit the run's task list from the UI (bumps `todo_rev` so a stale
+/// `todo_write` snapshot the model is generating gets discarded).
+pub(crate) async fn todo_set(AxumState(state): AxumState<S>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(r) = runs.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "run not found" }))).into_response();
+    };
+    let items = clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
+    let mut live = lock(&r.live);
+    live.todo = Value::Array(items.clone());
+    live.todo_rev += 1;
+    let rev = live.todo_rev;
+    drop(live);
+    let _ = r.tx.send(AgentEvent::Todo { items: Value::Array(items.clone()) });
+    Json(json!({ "ok": true, "count": items.len(), "rev": rev })).into_response()
+}
+
 pub(crate) fn router() -> Router<S> {
     Router::new()
         .route("/runs", post_route(start).get(list))
         .route("/runs/{id}", get_route(get))
         .route("/runs/{id}/events", get_route(events))
+        .route("/runs/{id}/todo", post_route(todo_set))
         .route("/runs/{id}/stop", post_route(stop))
         .route("/runs/{id}/approvals/{aid}", post_route(approve))
         .route("/runs/{id}/questions/{qid}", post_route(answer))
@@ -961,6 +1003,8 @@ pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Optio
         tools_spec: Value::Array(vec![]),
         params: Value::Null,
         parent: None,
+        plan: false,
+        critic: None,
     };
     Arc::new(RunShared {
         meta,
@@ -974,11 +1018,13 @@ pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Optio
             stop: None,
             pending_approvals: vec![],
             user_question: None,
-        pending_hook: None,
+            pending_hook: None,
             todo: None,
             scope,
             usage: RunUsage::default(),
             last_meta: None,
+            todo_rev: 0,
+            todo_base_rev: 0,
         }),
         tx,
         approvals: Mutex::new(HashMap::new()),
