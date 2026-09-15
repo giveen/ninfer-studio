@@ -368,16 +368,15 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
                 is_approved_command(&command, &gs.opts.approved)
             };
-            if !approved {
-                if let Some(reason) = detect_risky(&command) {
-                    match await_gate(run, GateKind::Risky, command.clone(), Some(reason.to_string())).await {
-                        GateDecision::Deny => {
-                            return json!({
-                                "error": format!("Risky command denied by the user: {reason}. Use a safer alternative or ask.")
-                            });
-                        }
-                        GateDecision::Once | GateDecision::Remember => {}
+            if !approved
+                && let Some(reason) = detect_risky(&command) {
+                match await_gate(run, GateKind::Risky, command.clone(), Some(reason.to_string())).await {
+                    GateDecision::Deny => {
+                        return json!({
+                            "error": format!("Risky command denied by the user: {reason}. Use a safer alternative or ask.")
+                        });
                     }
+                    GateDecision::Once | GateDecision::Remember => {}
                 }
             }
         }
@@ -434,10 +433,9 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
                 body["workspace"] = json!(scope);
             }
         }
-        "repo_search" | "repo_map" | "git_diff" | "web_fetch" | "web_search" | "browser" => {
-            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) {
-                body["workspace"] = json!(scope);
-            }
+        "repo_search" | "repo_map" | "git_diff" | "web_fetch" | "web_search" | "browser"
+            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) => {
+            body["workspace"] = json!(scope);
         }
         _ => {}
     }
@@ -915,6 +913,7 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
 /// registry and any client can attach to watch it. `prompt` is the seed user
 /// message; the model's `tools` allow-list is filtered against `filter_tools`
 /// (nothing survives → `default_tools`), and maxSteps/model come from args.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_child(
     state: &S,
     parent: &Arc<RunShared>,
@@ -947,10 +946,9 @@ async fn spawn_child(
     let mut tools_spec = Vec::new();
     if let Some(arr) = parent.meta.tools_spec.as_array() {
         for t in arr {
-            if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
-                if tool_names.iter().any(|x| x == n) {
-                    tools_spec.push(t.clone());
-                }
+            if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str())
+                && tool_names.iter().any(|x| x == n) {
+                tools_spec.push(t.clone());
             }
         }
     }
@@ -1005,10 +1003,9 @@ async fn spawn_child(
             let mut p = parent.meta.params.clone();
             // The client's per-kind maxTokens (worker 4096, scout 2048); chat
             // runs keep the chat screen's own params untouched.
-            if parent.meta.tool_set != "chat" {
-                if let Value::Object(o) = &mut p {
-                    o.insert("maxTokens".to_string(), json!(if kind == "worker" { 4096 } else { 2048 }));
-                }
+            if parent.meta.tool_set != "chat"
+                && let Value::Object(o) = &mut p {
+                o.insert("maxTokens".to_string(), json!(if kind == "worker" { 4096 } else { 2048 }));
             }
             p
         },
@@ -1127,7 +1124,7 @@ async fn git_tree(scope: Option<&str>) -> Option<String> {
 /// at 60k chars — the same capture the client made).
 async fn net_diff(scope: Option<&str>, pre: Option<&str>) -> Option<String> {
     let post = git_tree(scope).await?;
-    let pre = pre.filter(|p| *p != &post)?;
+    let pre = pre.filter(|p| *p != post)?;
     git_run(scope, &["--no-pager", "diff", pre, &post], 60)
         .await
         .map(|s| s.chars().take(60_000).collect())
@@ -1135,7 +1132,7 @@ async fn net_diff(scope: Option<&str>, pre: Option<&str>) -> Option<String> {
 
 /// One critic pass: review the diff against the task, parse the VERDICT line
 /// + LEARNING/AVOID lines. Fail-open at the call site (an error never blocks
-/// the run — the client's critic errored into an approval).
+///   the run — the client's critic errored into an approval).
 async fn run_critic(
     state: &S,
     parent: &Arc<RunShared>,

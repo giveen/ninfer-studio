@@ -527,7 +527,7 @@ fn pack_one(shared: &RunShared, m: &Value, content: &str) -> Option<Value> {
     if obj.get("_summarized").and_then(|v| v.as_bool()) == Some(true) {
         return None; // already a compact receipt
     }
-    let text = extract_tool_result_text(&obj)?;
+    let text = extract_tool_result_text(obj)?;
     if text.len() <= PACK_THRESHOLD_BYTES {
         return None;
     }
@@ -570,12 +570,12 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
 
     let n = tool_indices.len();
     let mut out = context.to_vec();
-    for rank in 0..n {
+    for (rank, idx) in tool_indices.iter().enumerate() {
         let later_count = n - 1 - rank;
         if later_count < PACK_FULL_SENDS {
             continue; // still within its full-send window
         }
-        let idx = tool_indices[rank];
+        let idx = *idx;
         let m = &out[idx];
         let content = match m.get("content").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
@@ -688,8 +688,8 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
                 continue;
             };
             // Timings (SGLang-style engine extensions), usage, and deltas.
-            if let Some(t) = chunk_v.get("timings").and_then(|v| v.as_object()) {
-                if first_chunk.is_some() && meta.get("promptTokPerSec").is_none() {
+            if let Some(t) = chunk_v.get("timings").and_then(|v| v.as_object())
+                && first_chunk.is_some() && meta.get("promptTokPerSec").is_none() {
                     if let Some(v) = t.get("prompt_per_second").cloned() {
                         meta.insert("promptTokPerSec".into(), v);
                     }
@@ -715,7 +715,6 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
                     if let Some(v) = t.get("draft_n_accepted").cloned() {
                         meta.insert("draftNAccepted".into(), v);
                     }
-                }
             }
             if let Some(u) = chunk_v.get("usage").and_then(|v| v.as_object()) {
                 if let Some(p) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
@@ -800,8 +799,8 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
         }
     }
 
-    if first_chunk.is_some() {
-        meta.insert("ttftMs".into(), json!(first_chunk.unwrap()));
+    if let Some(first) = first_chunk {
+        meta.insert("ttftMs".into(), json!(first));
     }
     Ok(Turn {
         content,
@@ -856,10 +855,9 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             let mut live = lock_live(&shared);
             live.todo_base_rev = live.todo_rev;
             let mut sys = meta.system.clone().unwrap_or_default();
-            if meta.kind == "coder" {
-                if let Some(t) = live.todo.as_ref().filter(|t| !t.is_null()) {
-                    sys.push_str(&todo_system_block(t));
-                }
+            if meta.kind == "coder"
+                && let Some(t) = live.todo.as_ref().filter(|t| !t.is_null()) {
+                sys.push_str(&todo_system_block(t));
             }
             sys
         };
@@ -1160,6 +1158,7 @@ pub(crate) fn todo_system_block(todos: &Value) -> String {
 /// One-shot engine chat for the auxiliary passes (worker ideation, critic
 /// review): stream `/v1/chat/completions` and return the final content. No
 /// usage tap, no events — these are best-effort helper calls.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_once(
     client: &reqwest::Client,
     state: &S,

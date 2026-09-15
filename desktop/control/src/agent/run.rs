@@ -33,7 +33,7 @@ pub(crate) const MAX_CONCURRENT_RUNS: usize = 16;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Full run snapshot, sent first on every SSE connection.
-    State { snapshot: RunSnapshot },
+    State { snapshot: Box<RunSnapshot> },
     /// Streaming assistant content delta (kind: "content" or "reasoning").
     Delta { kind: &'static str, text: String },
     /// A new assistant turn is about to stream (turn index).
@@ -941,7 +941,7 @@ pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String
 async fn sse_pump(run: Arc<RunShared>, out: tokio::sync::mpsc::Sender<bytes::Bytes>) {
     let mut rx = run.tx.subscribe();
     let snap = run.snapshot();
-    let first = sse_frame("state", &serde_json::to_string(&AgentEvent::State { snapshot: snap }).unwrap_or_default());
+    let first = sse_frame("state", &serde_json::to_string(&AgentEvent::State { snapshot: Box::new(snap) }).unwrap_or_default());
     if out.send(first).await.is_err() {
         return; // client is already gone
     }
