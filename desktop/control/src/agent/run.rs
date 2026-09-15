@@ -690,17 +690,23 @@ impl futures_util::Stream for SseStream {
                 let data = serde_json::to_string(&ev).unwrap_or_default();
                 return Poll::Ready(Some(Self::frame("state", &data)));
             }
-            match self.rx.recv() {
+            match self.rx.try_recv() {
                 Ok(ev) => {
                     let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
                     let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
                     return Poll::Ready(Some(Self::frame(&name, &v.to_string())));
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // No frame right now: wake on the next send. The broadcast
+                    // channel registers the waker for us while empty (the
+                    // poll loop re-runs on each sender).
+                    return Poll::Pending;
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     cx.waker().wake_by_ref();
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => return Poll::Ready(None),
+                Err(broadcast::error::TryRecvError::Closed) => return Poll::Ready(None),
             }
         }
     }
