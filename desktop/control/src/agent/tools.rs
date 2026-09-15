@@ -109,10 +109,27 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     match name {
         "ask_user" => return ask_user(run, args).await,
         "todo_write" => {
+            // The client's guard, ported: validate the items (the JSON schema
+            // is a model hint only — malformed items are dropped, never
+            // stringified) and discard updates the user superseded mid-run
+            // (a user edit bumps `todo_rev` past the rev captured at request
+            // build time — `todo_base_rev`).
+            let items = crate::agent::run::clean_todo_items(args.get("todos").unwrap_or(&Value::Null));
             let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
-            live.todo = Some(args.clone());
-            let _ = run.tx.send(AgentEvent::Todo { items: args.clone() });
-            return json!({ "ok": true });
+            if live.todo_rev != live.todo_base_rev {
+                let current = live.todo.clone().unwrap_or(Value::Array(vec![]));
+                return json!({
+                    "success": false,
+                    "reason": format!(
+                        "the task list was edited by the user while this response was being generated, so this update was not applied. The current list is: {current} — re-emit todo_write with the full intended list if your plan is still correct."
+                    ),
+                });
+            }
+            live.todo = Some(Value::Array(items.clone()));
+            live.todo_rev += 1;
+            drop(live);
+            let _ = run.tx.send(AgentEvent::Todo { items: Value::Array(items.clone()) });
+            return json!({ "success": true, "count": items.len() });
         }
         "set_directory" => {
             let requested = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -123,7 +140,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 let home = std::env::var("HOME").unwrap_or_default();
                 format!("{home}{}", requested.trim_start_matches('~'))
             } else {
-                requested
+                requested.clone()
             };
             let Ok(canon) = std::fs::canonicalize(&expanded) else {
                 return json!({ "error": format!("{requested} does not exist") });
@@ -226,7 +243,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             };
             let file_args = file_tokens
                 .iter()
-                .map(|t| (if t.starts_with('-') { t.clone() } else { q(t) }))
+                .map(|t| if t.starts_with("-") { t.clone() } else { q(t) })
                 .collect::<Vec<_>>()
                 .join(" ");
             let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("Agent commit").to_string();
@@ -235,7 +252,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 body["cwd"] = json!(scope);
                 body["workspace"] = json!(scope);
             }
-            return flatten(exec::exec(state.clone(), Json(body)).await);
+            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
         }
         "ast_grep" => {
             // Same invocation the client made through exec: `sg -p '…' -l lang`.
@@ -246,9 +263,33 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 body["cwd"] = json!(scope);
                 body["workspace"] = json!(scope);
             }
-            return flatten(exec::exec(state.clone(), Json(body)).await);
+            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
         }
         _ => {}
+    }
+
+    // --- plan mode (read-only investigation run) -------------------------
+    // Mirrors the client's checkPerm plan branch: mutating tools are denied,
+    // MCP tools are disabled, and bash is locked to inspection commands — so
+    // a surviving plan run stays read-only even with no client attached.
+    if run.meta.plan {
+        const MUTATING: &[&str] = &["write", "edit", "apply_patch", "git_commit", "git_branch", "git_worktree", "subagent"];
+        if name == "bash" {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !is_read_only_command(cmd) {
+                return json!({
+                    "error": "Plan mode is read-only — bash may only run inspection commands (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show, …); redirection, pipes, and chaining are rejected. Turn Plan off to execute anything that changes state."
+                });
+            }
+        } else if MUTATING.contains(&name) {
+            return json!({
+                "error": "Plan mode is read-only — the run cannot write files or execute commands. Turn Plan off to apply changes."
+            });
+        } else if mcp_name(name).is_some() {
+            return json!({
+                "error": "Plan mode is read-only — external MCP tools are disabled (they may mutate external state)."
+            });
+        }
     }
 
     // --- permission preflight ------------------------------------------
@@ -298,7 +339,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // MCP tools are namespaced (`mcp__<server>__<tool>`) and always
     // endpoint-dispatchable; everything else must be in the tool-set's table.
     let family = if run.meta.tool_set == "chat" { CHAT_TOOLS } else { CODER_TOOLS };
-    if mcp_name(name).is_none() && family.iter().all(|f| f != name) {
+    if mcp_name(name).is_none() && family.iter().all(|f| *f != name) {
         return json!({ "error": format!("unknown tool: {name}") });
     }
 
@@ -369,15 +410,15 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         if let Some(t) = body.get("approvalToken").cloned() {
             req["approvalToken"] = t;
         }
-        return flatten(crate::mcp::mcp_call(state.clone(), Json(req)).await);
+        return flatten(crate::mcp::mcp_call(AxumState(state.clone()), Json(req)).await);
     }
     let res: Result<Value, (axum::http::StatusCode, Json<Value>)> = match name {
-        "read" => fs::fs_read(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "write" => fs::fs_write(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "edit" => fs::fs_edit(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "apply_patch" => fs::fs_patch(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "grep" => grep::grep(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "glob" => grep::glob(state.clone(), Json(body.clone())).await.map(|j| j.0),
+        "read" => fs::fs_read(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "write" => fs::fs_write(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "edit" => fs::fs_edit(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "apply_patch" => fs::fs_patch(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "grep" => grep::grep(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "glob" => grep::glob(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "tree" => {
             let mut q = std::collections::HashMap::new();
             if let Some(v) = body.get("depth").and_then(|v| v.as_u64()) {
@@ -389,15 +430,15 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
             if let Some(v) = body.get("workspace").and_then(|v| v.as_str()) {
                 q.insert("workspace".into(), v.to_string());
             }
-            fs::tree(state.clone(), Query(q)).await.map(|j| j.0)
+            fs::tree(AxumState(state.clone()), Query(q)).await.map(|j| j.0)
         }
-        "bash" => exec::exec(state.clone(), Json(body.clone())).await.map(|j| j.0),
+        "bash" => exec::exec(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "bash_poll" => {
             let id = body.get("jobId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            exec::job_get(state.clone(), AxumPath(id)).await.map(|j| j.0)
+            exec::job_get(AxumState(state.clone()), AxumPath(id)).await.map(|j| j.0)
         }
         "git_diff" => search::diff(
-            state.clone(),
+            AxumState(state.clone()),
             Query(search::WsQuery { workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from) }),
         )
         .await
@@ -405,7 +446,7 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         // `search` is non-Result (it degrades to empty results) — wrap.
         "repo_search" => Ok(
             search::search(
-                state.clone(),
+                AxumState(state.clone()),
                 Query(search::SearchQuery {
                     q: body.get("query").and_then(|v| v.as_str()).map(String::from),
                     limit: body.get("limit").and_then(|v| v.as_u64()),
@@ -416,16 +457,16 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
             .0,
         ),
         "repo_map" => search::repo_map(
-            state.clone(),
+            AxumState(state.clone()),
             Query(search::WsQuery { workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from) }),
         )
         .await
         .map(|j| j.0),
-        "web_fetch" => web::web_fetch(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "web_search" => web::web_search(state.clone(), Json(body.clone())).await.map(|j| j.0),
-        "browser" => browser::browser(state.clone(), Json(body.clone())).await.map(|j| j.0),
+        "web_fetch" => web::web_fetch(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "web_search" => web::web_search(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "browser" => browser::browser(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
         "memory" => memory::memory_get(
-            state.clone(),
+            AxumState(state.clone()),
             Query(memory::MemQuery {
                 workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
             }),
@@ -641,6 +682,7 @@ async fn spawn_child(
         stop: None,
         pending_approvals: vec![],
         user_question: None,
+        pending_hook: None,
         todo: None,
         scope: parent.scope_opt(),
         usage: Default::default(),
@@ -707,4 +749,44 @@ pub fn known_tool(tool_set: &str, name: &str) -> bool {
     } else {
         CODER_TOOLS.contains(&name)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-mode bash guard (the client's `isReadOnlyCommand`, ported)
+// ---------------------------------------------------------------------------
+
+const READONLY_BASH: &[&str] = &[
+    "find", "ls", "cat", "head", "tail", "wc", "grep", "rg", "fd", "file", "stat", "du", "df", "tree", "pwd",
+    "which", "uname", "date", "sort", "uniq", "diff", "nl", "basename", "dirname", "realpath", "readlink",
+    "md5sum", "sha256sum",
+];
+/// Read-only git subcommands allowed in plan mode.
+const READONLY_GIT: &[&str] = &[
+    "status", "log", "diff", "show", "branch", "tag", "remote", "blame", "shortlog", "describe", "ls-files",
+    "rev-parse",
+];
+
+static RE_SHELL_CONTROL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+/// Redirection, pipes, chaining, command substitution, or a paren group make
+/// a command non-inspection.
+fn re_shell_control() -> &'static Regex {
+    RE_SHELL_CONTROL
+        .get_or_init(|| Regex::new(r#"[>|;&`\(]"#).expect("static regex"))
+}
+
+/// Would this shell command only inspect state? (The client's
+/// `isReadOnlyCommand`, ported: no shell operators, and the first word is an
+/// inspection tool — or `git` + a read-only subcommand.)
+pub(crate) fn is_read_only_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty() || re_shell_control().is_match(cmd) {
+        return false;
+    }
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    let first = toks[0];
+    if first == "git" {
+        return toks.get(1).is_some_and(|s| READONLY_GIT.contains(s));
+    }
+    READONLY_BASH.contains(&first)
 }
