@@ -411,7 +411,7 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
 
 /// `POST /api/agent/runs` — start a run. Returns `{id, status}`; follow the
 /// run via `GET /api/agent/runs/{id}/events` (SSE) or poll the snapshot.
-pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) -> Response {
+pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) -> Response {
     if body.messages.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "messages must not be empty"}))).into_response();
     }
@@ -515,7 +515,7 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
 }
 
 /// `GET /api/agent/runs` — list runs (newest first), light summaries.
-pub async fn list(AxumState(state): AxumState<S>) -> Response {
+pub(crate) async fn list(AxumState(state): AxumState<S>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let mut out: Vec<Value> = runs.values().map(|r| {
         let snap = r.snapshot();
@@ -545,7 +545,7 @@ pub async fn list(AxumState(state): AxumState<S>) -> Response {
 
 /// `GET /api/agent/runs/{id}` — full snapshot (transcript, pending
 /// approvals, usage).
-pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
+pub(crate) async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     match runs.get(&id) {
         Some(r) => Json(serde_json::to_value(r.snapshot()).unwrap()).into_response(),
@@ -555,7 +555,7 @@ pub async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Resp
 
 /// `POST /api/agent/runs/{id}/stop` — abort the loop. The run is marked
 /// stopped; in-flight engine reads and tool dispatches are dropped.
-pub async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
+pub(crate) async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
@@ -573,7 +573,7 @@ pub async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Res
 /// mints the one-shot token through the existing `/api/coder/perms/approve`
 /// first and passes it here; the loop injects it and `enforce_perm`
 /// consumes it (single-use, TTL, tool+path scoped — unchanged).
-pub async fn approve(
+pub(crate) async fn approve(
     AxumState(state): AxumState<S>,
     Path((id, aid)): Path<(String, String)>,
     Json(body): Json<ApproveBody>,
@@ -613,7 +613,7 @@ struct ApproveBody {
 
 /// `POST /api/agent/runs/{id}/questions/{qid}` — answer a pending
 /// `ask_user` pause. Body: `{answer}`.
-pub async fn answer(
+pub(crate) async fn answer(
     AxumState(state): AxumState<S>,
     Path((id, qid)): Path<(String, String)>,
     Json(body): Json<AnswerBody>,
@@ -643,7 +643,7 @@ struct AnswerBody {
 /// subsequent frames: one per [`AgentEvent`], event name = its `type`
 /// value. A lagging subscriber just drops frames; it can resync with a
 /// `GET /runs/{id}` snapshot (same shape as the first frame).
-pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
+pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
@@ -720,7 +720,7 @@ impl futures_util::Stream for SseMpsc {
 }
 
 /// Router for the whole `/api/agent` surface.
-pub fn router() -> Router<S> {
+pub(crate) fn router() -> Router<S> {
     Router::new()
         .route("/runs", post_route(start).get(list))
         .route("/runs/{id}", get_route(get))
@@ -820,7 +820,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         let shared = test_run(&state, "coder", &["write", "read"], Some(dir.join("ws").to_string_lossy().into()));
         let w = crate::agent::tools::dispatch(&state, &shared, "write", &json!({"path": "a.txt", "content": "hello"})).await;
-        assert_eq!(w.get("ok").and_then(|v| v.as_bool()), Some(true), "write: {w}");
+        assert_eq!(w.get("created").and_then(|v| v.as_bool()), Some(true), "write: {w}");
         let r = crate::agent::tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
         assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("hello"));
         let _ = std::fs::remove_dir_all(dir);
