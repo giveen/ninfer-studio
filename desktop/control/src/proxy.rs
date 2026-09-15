@@ -22,6 +22,56 @@ pub(crate) const ENGINE_PROXY_TIMEOUT_SECS: u64 = 3600;
 // ---------------------------------------------------------------------------
 /// Choose the engine port for a proxied request. When the JSON body names a
 /// model, route to the engine that serves it; otherwise fall back to the
+/// Wait until the engine on `port` is ready (or transition from Starting to Running once health passes).
+pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), String> {
+    let start_time = std::time::Instant::now();
+    let max_wait = std::time::Duration::from_secs(120);
+
+    loop {
+        let (eng_state, fail_reason) = {
+            let eng = state.engine.read().await;
+            if eng.port == Some(port) {
+                (Some(eng.state.clone()), eng.fail_reason.clone())
+            } else {
+                (None, None)
+            }
+        };
+
+        if let Some(st) = eng_state {
+            match st {
+                crate::types::EngineState::Running | crate::types::EngineState::External => {
+                    return Ok(());
+                }
+                crate::types::EngineState::Stopped | crate::types::EngineState::Failed | crate::types::EngineState::Stopping => {
+                    let reason = fail_reason.unwrap_or_else(|| "engine stopped before becoming ready".to_string());
+                    return Err(reason);
+                }
+                crate::types::EngineState::Starting => {
+                    if crate::engine::engine_health(port).await {
+                        let mut eng = state.engine.write().await;
+                        if eng.state == crate::types::EngineState::Starting {
+                            eng.state = crate::types::EngineState::Running;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            if crate::engine::engine_health(port).await {
+                return Ok(());
+            }
+        }
+
+        if start_time.elapsed() >= max_wait {
+            return Err(format!("timeout waiting for engine on port {port} to become ready"));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Choose the engine port for a proxied request. When the JSON body names a
+/// model, route to the engine that serves it; otherwise fall back to the
 /// primary engine (or the single discovered one, or the configured port).
 pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
     let model: Option<String> = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
@@ -55,26 +105,32 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
             cands.push((port, Some(m)));
         }
     }
-    if let Some(m) = model {
+    let port = if let Some(m) = model {
         if let Some((p, _)) = cands
             .iter()
             .find(|(_, cm)| cm.as_deref() == Some(m.as_str()))
         {
-            return Ok(*p);
-        }
-        if cands.len() > 1 {
+            *p
+        } else if cands.len() > 1 {
             let avail = cands
                 .iter()
                 .map(|(p, cm)| format!("{} (:{p})", cm.clone().unwrap_or_else(|| "?".into())))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!("no engine serves model '{m}' — available: {avail}"));
+        } else if let Some((p, _)) = cands.first() {
+            *p
+        } else {
+            state.config.read().await.engine_port
         }
-    }
-    if let Some((p, _)) = cands.first() {
-        return Ok(*p);
-    }
-    Ok(state.config.read().await.engine_port)
+    } else if let Some((p, _)) = cands.first() {
+        *p
+    } else {
+        state.config.read().await.engine_port
+    };
+
+    wait_for_engine_ready(state, port).await?;
+    Ok(port)
 }
 
 /// Merge request defaults into the body. Two sources, both with client fields
