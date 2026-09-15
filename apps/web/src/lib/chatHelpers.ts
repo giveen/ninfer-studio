@@ -304,7 +304,7 @@ export function resolveProviderConfig(
     return {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
-      model: params[`${role}CloudModel`] || 'gpt-4o',
+      model: params[`${role}CloudModel`] || appConfig.cloudProviderDefaultModel || 'gpt-4o',
     };
   }
   

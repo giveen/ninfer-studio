@@ -169,6 +169,9 @@ pub(crate) async fn set_config(
     {
         merged.cloud_provider_api_key = v.into();
     }
+    if let Some(v) = body.get("cloudProviderDefaultModel").and_then(|v| v.as_str()) {
+        merged.cloud_provider_default_model = v.into();
+    }
     persist_config(&state, &merged).await?;
     Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
 }

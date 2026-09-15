@@ -167,6 +167,9 @@ pub struct AppSettings {
     /// API Key for the cloud provider.
     #[serde(default)]
     pub cloud_provider_api_key: String,
+    /// Default cloud model selected by the user.
+    #[serde(default)]
+    pub cloud_provider_default_model: String,
 }
 
 /// One configured MCP server. Exactly one of `command` (stdio transport —
@@ -273,6 +276,7 @@ impl Default for AppSettings {
             cloud_provider_enabled: false,
             cloud_provider_base_url: String::new(),
             cloud_provider_api_key: String::new(),
+            cloud_provider_default_model: String::new(),
         }
     }
 }

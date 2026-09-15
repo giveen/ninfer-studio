@@ -59,13 +59,30 @@ export function ParamsPopover({
             {params.primaryProvider === 'cloud' && (
               <div className={row}>
                 <span className={lab}>Primary Model</span>
-                <input
-                  type="text"
-                  value={params.primaryCloudModel || ''}
-                  onChange={(e) => set({ primaryCloudModel: e.target.value })}
-                  placeholder="e.g. gpt-4o"
-                  className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                />
+                <div className="flex flex-col gap-1 w-full">
+                  <SelectField
+                    value={params.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                    onChange={(v) => set({ primaryCloudModel: v })}
+                    options={Array.from(
+                      new Set([
+                        'gpt-4o',
+                        'gpt-4o-mini',
+                        'gpt-4-turbo',
+                        'o1',
+                        'o3-mini',
+                        ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                        ...(params.primaryCloudModel ? [params.primaryCloudModel] : []),
+                      ])
+                    ).map((m) => ({ value: m, label: m }))}
+                  />
+                  <input
+                    type="text"
+                    value={params.primaryCloudModel || ''}
+                    onChange={(e) => set({ primaryCloudModel: e.target.value })}
+                    placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                    className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                  />
+                </div>
               </div>
             )}
             <div className={row}>
@@ -82,13 +99,30 @@ export function ParamsPopover({
             {params.subagentProvider === 'cloud' && (
               <div className={row}>
                 <span className={lab}>Subagent Model</span>
-                <input
-                  type="text"
-                  value={params.subagentCloudModel || ''}
-                  onChange={(e) => set({ subagentCloudModel: e.target.value })}
-                  placeholder="e.g. gpt-4o-mini"
-                  className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                />
+                <div className="flex flex-col gap-1 w-full">
+                  <SelectField
+                    value={params.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                    onChange={(v) => set({ subagentCloudModel: v })}
+                    options={Array.from(
+                      new Set([
+                        'gpt-4o-mini',
+                        'gpt-4o',
+                        'gpt-4-turbo',
+                        'o1-mini',
+                        'o3-mini',
+                        ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                        ...(params.subagentCloudModel ? [params.subagentCloudModel] : []),
+                      ])
+                    ).map((m) => ({ value: m, label: m }))}
+                  />
+                  <input
+                    type="text"
+                    value={params.subagentCloudModel || ''}
+                    onChange={(e) => set({ subagentCloudModel: e.target.value })}
+                    placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                    className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                  />
+                </div>
               </div>
             )}
           </div>

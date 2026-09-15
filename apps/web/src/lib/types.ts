@@ -111,6 +111,7 @@ export interface AppSettings {
   cloudProviderEnabled?: boolean;
   cloudProviderBaseUrl?: string;
   cloudProviderApiKey?: string;
+  cloudProviderDefaultModel?: string;
 }
 
 interface UpdateJob {

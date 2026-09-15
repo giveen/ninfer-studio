@@ -94,3 +94,26 @@ export function useStatus(intervalMs = 2500): { status: StatusPayload | null; er
   }, [intervalMs]);
   return { status, error };
 }
+
+/** Auto-detect models available on an OpenAI-compatible cloud provider endpoint (/v1/models). */
+export async function fetchCloudModels(baseUrl?: string, apiKey?: string): Promise<string[]> {
+  const base = (baseUrl?.trim() || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  const url = base.endsWith('/models') ? base : `${base}/models`;
+  const headers: Record<string, string> = {};
+  if (apiKey?.trim() && apiKey !== '******** (saved)') {
+    headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+  }
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Cloud models request failed (${res.status}): ${text.slice(0, 100) || res.statusText}`);
+  }
+  const data = await res.json();
+  if (Array.isArray(data?.data)) {
+    return data.data
+      .map((m: any) => (typeof m === 'string' ? m : m?.id))
+      .filter((id: any): id is string => typeof id === 'string' && id.length > 0)
+      .sort();
+  }
+  return [];
+}
