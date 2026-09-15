@@ -490,7 +490,7 @@ fn pack_one(shared: &RunShared, m: &Value, content: &str) -> Option<Value> {
     {
         // Lossless store for obs_recall (in-run; the client's IndexedDB copy
         // is the webview's own pipeline's concern).
-        let recall = shared.recall.lock().unwrap_or_else(|p| p.into_inner());
+        let mut recall = shared.recall.lock().unwrap_or_else(|p| p.into_inner());
         recall.entry(id.clone()).or_insert_with(|| text.clone());
     }
     let placeholder = placeholder_for(&id, tool_name, &text);
