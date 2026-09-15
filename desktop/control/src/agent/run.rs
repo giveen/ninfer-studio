@@ -7,7 +7,6 @@
 //! SSE subscription, it never kills the run.
 
 use crate::agent::engine_loop;
-use crate::agent::tools;
 use crate::engine::S;
 use axum::extract::{Path, State as AxumState};
 use axum::http::{header, StatusCode};
@@ -663,15 +662,31 @@ pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> R
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response").into_response())
 }
 
-/// A pinned `recv()` future for the run's broadcast channel. We cannot use
+/// A pinned drain future for the run's broadcast channel. We cannot use
 /// `try_recv` in a `Stream::poll_next`: it never registers a waker, so a
-/// stream that returns `Pending` from it would never be woken again.
+/// stream that returned `Pending` from it would never be woken again. The
+/// async block *owns* its receiver (an `rx.recv()` future would borrow one
+/// from `self`, a self-referential struct), so we build a fresh one after
+/// each delivered frame.
 struct SseStream {
     run: Arc<RunShared>,
-    /// Live while no `recv()` future is in flight.
+    /// Live until the channel closes (the drain future takes it).
     rx: Option<broadcast::Receiver<AgentEvent>>,
-    recv: Option<Pin<Box<dyn Future<Output = Result<AgentEvent, broadcast::error::RecvError>> + Send>>>,
+    recv: Option<Pin<Box<dyn Future<Output = Option<AgentEvent>> + Send>>>,
     started: bool,
+}
+
+/// Owns `rx`; yields one event per completion, skipping lag drops.
+async fn recv_next(mut rx: broadcast::Receiver<AgentEvent>) -> Option<AgentEvent> {
+    loop {
+        match rx.recv().await {
+            Ok(ev) => return Some(ev),
+            // Lagged: frames were dropped for this slow subscriber — keep
+            // draining; the client resyncs via the snapshot endpoint.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
 }
 
 impl SseStream {
@@ -698,44 +713,34 @@ impl futures_util::Stream for SseStream {
     type Item = bytes::Bytes;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            if !self.started {
-                self.started = true;
-                let ev = AgentEvent::State { snapshot: self.run.snapshot() };
-                let data = serde_json::to_string(&ev).unwrap_or_default();
-                return Poll::Ready(Some(Self::frame("state", &data)));
+        if !self.started {
+            self.started = true;
+            let ev = AgentEvent::State { snapshot: self.run.snapshot() };
+            let data = serde_json::to_string(&ev).unwrap_or_default();
+            return Poll::Ready(Some(Self::frame("state", &data)));
+        }
+        // Ensure a drain future is in flight (it registers the waker with
+        // the channel and wakes us on the next send).
+        if self.recv.is_none() {
+            let Some(rx) = self.rx.take() else {
+                return Poll::Ready(None);
+            };
+            self.recv = Some(Box::pin(recv_next(rx)));
+        }
+        let fut = self.recv.as_mut().unwrap();
+        match std::future::Future::poll(fut.as_mut(), cx) {
+            Poll::Ready(Some(ev)) => {
+                self.recv = None;
+                let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+                let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
+                Poll::Ready(Some(Self::frame(&name, &v.to_string())))
             }
-            // Ensure a recv future is in flight (it registers the waker with
-            // the channel and wakes us on the next send).
-            if self.recv.is_none() {
-                let Some(mut rx) = self.rx.take() else {
-                    // No receiver left (channel closed and consumed).
-                    return Poll::Ready(None);
-                };
-                self.recv = Some(Box::pin(rx.recv()));
+            Poll::Ready(None) => {
+                self.rx = None;
+                self.recv = None;
+                Poll::Ready(None)
             }
-            let fut = self.recv.as_mut().unwrap();
-            match std::future::Future::poll(fut.as_mut(), cx) {
-                Poll::Ready(Ok(ev)) => {
-                    self.recv = None;
-                    let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
-                    let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
-                    return Poll::Ready(Some(Self::frame(&name, &v.to_string())));
-                }
-                // Lagged: frames were dropped for this slow subscriber.
-                // Wake immediately and keep draining — the client resyncs
-                // via the snapshot endpoint if it fell too far behind.
-                Poll::Ready(Err(broadcast::error::RecvError::Lagged(_))) => {
-                    cx.waker().wake_by_ref();
-                    continue;
-                }
-                Poll::Ready(Err(broadcast::error::RecvError::Closed)) => {
-                    self.rx = None;
-                    self.recv = None;
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -840,9 +845,9 @@ mod tests {
         let dir = state.data_dir.clone();
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         let shared = test_run(&state, "coder", &["write", "read"], Some(dir.join("ws").to_string_lossy().into()));
-        let w = tools::dispatch(&state, &shared, "write", &json!({"path": "a.txt", "content": "hello"})).await;
+        let w = crate::agent::tools::dispatch(&state, &shared, "write", &json!({"path": "a.txt", "content": "hello"})).await;
         assert_eq!(w.get("ok").and_then(|v| v.as_bool()), Some(true), "write: {w}");
-        let r = tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
+        let r = crate::agent::tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
         assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("hello"));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -851,7 +856,7 @@ mod tests {
     async fn unknown_tool_returns_model_error() {
         let state = fresh();
         let shared = test_run(&state, "coder", &["read"], None);
-        let r = tools::dispatch(&state, &shared, "nope", &json!({})).await;
+        let r = crate::agent::tools::dispatch(&state, &shared, "nope", &json!({})).await;
         let err = r.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(err.contains("unknown tool"), "{r}");
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
