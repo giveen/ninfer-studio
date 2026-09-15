@@ -738,20 +738,14 @@ pub async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) -> Resu
             if !parsed.is_empty() {
                 let declared: std::collections::HashSet<&str> =
                     shared.meta.tool_names.iter().map(String::as_str).collect();
+                dropped = parsed
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .filter(|n| !declared.contains(n.as_str()))
+                    .collect();
                 let kept: Vec<Tc> = parsed
                     .into_iter()
                     .filter(|tc| declared.contains(tc.name.as_str()))
-                    .collect();
-                dropped = kept.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
-                // (names kept == names dispatched; the dropped set is the
-                // parsed names minus the kept ones)
-                let kept_names: std::collections::HashSet<&str> =
-                    kept.iter().map(|t| t.name.as_str()).collect();
-                dropped = parse_markup_tool_calls(source)
-                    .0
-                    .iter()
-                    .map(|t| t.name.clone())
-                    .filter(|n| !kept_names.contains(n.as_str()))
                     .collect();
                 if !consumed.is_empty() {
                     content = strip_consumed(&content, &consumed);
