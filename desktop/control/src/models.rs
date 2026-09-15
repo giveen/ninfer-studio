@@ -321,22 +321,99 @@ pub async fn upgrade_model(state: &Arc<State>, body: Value) -> Value {
     
     let mut cmd = tokio::process::Command::new("python3");
     cmd.arg(&upgrade_script).arg(target).arg(&out_file).current_dir(ninfer_path);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     crate::clear_appimage_env(&mut cmd);
     
-    match cmd.output().await {
-        Ok(out) => {
-            if out.status.success() {
-                // Rename v3 file over the original
-                if let Err(e) = tokio::fs::rename(&out_file, target).await {
-                    return json!({ "ok": false, "message": format!("Upgrade succeeded but rename failed: {}", e) });
+    let Ok(mut child) = cmd.spawn() else {
+        return json!({ "ok": false, "message": "could not spawn upgrade script" });
+    };
+    let pid = child.id();
+    
+    let id = format!(
+        "upg_{:x}_{:x}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+        std::process::id()
+    );
+    
+    let file_name = target.file_name().unwrap().to_string_lossy().to_string();
+    let out_file_clone = out_file.clone();
+    let target_clone = target.to_path_buf();
+    
+    {
+        let mut d = state.downloads.lock().await;
+        d.insert(
+            id.clone(),
+            JobRec {
+                id: id.clone(),
+                action: Some("upgrade".to_string()),
+                cmd: Some(format!("python3 upgrade_ninfer_v2_to_v3.py {}", file_name)),
+                repo: None,
+                file: Some(file_name),
+                local_dir: Some(cfg.models_dir.clone()),
+                pid,
+                out: String::new(),
+                exit_code: None,
+                done: false,
+                failed: false,
+                total_bytes: None,
+                downloaded_bytes: None,
+                speed_bps: None,
+                started_at: crate::types::now_ms(),
+            }
+        );
+    }
+    
+    let state_c = state.clone();
+    let id_c = id.clone();
+    
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let mut buf_out = [0; 4096];
+        let mut buf_err = [0; 4096];
+        
+        loop {
+            tokio::select! {
+                Ok(n) = stdout.read(&mut buf_out) => {
+                    if n == 0 { break; }
+                    let s = String::from_utf8_lossy(&buf_out[..n]);
+                    let mut d = state_c.downloads.lock().await;
+                    if let Some(j) = d.get_mut(&id_c) {
+                        j.out.push_str(&s);
+                        if j.out.len() > 8192 { j.out.replace_range(..j.out.len()-4096, ""); }
+                    }
                 }
-                json!({ "ok": true })
-            } else {
-                json!({ "ok": false, "message": String::from_utf8_lossy(&out.stderr).to_string() })
+                Ok(n) = stderr.read(&mut buf_err) => {
+                    if n == 0 { break; }
+                    let s = String::from_utf8_lossy(&buf_err[..n]);
+                    let mut d = state_c.downloads.lock().await;
+                    if let Some(j) = d.get_mut(&id_c) {
+                        j.out.push_str(&s);
+                        if j.out.len() > 8192 { j.out.replace_range(..j.out.len()-4096, ""); }
+                    }
+                }
             }
         }
-        Err(e) => json!({ "ok": false, "message": e.to_string() })
-    }
+        
+        let status = child.wait().await.ok();
+        let success = status.map(|s| s.success()).unwrap_or(false);
+        
+        if success {
+            // Delete the old file first to ensure rename succeeds
+            let _ = tokio::fs::remove_file(&target_clone).await;
+            let _ = tokio::fs::rename(&out_file_clone, &target_clone).await;
+        }
+        
+        let mut d = state_c.downloads.lock().await;
+        if let Some(j) = d.get_mut(&id_c) {
+            j.done = true;
+            j.failed = !success;
+            j.exit_code = status.and_then(|s| s.code());
+        }
+    });
+
+    json!({ "ok": true })
 }
 
 pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {

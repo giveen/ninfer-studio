@@ -173,6 +173,19 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
+        {downloads.filter(d => d.action !== 'download' && (!d.done || d.failed)).length > 0 && (
+          <SectionCard title="Active Operations" icon={<Layers size={15} />}>
+            <div className="max-h-40 overflow-y-auto rounded-lg border border-line bg-inset p-2.5 font-mono text-[11px] leading-relaxed text-mute">
+              {downloads.filter(d => d.action !== 'download').slice(-5).map((d) => (
+                <div key={d.id} className={cn('mb-1', d.failed && 'text-danger')}>
+                  {d.failed ? '✗' : d.done ? '✓' : '⚙'} {d.action || 'job'} {d.file} — {d.done ? `exit ${d.exitCode}` : `pid ${d.pid}`}
+                  {d.out && <div className="whitespace-pre-wrap text-[10.5px] opacity-70">{d.out.split('\n').slice(-3).join('\n')}</div>}
+                </div>
+              ))}
+            </div>
+          </SectionCard>
+        )}
+
         <SectionCard
           title="Downloaded artifacts"
           description="Only explicitly registered .ninfer artifacts are loadable by the engine."
@@ -447,9 +460,9 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                 <Download size={13} /> download to {modelsDir?.split('/').pop() || 'models/'}
               </Button>
             </div>
-            {downloads.length > 0 && (
+            {downloads.filter(d => d.action === 'download' || !d.action).length > 0 && (
               <div className="max-h-40 overflow-y-auto rounded-lg border border-line bg-inset p-2.5 font-mono text-[11px] leading-relaxed text-mute">
-                {downloads.slice(-5).map((d) => (
+                {downloads.filter(d => d.action === 'download' || !d.action).slice(-5).map((d) => (
                   <div key={d.id} className={cn('mb-1', d.failed && 'text-danger')}>
                     {d.failed ? '✗' : d.done ? '✓' : '↓'} {d.file} — {d.done ? `exit ${d.exitCode}` : `pid ${d.pid}`}
                     {d.out && <div className="whitespace-pre-wrap text-[10.5px] opacity-70">{d.out.split('\n').slice(-3).join('\n')}</div>}

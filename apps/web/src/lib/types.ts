@@ -146,6 +146,8 @@ export interface StatusPayload {
 
 export interface DownloadRec {
   id: string;
+  action?: string;
+  cmd?: string;
   repo: string;
   file: string;
   localDir: string;
