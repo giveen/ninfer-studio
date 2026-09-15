@@ -511,7 +511,7 @@ pub async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) 
     };
     // Registered + spawned before this response goes out (see spawn_run),
     // so a client can attach to the SSE stream immediately.
-    let shared = spawn_run(&state, meta, live);
+    let _shared = spawn_run(&state, meta, live);
     Json(json!({ "id": id, "status": "running" })).into_response()
 }
 
@@ -649,99 +649,74 @@ pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> R
     let Some(r) = runs.get(&id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
     };
-    let rx = r.tx.subscribe();
-    let stream = SseStream { run: r.clone(), rx: Some(rx), recv: None, started: false };
+    // One pump task per attached client: it owns a broadcast receiver and
+    // forwards frames over an mpsc (a broadcast `recv()` future borrows the
+    // receiver, so it cannot live inside a `Stream` impl without a
+    // self-referential struct — the spawned task has none of that). When
+    // the client disconnects the mpsc receiver drops, the next send errors,
+    // and the pump drops its broadcast receiver.
+    let run = r.clone();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+    tokio::spawn(sse_pump(run, out_tx));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .body(axum::body::Body::from_stream(
-            futures_util::StreamExt::boxed(stream).map(|b| Ok::<_, std::convert::Infallible>(b)),
-        ))
+        .body(axum::body::Body::from_stream(SseMpsc { rx: out_rx }))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response").into_response())
 }
 
-/// A pinned drain future for the run's broadcast channel. We cannot use
-/// `try_recv` in a `Stream::poll_next`: it never registers a waker, so a
-/// stream that returned `Pending` from it would never be woken again. The
-/// async block *owns* its receiver (an `rx.recv()` future would borrow one
-/// from `self`, a self-referential struct), so we build a fresh one after
-/// each delivered frame.
-struct SseStream {
-    run: Arc<RunShared>,
-    /// Live until the channel closes (the drain future takes it).
-    rx: Option<broadcast::Receiver<AgentEvent>>,
-    recv: Option<Pin<Box<dyn Future<Output = Option<AgentEvent>> + Send>>>,
-    started: bool,
-}
-
-/// Owns `rx`; yields one event per completion, skipping lag drops.
-async fn recv_next(mut rx: broadcast::Receiver<AgentEvent>) -> Option<AgentEvent> {
-    loop {
-        match rx.recv().await {
-            Ok(ev) => return Some(ev),
-            // Lagged: frames were dropped for this slow subscriber — keep
-            // draining; the client resyncs via the snapshot endpoint.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return None,
+/// First frame is the snapshot (`event: state`); then one frame per
+/// [`AgentEvent`]. Ends when the run's channel closes or the client goes
+/// away.
+async fn sse_pump(run: Arc<RunShared>, out: tokio::sync::mpsc::Sender<bytes::Bytes>) {
+    let mut rx = run.tx.subscribe();
+    let snap = run.snapshot();
+    let first = sse_frame("state", &serde_json::to_string(&AgentEvent::State { snapshot: snap }).unwrap_or_default());
+    if out.send(first).await.is_err() {
+        return; // client is already gone
+    }
+    while let Ok(ev) = rx.recv().await {
+        let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+        let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
+        if out.send(sse_frame(&name, &v.to_string())).await.is_err() {
+            return;
         }
     }
 }
 
-impl SseStream {
-    fn frame(name: &str, data: &str) -> bytes::Bytes {
-        let mut out = String::new();
-        out.push_str(&format!("event: {name}\n"));
-        for line in data.split('\n') {
-            out.push_str("data: ");
-            out.push_str(line);
-            out.push('\n');
-        }
+/// One SSE frame: `event: <name>`, then one `data:` line per line of the
+/// (single-line) JSON payload.
+fn sse_frame(name: &str, data: &str) -> bytes::Bytes {
+    let mut out = String::new();
+    out.push_str(&format!("event: {name}\n"));
+    for line in data.split('\n') {
+        out.push_str("data: ");
+        out.push_str(line);
         out.push('\n');
-        bytes::Bytes::from(out)
     }
+    out.push('\n');
+    bytes::Bytes::from(out)
 }
 
-impl std::fmt::Debug for SseStream {
+/// Stream adapter over an mpsc receiver — `poll_recv` registers wakers
+/// properly (unlike `try_recv`).
+struct SseMpsc {
+    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+}
+
+impl std::fmt::Debug for SseMpsc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SseStream").field("started", &self.started).finish()
+        f.debug_struct("SseMpsc").finish()
     }
 }
 
-impl futures_util::Stream for SseStream {
-    type Item = bytes::Bytes;
+impl futures_util::Stream for SseMpsc {
+    type Item = Result<bytes::Bytes, std::convert::Infallible>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if !self.started {
-            self.started = true;
-            let ev = AgentEvent::State { snapshot: self.run.snapshot() };
-            let data = serde_json::to_string(&ev).unwrap_or_default();
-            return Poll::Ready(Some(Self::frame("state", &data)));
-        }
-        // Ensure a drain future is in flight (it registers the waker with
-        // the channel and wakes us on the next send).
-        if self.recv.is_none() {
-            let Some(rx) = self.rx.as_ref() else {
-                return Poll::Ready(None);
-            };
-            self.recv = Some(Box::pin(recv_next(rx.clone())));
-        }
-        let fut = self.recv.as_mut().unwrap();
-        match std::future::Future::poll(fut.as_mut(), cx) {
-            Poll::Ready(Some(ev)) => {
-                self.recv = None;
-                let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
-                let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
-                Poll::Ready(Some(Self::frame(&name, &v.to_string())))
-            }
-            Poll::Ready(None) => {
-                self.rx = None;
-                self.recv = None;
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().rx.poll_recv(cx).map(|b| b.map(Ok))
     }
 }
 
