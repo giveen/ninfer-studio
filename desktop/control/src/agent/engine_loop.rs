@@ -827,7 +827,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         };
         let req = build_request(&meta.model, Some(&system), &context, &meta.params, &meta.tools_spec);
         let raw = serde_json::to_vec(&req).unwrap_or_default();
-        /// Token estimate of this request for the client's compaction gate.
+        // Token estimate of this request for the client's compaction gate.
         let est_tokens = (raw.len() as f64 / CHARS_PER_TOKEN).round() as u64;
 
         let _ = shared.tx.send(AgentEvent::TurnStarted { turns });
