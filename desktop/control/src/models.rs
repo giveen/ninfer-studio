@@ -37,10 +37,8 @@ pub async fn list_models(state: &State) -> Value {
         if let Ok(mut f) = tokio::fs::File::open(&full).await {
             use tokio::io::AsyncReadExt;
             let mut magic = [0u8; 8];
-            if f.read_exact(&mut magic).await.is_ok() {
-                if magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0") {
-                    version = magic[7] as u32;
-                }
+            if f.read_exact(&mut magic).await.is_ok() && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0")) {
+                version = magic[7] as u32;
             }
         }
         let known = ARTIFACTS.iter().find(|a| a.file == name).cloned();
@@ -378,7 +376,7 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
         
     // Parse extra_args simply by splitting by whitespace (ignoring quotes for simplicity in this PoC)
     if !extra_args.trim().is_empty() {
-        for arg in extra_args.trim().split_whitespace() {
+        for arg in extra_args.split_whitespace() {
             cmd.arg(arg);
         }
     }
