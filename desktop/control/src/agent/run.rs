@@ -56,6 +56,10 @@ pub enum AgentEvent {
     /// The `ask_user` tool paused the run for a human answer.
     UserQuestionRequested { id: String, question: String },
     UserQuestionAnswered { id: String, answer: String },
+    /// Paused at a turn end for a client's turn-hook decision (the run is
+    /// in `awaiting_hook` status; the pending decision's id is here).
+    HookRequested { id: String },
+    HookResolved { id: String, action: String },
     /// The `todo_write` tool updated the run's todo list.
     Todo { items: Value },
     Status { status: RunStatus },
@@ -71,6 +75,9 @@ pub enum RunStatus {
     Running,
     AwaitingApproval,
     AwaitingUser,
+    /// Paused at a turn end for a client's turn-hook decision (humanize /
+    /// verify-critic gates / compaction).
+    AwaitingHook,
     Done,
     Stopped,
     Error,
@@ -103,6 +110,35 @@ pub struct PendingQuestion {
 pub enum ApprovalDecision {
     Approved { token: Option<String> },
     Denied,
+}
+
+/// Turn-hook mode: `auto` = the loop decides turn ends by itself (the
+/// webview-legacy behaviour); `client` = pause at each turn end and let the
+/// attached screen decide (rewrite / gate-continue / compact / abort).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookMode {
+    Auto,
+    Client,
+}
+
+/// A client's decision at a turn-hook pause.
+#[derive(Debug, Clone)]
+pub enum HookDecision {
+    /// The reply stands; finish the run.
+    Done,
+    /// Replace the last assistant turn's content (e.g. a humanized pass),
+    /// then finish.
+    Replace { content: String },
+    /// Keep the run going: optionally replace the turn's content, append a
+    /// gate note as the next user message, and (when `transcript` is given)
+    /// replace the run's transcript first — the client's compaction path.
+    Continue {
+        content: Option<String>,
+        note: Option<String>,
+        transcript: Option<Vec<Value>>,
+    },
+    /// Abort the run.
+    Abort,
 }
 
 /// Accumulated per-run usage across turns.
@@ -144,6 +180,11 @@ pub struct RunSnapshot {
     pub last_meta: Option<Value>,
     pub pending_approvals: Vec<PendingApproval>,
     pub user_question: Option<PendingQuestion>,
+    /// "auto" (decisions never pause) or "client" (the screen decides at
+    /// each turn end via `POST /runs/{id}/hooks/{hid}`).
+    pub hook_mode: String,
+    /// The id of a pending hook decision, if paused.
+    pub pending_hook: Option<String>,
 }
 
 /// Mutable, loop-owned part of a run. The loop is the single writer;
@@ -168,6 +209,8 @@ pub struct RunLive {
     pub usage: RunUsage,
     /// Last turn's meta (ttftMs, prompt/completion tokens, …).
     pub last_meta: Option<Value>,
+    /// The id of a pending turn-hook decision (set while `status == AwaitingHook`).
+    pub pending_hook: Option<String>,
 }
 
 /// Immutable run description, fixed at start.
@@ -211,6 +254,10 @@ pub struct RunShared {
     /// loop iteration.
     pub stop_tx: watch::Sender<bool>,
     pub stop_rx: watch::Receiver<bool>,
+    /// Turn-hook mode (see [`HookMode`]).
+    pub hook_mode: Mutex<HookMode>,
+    /// Resolver for a waiting turn-hook decision (mode == client).
+    pub hook_wait: Mutex<Option<oneshot::Sender<HookDecision>>>,
     pub client: reqwest::Client,
 }
 
@@ -236,6 +283,10 @@ pub(crate) fn now_ms() -> u64 {
 
 fn lock<'a>(m: &'a Mutex<RunLive>) -> MutexGuard<'a, RunLive> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn shared_hook_mode(r: &RunShared) -> &HookMode {
+    &*r.hook_mode.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl RunShared {
@@ -266,6 +317,11 @@ impl RunShared {
             last_meta: live.last_meta.clone(),
             pending_approvals: live.pending_approvals.clone(),
             user_question: live.user_question.clone(),
+            hook_mode: match *shared_hook_mode(self) {
+                HookMode::Auto => "auto",
+                HookMode::Client => "client",
+            },
+            pending_hook: live.pending_hook.clone(),
         }
     }
 
@@ -342,7 +398,7 @@ impl RunShared {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct StartBody {
+pub(crate) struct StartBody {
     #[serde(default = "default_kind")]
     kind: String,
     #[serde(default)]
@@ -395,6 +451,8 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
         packed_cache: Mutex::new(HashMap::new()),
         stop_tx,
         stop_rx,
+        hook_mode: Mutex::new(HookMode::Auto),
+        hook_wait: Mutex::new(None),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3600))
             .build()
@@ -489,6 +547,7 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         stop: None,
         pending_approvals: Vec::new(),
         user_question: None,
+        pending_hook: None,
         todo: None,
         scope: body.scope.clone(),
         usage: RunUsage::default(),
@@ -605,7 +664,7 @@ pub(crate) async fn approve(
 }
 
 #[derive(Debug, Deserialize)]
-struct ApproveBody {
+pub(crate) struct ApproveBody {
     decision: String,
     #[serde(default)]
     token: Option<String>,
@@ -634,7 +693,7 @@ pub(crate) async fn answer(
 }
 
 #[derive(Debug, Deserialize)]
-struct AnswerBody {
+pub(crate) struct AnswerBody {
     answer: String,
 }
 
@@ -719,6 +778,87 @@ impl futures_util::Stream for SseMpsc {
     }
 }
 
+/// `POST /api/agent/runs/{id}/hook` — set the turn-hook mode.
+/// `{mode: "auto" | "client"}`. `client` makes the loop pause at each turn
+/// end (`awaiting_hook`) until a decision is posted to
+/// `POST /runs/{id}/hooks/{hid}` — that is how the screens keep their
+/// humanize/verify/critic/compact passes while the loop itself is
+/// server-owned. A paused run times out back to plain `done` (see
+/// `engine_loop::client_hook`), so an absent client can never wedge a run.
+#[derive(Deserialize)]
+pub(crate) struct HookModeBody {
+    mode: String,
+}
+
+pub(crate) async fn set_hook_mode(
+    AxumState(state): AxumState<S>,
+    Path(id): Path<String>,
+    Json(body): Json<HookModeBody>,
+) -> Response {
+    let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(r) = runs.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+    };
+    let mode = match body.mode.as_str() {
+        "client" => HookMode::Client,
+        _ => HookMode::Auto,
+    };
+    *r.hook_mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
+    Json(json!({ "ok": true, "mode": if mode == HookMode::Client { "client" } else { "auto" } })).into_response()
+}
+
+/// `POST /api/agent/runs/{id}/hooks/{hid}` — the client's turn-hook
+/// decision. Body: `{action: "done"|"replace"|"continue"|"abort",
+/// content?, note?, transcript?}`.
+#[derive(Deserialize)]
+pub(crate) struct HookDecisionBody {
+    action: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    /// Client-side compaction: replace the run's transcript with this
+    /// (wire-format) transcript before continuing.
+    #[serde(default)]
+    transcript: Option<Vec<Value>>,
+}
+
+pub(crate) async fn hook_decision(
+    AxumState(state): AxumState<S>,
+    Path((id, hid)): Path<(String, String)>,
+    Json(body): Json<HookDecisionBody>,
+) -> Response {
+    let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(r) = runs.get(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+    };
+    // The pending decision's id is whatever the loop posted; a stale/second
+    // decision just finds nothing waiting and is a no-op.
+    let decision = match body.action.as_str() {
+        "replace" => HookDecision::Replace { content: body.content.unwrap_or_default() },
+        "continue" => HookDecision::Continue {
+            content: body.content,
+            note: body.note,
+            transcript: body.transcript,
+        },
+        "abort" => HookDecision::Abort,
+        _ => HookDecision::Done,
+    };
+    let action = decision.action_name().to_string();
+    let sender = r.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let Some(sender) = sender else {
+        return (StatusCode::CONFLICT, Json(json!({"error": "no pending hook decision"}))).into_response();
+    };
+    let _ = sender.send(decision);
+    {
+        let mut live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+        live.pending_hook = None;
+    }
+    r.set_status(RunStatus::Running);
+    let _ = r.tx.send(AgentEvent::HookResolved { id: hid, action });
+    Json(json!({ "ok": true })).into_response()
+}
+
 /// Router for the whole `/api/agent` surface.
 pub(crate) fn router() -> Router<S> {
     Router::new()
@@ -728,6 +868,20 @@ pub(crate) fn router() -> Router<S> {
         .route("/runs/{id}/stop", post_route(stop))
         .route("/runs/{id}/approvals/{aid}", post_route(approve))
         .route("/runs/{id}/questions/{qid}", post_route(answer))
+        .route("/runs/{id}/hook", post_route(set_hook_mode))
+        .route("/runs/{id}/hooks/{hid}", post_route(hook_decision))
+}
+
+impl HookDecision {
+    /// Wire name of the decision (for the `hook_resolved` event).
+    pub fn action_name(&self) -> &'static str {
+        match self {
+            HookDecision::Done => "done",
+            HookDecision::Replace { .. } => "replace",
+            HookDecision::Continue { .. } => "continue",
+            HookDecision::Abort => "abort",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +918,7 @@ pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Optio
             stop: None,
             pending_approvals: vec![],
             user_question: None,
+        pending_hook: None,
             todo: None,
             scope,
             usage: RunUsage::default(),
