@@ -956,6 +956,7 @@ pub(crate) async fn todo_set(AxumState(state): AxumState<S>, Path(id): Path<Stri
     Json(json!({ "ok": true, "count": items.len(), "rev": rev })).into_response()
 }
 
+/// Router for the whole `/api/agent` surface.
 pub(crate) fn router() -> Router<S> {
     Router::new()
         .route("/runs", post_route(start).get(list))
