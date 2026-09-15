@@ -14,6 +14,7 @@
 //! inject and `enforce_perm` consumes — the existing security model.
 
 use crate::agent::run::{now_ms, AgentEvent, ApprovalDecision, PendingApproval, PendingQuestion, RunShared, RunStatus};
+use regex::Regex;
 use crate::coder::{browser, exec, fs, grep, memory, search, web};
 use crate::engine::S;
 use axum::extract::{Path as AxumPath, Query, State as AxumState};
@@ -621,7 +622,7 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
 
     // Baseline tree for the net diff across every worker attempt (the blob
     // tree of the working tree, captured before the first worker runs).
-    let pre = git_tree(parent.scope_opt()).await;
+    let pre = git_tree(parent.scope_opt().as_deref()).await;
     // Fresh-context brainstorm before any code is written (best-effort — an
     // empty result just means the worker proceeds without ideation notes).
     let ideation = crate::agent::engine_loop::chat_once(
@@ -678,7 +679,7 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         exhausted = res["stop"].as_str() == Some("steps");
         // Net diff across attempts (git write-tree before/after) — the critic
         // reviews the working-tree diff, not the worker's self-report.
-        diff = net_diff(parent.scope_opt(), pre.as_deref()).await.unwrap_or_default();
+        diff = net_diff(parent.scope_opt().as_deref(), pre.as_deref()).await.unwrap_or_default();
         // No critic spec (or an empty diff) → no review gate for this attempt.
         let Some(spec) = critic.as_ref().filter(|_| !diff.trim().is_empty()) else {
             break;
@@ -870,9 +871,10 @@ async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Optio
         c.current_dir(s);
     }
     c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output())
-        .await
-        .ok()??;
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output()).await {
+        Ok(Ok(out)) => out,
+        _ => return None,
+    };
     if !out.status.success() {
         return None;
     }
@@ -954,7 +956,15 @@ static RE_VERDICT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
 fn re_verdict() -> &'static Regex {
     // Case-insensitive via regex flags — the client tested /VERDICT:\s*APPROVED/i.
-    RE_VERDICT.get_or_init(|| Regex::new(?is"VERDICT:\s*APPROVED").expect("static regex"))
+    RE_VERDICT.get_or_init(|| Regex::new("(?i)VERDICT:\\s*APPROVED").expect("static regex"))
+}
+
+static RE_VERDICT_LINE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+/// The whole `VERDICT: …` line, for stripping it out of the critic's issue
+/// text (the client stripped it with /VERDICT:.*$/i per line).
+fn re_verdict_line() -> &'static Regex {
+    RE_VERDICT_LINE.get_or_init(|| Regex::new("(?im)^.*VERDICT:.*$").expect("static regex"))
 }
 
 /// Persist critic/agent learnings to the per-repo memory store (in-process
