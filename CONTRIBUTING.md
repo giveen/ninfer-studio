@@ -14,7 +14,10 @@ requests, and discussion.
 ## Making a change
 
 - Keep pull requests focused — one logical change per PR is easier to review
-  than a large mixed one.
+  than a large mixed one. Squash agent/AI working commits before opening the
+  PR — `Agent auto-commit: patched|edited …` messages are blocked by CI (see
+  `node scripts/check-commit-hygiene.mjs`): one subject per commit,
+  `<type>(<scope>): <what>`, short (≤72 chars preferred, e.g. `fix(coder): …`).
 - Match the existing code style in the file/module you're touching.
 - Add or update tests where it makes sense for the change.
 - Update documentation (README, DESIGN.md, etc.) if your change affects

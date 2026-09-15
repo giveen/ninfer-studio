@@ -14,6 +14,10 @@
 
 import type { ChatMessage } from './types';
 import { CHARS_PER_TOKEN } from './format';
+import { summarizeOutputVerified, renderOutputReceipt } from './api/chat';
+
+const SUMMARY_THRESHOLD = 16 * 1024;
+const SUMMARY_TAIL = 1500;
 
 const DB_NAME = 'ninfier-observation-pack';
 const STORE_NAME = 'observations';
@@ -256,4 +260,42 @@ export async function packForRequest(messages: ChatMessage[]): Promise<ChatMessa
     changed = true;
   }
   return changed ? out : messages;
+}
+
+export async function maybeSummarizeTool(
+  name: string,
+  resultStr: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (LARGE_OUTPUT_EXCLUDED_TOOLS.has(name)) return resultStr;
+  let res: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(resultStr);
+    if (parsed && typeof parsed === 'object') res = parsed as Record<string, unknown>;
+  } catch {
+    return resultStr;
+  }
+  if (!res) return resultStr;
+  const extracted = extractToolResultText(res);
+  if (!extracted) return resultStr;
+  const { text, hasStd } = extracted;
+  if (text.length <= SUMMARY_THRESHOLD) return resultStr;
+  const isError = hasStd && typeof res.exitCode === 'number' ? res.exitCode !== 0 : undefined;
+  try {
+    const receipt = await summarizeOutputVerified({ model, output: text, isError, signal });
+    if (!receipt) return resultStr;
+    const tail = text.slice(-SUMMARY_TAIL);
+    const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+    if (hasStd) {
+      res.stdout = wrapped;
+      res.stderr = '';
+    } else {
+      res.content = wrapped;
+    }
+    res._summarized = true;
+    return JSON.stringify(res);
+  } catch {
+    return resultStr;
+  }
 }

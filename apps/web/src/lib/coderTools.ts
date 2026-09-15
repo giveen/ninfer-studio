@@ -551,3 +551,61 @@ export function mcpToolSchema(t: { name: string; description: string; parameters
     },
   };
 }
+
+export const PURE_DEDUP_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall', 'memory_recall']);
+export const READ_STREAK_TOOLS = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'repo_search', 'obs_recall', 'memory_recall']);
+
+export const hashToolCall = (name: string, argsStr: string): string => {
+  let norm = argsStr;
+  try {
+    const o = JSON.parse(argsStr);
+    if (o && typeof o === 'object') norm = JSON.stringify(o, Object.keys(o).sort());
+  } catch { /* not JSON */ }
+  return `${name}|${norm}`;
+};
+
+export const isErrorResult = (s: string): boolean => {
+  try { const o = JSON.parse(s); return !!(o && typeof o === 'object' && 'error' in o); } catch { return false; }
+};
+
+export const withNote = (resultStr: string, note: string): string => {
+  try {
+    const o = JSON.parse(resultStr);
+    if (o && typeof o === 'object') { (o as Record<string, unknown>)._note = note; return JSON.stringify(o); }
+  } catch { /* not JSON */ }
+  return `${resultStr}\n\n[SYSTEM] ${note}`;
+};
+
+export const SCOUT_PROBES = [
+  { label: 'structure', goal: 'Map the relevant code structure: key files, modules, entry points, and how they connect. Be concrete with paths.' },
+  { label: 'usages', goal: 'Find existing usages, tests, and examples related to the task. Quote exact paths.' },
+  { label: 'history', goal: 'Summarize recent related work or docs that bear on the task (from file layout, changelogs, notes, or git diffs of related areas).' },
+];
+
+export const RISKY_PATTERNS: Array<[RegExp, string]> = [
+  [/\brm\s+(-[rf]*\s+)?(\/|~|\.\.)(\/|\s|$)/i, 'deletes root, home, or parent directory'],
+  [/\b(mkfs|dd|fdisk|parted)\b/i, 'formats or overwrites disk partitions'],
+  [/\bssh\b(?!-)/i, 'opens an SSH connection to a remote host'],
+  [/\b(scp|rsync|sftp)\b/i, 'transfers files to/from a remote host'],
+  [/\b(docker|podman)\b/i, 'runs containers'],
+  [/\b(kubectl|helm|terraform\s+apply|ansible)\b/i, 'applies infrastructure changes'],
+  [/\b(aws|gcloud|az)\b[^]*?\b(ec2|s3|deploy|apply|create|delete|update|push)\b/i, 'mutates cloud resources'],
+  [/\b(apt|apt-get|yum|dnf|apk)\b\s+(install|remove|upgrade|update)\b/i, 'changes system packages'],
+  [/\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b/i, 'installs a global package'],
+];
+
+export const detectRisky = (cmd: string): string | null => {
+  for (const [re, why] of RISKY_PATTERNS) if (re.test(cmd)) return why;
+  return null;
+};
+
+export const normalizeCommand = (cmd: string): string => cmd.replace(/\s+/g, ' ').trim();
+
+export const isApprovedCommand = (cmd: string, approved: string[] = []): boolean => {
+  const c = normalizeCommand(cmd);
+  return approved.some((a) => {
+    const na = normalizeCommand(a);
+    return c === na || c.startsWith(na + ' ');
+  });
+};
+

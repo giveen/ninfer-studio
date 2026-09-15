@@ -9,7 +9,7 @@ export interface UseCoderFileTreeOptions {
   activeWsDir: string;
   treeOpen: boolean;
   wsFlushed: number;
-  wsAppliedDirRef: React.MutableRefObject<string>;
+  wsAppliedDirRef: React.RefObject<string | null>;
   setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
   refreshRepoMap: () => void | Promise<void>;
 }

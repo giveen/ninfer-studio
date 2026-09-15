@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
-import type { ChatMessage, TodoItem } from '../lib/types';
+import type { ChatMessage } from '../lib/types';
 import { coderExec } from '../lib/api';
-import type { Checkpoint, CoderStore, LogEntry } from '../lib/coderStore';
+import type { Checkpoint, CoderStore, LogEntry, TodoItem } from '../lib/coderStore';
 
 const MAX_AUTO_CHECKPOINTS = 5;
 
@@ -16,7 +16,7 @@ export interface UseCoderCheckpointsOptions {
   setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
   setLedger: React.Dispatch<React.SetStateAction<LogEntry[]>>;
-  applyTodos: (nextTodos: TodoItem[], nextNotes: string | null) => void;
+  applyTodos: (nextTodos: TodoItem[], ts?: number | null) => void;
   addLog: (entry: Omit<LogEntry, 'id' | 'time'>) => void;
   loadGitCommits?: () => void;
   refreshRepoMap?: () => void;

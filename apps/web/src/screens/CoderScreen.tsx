@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspens
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare, Activity } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
+import { loadStore, baseName, relTime, CoderStore, ConvMeta, LogEntry, TodoItem, newConvId, emptyConv, WsData, loadDefaultPerms, detectCommands, todoSystemBlock, CONV_KEY } from '../lib/coderStore';
+
 import { DirBrowser } from '../components/DirBrowser';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
 // ~300KB chunk that costs nothing at startup this way, only when the first
@@ -37,13 +39,24 @@ import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
 import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, filterToolsByConfig, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
 import { CODER_SYSTEM, WORKER_SYSTEM, CRITIC_SYSTEM } from '../lib/coderPrompts';
-import { SidebarSection } from '../components/coder/CoderSidebar';
+import { SidebarSection, CoderSidebar } from '../components/coder/CoderSidebar';
 import { CheckpointsPanel } from '../components/coder/CheckpointsPanel';
 import { useCoderCheckpoints } from '../hooks/useCoderCheckpoints';
 import { useCoderToolHandlers, isGitCommitCommand } from '../hooks/useCoderToolHandlers';
 import { useCoderFileTree } from '../hooks/useCoderFileTree';
 import { useCoderUndo } from '../hooks/useCoderUndo';
 import { useCoderBranchManager } from '../hooks/useCoderBranchManager';
+import { CoderHeader } from '../components/coder/CoderHeader';
+import { CoderTranscriptView } from '../components/coder/CoderTranscriptView';
+import { CoderComposer } from '../components/coder/CoderComposer';
+import { CoderWorkspaceTabs } from '../components/coder/CoderWorkspaceTabs';
+import { CoderTodoSidebar } from '../components/coder/CoderTodoSidebar';
+import { CoderModals } from '../components/coder/CoderModals';
+import { useCoderToolDispatcher } from '../hooks/useCoderToolDispatcher';
+import { useCoderAgentLoop } from '../hooks/useCoderAgentLoop';
+import { useCoderSubagents } from '../hooks/useCoderSubagents';
+
+
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -157,10 +170,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // File Tree panel — browse the workspace and pin files/folders so the system
   // prompt "follows" them (system-prompt follow binding).
   const [treeOpen, setTreeOpen] = useState(true);
-  const [treeNodes, setTreeNodes] = useState<FileNode[]>([]);
-  const [treeLoading, setTreeLoading] = useState(false);
-  const [treeExpanded, setTreeExpanded] = useState<Record<string, boolean>>({});
-  const [treeChildren, setTreeChildren] = useState<Record<string, FileNode[]>>({});
 
   // Commit history of the active workspace (state + fetch live in useCoderGit).
   // Sampling params for the coder runs (persisted globally, not per workspace).
@@ -1182,1106 +1191,100 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   };
 
+  const {
+    showCheckpoints,
+    setShowCheckpoints,
+    createCheckpoint,
+    restoreCheckpoint,
+    deleteCheckpoint,
+  } = useCoderCheckpoints({
+    activeWs,
+    activeConv,
+    activeWsDir,
+    messages,
+    ledger,
+    todos,
+    running,
+    setStore,
+    setMessages,
+    setLedger,
+    applyTodos,
+    addLog,
+    loadGitCommits: git.loadCommits,
+    refreshRepoMap,
+  });
+  const checkpoints = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
+
   const { getFilePreview, runPostEditChecks } = useCoderToolHandlers({
     activeWsDir,
     detectedCmdsByWsRef,
   });
-  const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
-    const nextMessages = [...currentMessages];
-    let mutated = false;
-    // Fires once per turn (handleToolCalls runs fresh each turn), right before
-    // the first mutating call actually executes — a safety snapshot so a bad
-    // multi-step turn is always recoverable even if the user never remembered
-    // to hit "+ checkpoint" themselves.
-    let autoCheckpointed = false;
-    // Passed to every tool-call API call below so Stop actually cancels an
-    // in-flight one instead of only taking effect on the next loop turn.
-    const toolSignal = abortRef.current?.signal ?? new AbortController().signal;
 
-    // Fast path: a turn made entirely of `delegate` calls is exactly the
-    // fan-out-research case the tool's own description promises runs "in
-    // parallel" — but the general loop below always ran everything one at a
-    // time, delegate included. Run them concurrently here instead. Any turn
-    // that mixes in another tool type falls through to the general
-    // sequential loop unchanged: mutating/approval-gated tools need strict
-    // ordering, and delegate alone never does (it's read-only and never
-    // touches the git working tree).
-    if (calls.length > 1 && calls.every((c) => c.name === 'delegate')) {
-      const results = await Promise.all(calls.map(async (call) => {
-        const t0 = performance.now();
-        let result = '';
-        let logType: LogEntry['type'] = 'error';
-        let logDetail = '';
-        try {
-          const args = JSON.parse(call.arguments);
-          const permVerdict = checkPerm(call.name, args);
-          if (permVerdict !== null) {
-            logDetail = `${call.name} blocked`;
-            // A parallel batch can't safely show one interactive approval
-            // dialog per call — they'd race the single pending-approval
-            // slot. Refuse here so the model can retry this one alone,
-            // where 'ask' still works correctly (single-delegate turns
-            // fall through to the general loop below).
-            result = JSON.stringify({
-              error: permVerdict === 'ask'
-                ? `'${call.name}' requires interactive approval and can't run inside a parallel batch — call it alone.`
-                : permVerdict,
-            });
-          } else {
-            logType = 'ask';
-            logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-            const res = await runSubagent(
-              'delegate',
-              `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`,
-              modelRef.current,
-              toolSignal,
-              6,
-              filterToolAllowList(args.tools, READONLY_TOOL_NAMES),
-            );
-            result = JSON.stringify({ summary: res });
-          }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          logDetail = msg;
-          result = JSON.stringify({ error: msg });
-        }
-        const durationMs = Math.round(performance.now() - t0);
-        addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
-        const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
-        if (maybeSummarized !== result) {
-          addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
-        }
-        return { call, content: maybeSummarized };
-      }));
-      for (const { call, content } of results) {
-        nextMessages.push({ role: 'tool', content, tool_call_id: call.id, name: call.name });
-      }
-      return nextMessages;
-    }
+  const {
+    engineMaxConcurrency,
+    runSubagent,
+    runWorker,
+    runIdeation,
+    runCritic,
+    persistLearnings,
+  } = useCoderSubagents({
+    activeWsDir,
+    activeWs,
+    jobs,
+    appConfig,
+    coderParams,
+    dynamicSystemRef,
+    requestApproval,
+    addLog,
+    memoryRef,
+  });
 
-    for (const call of calls) {
-      let result = '';
-      const t0 = performance.now();
-      let logType: LogEntry['type'] = 'error';
-      let logDetail = '';
+  const { handleToolCalls } = useCoderToolDispatcher({
+    abortRef,
+    activeWsDir,
+    activeWs,
+    activeConv,
+    perms,
+    modelRef,
+    toolDedupRef,
+    readPathsRef,
+    unreadWriteWarnedRef,
+    patchFailuresRef,
+    readStreakRef,
+    askRef,
+    askConvRef,
+    runConvRef,
+    todosRef,
+    todosRevRef,
+    todosRevAtReqStartRef,
+    memoryRef,
+    mcpToolsRef,
+    commitApproval,
+    criticMode,
+    jobs,
+    addLog,
+    createCheckpoint,
+    requestApproval,
+    requestRiskyApproval,
+    addApprovedCommand,
+    requestCommitApproval,
+    setStore,
+    setPendingQuestion,
+    updateRunTodos,
+    flashTodosCreated,
+    adoptMemory,
+    runPostEditChecks,
+    getFilePreview,
+    trackPatchSpiral,
+    checkPerm,
+    runSubagent,
+    runWorker,
+    runIdeation,
+    runCritic,
+    persistLearnings,
+    isGitCommitCommand,
+  });
 
-      // Tool-call dedup: an identical PURE (read-only, no side effects) call
-      // within the recent window is short-circuited with the cached result
-      // instead of re-executing — small models loop, re-reading the same
-      // file or re-running the same grep. Skips the permission gate too:
-      // it was already granted for this exact call moments ago and nothing
-      // about a pure lookup's permission verdict changes between calls.
-      if (PURE_DEDUP_TOOLS.has(call.name)) {
-        const hash = hashToolCall(call.name, call.arguments);
-        const hit = toolDedupRef.current.find((e) => e.hash === hash);
-        if (hit) {
-          logType = 'read';
-          logDetail = `${call.name} (cached — identical call already executed this run)`;
-          const durationMs = Math.round(performance.now() - t0);
-          addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
-          nextMessages.push({ role: 'tool', content: withNote(hit.result, 'cached — identical call already executed this run'), tool_call_id: call.id, name: call.name });
-          continue;
-        }
-      }
-
-      try {
-        const args = JSON.parse(call.arguments);
-        // Permission gate: plan-mode read-only, per-tool tiers, denied paths.
-        // `ask` pauses the loop on a user decision; denials return an error
-        // the model can react to instead of executing.
-        const permVerdict = checkPerm(call.name, args);
-        // Set when the user approves an `ask` call — the dispatch below runs.
-        let approvedAfterAsk = false;
-        // Minted by coderPermsApprove the moment a human approves below —
-        // attached to the actual dispatch call so the endpoint (enforce_perm)
-        // can tell an approved call apart from one that skipped this dialog
-        // entirely. Only meaningful for the tools with their own dedicated
-        // server-side gate (bash/read/write/edit/apply_patch/grep/glob/
-        // web_fetch/web_search/browser) — a pseudo-tool like git_commit that
-        // routes through the same `bash` endpoint is gated by bash's own
-        // tier server-side regardless of git_commit's own client-side tier.
-        let approvalToken: string | undefined;
-        if (permVerdict !== null) {
-          logType = 'error';
-          logDetail = `${call.name} blocked`;
-          if (permVerdict === 'ask') {
-            const detail = call.name === 'bash' ? String(args.command ?? '') : call.name.startsWith(MCP_NAME_PREFIX) ? JSON.stringify(args).slice(0, 160) : String(args.path ?? args.files ?? args.pattern ?? args.query ?? args.url ?? '');
-            addLog({ type: 'ask', label: call.name, detail });
-            const ok = await requestApproval(call.name, detail);
-            addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
-            if (!ok) {
-              result = JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
-            } else {
-              approvedAfterAsk = true;
-              try {
-                approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
-              } catch { /* best-effort — enforce_perm rejects without a token */ }
-            }
-          } else {
-            result = JSON.stringify({ error: permVerdict });
-          }
-        }
-        if (result === '' && (permVerdict === null || approvedAfterAsk)) {
-          if (!autoCheckpointed && MUTATING_TOOLS.has(call.name)) {
-            autoCheckpointed = true;
-            // Awaited so the snapshot's HEAD read happens strictly before this
-            // call's own mutation, not racing it.
-            try { await createCheckpoint({ auto: true }); } catch { /* best-effort safety snapshot */ }
-          }
-          if (call.name === 'bash') {
-          logType = 'bash'; logDetail = args.background ? `bg: ${args.command}` : args.command;
-          // Risky-command HITL gate + per-workspace approval memory. Truly
-          // catastrophic commands are already hard-blocked by server-side safe mode;
-          // this pauses on *risky but allowed* operations and learns approvals so the
-          // user isn't prompted again for the same command in this workspace.
-          const command0 = String(args.command || '');
-          const riskyReason = detectRisky(command0);
-          if (riskyReason && !isApprovedCommand(command0, perms.approvedCommands || [])) {
-            addLog({ type: 'ask', label: 'bash', detail: `risky: ${command0}` });
-            const v = await requestRiskyApproval(command0, riskyReason);
-            addLog({ type: v === 'deny' ? 'error' : 'bash', label: 'bash', detail: v === 'deny' ? `denied: ${command0}` : `approved (${v}): ${command0}` });
-            if (v === 'deny') {
-              result = JSON.stringify({ error: `Risky command denied by the user: ${riskyReason}. Use a safer alternative or ask.` });
-            } else if (v === 'remember') {
-              addApprovedCommand(command0);
-            }
-          }
-          if (result === '') {
-            // Commit-approval gate: a shell `git commit` must be signed off too.
-            let commitBlocked = false;
-            if (commitApproval && isGitCommitCommand(String(args.command || ''))) {
-              addLog({ type: 'ask', label: 'bash', detail: 'git commit — awaiting human review' });
-              const ok = await requestCommitApproval();
-              addLog({ type: ok ? 'bash' : 'error', label: 'bash', detail: ok ? 'approved' : 'denied by user' });
-              if (!ok) commitBlocked = true;
-            }
-            if (commitBlocked) {
-              result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
-            } else {
-              const res = await coderExec(args.command, undefined, args.timeoutMs, activeWsDir, args.background === true, toolSignal, activeWsDir, approvalToken);
-              result = JSON.stringify(res);
-              if (args.background === true) mutated = true;
-              if (res.jobId) {
-                const id = res.jobId;
-                const cmd = String(args.command || '');
-                jobs.registerJob(id, cmd, activeWsDir);
-              }
-            }
-          }
-        } else if (call.name === 'bash_poll') {
-          logType = 'bash'; logDetail = `poll ${args.jobId}`;
-          try {
-            const res = await coderJob(String(args.jobId || ''), toolSignal);
-            result = JSON.stringify(res);
-            jobs.settleJobStatus(res.jobId, res);
-          } catch (e) {
-            result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-          }
-        } else if (call.name === 'obs_recall') {
-          const id = String(args.id || '');
-          const offset = Number(args.offset) || 0;
-          logType = 'read'; logDetail = `recall ${id} @${offset}`;
-          result = JSON.stringify(await readRecallChunk(id, offset));
-        } else if (call.name === 'read') {
-          logType = 'read'; logDetail = args.path;
-          const res = await coderRead(args.path, args.offset, args.limit, toolSignal, activeWsDir, approvalToken);
-          result = JSON.stringify(res);
-          readPathsRef.current.add(String(args.path || ''));
-        } else if (call.name === 'write') {
-          logType = 'write'; logDetail = args.path;
-          const wpath = String(args.path || '');
-          let blockedUnread = false;
-          if (!readPathsRef.current.has(wpath) && !unreadWriteWarnedRef.current.has(wpath)) {
-            // Read-before-write guard: an existing file the model hasn't
-            // looked at this run gets ONE refusal (with a hint to `read`
-            // first) instead of a blind overwrite — small models often
-            // hallucinate content instead of checking what's actually
-            // there. New files, and a second attempt on the same path,
-            // are always allowed through.
-            // Probe existence with a 1-byte read. The backend reports a
-            // missing file as HTTP 404 specifically (coder.rs fs_read) — any
-            // OTHER failure (network hiccup, a timeout on a large file,
-            // which is exactly the case this guard cares about) must not
-            // silently disable the guard by being mistaken for "doesn't
-            // exist"; fail closed (assume it exists) instead.
-            const exists = await coderRead(wpath, 0, 1, toolSignal, activeWsDir).then(
-              () => true,
-              (e: unknown) => !(e instanceof Error && /HTTP 404\b/.test(e.message)),
-            );
-            if (exists) {
-              unreadWriteWarnedRef.current.add(wpath);
-              result = JSON.stringify({ error: `${wpath} already exists and hasn't been read this run. Read it first with \`read\` so this write doesn't blindly overwrite content you haven't seen — or call \`write\` again on ${wpath} if you intend a deliberate full overwrite.` });
-              blockedUnread = true;
-            }
-          }
-          if (!blockedUnread) {
-            const res = await coderWrite(args.path, args.content, toolSignal, activeWsDir, approvalToken);
-            readPathsRef.current.add(wpath);
-            mutated = true;
-            if (commitApproval) {
-              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
-            } else {
-              const { preview } = await getFilePreview(args.path, toolSignal);
-              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
-            }
-          }
-        } else if (call.name === 'edit') {
-          logType = 'edit'; logDetail = args.path;
-          const epath = String(args.path || '');
-          const res = await coderEdit(args.path, args.old, args.new, args.replaceAll, toolSignal, activeWsDir, approvalToken);
-          result = JSON.stringify(res);
-          mutated = true;
-          if (res.replacements > 0) {
-            readPathsRef.current.add(epath);
-            if (commitApproval) {
-              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
-            } else {
-              const { preview } = await getFilePreview(args.path, toolSignal);
-              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
-            }
-          }
-          const editSpiralNote = trackPatchSpiral(epath, res.replacements > 0);
-          if (editSpiralNote) result = withNote(result, editSpiralNote);
-        } else if (call.name === 'apply_patch') {
-          logType = 'edit'; logDetail = `${args.path} (${Array.isArray(args.edits) ? args.edits.length : 0} hunks)`;
-          const ppath = String(args.path || '');
-          const res = await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], toolSignal, activeWsDir, approvalToken);
-          result = JSON.stringify(res);
-          mutated = true;
-          if (res.replacements > 0) {
-            readPathsRef.current.add(ppath);
-            if (commitApproval) {
-              result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
-            } else {
-              const { preview } = await getFilePreview(args.path, toolSignal);
-              result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
-            }
-          }
-          const patchSpiralNote = trackPatchSpiral(ppath, res.replacements > 0);
-          if (patchSpiralNote) result = withNote(result, patchSpiralNote);
-        } else if (call.name === 'git_branch') {
-          const action = String(args.action || 'list');
-          logType = 'bash'; logDetail = `git branch ${action}${args.name ? ` ${args.name}` : ''}`;
-          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-          if (action === 'list') {
-            const r = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 15000, undefined, false, toolSignal, activeWsDir);
-            const { current, branches } = parseBranchList(r.stdout || '');
-            result = JSON.stringify({ current, branches, ...r });
-          } else if (action === 'create' || action === 'switch') {
-            const name = String(args.name || '').trim();
-            if (!name) {
-              result = JSON.stringify({ error: `branch name required for action '${action}'` });
-            } else if (!/^[A-Za-z0-9._\/-]+$/.test(name)) {
-              result = JSON.stringify({ error: `invalid branch name: ${name}` });
-            } else {
-              const cmd = action === 'create' ? `git checkout -b ${q(name)}` : `git switch ${q(name)}`;
-              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
-              result = JSON.stringify(r);
-              if (r.exitCode === 0) mutated = true;
-            }
-          } else {
-            result = JSON.stringify({ error: `unknown action: ${action} (use list, create, or switch)` });
-          }
-        } else if (call.name === 'git_worktree') {
-          const action = String(args.action || 'list');
-          logType = 'bash'; logDetail = `git worktree ${action}${args.path ? ` ${args.path}` : ''}`;
-          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-          if (action === 'list') {
-            const r = await coderExec('git worktree list', undefined, 15000, undefined, false, toolSignal, activeWsDir);
-            const lines = (r.stdout || '').split('\n').map((s: string) => s.trim()).filter(Boolean);
-            result = JSON.stringify({ worktrees: lines, ...r });
-          } else if (action === 'add') {
-            const p = String(args.path || '').trim();
-            const b = String(args.branch || '').trim();
-            if (!p || !b) {
-              result = JSON.stringify({ error: "path and branch required for action 'add'" });
-            } else if (!/^[A-Za-z0-9._\/-]+$/.test(b) || !/^\.\.\/[A-Za-z0-9._\/-]+$/.test(p)) {
-              result = JSON.stringify({ error: "invalid branch or path (path must start with '../' to keep it out of the main worktree)" });
-            } else {
-              const cmd = `git worktree add -B ${q(b)} ${q(p)} ${q(b)} || git worktree add -b ${q(b)} ${q(p)}`;
-              const r = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
-              result = JSON.stringify(r);
-              if (r.exitCode === 0) {
-                // Link the conversation to this new worktree
-                setStore((prev) => {
-                  const wsd = prev.workspaces[activeWs];
-                  const meta = wsd?.conversations[activeConv];
-                  if (!wsd || !meta) return prev;
-                  return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, worktree: p } } } } };
-                });
-                mutated = true;
-              }
-            }
-          } else {
-            result = JSON.stringify({ error: `unknown action: ${action} (use list or add)` });
-          }
-        } else if (call.name === 'git_pr') {
-          // Open a PR for the current branch. Pushes to the remote, then uses `gh`
-          // when present; otherwise returns a compare URL to open manually. Never
-          // force-pushes. Requires a clean, committed working tree on a real branch.
-          logType = 'bash'; logDetail = `git pr: ${String(args.title || '').slice(0, 40)}`;
-          const q = (s: string) => `'${String(s).replace(/'/g, "'\\''")}'`;
-          const gitRemoteToWeb = (url: string, base: string, head: string): string => {
-            if (!url) return '';
-            let host: string | undefined; let repo: string | undefined;
-            const ssh = url.match(/^git@([^:]+):(.+?)(?:\.git)?$/);
-            if (ssh) { host = ssh[1]; repo = ssh[2]; }
-            else {
-              try { const u = new URL(url); host = u.host; repo = u.pathname.replace(/^\//, '').replace(/\.git$/, ''); } catch { return ''; }
-            }
-            return host && repo ? `https://${host}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}` : '';
-          };
-          const br = await coderExec('git rev-parse --abbrev-ref HEAD', undefined, 10000, undefined, false, toolSignal, activeWsDir);
-          const branch = (br.stdout || '').trim();
-          if (!branch || branch === 'HEAD') {
-            result = JSON.stringify({ ok: false, error: 'Cannot open a PR from a detached HEAD. Create or check out a branch first.' });
-          } else {
-            const st = await coderExec('git status --porcelain', undefined, 10000, undefined, false, toolSignal, activeWsDir);
-            if ((st.stdout || '').trim()) {
-              result = JSON.stringify({ ok: false, error: 'Working tree is not clean — commit (or stash) your changes before opening a PR.' });
-            } else {
-              const rm = await coderExec('git remote', undefined, 10000, undefined, false, toolSignal, activeWsDir);
-              const remote = (rm.stdout || '').trim().split('\n')[0];
-              if (!remote) {
-                result = JSON.stringify({ ok: false, error: 'No git remote configured. Add one (git remote add origin <url>) before opening a PR.' });
-              } else {
-                const base = String(args.base || '').trim()
-                  || (await coderExec(`git rev-parse --abbrev-ref ${q(remote)}/HEAD 2>/dev/null || true`, undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim()
-                  || 'main';
-                const push = await coderExec(`git push -u ${q(remote)} ${q(branch)}`, undefined, 60000, undefined, false, toolSignal, activeWsDir);
-                if (push.exitCode !== 0) {
-                  result = JSON.stringify({ ok: false, error: 'push failed', stderr: push.stderr, stdout: push.stdout });
-                } else {
-                  const gh = await coderExec('command -v gh >/dev/null 2>&1 && echo yes || echo no', undefined, 10000, undefined, false, toolSignal, activeWsDir);
-                  if ((gh.stdout || '').trim() === 'yes') {
-                    let cmd = `gh pr create --title ${q(args.title)} --body ${q(args.body || '')}`;
-                    if (base) cmd += ` --base ${q(base)}`;
-                    const pr = await coderExec(cmd, undefined, 60000, undefined, false, toolSignal, activeWsDir);
-                    const url = (pr.stdout || '').match(/https?:\/\/\S+/)?.[0] || '';
-                    result = JSON.stringify({ ok: pr.exitCode === 0, url, stdout: pr.stdout, stderr: pr.stderr });
-                  } else {
-                    const urlOut = await coderExec(`git remote get-url ${q(remote)}`, undefined, 10000, undefined, false, toolSignal, activeWsDir);
-                    const compare = gitRemoteToWeb((urlOut.stdout || '').trim(), base, branch);
-                    result = JSON.stringify({ ok: true, pushed: true, remote, branch, base, compareUrl: compare, note: 'gh CLI not found — open the PR manually at the compare URL (or install gh).' });
-                  }
-                }
-              }
-            }
-          }
-        } else if (call.name === 'repo_search') {
-          logType = 'read'; logDetail = `search: ${String(args.query ?? '').slice(0, 30)}`;
-          const sr = await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, toolSignal, activeWsDir);
-          result = JSON.stringify(sr);
-        } else if (call.name === 'grep') {
-          logType = 'grep'; logDetail = args.pattern;
-          const res = await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, toolSignal, activeWsDir, approvalToken);
-          result = JSON.stringify(res);
-        } else if (call.name === 'glob') {
-          logType = 'glob'; logDetail = args.pattern;
-          const res = await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, toolSignal, activeWsDir, approvalToken);
-          result = JSON.stringify(res);
-        } else if (call.name === 'ast_grep') {
-          logType = 'grep'; logDetail = `[AST] ${args.pattern}`;
-          const res = await coderExec(`sg -p '${args.pattern.replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, toolSignal, activeWsDir);
-          result = JSON.stringify(res);
-        } else if (call.name === 'web_fetch') {
-          logType = 'web'; logDetail = args.url;
-          const res = await coderWebFetch(args.url, toolSignal, approvalToken);
-          result = JSON.stringify(res);
-        } else if (call.name === 'web_search') {
-          logType = 'web'; logDetail = args.query;
-          const res = await coderWebSearch(args.query, toolSignal, approvalToken);
-          result = JSON.stringify(res);
-        } else if (call.name === 'browser') {
-          logType = 'web'; logDetail = `browser ${String(args.action ?? '')}${args.url ? ` ${args.url}` : ''}`;
-          const bargs: Record<string, string | number> = {};
-          for (const k of ['url', 'selector', 'value', 'key', 'expression', 'wait_until']) if (typeof args[k] === 'string') bargs[k] = String(args[k]);
-          if (typeof args.timeout === 'number') bargs.timeout = args.timeout;
-          result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), bargs, toolSignal, approvalToken));
-        } else if (call.name === 'git_commit') {
-          logType = 'bash'; logDetail = `git commit ${args.files}`;
-          // Commit-approval gate: when ON, the human must sign off on the
-          // working-tree-vs-HEAD diff before the commit actually runs.
-          let proceed = true;
-          if (commitApproval) {
-            addLog({ type: 'ask', label: 'git_commit', detail: 'awaiting human review' });
-            proceed = await requestCommitApproval();
-            addLog({ type: proceed ? 'bash' : 'error', label: 'git_commit', detail: proceed ? 'approved' : 'denied by user' });
-          }
-          if (!proceed) {
-            result = JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff (Diff button) and adjust your changes; the commit was not made.' });
-            continue;
-          }
-          // Safely quote each workspace path / flag; only bare flags (e.g. -A)
-          // are passed through unquoted so git globs/flags still work.
-          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-          const fileTokens = args.files && String(args.files).trim()
-            ? String(args.files).trim().split(/\s+/)
-            : ['-A'];
-          const fileArgs = fileTokens.map((t) => (t.startsWith('-') ? t : q(t))).join(' ');
-          const message = args.message || 'Agent commit';
-          const commitRes = await coderExec(`git add ${fileArgs} && git commit -m ${q(message)} && git rev-parse HEAD`, undefined, 30000, undefined, false, toolSignal, activeWsDir);
-          result = JSON.stringify(commitRes);
-          // Note: a commit doesn't change the file tree, so we deliberately do
-          // NOT set mutated=true (which would trigger a repo-map rescan, M5).
-        } else if (call.name === 'git_diff') {
-          logType = 'bash'; logDetail = `git diff ${args.ref || ''}`.trim();
-          const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-          const ref = (args.ref || '').trim();
-          // `path` may be a single path or several space-separated ones (L3).
-          const pathTokens = (args.path || '').trim().split(/\s+/).filter(Boolean);
-          const refArg = ref ? q(ref) : '';
-          const pathArg = pathTokens.map(q).join(' ');
-          const cmd = `git --no-pager diff ${refArg} ${pathArg}`.replace(/\s+/g, ' ').trim();
-          const diffRes = await coderExec(cmd, undefined, 30000, undefined, false, toolSignal, activeWsDir);
-          result = JSON.stringify(diffRes);
-        } else if (call.name === 'ask_user') {
-          // Pause the run and surface the question to the user. We record the
-          // question in askRef; runAgent detects it after the tool pass and stops,
-          // leaving the conversation ready for the user's answer (release #5).
-          logType = 'ask'; logDetail = args.question || '(no question)';
-          askRef.current = String(args.question || '');
-          result = JSON.stringify({ question: args.question, status: 'awaiting_user' });
-        } else if (call.name === 'todo_write') {
-          logType = 'todo'; logDetail = 'Updated task list';
-          // Validate: the JSON schema is model-hint only. Reject malformed
-          // items instead of stringifying them into real tasks — `String(...)`
-          // would turn `{}` into "[object Object]" and arrays into
-          // comma-joined text, which would then render and reach the system
-          // prompt. The schema requires a string; non-strings don't qualify.
-          const raw: unknown = Array.isArray(args.todos) ? args.todos : [];
-          const cleaned: TodoItem[] = [];
-          for (const t of raw as Array<Record<string, unknown>>) {
-            const content = t && typeof t.content === 'string' ? t.content.trim() : '';
-            if (!content) continue; // malformed (non-string/empty) — skip
-            cleaned.push({
-              content,
-              status: t.status === 'in_progress' ? 'in_progress' : t.status === 'completed' ? 'completed' : 'pending',
-            });
-          }
-          // Stale-write guard: todo_write replaces the WHOLE list, and this
-          // response was generated from the list sent in `system` at request
-          // build time. If the user edited the list while the request was
-          // in flight, the model's snapshot is older than the user's edits —
-          // discard it rather than clobber newer user state (the model sees
-          // the user's list in the next turn's system prompt and can
-          // re-emit if its plan is still the right one).
-          if (todosRevRef.current > todosRevAtReqStartRef.current) {
-            logDetail = 'Task list update discarded (edited mid-run)';
-            addLog({ type: 'todo', label: 'todo_write', detail: 'discarded: list edited by the user mid-run' });
-            result = JSON.stringify({ success: false, reason: 'the task list was edited by the user while this response was being generated, so this update was not applied. The current list is in your system prompt — re-emit todo_write with the full intended list if your plan is still correct.' });
-          } else {
-            // Composite of #5 (validation + stale-guard above) and #11 (run
-            // pinning): sync the run-loop ref FIRST so the next LLM call's
-            // system-prompt injection sees this list even before effects run,
-            // then write through the pinned path (store lands in the run's
-            // conversation even mid-switch; visible transcript mirrors it).
-            const wasEmpty = todosRef.current.length === 0;
-            todosRef.current = cleaned;
-            updateRunTodos(cleaned, Date.now());
-            if (wasEmpty && cleaned.length > 0) flashTodosCreated();
-            result = JSON.stringify({ success: true, count: cleaned.length });
-          }
-        } else if (call.name === 'delegate') {
-          logType = 'ask'; logDetail = `delegate: ${String(args.task ?? '').slice(0, 30)}`;
-          const res = await runSubagent(`delegate`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, modelRef.current, toolSignal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES));
-          result = JSON.stringify({ summary: res });
-        } else if (call.name === 'subagent') {
-          // Implementation subagent (worker): spawn a focused agent, capture its
-          // diff, and optionally bounce it through the critic for a fix loop.
-          logType = 'bash';
-          const task = String(args.task || '');
-          logDetail = `subagent: ${task.slice(0, 40)}`;
-          addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
-          const wmodel = (args.model && String(args.model).trim()) || modelRef.current;
-          // BUG FIX: this used to filter against READONLY_TOOL_NAMES, which
-          // silently stripped write/edit/apply_patch/bash whenever a caller
-          // passed a tools list (exactly what the tool's own description
-          // tells the model to do) — an implementation subagent with no
-          // write tools, or with none at all if every requested tool got
-          // filtered out. WORKER_TOOL_NAMES is the correct allow-list.
-          const workerTools = filterToolAllowList(args.tools, WORKER_TOOL_NAMES);
-          // Track the run so it shows live in the Jobs panel, same as
-          // delegate/scout (runSubagent) — this was previously invisible
-          // since it calls runWorker directly instead of runSubagent.
-          const subId = `subagent-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-          jobs.registerSub({ id: subId, label: 'subagent', task: task.slice(0, 100), ws: activeWsDir });
-          try {
-            let preTree = '';
-            try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim(); } catch { /* no git */ }
-            const ideation = await runIdeation(task, wmodel, toolSignal);
-            addLog({ type: 'read', label: 'subagent', detail: ideation ? `ideation: ${ideation.slice(0, 150)}` : 'ideation pass produced no candidates' });
-            let res = { summary: '', diff: '', ok: false };
-            let critique = '';
-            let prevCritique = '';
-            // null = critic never actually reviewed anything (criticMode off,
-            // or every attempt produced an empty diff) — distinct from an
-            // explicit rejection, so a caller can tell "not reviewed" apart
-            // from "reviewed and rejected."
-            let criticApproved: boolean | null = null;
-            const MAX_WORKER_CRIT = 2;
-            for (let attempt = 0; attempt <= MAX_WORKER_CRIT; attempt++) {
-              const p = attempt === 0
-                ? `TASK (implement now):\n${task}${ideation ? `\n\nCandidate approaches to consider (from an ideation pass -- pick one, don't just list them):\n${ideation}` : ''}`
-                : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
-              res = await runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
-              if (criticMode && res.diff.trim()) {
-                const c = await runCritic(res.diff, task);
-                criticApproved = c.approved;
-                if (c.learnings.length) {
-                  await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);
-                }
-                if (!c.approved) {
-                  // Stuck detection: if the reviewer raises the same
-                  // (non-empty) issues again, the worker isn't converging on
-                  // a fix — stop burning the remaining retries on a repeat.
-                  if (attempt > 0 && c.issues.trim() && c.issues.trim().toLowerCase() === prevCritique.trim().toLowerCase()) {
-                    critique = c.issues;
-                    addLog({ type: 'error', label: 'critic', detail: 'same issues raised again — worker not converging, stopping retries early' });
-                    break;
-                  }
-                  prevCritique = critique = c.issues;
-                  addLog({ type: 'error', label: 'critic', detail: `subagent changes rejected (${attempt + 1}/${MAX_WORKER_CRIT}) — re-running worker` });
-                  continue;
-                }
-              }
-              break;
-            }
-            // Net diff across all worker attempts (git write-tree before/after).
-            let diff = res.diff;
-            try {
-              const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, toolSignal, activeWsDir)).stdout.trim();
-              if (preTree && postTree && preTree !== postTree) {
-                const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, toolSignal, activeWsDir);
-                diff = (d.stdout || '').slice(0, 60000);
-              }
-            } catch { /* keep res.diff */ }
-            mutated = true;
-            // The worker's own `ok` only means "ran without error/budget
-            // exhaustion" — it says nothing about review. Fold in the critic's
-            // verdict so a supervisor reading `ok` can't mistake "rejected
-            // twice and we gave up" for success; `criticApproved` carries the
-            // raw tri-state for anything that wants to distinguish
-            // not-reviewed from reviewed-and-rejected.
-            const ok = res.ok && criticApproved !== false;
-            result = JSON.stringify({ summary: res.summary, diff, ok, criticApproved });
-            addLog({ type: ok ? 'bash' : 'error', label: 'subagent', detail: `done: ${res.summary.slice(0, 60)}` });
-          } finally {
-            jobs.unregisterSub(subId);
-          }
-        } else if (call.name === 'memory_update') {
-          // Agent-proactive learning capture (the critic also writes learnings).
-          // Persist outside the repo and refresh local state so the rest of this
-          // run (and future runs) see the updated memory.
-          logType = 'todo';
-          const text = String(args.text || '').trim();
-          const rawKind = String(args.kind || 'tip');
-          const kind: CoderLearningKind = rawKind === 'success' || rawKind === 'avoid' ? rawKind : 'tip';
-          logDetail = `memory: ${kind} — ${text.slice(0, 40)}`;
-          addLog({ type: 'todo', label: 'memory', detail: `recording ${kind} learning` });
-          if (!text) {
-            result = JSON.stringify({ error: 'memory_update requires non-empty `text`.' });
-          } else {
-            try {
-              const m = await coderMemoryAddLearning({ text, kind, provenance: 'tool' }, toolSignal);
-              // The write landed in the store the control points at *now*;
-              // adopt it into the active workspace's state only if that is
-              // still the confirmed workspace (guard lives in adoptMemory).
-              adoptMemory(m);
-              result = JSON.stringify({ ok: true, kind, learnings: m.learnings.length });
-            } catch (e) {
-              result = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-            }
-          }
-        } else if (call.name === 'memory_recall') {
-          // Search the FULL learnings history — the system prompt only ever
-          // injects the most recent 15 (see the injection block above), so an
-          // older-but-relevant learning is otherwise invisible mid-run.
-          logType = 'read';
-          const query = String(args.query || '').trim();
-          const kindFilter = String(args.kind || '').trim();
-          const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 30);
-          logDetail = `memory_recall: "${query.slice(0, 40)}"`;
-          if (!query) {
-            result = JSON.stringify({ error: 'memory_recall requires non-empty `query`.' });
-          } else {
-            const q = query.toLowerCase();
-            const all = memoryRef.current.learnings ?? [];
-            const filtered = all.filter((l) =>
-              (!kindFilter || l.kind === kindFilter) &&
-              (l.text.toLowerCase().includes(q) || (l.task ?? '').toLowerCase().includes(q))
-            );
-            const learnings = filtered.slice(-limit).reverse();
-            result = JSON.stringify({ query, matched: filtered.length, returned: learnings.length, learnings });
-          }
-        } else if (call.name.startsWith(MCP_NAME_PREFIX)) {
-          // External MCP tool (mcp__<server>__<tool>) — executed by the control
-          // plane (desktop/control/src/mcp.rs), which re-checks the tier
-          // server-side (per-tool row over the mcp__<server> row). Tool-level
-          // failures come back as {ok:false} and are fed to the model.
-          logType = 'bash'; logDetail = call.name;
-          const res = await mcpCall({ name: call.name, arguments: args, scope: activeWsDir, approvalToken }, toolSignal);
-          result = res.ok ? res.output : JSON.stringify({ error: res.output });
-        } else {
-          result = JSON.stringify({ error: 'Unknown tool' });
-        }
-        }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logDetail = msg;
-        // Feed the failure back to the model instead of an empty result so it
-        // can adapt (retry differently, skip, or report) rather than guess.
-        result = JSON.stringify({ error: msg });
-      }
-
-      // Read-loop nudge: 8 read-only tool calls in a row (no write/run/plan
-      // call in between) usually means the model has enough context and
-      // just needs to be told to stop investigating and produce output.
-      if (READ_STREAK_TOOLS.has(call.name)) {
-        readStreakRef.current += 1;
-        if (readStreakRef.current === 8) {
-          result = withNote(result, `You have used read-only tools ${readStreakRef.current} times in a row without writing or running anything. If you have enough context, stop investigating and produce your output (edit, write, or a final answer) now.`);
-          readStreakRef.current = 0;
-        }
-      } else {
-        readStreakRef.current = 0;
-      }
-
-      const durationMs = Math.round(performance.now() - t0);
-      addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
-
-      // AI-summarize giant outputs so the agent gets a condensed summary + raw
-      // tail instead of a raw multi-KB dump (keeps its context small).
-      const maybeSummarized = await maybeSummarizeTool(call.name, result, modelRef.current, abortRef.current?.signal);
-      if (maybeSummarized !== result) {
-        addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
-      }
-
-      // Record a successful PURE call for the dedup cache above — AFTER
-      // summarization, so a cache hit replays the same (possibly
-      // AI-summarized) content the model actually saw, never the raw
-      // pre-summarization dump. Never cache an error — the model should be
-      // allowed to retry after a real fix.
-      if (PURE_DEDUP_TOOLS.has(call.name) && !isErrorResult(maybeSummarized)) {
-        const hash = hashToolCall(call.name, call.arguments);
-        toolDedupRef.current = toolDedupRef.current.filter((e) => e.hash !== hash);
-        toolDedupRef.current.push({ hash, name: call.name, result: maybeSummarized });
-        if (toolDedupRef.current.length > TOOL_DEDUP_WINDOW) toolDedupRef.current.shift();
-      }
-
-      nextMessages.push({
-        role: 'tool',
-        content: maybeSummarized,
-        tool_call_id: call.id,
-        name: call.name
-      });
-    }
-
-    if (mutated) {
-      try { await onMutated?.(); } catch { /* ignore */ }
-    }
-    return nextMessages;
-  };
-  // ---- Read-only scout pre-pass (subagents lite) ----
-  // Three parallel probes (structure / usages+tests / history+docs) with their
-  // own short context; only merged summaries reach the main run. Parallelism
-  // needs parallel engine slots, so this runs ONLY when the engine's
-  // max-concurrency (from the profile it was launched with) exceeds 1.
-  const SCOUT_PROBES = [
-    { label: 'structure', goal: 'Map the relevant code structure: key files, modules, entry points, and how they connect. Be concrete with paths.' },
-    { label: 'usages', goal: 'Find existing usages, tests, and examples related to the task. Quote exact paths.' },
-    { label: 'history', goal: 'Summarize recent related work or docs that bear on the task (from file layout, changelogs, notes, or git diffs of related areas).' },
-  ];
-  const engineMaxConcurrency = async (): Promise<number> => {
-    try {
-      const s = await getStatus();
-      const mc = s?.lastStart?.profile?.maxConcurrency;
-      if (typeof mc === 'number' && mc > 0) return mc;
-    } catch { /* unknown — fail closed below */ }
-    return 1;
-  };
-  const runSubagent = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
-    if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-    // Track the run so it shows live in the Jobs panel.
-    const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
-    jobs.registerSub({ id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
-    try {
-      return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
-    } finally {
-      jobs.unregisterSub(subId);
-    }
-  };
-  const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
-    if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-    const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser']);
-    // The old readOnly registry only ever executed these (plus nested
-    // delegate) — anything else errored as "scout cannot use tool". Cap the
-    // allow-list the same way so the server can't dispatch what the scout
-    // could never do.
-    const SCOUT_CAPABLE = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'obs_recall']);
-    const names = [...allowed].filter((n) => SCOUT_CAPABLE.has(n));
-    if (!names.includes('delegate')) names.push('delegate');
-    const rawTools = TOOLS.filter((t) => names.includes(t.function.name));
-    const tools = filterToolAllowList(filterToolsByConfig(rawTools, appConfig), allowed);
-    // Server-side scout run: the control plane owns the loop and dispatches
-    // in-process (tiers enforced from the mirrored perms). Ask-tier tools
-    // pause the run — the same dialogs the old readOnly registry showed,
-    // tagged [subagent], resolve them here.
-    let id: string | null = null;
-    const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
-    try {
-      const subConfig = resolveProviderConfig('subagent', appConfig, {
-        provider: coderParams.subagentProvider,
-        cloudModel: coderParams.subagentCloudModel,
-      });
-      const started = await agentRunsApi.start({
-        messages: [{ role: 'user', content: prompt }],
-        kind: 'scout',
-        label: `scout: ${label}`,
-        model: subConfig.model,
-        baseUrl: subConfig.baseUrl,
-        apiKey: subConfig.apiKey,
-        system: dynamicSystemRef.current,
-        maxSteps,
-        toolSet: 'coder',
-        toolNames: names,
-        tools,
-        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 },
-        scope: activeWsDir,
-      });
-      id = started.id;
-      if (signal.aborted) { stop(); return `(subagent ${label} aborted)`; }
-      signal.addEventListener('abort', stop, { once: true });
-      try {
-        const stream = new RunStream(
-          id,
-          () => {},
-          (ev) => {
-            if (signal.aborted || ev.type !== 'approval_requested') return;
-            const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
-            const detail = a.rel ?? a.args.slice(0, 160);
-            void (async () => {
-              addLog({ type: 'ask', label: a.tool, detail: `[subagent] ${detail}` });
-              const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
-              addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
-              let token: string | undefined;
-              if (ok) {
-                try {
-                  token = (await coderPermsApprove(a.tool, undefined, activeWsDir)).token;
-                } catch { /* best-effort — enforce_perm rejects without a token */ }
-              }
-              await agentRunsApi.approve(id as string, a.id, ok ? 'approve' : 'deny', token).catch(() => {});
-            })();
-          },
-          () => {},
-        );
-        await stream.attach();
-        const snap = await agentRunsApi.get(id);
-        if (snap.stop === 'aborted' || snap.status === 'stopped' || signal.aborted) return `(subagent ${label} aborted)`;
-        if (snap.status === 'error') return `(subagent ${label} failed: ${snap.error ?? 'unknown error'})`;
-        if (snap.stop === 'steps') return '(subagent step budget reached)';
-        const last = [...snap.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
-        return ((last?.content as string) ?? '').trim() || '(no findings)';
-      } finally {
-        signal.removeEventListener('abort', stop);
-      }
-    } catch (e) {
-      stop();
-      return `(subagent ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
-    }
-  };
-
-  /** Summarize a worker turn that was cut off by the token limit, so the next
-   *  step sees a coherent "what was attempted" note instead of raw truncated
-   *  (possibly mid-codeblock) text polluting its own context. */
-  const summarizeCutoff = async (partial: string, model: string, signal: AbortSignal): Promise<string> => {
-    const snippet = partial.length <= 9000 ? partial : `${partial.slice(0, 3500)}\n...[middle omitted]...\n${partial.slice(-5500)}`;
-    let out = '';
-    try {
-      await trackedStream(
-        buildChatRequest(
-          model,
-          "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
-          [{ role: 'user', content: `CUT-OFF ATTEMPT:\n${snippet}` }],
-          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 512 } as ChatParams,
-          {},
-          coderParams.promptCache,
-        ),
-        signal,
-        'worker-cutoff-summary',
-        { onContentDelta: (t) => { out += t; } },
-      );
-    } catch { /* best-effort — fall through to the generic message below */ }
-    return out.trim() || '(the cut-off attempt could not be summarized)';
-  };
-
-  /** Fresh-context brainstorm before any code is written: propose several
-   *  genuinely distinct candidate approaches with pitfalls, no code yet. One
-   *  cheap call that steers the worker away from committing to the first
-   *  idea that comes to mind. Best-effort — an empty result just means the
-   *  worker proceeds without ideation notes. */
-  const runIdeation = async (task: string, model: string, signal: AbortSignal): Promise<string> => {
-    let out = '';
-    try {
-      await trackedStream(
-        buildChatRequest(
-          model,
-          'You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.',
-          [{ role: 'user', content: `TASK:\n${task}` }],
-          { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: 0.4, maxTokens: 1024 } as ChatParams,
-          {},
-          coderParams.promptCache,
-        ),
-        signal,
-        'ideation',
-        { onContentDelta: (t) => { out += t; } },
-      );
-    } catch { /* best-effort */ }
-    return out.trim();
-  };
-
-  // Run an autonomous implementation worker: a focused agent loop that shares the
-  // workspace. Captures the net working-tree change (git write-tree before/after)
-  // so the supervisor gets a clean per-task diff regardless of commits/edits.
-  const runWorker = async (
-    label: string,
-    prompt: string,
-    model: string,
-    signal: AbortSignal,
-    maxSteps = 12,
-    allowedTools?: string[],
-    depth = 0,
-  ): Promise<{ summary: string; diff: string; ok: boolean }> => {
-    if (depth > 3) return { summary: '(worker depth limit reached)', diff: '', ok: false };
-    const allowed = allowedTools ? new Set(allowedTools) : WORKER_TOOL_NAMES;
-    const tools = TOOLS.filter((t) => allowed.has(t.function.name));
-    let preTree = '';
-    try { preTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, signal, activeWsDir)).stdout.trim(); } catch { /* no git */ }
-    let summary = '';
-    // Set only when the loop runs out of steps without the model finishing —
-    // used below so that outcome is reported like every other bounded loop
-    // (delegate/scout already return "(subagent step budget reached)")
-    // instead of silently returning ok:true with a thin/empty summary.
-    let budgetReached = false;
-    try {
-      // Server-side worker run: the control plane owns the loop and
-      // dispatches in-process (tiers enforced from the mirrored perms, plus
-      // the risky/commit gates passed below). Ask-tier approvals and gate
-      // pauses resolve through the same [subagent]-tagged dialogs the old
-      // worker dispatcher showed; the cutoff summarizer rides the turn hook.
-      const subConfig = resolveProviderConfig('subagent', appConfig, {
-        provider: coderParams.subagentProvider,
-        cloudModel: coderParams.subagentCloudModel,
-      });
-      const started = await agentRunsApi.start({
-        messages: [{ role: 'user', content: prompt }],
-        kind: 'worker',
-        label: `worker: ${label}`,
-        model: subConfig.model,
-        baseUrl: subConfig.baseUrl,
-        apiKey: subConfig.apiKey,
-        system: WORKER_SYSTEM,
-        maxSteps,
-        toolSet: 'coder',
-        toolNames: [...allowed],
-        tools,
-        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 },
-        scope: activeWsDir,
-        hookMode: 'client',
-        riskyGate: true,
-        commitGate: commitApproval,
-        approvedCommands: perms.approvedCommands ?? [],
-      });
-      const runId = started.id;
-      const stopRun = () => agentRunsApi.stop(runId).catch(() => {});
-      if (signal.aborted) { stopRun(); throw new Error('aborted'); }
-      signal.addEventListener('abort', stopRun, { once: true });
-      try {
-        const stream = new RunStream(
-          runId,
-          () => {},
-          (ev) => {
-            if (signal.aborted) return;
-            switch (ev.type) {
-              case 'approval_requested': {
-                const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
-                const aargs = JSON.parse(a.args) as Record<string, unknown>;
-                const detail = a.tool === 'bash' ? String(aargs.command ?? '') : String(aargs.path ?? aargs.pattern ?? aargs.query ?? aargs.url ?? '');
-                void (async () => {
-                  addLog({ type: 'ask', label: a.tool, detail: `[subagent] ${detail}` });
-                  const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
-                  addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
-                  let token: string | undefined;
-                  if (ok) {
-                    try {
-                      const p = typeof aargs.path === 'string' ? aargs.path : undefined;
-                      token = (await coderPermsApprove(a.tool, p, activeWsDir)).token;
-                    } catch { /* best-effort — enforce_perm rejects without a token */ }
-                  } else {
-                    // Mirror the dispatcher's denial text so the model reacts the same way.
-                    await agentRunsApi.approve(runId, a.id, 'deny', undefined).catch(() => {});
-                    return;
-                  }
-                  await agentRunsApi.approve(runId, a.id, 'approve', token).catch(() => {});
-                })();
-                break;
-              }
-              case 'gate_requested': {
-                const g = ev as unknown as { id: string; kind: 'risky' | 'commit'; command: string; reason: string | null };
-                void (async () => {
-                  if (g.kind === 'risky') {
-                    const v = signal.aborted ? 'deny' : await requestRiskyApproval(g.command, g.reason ?? 'risky command', true);
-                    if (v === 'deny') {
-                      await agentRunsApi.decideGate(runId, g.id, 'deny').catch(() => {});
-                      return;
-                    }
-                    if (v === 'remember') addApprovedCommand(g.command);
-                    await agentRunsApi.decideGate(runId, g.id, v === 'remember' ? 'remember' : 'once').catch(() => {});
-                  } else {
-                    const ok = signal.aborted ? false : await requestCommitApproval(true);
-                    await agentRunsApi.decideGate(runId, g.id, ok ? 'approve' : 'deny').catch(() => {});
-                  }
-                })();
-                break;
-              }
-              case 'user_question_requested':
-                // The worker set never offers ask_user (and its system prompt
-                // forbids questions) — answer empty so the run keeps moving.
-                void agentRunsApi.answer(runId, ev.id as string, '').catch(() => {});
-                break;
-              case 'hook_requested': {
-                const h = ev as unknown as { id: string; had_tool_calls: boolean; finish_reason: string | null };
-                if (h.had_tool_calls) {
-                  void agentRunsApi.decideHook(runId, h.id, { action: 'continue' }).catch(() => {});
-                  break;
-                }
-                void (async () => {
-                  // Cut off mid-generation with no tool call parsed — the raw
-                  // text is likely a half-written code block or mid-sentence.
-                  // Summarize it instead of feeding it back raw.
-                  let content = '';
-                  try {
-                    const cur = await agentRunsApi.get(runId);
-                    const last = [...cur.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
-                    content = ((last?.content as string) ?? '').trim();
-                  } catch { /* fall through → plain continue */ }
-                  if (h.finish_reason !== 'length' || !content || signal.aborted) {
-                    await agentRunsApi.decideHook(runId, h.id, { action: signal.aborted ? 'abort' : 'continue' }).catch(() => {});
-                    return;
-                  }
-                  const digest = await summarizeCutoff(content, model, signal);
-                  summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
-                  await agentRunsApi.decideHook(runId, h.id, {
-                    action: 'continue',
-                    content: `[cut off at the token limit — summary of the partial attempt]\n${digest}`,
-                  }).catch(() => {});
-                })();
-                break;
-              }
-              default:
-                break;
-            }
-          },
-          () => {},
-        );
-        await stream.attach();
-        const snap = await agentRunsApi.get(runId);
-        budgetReached = snap.stop === 'steps';
-        if (snap.status === 'error') throw new Error(snap.error ?? 'unknown error');
-        const last = [...snap.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
-        summary = ((last?.content as string) ?? '').trim();
-      } finally {
-        signal.removeEventListener('abort', stopRun);
-      }
-    } catch (e) {
-      summary = `(worker ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
-    }
-    if (budgetReached) {
-      summary = `(worker ${label} reached its step budget of ${maxSteps} before finishing — partial work may be present)${summary ? `\n\nLast partial output:\n${summary}` : ''}`;
-    }
-    let diff = '';
-    // Deliberately not gated on `signal` (unlike the loop above): even after
-    // a Stop, whatever the worker already changed on disk should still be
-    // surfaced as a diff instead of silently discarded.
-    try {
-      const postTree = (await coderExec('git write-tree', undefined, 10000, undefined, false, undefined, activeWsDir)).stdout.trim();
-      if (preTree && postTree && preTree !== postTree) {
-        const d = await coderExec(`git --no-pager diff ${preTree} ${postTree}`, undefined, 60000, undefined, false, undefined, activeWsDir);
-        diff = (d.stdout || '').slice(0, 60000);
-      }
-    } catch { /* no diff */ }
-    return { summary: summary || '(no summary)', diff, ok: !summary.startsWith('(worker') };
-  };
-
-  // Critic: review a working-tree-vs-HEAD diff against the task. Bounded and
-  // fail-open (a critic error never blocks the run).
-  /**
-   * Review a diff and decide approve / reject. Also parses any `LEARNING:` /
-   * `AVOID:` lines the critic appended into structured learnings the caller can
-   * persist (the critic is the memory writer for the self-improving loop).
-   */
-  const runCritic = async (
-    diff: string,
-    task: string,
-  ): Promise<{ approved: boolean; issues: string; learnings: Array<{ text: string; kind: CoderLearningKind }> }> => {
-    const criticModel = coderParams.criticModel?.trim() || modelRef.current;
-    const prompt = `TASK:\n${task.slice(0, 2000)}\n\nDIFF (working tree vs HEAD):\n\`\`\`diff\n${diff.slice(0, 24000)}\n\`\`\`\n\nReview the diff against the task.`;
-    // When a review lens is active, extend the critic's rubric with it so the
-    // second-pass reviewer judges the diff by that discipline (e.g. Linus's
-    // "fatal invariants first" method) rather than generic taste. Concatenated
-    // (not a template literal) because LINUS_LENS contains backticks.
-    const criticSystem =
-      coderParams.reviewLens === 'linus'
-        ? CRITIC_SYSTEM + '\n\n# Review rubric — Linus Torvalds method (distilled)\n' + LINUS_LENS
-        : CRITIC_SYSTEM;
-    let content = '';
-    try {
-      await trackedStream(
-        buildChatRequest(criticModel, criticSystem, [{ role: 'user', content: prompt }], { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 2048 } as ChatParams, {}),
-        abortRef.current?.signal ?? new AbortController().signal,
-        'critic',
-        { onContentDelta: (t) => { content += t; } },
-      );
-    } catch {
-      return { approved: true, issues: '', learnings: [] };
-    }
-    const approved = /VERDICT:\s*APPROVED/i.test(content);
-    // Pull learnings out of the raw text first so they don't bleed into `issues`.
-    let learnings: any[] = [];
-    let issues = content.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '').trim();
-    
-    const jsonMatch = content.match(/\`\`\`json\s*(\[[\s\S]*?\])\s*\`\`\`/);
-    if (jsonMatch) {
-      try {
-        learnings = JSON.parse(jsonMatch[1]);
-        issues = issues.replace(jsonMatch[0], '').trim();
-      } catch { /* ignore parse error */ }
-    }
-    return { approved, issues, learnings };
-  };
-
-  /**
-   * Persist critic / agent learnings to the per-repo memory store (outside the
-   * repo) and refresh local state so the rest of this run + future runs see them.
-   */
-  const persistLearnings = async (
-    items: Array<{ text: string; kind: CoderLearningKind }>,
-    provenance: string,
-    task?: string,
-  ) => {
-    if (!items.length) return;
-    let m = memoryRef.current;
-    for (const it of items) {
-      try {
-        m = await coderMemoryAddLearning({ text: it.text, kind: it.kind, provenance, task: task || undefined });
-      } catch {
-        // An individual persistence failure must not break the run loop.
-      }
-    }
-    // Adopt the final write response only if the control is still confirmed
-    // at the active workspace (guard lives in adoptMemory).
-    adoptMemory(m);
-  };
 
 
 
@@ -2350,588 +1353,61 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
   };
 
-  const runAgent = async (initialMessages: ChatMessage[], opts?: { scout?: boolean; pin?: { ws: string; convId: string } }) => {
-    // Pin the run to its conversation BEFORE anything can switch the view, so
-    // every transcript/log/todo write below lands in this conversation's store
-    // entry even if the user moves to a different conversation mid-run.
-    setRunConv(opts?.pin ?? { ws: activeWs, convId: activeConv });
-    setRunning(true);
-    stoppedRef.current = false;
-    // Pin the run's token accounting; the visible meter may follow the view.
-    runTokensRef.current = lastPromptTokensRef.current;
-    // Settle any in-flight control-plane re-point BEFORE the first tool call: a
-    // switch POST only ever targets the view the run starts in, so awaiting
-    // it makes the early calls hit the right repo instead of the previous
-    // workspace, and nothing re-points mid-run (switches now queue behind it).
-    await wsApplyQueueRef.current.catch(() => undefined);
-    let currentMessages = initialMessages;
-    // Capture the repo HEAD at run start so the critic can review the CUMULATIVE
-    // diff of everything the agent did this run (including auto-committed edits),
-    // not just the (often empty) working-tree-vs-HEAD diff.
-    let runStartHead = '';
-    try { runStartHead = (await coderExec('git rev-parse HEAD', undefined, 10000, undefined, false, undefined, activeWsDir)).stdout.trim(); } catch { /* not a repo yet */ }
-
-    // Reset all per-run reliability-guard state (read-before-write tracking,
-    // tool-call dedup cache, patch-spiral counters, read-loop streak) — these
-    // are scoped to a single run, not the workspace or session.
-    readPathsRef.current = new Set();
-    unreadWriteWarnedRef.current = new Set();
-    toolDedupRef.current = [];
-    patchFailuresRef.current = new Map();
-    readStreakRef.current = 0;
-
-    // Auto-detect lint/test/build commands once per run (config, else
-    // manifests) — cached under the workspace the run started in. Runs
-    // BEFORE refreshRepoMap so its bootstrap block can inject the result.
-    {
-      const m = detectedCmdsByWsRef.current;
-      if (!m.has(activeWsDir) && m.size >= 8) m.delete(m.keys().next().value!);
-      m.set(activeWsDir, await detectCommands());
-    }
-    // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
-    // after file mutations during the run (P1 #6).
-    await refreshRepoMap();
-
-    // --- DYNAMIC RETRIEVAL TAGGER ---
-    let intentRulesBlock = '';
-    try {
-      const mem = memoryRef.current;
-      const comps = Array.from(new Set((mem?.learnings || []).map(l => l.component).filter(c => c && c !== 'general')));
-      let activeComponents = new Set<string>(['general']);
-      
-      const lastUserMsg = [...currentMessages].reverse().find(m => m.role === 'user' && !isCompactedMsg(m))?.content || '';
-      if (comps.length > 0 && lastUserMsg) {
-        const taggerPrompt = `TASK: \`\`\`\n${lastUserMsg.slice(0, 500)}\n\`\`\`\n\nWhich of the following components does this task involve? ${comps.join(', ')}\nReply with a JSON array of strings.`;
-        const taggerModel = coderParams.criticModel?.trim() || modelRef.current || 'qwen-coder';
-        const req = buildChatRequest(taggerModel, 'You are a task categorizer. Reply only with a JSON array of matching component strings.', [{ role: 'user', content: taggerPrompt }], { thinking: false, maxTokens: 100 } as ChatParams, {});
-        let textContent = '';
-        await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } });
-        const jsonMatch = textContent.match(/\[[\s\S]*?\]/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          for (const c of parsed) activeComponents.add(c);
-        }
-      }
-
-      if (mem && mem.learnings.length > 0) {
-        const byComponent: Record<string, CoderLearning[]> = {};
-        for (const l of mem.learnings) {
-          const comp = l.component || 'general';
-          if (!activeComponents.has(comp) && activeComponents.size > 1) continue; 
-          if (!byComponent[comp]) byComponent[comp] = [];
-          byComponent[comp].push(l);
-        }
-        const parts = [];
-        for (const [comp, rules] of Object.entries(byComponent)) {
-          parts.push(`### Component: ${comp}`);
-          for (const r of rules) parts.push(`- [${r.kind}] ${r.text}`);
-        }
-        if (parts.length > 0) {
-            intentRulesBlock = `\n\n# Intent Continuity Rules\n${parts.join('\n')}\n`;
-        }
-      }
-    } catch { /* ignore */ }
-    // --- END DYNAMIC RETRIEVAL TAGGER ---
-
-    abortRef.current = new AbortController();
-
-    // Resolve the model the engine is actually serving — don't assume 'qwen-coder'
-    // (P0 #1). Used for every request, the summarizer, and the context-size lookup.
-    let model = 'qwen-coder';
-    try {
-      const s = await getStatus();
-      if (s?.engine?.modelId) model = s.engine.modelId;
-    } catch { /* ignore */ }
-    modelRef.current = model;
-
-    // Read-only scout pre-pass. The probes fan out concurrently, so they run
-    // ONLY when the engine was launched with max-concurrency > 1 (parallel
-    // slots must exist); otherwise the main loop works unaided.
-    if (opts?.scout && scoutOn) {
-      const mc = await engineMaxConcurrency();
-      if (mc > 1 && !abortRef.current.signal.aborted) {
-        const task = [...currentMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
-        addLog({ type: 'read', label: 'scout', detail: `3 parallel probes (engine concurrency ${mc})` });
-        const signal = abortRef.current.signal;
-        const summaries = await Promise.all(
-          SCOUT_PROBES.map(async (p) => {
-            const s = await runSubagent(p.label, `Task: ${task.slice(0, 2000)}\n\nScout goal (${p.label}): ${p.goal}\n\nYou are read-only: investigate with tools and reply with a concise findings report (paths + facts). Do not write code.`, model, signal);
-            addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
-            return `## ${p.label}\n${s}`;
-          }),
-        );
-        if (!signal.aborted) {
-          const scoutMsg: ChatMessage = {
-            role: 'user',
-            displayName: 'Scout',
-            collapsed: true,
-            content: `# Scout Report (read-only pre-pass, ${SCOUT_PROBES.length} parallel probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
-          };
-          currentMessages = [...currentMessages, scoutMsg];
-          updateRunMessages((prev) => [...prev, scoutMsg]);
-        }
-      } else if (!abortRef.current.signal.aborted) {
-        addLog({ type: 'read', label: 'scout', detail: `skipped: engine max-concurrency is ${mc} (needs > 1 for parallel probes)` });
-      }
-    }
-    if (abortRef.current.signal.aborted) {
-      setRunning(false);
-      abortRef.current = null;
-      setRunConv(null);
-      return;
-    }
-
-    // Read the engine's context window so we can auto-compact once usage crosses
-    // the configured share of max (coderParams.compactAt, default 80%). Prefer
-    // the engine's own /v1/models advertisement, falling back to the
-    // control-plane-reported maxContext.
-    let maxContext = 0;
-    try {
-      maxContext = (await getEngineContextSize(model)) ?? 0;
-    } catch { /* ignore */ }
-    if (!maxContext) {
-      try {
-        const s = await getStatus();
-        maxContext = s?.engine?.maxContext ?? 0;
-      } catch { /* ignore */ }
-    }
-    setCtxLimit(maxContext > 0 ? maxContext : null);
-    const COMPACT_AT = (coderParams.compactAt ?? 80) / 100;
-    const MAX_ATTEMPTS = 3;
-    // Hard ceiling on agent turns so a non-terminating plan (or a model that
-    // keeps emitting tool calls) can't loop forever — it stops with a clear
-    // message instead (release blocker #1). User-adjustable in the params
-    // panel (coderParams.maxAgentSteps); falls back to the default.
-    const MAX_AGENT_STEPS = coderParams.maxAgentSteps || DEFAULT_MAX_AGENT_STEPS;
-    // Bounded self-repair: when the agent tries to "finish" right after a tool
-    // action failed, nudge it to fix the error instead of declaring success (#6).
-    const MAX_REPAIR = 3;
-    // Bounded critic bounce-back: a reviewer can reject the final diff and send the
-    // run back to fix at most MAX_CRITIC times before we give up and finish (M6).
-    const MAX_CRITIC = 2;
-    let criticBudget = 0;
-    // Bounded auto-continue: a final (non-tool-call) reply that hit the token
-    // cap gets nudged to pick up where it left off, same as a Verify/Critic
-    // bounce — the run is autonomous, so this stays consistent with how every
-    // other "not actually done yet" case here is handled, rather than
-    // stranding a half-finished answer for the user to notice and resume by hand.
-    const MAX_CONTINUE = 4;
-    let continueCount = 0;
-    // The original user task — used as the critic's review context.
-    const taskText = [...initialMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
-    // Derive the response budget from the engine's context window so a small
-    // context still leaves room for the prompt (P3 #12). The Coder always thinks,
-    // and a reasoning trace plus the answer can exceed a tiny budget, so floor
-    // thinking runs higher (M4). Falls back to 8192.
-    const respFloor = 4096;
-    const respMax = maxContext > 0
-      ? Math.min(Math.max(Math.floor(maxContext / 2), respFloor), 16384)
-      : 8192;
-
-    // whose tool results push past the window is caught before we send it (P1 #4).
-    const sysTokenEstimate = Math.ceil(dynamicSystemRef.current.length / CHARS_PER_TOKEN);
-    const estimateTokens = (msgs: ChatMessage[]): number => {
-      let n = sysTokenEstimate;
-      for (const m of msgs) {
-        n += typeof m.content === 'string' ? m.content.length : 0;
-        if (m.tool_calls) n += JSON.stringify(m.tool_calls).length;
-      }
-      return Math.ceil(n / CHARS_PER_TOKEN);
-    };
-    
-    try {
-      let agentSteps = 0;
-      setAgentSteps(0);
-      let repairCount = 0;
-      while (true) {
-        if (abortRef.current?.signal.aborted) break;
-
-        // Auto-compact when the model context is near (>=COMPACT_AT) or past
-        // (estimate >=100%) the window limit, so we never silently truncate
-        // mid-task. Use the recorded prompt-token count when the engine
-        // reports it; otherwise fall back to the local estimate (M3) so the
-        // trigger still fires.
-        const est = estimateTokens(currentMessages);
-        const recordedOrEst = Math.max(runTokensRef.current, est);
-        const overBudget =
-          maxContext > 0 &&
-          (recordedOrEst >= COMPACT_AT * maxContext || est >= maxContext);
-        if (overBudget) {
-          addLog({ type: 'compact', label: 'compact', detail: `context ${runTokensRef.current}/${maxContext} — summarizing` });
-          try {
-            const summary = await summarizeConversation({
-              model,
-              systemPrompt: dynamicSystemRef.current,
-              history: currentMessages,
-              maxTokens: 2048,
-              signal: abortRef.current?.signal,
-            });
-            if (!summary) throw new Error('compaction produced no summary');
-            currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
-            // Keep the full transcript on screen; only the model context is
-            // cleared down to the summary checkpoint (re-injected as leading
-            // context on the next turn).
-            updateRunMessages((prev) => [...prev, ...currentMessages]);
-            noteRunTokens(0);
-            // The read-before-write guard's "already read this run" state
-            // is only true while the actual file content is still in the
-            // model's context — compaction just discarded it in favor of a
-            // terse summary, so a path read before this point should no
-            // longer be treated as safely read for a later blind write.
-            readPathsRef.current = new Set();
-            unreadWriteWarnedRef.current = new Set();
-            continue;
-          } catch (e) {
-            // A deliberate Stop mid-compaction throws AbortError (see
-            // summarizeConversation) — the run is already stopping, so don't
-            // pile on a "compaction failed" message for what the user asked for.
-            if (!(e instanceof DOMException && e.name === 'AbortError')) {
-              // Compaction is our only guard against context overflow — if it
-              // fails we must stop rather than send an oversized payload (P1 #3).
-              addLog({ type: 'error', label: 'compact', detail: e instanceof Error ? e.message : String(e) });
-              updateRunMessages((prev) => [
-                ...prev,
-                {
-                  role: 'system',
-                  content:
-                    '⚠ Auto-compaction failed, so the run was stopped to avoid exceeding the model context window. Start a new conversation or compact manually.',
-                },
-              ]);
-            }
-            break;
-          }
-        }
-        
-        // Hard stop after MAX_AGENT_STEPS real turns (compactions above don't
-        // count) so a runaway plan can't loop indefinitely (release blocker #1).
-        if (agentSteps >= MAX_AGENT_STEPS) {
-          addLog({ type: 'error', label: 'limit', detail: `reached max agent steps (${MAX_AGENT_STEPS}) — stopping to avoid a runaway run` });
-          updateRunMessages((prev) => [...prev, {
-            role: 'system',
-            content: `⚠ Reached the maximum number of agent steps (${MAX_AGENT_STEPS}). The run was stopped to avoid a runaway loop. Review the work so far, then continue in a new message or break the task into smaller steps.`,
-          }]);
-          break;
-        }
-        agentSteps++;
-        setAgentSteps(agentSteps);
-
-        let content = '';
-        let reasoning = '';
-        let toolCalls: AgentToolCall[] = [];
-        let finishReason: string | undefined;
-
-        // Tools the workspace denies outright never need to be advertised —
-        // checkPerm would reject them anyway, so dropping them from the schema
-        // saves prompt space every turn instead of just wasting a round trip.
-        const undeniedTools = TOOLS.filter((t) => (perms.tools[t.function.name] ?? 'allow') !== 'deny');
-        // MCP tools (mcp__<server>__<tool>): a per-tool row overrides the
-        // mcp__<server> row; denied ones are dropped from the schema like the
-        // built-in tools above (checkPerm still enforces either way).
-        const undeniedMcp = mcpToolsRef.current
-          .filter((t) => mcpToolTier(perms, t.name) !== 'deny')
-          .map(mcpToolSchema);
-        // Plan mode advertises read-only tools only; the permission gate in
-        // handleToolCalls enforces it even if the model tries otherwise.
-        // Plan mode keeps read-only tools PLUS bash (enforced to inspection
-        // commands by checkPerm), so investigation doesn't push the model
-        // into inventing tool markup for an undeclared tool. MCP tools never
-        // ship in plan mode (external tools may mutate external state).
-        const activeTools = planMode
-          ? undeniedTools.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash')
-          : [...undeniedTools, ...undeniedMcp];
-        const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
-        const system = (planMode
-          ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
-          : dynamicSystemRef.current) + intentRulesBlock + todoSystemBlock(todosRef.current);
-        // Baseline for the stale todo_write guard: this request's system
-        // prompt carried the list as of this moment.
-        todosRevAtReqStartRef.current = todosRevRef.current;
-        // ObservationPack: replace old, already-seen large tool results with
-        // a compact placeholder for THIS request only — the canonical
-        // currentMessages (shown in the UI, fed to compaction) is untouched.
-        const wireMessages = await packForRequest(currentMessages);
-        const turnParams = { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: respMax } as ChatParams;
-        // Bounded retry on transient stream failures so a single dropped
-        // connection doesn't kill a long agent run (P2 #9).
-        let attempt = 0;
-        let turn: TurnResult | null = null;
-        // A request-level rejection (bad params, unsupported field — see
-        // streamChat's !r.ok path) resolves streamTurn with an empty,
-        // content-less result rather than throwing, so the retry loop above
-        // never sees it and the isEmptyResponse log below would otherwise
-        // just say "empty response" with no clue why. Capture the real
-        // message here so that log can quote it instead.
-        let streamErrorMsg: string | null = null;
-        while (!turn && attempt < MAX_ATTEMPTS) {
-          attempt++;
-          try {
-            turn = await streamTurn({
-              model,
-              system,
-              messages: wireMessages,
-              params: turnParams,
-              tools: activeTools,
-              cacheSystem: coderParams.promptCache,
-              signal: abortRef.current.signal,
-              stream: (r, sig, cb) => {
-                const primaryConfig = resolveProviderConfig('primary', appConfig, {
-                  primaryProvider: coderParams.primaryProvider,
-                  primaryCloudModel: coderParams.primaryCloudModel,
-                });
-                return trackedStream(r, sig, 'agent', cb, { baseUrl: primaryConfig.baseUrl, apiKey: primaryConfig.apiKey });
-              },
-              onStreamError: (msg) => { streamErrorMsg = msg; },
-            });
-          } catch (e) {
-            if (abortRef.current?.signal.aborted) throw e;
-            const msg = e instanceof Error ? e.message : String(e);
-            if (attempt >= MAX_ATTEMPTS) {
-              addLog({ type: 'error', label: 'retry', detail: `stream failed after ${MAX_ATTEMPTS} attempts: ${msg}` });
-              throw e;
-            }
-            addLog({ type: 'error', label: 'retry', detail: `stream failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying: ${msg}` });
-            await new Promise((r) => setTimeout(r, 800 * attempt));
-          }
-        }
-        if (!turn) throw new Error('stream produced no turn without throwing');
-        // streamTurn accumulates content/reasoning/tool calls and recovers
-        // text-emitted markup (small local models); undeclared names are
-        // dropped with an explanatory note the model sees.
-        content = turn.content;
-        reasoning = turn.reasoning;
-        toolCalls = turn.toolCalls;
-        finishReason = turn.finishReason;
-        // Record the engine's real prompt-token count when present; otherwise
-        // keep the local estimate so accounting stays accurate across turns
-        // even when usage is omitted (M3). Pinned to the run — the visible
-        // meter may follow a different conversation.
-        noteRunTokens(turn.meta?.promptTokens ?? est);
-        if (turn.recoveredFromMarkup) {
-          const declared = activeTools.map((t) => t.function.name);
-          addLog({ type: 'error', label: 'markup', detail: `recovered ${toolCalls.length} tool call(s) from ${turn.recoveredFromMarkup} markup${turn.dropped.length ? `; dropped undeclared: ${turn.dropped.join(', ')}` : ''}` });
-          if (turn.dropped.length) {
-            content += `\n\n[System: your tool-call markup for ${turn.dropped.join(', ')} was ignored — those tools are not available right now. Available tools: ${declared.join(', ')}. Use the native tool-call format.]`;
-          }
-        }
-
-        // A response with neither content nor tool calls is a no-op (the engine
-        // produced nothing actionable). Don't push a blank bubble into the
-        // transcript or the model context, and don't treat it as "done" — just
-        // stop the turn cleanly so the user can retry (H1).
-        const isEmptyResponse = !content.trim() && toolCalls.length === 0;
-        if (isEmptyResponse) {
-          addLog({
-            type: 'error',
-            label: 'empty',
-            detail: streamErrorMsg
-              ? `${streamErrorMsg} — stopping the turn.`
-              : 'Model returned an empty response (no content or tool calls) — stopping the turn.',
-          });
-          break;
-        }
-
-        const assistantMsg: ChatMessage = {
-          role: 'assistant',
-          content,
-          reasoning: reasoning || undefined,
-          tool_calls: toolCalls.length > 0 ? toolCalls : undefined
-        };
-
-        currentMessages = [...currentMessages, assistantMsg];
-        updateRunMessages((prev) => [...prev, assistantMsg]);
-
-        // Not-Ai auto-rewrite: for content-only (user-facing) replies, run the
-        // deterministic tell-gate and silently re-write the message in place when
-        // it trips a high-signal tell. Skipped for tool-call turns.
-        if (coderParams.humanize && toolCalls.length === 0 && assistantMsg.content.trim()) {
-          // Best-effort pass: a gate/rewrite failure keeps the original reply,
-          // never strands the run.
-          try {
-            const humanized = await humanizePassText(assistantMsg.content, {
-              voice: effectiveVoice({ ...coderParams, humanize: true }, 'technical'),
-              signal: abortRef.current?.signal,
-              rewrite: (current) => humanizeRewriteText({
-                model,
-                baseSystem: dynamicSystemRef.current,
-                priorMessages: currentMessages.slice(0, currentMessages.length - 1),
-                originalText: current,
-                params: { thinking: coderParams.thinking, humanize: true, voiceProfile: coderParams.voiceProfile || 'technical' },
-                signal: abortRef.current?.signal,
-              }),
-            });
-            if (humanized.trim() !== assistantMsg.content.trim()) {
-              const updated: ChatMessage = { ...assistantMsg, content: humanized };
-              currentMessages = currentMessages.map((m) => (m === assistantMsg ? updated : m));
-              updateRunMessages((prev) => prev.map((m) => (m === assistantMsg ? updated : m)));
-            }
-          } catch {
-            /* keep the original reply if the gate or rewrite fails */
-          }
-        }
-
-        if (toolCalls.length > 0) {
-          const before = currentMessages.length;
-          // Agent mutated files: refresh repo map, re-fetch open tabs (adopt or
-          // conflict per tab), and refresh git badges.
-          currentMessages = await handleToolCalls(toolCalls, currentMessages, async () => {
-            await refreshRepoMap();
-            await tabs.refreshOpenTabs();
-            await tabs.refreshGitStatus();
-            git.loadBranches();
-          });
-          // Keep the Commit History panel live as the agent commits changes.
-          git.loadCommits();
-          // Append only the new tool results to the visible transcript.
-          updateRunMessages((prev) => [...prev, ...currentMessages.slice(before)]);
-          // Human-in-the-loop pause: if the agent asked the user a question, stop
-          // the run and surface it. The (already-visible) transcript includes the
-          // question; the user's answer resumes the run (#5).
-          if (askRef.current) {
-            const q = askRef.current;
-            askRef.current = null;
-            askConvRef.current = runConvRef.current; // resume into THIS conversation
-            setPendingQuestion(q);
-            addLog({ type: 'ask', label: 'ask_user', detail: q });
-            return;
-          }
-        } else if (finishReason === 'length' && continueCount < MAX_CONTINUE) {
-          // The final reply hit the token cap before finishing — nudge it to
-          // pick up exactly where it left off instead of declaring the run
-          // done on a half-written answer. Skips Verify/Critic this iteration;
-          // they run once a genuinely complete reply lands.
-          continueCount++;
-          addLog({ type: 'error', label: 'continue', detail: `reply hit the token limit — continuing (${continueCount}/${MAX_CONTINUE})` });
-          currentMessages = [...currentMessages, {
-            role: 'user',
-            displayName: 'Continue',
-            collapsed: true,
-            content: 'Continue your previous response exactly where it left off. Do not repeat any text you already wrote, and do not add any preamble or acknowledgement.',
-          }];
-          updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
-          continue;
-        } else {
-          // Verification gate: before declaring done, confirm lint/test pass. If
-          // they fail, send the run back to fix them (bounded by MAX_REPAIR) rather
-          // than finishing with broken code.
-          let bounced = false;
-          if (verifyMode && repairCount < MAX_REPAIR) {
-            const v = await runPostEditChecks({}, '', abortRef.current?.signal);
-            if (v.linter_error || v.test_error) {
-              repairCount++;
-              const summary = String(v.linter_error || v.test_error || '').slice(0, 2500);
-              addLog({ type: 'error', label: 'verify', detail: `checks failing — sending back to fix (${repairCount}/${MAX_REPAIR})` });
-              currentMessages = [...currentMessages, {
-                role: 'user',
-                displayName: 'Verify',
-                collapsed: true,
-                content: `VERIFICATION GATE: the project's lint/test checks are still failing. You must fix them before the task is complete — do not declare success. Re-run the checks after fixing.\n\n${summary}`,
-              }];
-              updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
-              bounced = true;
-            }
-          }
-          // Critic gate: if there are working-tree changes, a (possibly different)
-          // model reviews the diff and can reject it, bouncing the run back to fix
-          // before it is allowed to finish (bounded by MAX_CRITIC).
-          if (!bounced && criticMode && criticBudget < MAX_CRITIC) {
-            // Review the cumulative run diff (everything since run start, including
-            // auto-committed edits). Falls back to working-tree-vs-HEAD if no base commit.
-            let d = '';
-            try {
-              d = runStartHead
-                ? (await coderExec(`git --no-pager diff ${runStartHead}`, undefined, 60000, undefined, false, undefined, activeWsDir)).stdout || ''
-                : (await coderDiff(activeWsDir)).diff || '';
-            } catch { d = ''; }
-            if (d.trim()) {
-              const c = await runCritic(d, taskText);
-              if (c.learnings.length) {
-                await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
-              }
-              if (!c.approved) {
-                criticBudget++;
-                addLog({ type: 'error', label: 'critic', detail: `review rejected (${criticBudget}/${MAX_CRITIC}) — sending back to fix` });
-                currentMessages = [...currentMessages, {
-                  role: 'user',
-                  displayName: 'Critic',
-                  collapsed: true,
-                  content: `CODE REVIEW REJECTED: a reviewer found issues with your changes. Address every point below, then continue — do not declare success until the review passes.\n\n${c.issues}`,
-                }];
-                updateRunMessages((prev) => [...prev, currentMessages[currentMessages.length - 1]]);
-                bounced = true;
-              } else {
-                addLog({ type: 'todo', label: 'critic', detail: 'review passed' });
-              }
-            }
-          }
-          if (bounced) continue;
-          // Suggested follow-ups: a fast, best-effort pass offering 3 one-click
-          // next instructions so the user isn't stuck staring at a blank
-          // composer. Mirrors the Chat screen; skipped on abort or a
-          // truncated/empty final reply — neither is a clean "done" to build
-          // suggestions from. `wireMessages` is this turn's already-packed
-          // request context — reusing it (plus the reply it produced) avoids
-          // re-packing a potentially large transcript just for this.
-          if (!abortRef.current?.signal.aborted && finishReason !== 'length') {
-            const lastAssistant = currentMessages[currentMessages.length - 1];
-            if (lastAssistant?.role === 'assistant' && lastAssistant.content.trim()) {
-              try {
-                const followUps = await suggestFollowUps({
-                  model,
-                  history: [...wireMessages, lastAssistant],
-                  signal: abortRef.current?.signal,
-                });
-                if (!abortRef.current?.signal.aborted && followUps.length) {
-                  const withFollowUps: ChatMessage = { ...lastAssistant, followUps };
-                  currentMessages = currentMessages.map((m) => (m === lastAssistant ? withFollowUps : m));
-                  updateRunMessages((prev) => prev.map((m) => (m === lastAssistant ? withFollowUps : m)));
-                }
-              } catch (followUpError) {
-                console.warn('[coder] follow-up suggestions skipped', followUpError);
-              }
-            }
-          }
-          break; // Done!
-        }
-      }
-    } catch (err: unknown) {
-      const isAbort = err instanceof Error && err.name === 'AbortError';
-      if (!isAbort) {
-        const msg = err instanceof Error ? err.message : String(err);
-        addLog({ type: 'error', label: 'System Error', detail: msg });
-        // The ledger line alone is easy to miss — surface run-death in the
-        // transcript itself so a dead run never looks like a silent stop
-        // ("subagents did their job and then nothing").
-        setMessages((prev) => [...prev, { role: 'user', displayName: 'System', content: `[Run failed: ${msg}]`, error: true }]);
-      }
-    } finally {
-      // Captured before setRunConv(null) below clears the ref — identifies
-      // whose queue (if any) to drain now that this run is done.
-      const finishedConv = runConvRef.current;
-      const wasPaused = askConvRef.current !== null; // ask_user pause, not a real finish
-      setRunning(false);
-      abortRef.current = null;
-      setRunConv(null);
-      if (finishedConv && !stoppedRef.current && !wasPaused) {
-        const pending = queuedRef.current[finishedConv.convId];
-        if (pending && pending.length > 0) {
-          const [item, ...rest] = pending;
-          setQueued((q) => ({ ...q, [finishedConv.convId]: rest }));
-          const base = storeRef.current.workspaces[finishedConv.ws]?.conversations[finishedConv.convId]?.messages ?? [];
-          const msg: ChatMessage = { role: 'user', content: item.text, attachments: item.attachments.length ? item.attachments : undefined };
-          setStore((prev) => {
-            const wsd = prev.workspaces[finishedConv.ws];
-            const meta = wsd?.conversations[finishedConv.convId];
-            if (!wsd || !meta) return prev;
-            return { ...prev, workspaces: { ...prev.workspaces, [finishedConv.ws]: { ...wsd, conversations: { ...wsd.conversations, [finishedConv.convId]: { ...meta, messages: [...(meta.messages ?? []), msg], updatedAt: Date.now() } } } } };
-          });
-          if (finishedConv.ws === storeRef.current.activeWs && finishedConv.convId === storeRef.current.activeConv) {
-            setMessages((prev) => [...prev, msg]);
-          }
-          runAgent(compactedContext(base).concat(msg), { scout: true, pin: finishedConv });
-        }
-      }
-    }
-  };
+  const { runAgent } = useCoderAgentLoop({
+    activeWs,
+    activeConv,
+    activeWsDir,
+    setRunConv,
+    setRunning,
+    stoppedRef,
+    runTokensRef,
+    lastPromptTokensRef,
+    wsApplyQueueRef,
+    readPathsRef,
+    unreadWriteWarnedRef,
+    toolDedupRef,
+    patchFailuresRef,
+    readStreakRef,
+    detectedCmdsByWsRef,
+    refreshRepoMap,
+    memoryRef,
+    coderParams,
+    modelRef,
+    abortRef,
+    scoutOn,
+    setCtxLimit,
+    setAgentSteps,
+    perms,
+    mcpToolsRef,
+    planMode,
+    dynamicSystemRef,
+    todosRef,
+    todosRevRef,
+    todosRevAtReqStartRef,
+    appConfig,
+    handleToolCalls,
+    tabs,
+    git,
+    askRef,
+    askConvRef,
+    runConvRef,
+    setPendingQuestion,
+    addLog,
+    verifyMode,
+    runPostEditChecks,
+    criticMode,
+    runCritic,
+    persistLearnings,
+    updateRunMessages,
+    noteRunTokens,
+    setMessages,
+    queuedRef,
+    setQueued,
+    storeRef,
+    setStore,
+    engineMaxConcurrency,
+    runSubagent,
+  });
 
   const onSubmit = () => {
     if ((!input.trim() && attachments.length === 0) || !activeWs) return;
@@ -3184,651 +1660,95 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   return (
     <div className="flex h-full w-full">
-      {/* Left: workspace folders + conversations + ledger */}
-      <div className="flex w-72 flex-col border-r border-line bg-panel">
-        <div className="flex items-center gap-2 border-b border-line p-2 text-sm font-semibold">
-          <Terminal size={14} /> Conversations
-          <button
-            className="ml-auto flex items-center gap-1 rounded border border-line px-2 py-0.5 text-[11px] font-normal text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            title="Add a workspace folder"
-            onClick={() => setShowDir(true)}
-            disabled={wsBusy}
-          >
-            <FolderPlus size={13} /> Add
-          </button>
-        </div>
+      <CoderSidebar
+        store={store}
+        activeWs={activeWs}
+        activeConv={activeConv}
+        runConv={runConv}
+        wsBusy={wsBusy}
+        setShowDir={setShowDir}
+        handleToggleExpand={handleToggleExpand}
+        handleSelectWorkspace={handleSelectWorkspace}
+        baseName={baseName}
+        newChat={newChat}
+        handleRemoveWorkspace={handleRemoveWorkspace}
+        editingConv={editingConv}
+        setEditingConv={setEditingConv}
+        handleRenameConv={handleRenameConv}
+        handleSelectConv={handleSelectConv}
+        relTime={relTime}
+        handleArchiveConv={handleArchiveConv}
+        handleDeleteConv={handleDeleteConv}
+        archivedOpen={archivedOpen}
+        setArchivedOpen={setArchivedOpen}
+        ledger={ledger}
+        perms={perms}
+        permsOpen={permsOpen}
+        setPermsOpen={setPermsOpen}
+        setToolPerm={setToolPerm}
+        mcpTools={mcpTools}
+        activeWsDir={activeWsDir}
+        setPerms={setPerms}
+        setStore={setStore}
+        git={git}
+        jobs={jobs}
+        treeOpen={treeOpen}
+        setTreeOpen={setTreeOpen}
+        treeLoading={treeLoading}
+        treeNodes={treeNodes}
+        loadTree={loadTree}
+        renderTree={renderTree}
+        boundPaths={boundPaths}
+        clearBinds={clearBinds}
+      />
 
-        <div className="min-h-0 flex-1 overflow-auto">
-          {Object.keys(store.workspaces).length === 0 && (
-            <div className="p-3 text-[11px] italic text-faint">
-              No workspaces yet — click “Add” to point the coder at a folder.
-            </div>
-          )}
-          {Object.entries(store.workspaces).map(([ws, wsd]) => {
-            const isActiveWs = ws === activeWs;
-            return (
-              <div key={ws} className="border-b border-line/60">
-                <div className={cn('group flex items-center gap-1 px-1.5 py-1.5', isActiveWs ? 'bg-accent/10' : 'hover:bg-panel2')}>
-                  <button
-                    className="shrink-0 text-faint hover:text-ink"
-                    onClick={() => handleToggleExpand(ws)}
-                    title={wsd.expanded ? 'Collapse' : 'Expand'}
-                  >
-                    {wsd.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                  </button>
-                  <button className="flex min-w-0 flex-1 items-center gap-1.5 text-left" onClick={() => handleSelectWorkspace(ws)} title={ws}>
-                    <Folder size={13} className={cn('shrink-0', isActiveWs ? 'text-accent' : 'text-mute')} />
-                    <span className={cn('truncate text-[12px] font-medium', isActiveWs ? 'text-ink' : 'text-mute')}>{baseName(ws)}</span>
-                    <span className="shrink-0 rounded-full bg-panel2 px-1.5 text-[9.5px] text-faint">{wsd.order.length}</span>
-                  </button>
-                  <button
-                    className="shrink-0 text-faint opacity-0 hover:text-ink group-hover:opacity-100"
-                    title="New conversation in this workspace"
-                    onClick={() => newChat(ws)}
-                  >
-                    <Plus size={13} />
-                  </button>
-                  <button
-                    className="shrink-0 text-faint opacity-0 hover:text-danger group-hover:opacity-100"
-                    title="Remove workspace"
-                    onClick={() => handleRemoveWorkspace(ws)}
-                  >
-                    <X size={13} />
-                  </button>
-                </div>
-
-                {wsd.expanded && (
-                  <div className="space-y-0.5 pb-1.5 pl-6 pr-1.5">
-                    {wsd.order
-                      .filter((cid) => {
-                        const c = wsd.conversations[cid];
-                        return c && !c.archived;
-                      })
-                      .map((cid) => {
-                        const c = wsd.conversations[cid];
-                        if (!c) return null;
-                        const isActive = ws === activeWs && cid === activeConv;
-                        const isEditing = editingConv?.ws === ws && editingConv?.cid === cid;
-                        const isRunning = runConv?.ws === ws && runConv?.convId === cid;
-                        return (
-                          <div
-                            key={cid}
-                            className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
-                          >
-                            {isRunning && (
-                              <span role="status" aria-label="Run in progress" className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="Run in progress — this conversation keeps updating in the background" />
-                            )}
-                            {isEditing ? (
-                              <input
-                                autoFocus
-                                defaultValue={c.title}
-                                className="min-w-0 flex-1 rounded border border-line bg-inset px-1 py-0.5 text-[11.5px] outline-none focus:border-accent/50"
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') handleRenameConv(ws, cid, (e.target as HTMLInputElement).value);
-                                  if (e.key === 'Escape') setEditingConv(null);
-                                }}
-                                onBlur={(e) => handleRenameConv(ws, cid, e.target.value)}
-                              />
-                            ) : (
-                              <button
-                                onClick={() => handleSelectConv(ws, cid)}
-                                className={cn('min-w-0 flex-1 truncate text-left text-[11.5px]', isActive ? 'font-medium' : '')}
-                                title={c.title}
-                              >
-                                {c.title || 'New conversation'}
-                              </button>
-                            )}
-                            {c.updatedAt && !isEditing ? (
-                              <span className="shrink-0 text-[9.5px] text-faint">{relTime(c.updatedAt)}</span>
-                            ) : null}
-                            {!isEditing && (
-                              <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
-                                <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                  title="Rename conversation"
-                                  onClick={() => setEditingConv({ ws, cid })}
-                                >
-                                  <Pencil size={14} />
-                                </button>
-                                <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                  title="Archive conversation"
-                                  onClick={() => handleArchiveConv(ws, cid, true)}
-                                >
-                                  <Archive size={14} />
-                                </button>
-                                <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
-                                  title="Delete conversation"
-                                  onClick={() => handleDeleteConv(ws, cid)}
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-
-                    {wsd.order.some((cid) => wsd.conversations[cid]?.archived) && (
-                      <div className="pt-1">
-                        <button
-                          onClick={() => setArchivedOpen((o) => ({ ...o, [ws]: !o[ws] }))}
-                          className="flex w-full items-center gap-1 px-1.5 py-1 text-[10.5px] text-faint hover:text-ink"
-                        >
-                          {archivedOpen[ws] ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                          Archived ({wsd.order.filter((cid) => wsd.conversations[cid]?.archived).length})
-                        </button>
-                        {archivedOpen[ws] &&
-                          wsd.order
-                            .filter((cid) => wsd.conversations[cid]?.archived)
-                            .map((cid) => {
-                              const c = wsd.conversations[cid];
-                              if (!c) return null;
-                              const isActive = ws === activeWs && cid === activeConv;
-                              return (
-                                <div
-                                  key={cid}
-                                  className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-faint hover:bg-panel2')}
-                                >
-                                  <button
-                                    onClick={() => handleSelectConv(ws, cid)}
-                                    className="min-w-0 flex-1 truncate text-left text-[11.5px] line-through"
-                                    title={c.title}
-                                  >
-                                    {c.title || 'New conversation'}
-                                  </button>
-                                  <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
-                                    <button
-                                      className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                      title="Restore conversation"
-                                      onClick={() => handleArchiveConv(ws, cid, false)}
-                                    >
-                                      <RotateCcw size={14} />
-                                    </button>
-                                    <button
-                                      className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
-                                      title="Delete conversation"
-                                      onClick={() => handleDeleteConv(ws, cid)}
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
-                                  </div>
-                                </div>
-                              );
-                            })}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Session Ledger */}
-        <SidebarSection title="Session Ledger" defaultOpen={false}>
-        <div className="max-h-44 shrink-0 overflow-auto border-t border-line p-2">
-          <div className="space-y-1.5">
-            {ledger.map((l) => (
-              <div key={l.id} className="flex flex-col gap-0.5 border-l-2 border-line pl-2 ml-1 text-[10.5px]">
-                <div className="flex items-center gap-1.5">
-                  <span className="font-mono text-faint">{new Date(l.time).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                  <span className={cn(
-                    "font-semibold",
-                    l.type === 'error' ? 'text-danger' : 
-                    l.type === 'bash' ? 'text-[#e5c07b]' : 
-                    l.type === 'compact' ? 'text-accent' : 
-                    l.type === 'todo' ? 'text-ok' : 'text-accent'
-                  )}>{l.label}</span>
-                  {l.durationMs !== undefined && <span className="text-faint ml-auto">{l.durationMs}ms</span>}
-                </div>
-                {l.detail && <div className="text-mute truncate font-mono" title={l.detail}>{l.detail}</div>}
-              </div>
-            ))}
-            {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
-          </div>
-        </div>
-        </SidebarSection>
-
-        {/* Safe Mode / Sandbox / Commit approval now live in Settings > Safety & Permissions */}
-        {/* Permissions — per-tool allow/ask/deny + denied path prefixes (per workspace) */}
-        <SidebarSection title="Permissions" icon={<Shield size={13} />} defaultOpen={false}>
-        <div className="shrink-0 border-t border-line p-2">
-          <div className="mb-1.5 flex items-center">
-            <button
-              type="button"
-              className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-              title={permsOpen ? 'Collapse' : 'Expand'}
-              onClick={() => setPermsOpen((o) => !o)}
-            >
-              {permsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-            </button>
-          </div>
-          {permsOpen && (
-          <>
-          {!activeWs ? (
-            <div className="text-[10.5px] italic text-faint">Select a workspace.</div>
-          ) : (
-            <>
-              <div className="max-h-36 space-y-1 overflow-auto">
-                {TOOLS.map((t) => {
-                  const tier = perms.tools[t.function.name] ?? 'allow';
-                  return (
-                    <div key={t.function.name} className="flex items-center gap-1">
-                      <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.function.description}>{t.function.name}</span>
-                      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                        <button
-                          key={v}
-                          type="button"
-                          onClick={() => setToolPerm(t.function.name, v)}
-                          title={`${v} ${t.function.name}`}
-                          className={cn(
-                            'rounded px-1.5 py-px text-[10px] font-medium',
-                            tier === v
-                              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                              : 'text-faint hover:bg-panel2 hover:text-mute',
-                          )}
-                        >
-                          {v}
-                        </button>
-                      ))}
-                    </div>
-                  );
-                })}
-                {mcpTools.length > 0 && (
-                  <>
-                    {Array.from(new Set(mcpTools.map((t) => mcpServerKey(t.name) ?? t.name))).map((serverKey) => {
-                      const serverName = serverKey.replace(/^mcp__/, '');
-                      const tools = mcpTools.filter((t) => mcpServerKey(t.name) === serverKey);
-                      const serverTier = mcpToolTier(perms, serverKey);
-                      return (
-                        <div key={serverKey}>
-                          <div className="flex items-center gap-1">
-                            <span
-                              className="min-w-0 flex-1 truncate font-mono text-[10.5px] font-semibold text-mute"
-                              title={`MCP server ${serverName} — this tier applies to every tool the server exposes unless a tool below overrides it`}
-                            >
-                              {serverName}
-                            </span>
-                            {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                              <button
-                                key={v}
-                                type="button"
-                                onClick={() => setToolPerm(serverKey, v)}
-                                title={`${v} every tool from ${serverName}`}
-                                className={cn(
-                                  'rounded px-1.5 py-px text-[10px] font-medium',
-                                  serverTier === v
-                                    ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                                    : 'text-faint hover:bg-panel2 hover:text-mute',
-                                )}
-                              >
-                                {v}
-                              </button>
-                            ))}
-                          </div>
-                          {tools.map((t) => {
-                            const tier = mcpToolTier(perms, t.name);
-                            const short = splitMcpName(t.name)?.tool ?? t.name;
-                            return (
-                              <div key={t.name} className="flex items-center gap-1 pl-3">
-                                <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.description}>{short}</span>
-                                {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                                  <button
-                                    key={v}
-                                    type="button"
-                                    onClick={() => setToolPerm(t.name, v)}
-                                    title={`${v} ${t.name}`}
-                                    className={cn(
-                                      'rounded px-1.5 py-px text-[10px] font-medium',
-                                      tier === v
-                                        ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                                        : 'text-faint hover:bg-panel2 hover:text-mute',
-                                    )}
-                                  >
-                                    {v}
-                                  </button>
-                                ))}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      );
-                    })}
-                  </>
-                )}
-              </div>
-              <input
-                key={activeWs}
-                defaultValue={perms.denyPaths.join(' ')}
-                placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
-                title="Tool calls touching these workspace-relative paths are denied"
-                onBlur={(e) => setPerms({ ...perms, denyPaths: e.target.value.split(/\s+/).map((s) => s.trim()).filter(Boolean) })}
-                onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-                className="mt-1.5 w-full rounded border border-line bg-inset px-1.5 py-1 font-mono text-[10.5px] outline-none placeholder:text-faint focus:border-accent/50"
-              />
-              <div className="mt-2">
-                <div className="mb-1 text-[10.5px] font-semibold text-mute">Approved risky commands</div>
-                {(perms.approvedCommands || []).length === 0 ? (
-                  <div className="text-[10px] italic text-faint">None yet. Risky commands (push, publish, ssh, sudo, docker, cloud/infra mutations…) prompt for approval; choose &quot;Approve &amp; remember&quot; to whitelist them here for this workspace.</div>
-                ) : (
-                  <div className="max-h-28 space-y-1 overflow-auto">
-                    {(perms.approvedCommands || []).map((c) => (
-                      <div key={c} className="flex items-center gap-1 rounded border border-line bg-inset px-1.5 py-0.5">
-                        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-mute" title={c}>{c}</span>
-                        <button
-                          type="button"
-                          onClick={() => setStore((prev) => {
-                            const wsd = prev.workspaces[activeWs];
-                            if (!wsd) return prev;
-                            const cur = wsd.perms?.approvedCommands || [];
-                            return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: cur.filter((x) => x !== c) } } } };
-                          })}
-                          className="shrink-0 rounded p-0.5 text-faint hover:bg-danger/10 hover:text-danger"
-                          title="Remove from approved list"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-          </>
-          )}
-        </div>
-        </SidebarSection>
-
-        {/* Commit History — git log of the active workspace */}
-        <SidebarSection title="Commit History" icon={<GitCommit size={13} />} defaultOpen={false}>
-        <CommitsPanel git={git} />
-        </SidebarSection>
-        {/* Background Jobs — live view of detached shell jobs for this workspace */}
-        <SidebarSection title="Jobs" icon={<Terminal size={13} />} defaultOpen={false}>
-        <div className="shrink-0 border-t border-line p-2">
-          <JobsPanel jobs={jobs} activeWsDir={activeWsDir} />
-        </div>
-        </SidebarSection>
-        {/* Server Runs — every control-plane run, live or recent. Runs survive
-            window close and are multi-client: expand to attach read-only. */}
-        <SidebarSection title="Runs" icon={<Activity size={13} />} defaultOpen={false}>
-        <div className="shrink-0 border-t border-line p-2">
-          <RunsPanel />
-        </div>
-        </SidebarSection>
-      </div>
-      {/* Middle: file tree + system-prompt follow bindings */}
-      {treeOpen ? (
-        <div className="flex w-64 flex-col border-r border-line bg-panel">
-          <div className="flex items-center gap-2 border-b border-line p-2 text-sm font-semibold">
-            <Folder size={14} /> Files
-            <button type="button" className="ml-auto rounded p-0.5 text-faint hover:text-ink" title="Refresh tree" onClick={() => void loadTree()}>
-              <RefreshCw size={12} className={treeLoading ? 'animate-spin' : ''} />
-            </button>
-            <button type="button" className="rounded p-0.5 text-faint hover:text-ink" title="Collapse file tree" onClick={() => setTreeOpen(false)}>
-              <ChevronLeft size={14} />
-            </button>
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto text-[11.5px]">
-            {treeLoading ? (
-              <div className="p-3 text-faint">Loading…</div>
-            ) : treeNodes.length === 0 ? (
-              <div className="p-3 text-faint">No files.</div>
-            ) : (
-              renderTree(treeNodes, 0)
-            )}
-          </div>
-          <div className="shrink-0 border-t border-line p-2 text-[10.5px] text-faint">
-            System prompt follows <span className="text-ink">{boundPaths.length}</span> item{boundPaths.length === 1 ? '' : 's'}.
-            {boundPaths.length > 0 && (
-              <button type="button" className="ml-1 underline hover:text-ink" onClick={clearBinds}>Clear</button>
-            )}
-          </div>
-        </div>
-      ) : (
-        <button
-          type="button"
-          className="flex w-8 shrink-0 flex-col items-center justify-center gap-1 border-r border-line bg-panel text-faint hover:text-ink"
-          title="Show file tree"
-          onClick={() => { setTreeOpen(true); void loadTree(); }}
-        >
-          <Folder size={15} />
-        </button>
-      )}
-
-      {/* Center: VS Code-style tab container (Chat tab + one tab per open file) */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {/* tab strip */}
-        <div className="flex h-8 shrink-0 items-center overflow-x-auto border-b border-line bg-panel">
-          <button
-            type="button"
-            className={cn('flex h-full shrink-0 items-center gap-1.5 border-r border-line px-3 text-[11.5px]', !tabs.activeTabId ? 'bg-panel2 text-ink' : 'text-mute hover:text-ink')}
-            onClick={() => tabs.setActive(null)}
-            title="Chat"
-          >
-            <MessageSquare size={12} className="shrink-0" /> Chat
-            {running && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="agent run in flight" />}
-          </button>
-          {tabs.tabs.map((t) => (
-            <div key={t.id} className="flex h-full shrink-0 items-center border-r border-line">
-              <button
-                type="button"
-                className={cn('flex h-full min-w-0 items-center gap-1.5 px-2.5 text-[11.5px]', tabs.activeTabId === t.id ? 'bg-panel2 text-ink' : 'text-mute hover:text-ink')}
-                onClick={() => tabs.setActive(t.id)}
-                title={t.path}
-              >
-                {t.kind === 'image' ? <Image size={12} className="shrink-0" /> : <File size={12} className="shrink-0" />}
-                <span className="max-w-32 truncate font-mono text-[11px]">{t.path.split(/[\/]/).pop()}</span>
-                {t.gitStatus && (
-                  <span className={cn('shrink-0 font-mono text-[10px] font-bold', GIT_BADGE_CLASS[t.gitStatus])} title={`git status: ${t.gitStatus}`}>
-                    {t.gitStatus}
-                  </span>
-                )}
-                {t.status === 'conflict' && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="changed elsewhere since you opened it" />}
-                {t.dirty && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="unsaved changes" />}
-              </button>
-              <button type="button" className="shrink-0 px-1 text-faint hover:text-ink" onClick={() => tabs.closeTab(t.id)} title={`Close ${t.path}`}>
-                <X size={12} />
-              </button>
-            </div>
-          ))}
-          {tabs.notice && <span className="ml-2 shrink-0 text-[10.5px] text-warn">{tabs.notice}</span>}
-        </div>
-        <div className="min-h-0 flex-1">
-          {/* Chat panel: always mounted, hidden (never unmounted) while a file tab
-              is active — DOM scroll, composer draft, in-flight streaming survive. */}
-          <div style={{ display: tabs.activeTabId ? 'none' : undefined }} className="flex h-full min-h-0 flex-col">
-        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel px-3 text-[12px]">
-          <Folder size={13} className="text-accent" />
-          <span className="font-medium text-ink">{activeWs ? baseName(activeWs) : 'No workspace'}</span>
-          <span className="text-faint">/</span>
-          <span className="truncate text-mute">{activeMeta?.title || 'New conversation'}</span>
-          {runConv && !(runConv.ws === activeWs && runConv.convId === activeConv) && (
-            <span
-              role="status"
-              className="shrink-0 rounded-full border border-accent/40 bg-accent/10 px-1.5 text-[10px] text-accent"
-              title="A run is in progress in another conversation — it keeps running in the background; switch back to watch it."
-            >
-              ● running in {baseName(runConv.ws)} / {store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'}
-            </span>
-          )}
-          {wsHeld && (
-            <span
-              className="shrink-0 text-[10px] text-faint"
-              title="All agent tools run against the control plane's configured workspace, so the re-point to this workspace is held until the in-flight run finishes."
-            >
-              backend on {baseName(wsAppliedDirRef.current!)} until run ends
-            </span>
-          )}
-          <span
-            className="ml-auto hidden shrink-0 font-mono text-[10.5px] text-faint sm:inline"
-            title={ctxLimit != null ? `${formatTokens(ctxTokens)} of ${formatTokens(ctxLimit)} context tokens used (last request)` : 'Context usage appears after the first agent request'}
-          >
-            {ctxLimit != null ? `ctx ${formatTokens(ctxTokens)} / ${formatTokens(ctxLimit)}` : `ctx ${formatTokens(ctxTokens)}`}
-            {(running || agentSteps > 0) && <span className="text-mute"> · step {agentSteps}/{coderParams.maxAgentSteps || DEFAULT_MAX_AGENT_STEPS}</span>}
-          </span>
-          <button
-            type="button"
-            onClick={() => setPlanMode((v) => !v)}
-            disabled={running}
-            title={planMode ? 'Plan mode ON: read-only investigation, no writes or commands' : 'Turn on Plan mode: read-only investigation'}
-            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', planMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            Plan
-          </button>
-          <button
-            type="button"
-            onClick={() => setScoutOn((v) => !v)}
-            disabled={running}
-            title={scoutOn ? 'Scout pre-pass ON: 3 parallel read-only probes when the engine allows (max-concurrency > 1)' : 'Scout pre-pass OFF'}
-            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', scoutOn ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            Scout
-          </button>
-          <button
-            type="button"
-            onClick={() => setVerifyMode((v) => !v)}
-            disabled={running}
-            title={verifyMode ? 'Verify mode ON: the run must pass lint/test before it can finish' : 'Verify mode OFF'}
-            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', verifyMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            Verify
-          </button>
-          <button
-            type="button"
-            onClick={() => void runVerifyNow()}
-            disabled={running || verifyNowBusy}
-            title="Run now: lint/test the current working tree on disk, independent of the Verify toggle"
-            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-          >
-            <Play size={11} className={verifyNowBusy ? 'animate-pulse' : ''} />
-          </button>
-          <button
-            type="button"
-            onClick={() => setCriticMode((v) => !v)}
-            disabled={running}
-            title={criticMode ? 'Critic ON: a model reviews the diff and can bounce it back for fixes before the run finishes' : 'Critic OFF'}
-            className={cn('rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', criticMode ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            Critic
-          </button>
-          <button
-            type="button"
-            onClick={() => void runCriticNow()}
-            disabled={running || criticNowBusy}
-            title="Run now: get a critic review of the current uncommitted diff, independent of the Critic toggle"
-            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-          >
-            <Play size={11} className={criticNowBusy ? 'animate-pulse' : ''} />
-          </button>
-          <div className="relative" ref={branchMenuRef}>
-            <button
-              type="button"
-              onClick={() => { const next = !showBranchMenu; setShowBranchMenu(next); if (next) git.loadBranches(); }}
-              disabled={!activeWs}
-              title="Switch branch"
-              className="flex max-w-[140px] items-center gap-1 rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            >
-              <GitBranch size={13} /> <span className="truncate">{git.currentBranch || 'branch'}</span>
-            </button>
-            {showBranchMenu && (
-              <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-auto rounded border border-line bg-panel py-1 shadow-lg">
-                {git.branchesLoading ? (
-                  <div className="px-2 py-1 text-[11px] italic text-faint">Loading…</div>
-                ) : git.branches.length === 0 ? (
-                  <div className="px-2 py-1 text-[11px] italic text-faint">No branches.</div>
-                ) : (
-                  git.branches.map((b) => (
-                    <button
-                      key={b}
-                      type="button"
-                      onClick={() => void handleSwitchBranch(b)}
-                      disabled={running}
-                      title={running ? 'Stop the agent before switching branches' : `Switch to ${b}`}
-                      className={cn('block w-full truncate px-2 py-1 text-left text-[11px] hover:bg-panel2 disabled:opacity-40', b === git.currentBranch ? 'text-accent' : 'text-ink')}
-                    >
-                      {b}
-                    </button>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={() => void handleCreateBranch()}
-            disabled={!activeWs || running}
-            title={running ? 'Stop the agent before creating a branch' : 'Create a new branch from HEAD and switch to it'}
-            className="rounded border border-line p-0.5 text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-          >
-            <Plus size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={() => setDiffViewOpen(true)}
-            disabled={!activeWs}
-            title="Review the working-tree vs HEAD diff"
-            className={cn('flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', diffViewOpen ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            <GitCommit size={13} /> Diff
-          </button>
-          <button
-            type="button"
-            onClick={() => setMemOpen(true)}
-            disabled={!activeWs}
-            title={`Repository intent rules (${memory.learnings.length} rule${memory.learnings.length === 1 ? '' : 's'})`}
-            className={cn('flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', memOpen ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-          >
-            <BookmarkPlus size={13} /> Memory{memory.learnings.length ? ` (${memory.learnings.length})` : ''}
-          </button>
-          <button
-            type="button"
-            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            onClick={forkConversation}
-            disabled={!activeWs || running}
-            title="Fork this conversation into a new thread"
-          >
-            <GitFork size={13} />
-          </button>
-          <button
-            type="button"
-            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            onClick={exportTranscript}
-            disabled={!activeWs || messages.length === 0}
-            title="Export transcript as Markdown"
-          >
-            <Download size={13} />
-          </button>
-          <button
-            type="button"
-            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            onClick={undoLastCommit}
-            disabled={!activeWs || running || git.commits.length === 0}
-            title="Undo last commit (changes stay in the worktree)"
-          >
-            <Undo2 size={13} />
-          </button>
-          <button
-            type="button"
-            className={cn('rounded border px-2 py-0.5 text-[11px] disabled:opacity-40', showCheckpoints ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
-            onClick={() => setShowCheckpoints((o) => !o)}
-            disabled={!activeWs}
-            title="Checkpoints — snapshot transcript + workspace, restore on a wrong turn"
-          >
-            <BookmarkPlus size={13} />
-          </button>
-          <button
-            className="rounded border border-line px-2 py-0.5 text-[11px] text-mute hover:bg-panel2 hover:text-ink disabled:opacity-40"
-            onClick={() => newChat(activeWs)}
-            disabled={!activeWs}
-            title="New conversation in this workspace"
-          >
-            + chat
-          </button>
-        </div>
+      <CoderWorkspaceTabs tabs={tabs} running={running} setFileDiffPath={setFileDiffPath}>
+        <CoderHeader
+          activeWs={activeWs}
+          activeMeta={activeMeta ?? null}
+          runConv={runConv}
+          wsHeld={wsHeld}
+          wsAppliedDirRef={wsAppliedDirRef}
+          ctxTokens={ctxTokens}
+          ctxLimit={ctxLimit}
+          running={running}
+          agentSteps={agentSteps}
+          maxAgentSteps={coderParams.maxAgentSteps}
+          planMode={planMode}
+          setPlanMode={setPlanMode}
+          scoutOn={scoutOn}
+          setScoutOn={setScoutOn}
+          verifyMode={verifyMode}
+          setVerifyMode={setVerifyMode}
+          runVerifyNow={runVerifyNow}
+          verifyNowBusy={verifyNowBusy}
+          criticMode={criticMode}
+          setCriticMode={setCriticMode}
+          runCriticNow={runCriticNow}
+          criticNowBusy={criticNowBusy}
+          showBranchMenu={showBranchMenu}
+          setShowBranchMenu={setShowBranchMenu}
+          branchMenuRef={branchMenuRef}
+          git={git}
+          handleSwitchBranch={handleSwitchBranch}
+          handleCreateBranch={handleCreateBranch}
+          diffViewOpen={diffViewOpen}
+          setDiffViewOpen={setDiffViewOpen}
+          memOpen={memOpen}
+          setMemOpen={setMemOpen}
+          memory={memory}
+          forkConversation={forkConversation}
+          exportTranscript={exportTranscript}
+          undoLastCommit={undoLastCommit}
+          showCheckpoints={showCheckpoints}
+          setShowCheckpoints={setShowCheckpoints}
+          newChat={newChat}
+          messagesCount={messages.length}
+          store={store}
+          baseName={baseName}
+          formatTokens={formatTokens}
+          defaultMaxAgentSteps={DEFAULT_MAX_AGENT_STEPS}
+        />
         <CheckpointsPanel
           showCheckpoints={showCheckpoints}
           activeWs={activeWs}
@@ -3840,519 +1760,98 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           deleteCheckpoint={deleteCheckpoint}
         />
 
-        <div
-          ref={transcriptRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            // Hidden chat panel (file tab active): dims are all 0, the stick
-            // check would mis-fire as "pinned" — skip it.
-            if (tabs.activeTabId) return;
-            transcriptStick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-          }}
-          className="flex-1 overflow-auto bg-panel2 space-y-4 p-4"
-        >
-          {planMode && (
-            <div className="rounded-md border border-accent/40 bg-accent/10 px-3 py-2 text-[11.5px] text-accent flex items-center gap-2">
-              <BrainCircuit size={13} className="shrink-0" />
-              <span>Plan mode is on — the agent investigates read-only and cannot write files or run commands. Turn it off to apply changes.</span>
-            </div>
-          )}
-          {coderSafeMode && (
-            <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-[11.5px] text-warn flex items-center gap-2">
-              <span>🛡</span>
-              <span>Safe mode is on — destructive commands (e.g. <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, piping a download into a shell) are blocked. Turn it off in Settings &gt; Safety &amp; Permissions only for trusted workspaces.</span>
-            </div>
-          )}
-          {!activeWs ? (
-            <div className="flex h-full items-center justify-center text-center text-[13px] text-faint">
-              <div>
-                <p>No workspace selected.</p>
-                <p className="mt-1 text-[12px]">Click “Add” to point the coder at a folder.</p>
-              </div>
-            </div>
-          ) : (
-            messageGroups.map((g, i) => (
-              <React.Fragment key={i}>
-                {g.type === 'compact' ? (
-                  <div className="my-1 flex items-center gap-2 text-[10.5px] text-faint">
-                    <span className="h-px flex-1 bg-line" />
-                    <span className="flex items-center gap-1">✂ Context compacted</span>
-                    <span className="h-px flex-1 bg-line" />
-                  </div>
-                ) : g.type === 'trajectory' ? (
-                  <TrajectoryBlock items={g.items} />
-                ) : g.items[0].displayName && g.items[0].collapsed ? (
-                  <ReportBlock message={g.items[0]} />
-                ) : (
-                  <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
-                    <div className="font-semibold text-xs text-faint mb-1">{g.items[0].displayName ?? (g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role)}</div>
-                    {g.items[0].attachments?.length ? (
-                      <div className="flex flex-wrap gap-1.5 mb-1.5">
-                        {g.items[0].attachments.map((a, i) => (
-                          <span key={i} className="inline-flex items-center gap-1 rounded-full border border-line bg-panel2 px-2 py-0.5 text-[11.5px] text-ink">{a.kind === 'image' ? <Image size={11} /> : <File size={11} />} {a.name}</span>
-                        ))}
-                      </div>
-                    ) : null}
-                    {g.items[0].content && (
-                      g.items[0].role === 'assistant' || g.items[0].displayName
-                        ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown>{g.items[0].content}</Markdown></Suspense></div>
-                        : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
-                    )}
-                    {i === messageGroups.length - 1 && !running && !pendingQuestion && g.items[0].followUps && g.items[0].followUps.length > 0 && (
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {g.items[0].followUps.map((q, qi) => (
-                          <button
-                            key={qi}
-                            type="button"
-                            onClick={() => onFollowUp(q)}
-                            className="rounded-full border border-line bg-panel px-3 py-1.5 text-left text-[12px] text-mute transition-colors hover:border-accent/40 hover:text-ink"
-                          >
-                            {q}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </React.Fragment>
-            ))
-          )}
-        </div>
-        <div className="border-t border-line bg-panel p-3">
-          {llmPhase && (
-            <div className="mb-2 flex items-center gap-2 rounded-md border border-accent/25 bg-accent/8 px-2.5 py-1.5 text-[11.5px] text-mute">
-              <BrainCircuit size={13} className="animate-pulse text-accent" />
-              <span className="font-medium text-ink">
-                {llmPhase.stage === 'prefill' ? 'Model reading context (prefill)' : 'Model writing (decode)'}
-              </span>
-              <span className="text-faint">
-                · {llmPhase.label} · {((nowTick - llmPhase.since) / 1000).toFixed(1)}s · {llmPhase.chars.toLocaleString()} chars
-              </span>
-            </div>
-          )}
-          {attachments.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 mb-2">
-              {attachments.map((a) => (
-                <span key={a.path} className="inline-flex items-center gap-1 rounded-full border border-line bg-panel2 px-2 py-0.5 text-[11.5px] text-ink">
-                  {a.kind === 'image' ? <Image size={11} /> : <File size={11} />} {a.name}
-                  <button type="button" onClick={() => removeAttachment(a.path)} className="text-faint hover:text-danger" title="Remove">
-                    <X size={11} />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-          {showCoderParams && (
-            <div className="rounded-md border border-line bg-panel2 px-3 py-2 mb-2">
-              <div className="flex items-center gap-4 flex-wrap">
-                {appConfig?.cloudProviderEnabled && (
-                  <>
-                    <div className="flex w-full items-center gap-4 flex-wrap pb-1 border-b border-line/50">
-                      <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Primary Agent</span>
-                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                        provider
-                        <SelectField
-                          value={coderParams.primaryProvider || 'ninfer'}
-                          onChange={(v) => setCoderParams({ ...coderParams, primaryProvider: v as 'ninfer' | 'cloud' })}
-                          options={[
-                            { value: 'ninfer', label: 'Local (ninfer)' },
-                            { value: 'cloud', label: 'Cloud API' },
-                          ]}
-                        />
-                      </label>
-                      {coderParams.primaryProvider === 'cloud' && (
-                        <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                          cloud model
-                          <input
-                            type="text"
-                            value={coderParams.primaryCloudModel || ''}
-                            onChange={(e) => setCoderParams({ ...coderParams, primaryCloudModel: e.target.value })}
-                            placeholder="e.g. gpt-4o"
-                            className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                          />
-                        </label>
-                      )}
-                    </div>
-                    <div className="flex w-full items-center gap-4 flex-wrap pb-2 border-b border-line/50">
-                      <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Subagent (Worker)</span>
-                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                        provider
-                        <SelectField
-                          value={coderParams.subagentProvider || 'ninfer'}
-                          onChange={(v) => setCoderParams({ ...coderParams, subagentProvider: v as 'ninfer' | 'cloud' })}
-                          options={[
-                            { value: 'ninfer', label: 'Local (ninfer)' },
-                            { value: 'cloud', label: 'Cloud API' },
-                          ]}
-                        />
-                      </label>
-                      {coderParams.subagentProvider === 'cloud' && (
-                        <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                          cloud model
-                          <input
-                            type="text"
-                            value={coderParams.subagentCloudModel || ''}
-                            onChange={(e) => setCoderParams({ ...coderParams, subagentCloudModel: e.target.value })}
-                            placeholder="e.g. gpt-4o-mini"
-                            className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                          />
-                        </label>
-                      )}
-                    </div>
-                  </>
-                )}
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  <Toggle checked={coderParams.thinking} onChange={(v) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Reasoning effort sent to the engine as reasoning_effort (low/medium/high/xhigh). Default follows the thinking toggle; choosing a level forces thinking on.">
-                  think level
-                  <SelectField
-                    value={coderParams.thinkLevel || ''}
-                    onChange={(v) => setCoderParams({ ...coderParams, thinkLevel: (v || undefined) as CoderParams['thinkLevel'] })}
-                    options={[
-                      { value: '', label: 'default' },
-                      { value: 'low', label: 'low' },
-                      { value: 'medium', label: 'medium' },
-                      { value: 'high', label: 'high' },
-                      { value: 'xhigh', label: 'xhigh' },
-                    ]}
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Hard ceiling on agent turns per run — the run stops with a warning instead of looping forever once it's hit. Blank = default (60).">
-                  max steps
-                  <NumberField
-                    value={coderParams.maxAgentSteps ?? null}
-                    onChange={(v) => setCoderParams({ ...coderParams, maxAgentSteps: v })}
-                    onEmpty={() => setCoderParams({ ...coderParams, maxAgentSteps: undefined })}
-                    empty
-                    min={1}
-                    max={500}
-                    placeholder={String(DEFAULT_MAX_AGENT_STEPS)}
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Once usage crosses this share of the model's context window, the run auto-summarizes and continues instead of risking truncation. Blank = default (80%).">
-                  compact at %
-                  <NumberField
-                    value={coderParams.compactAt ?? null}
-                    onChange={(v) => setCoderParams({ ...coderParams, compactAt: v })}
-                    onEmpty={() => setCoderParams({ ...coderParams, compactAt: undefined })}
-                    empty
-                    min={20}
-                    max={95}
-                    placeholder="80"
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
-                  <Toggle checked={!!coderParams.promptCache} onChange={(v) => setCoderParams({ ...coderParams, promptCache: v })} /> prompt cache
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  temp <NumberField value={coderParams.temperature ?? null} onChange={(v) => setCoderParams({ ...coderParams, temperature: v })} onEmpty={() => setCoderParams({ ...coderParams, temperature: undefined })} empty />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  top_p <NumberField value={coderParams.topP ?? null} onChange={(v) => setCoderParams({ ...coderParams, topP: v })} onEmpty={() => setCoderParams({ ...coderParams, topP: undefined })} empty />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  top_k <NumberField value={coderParams.topK ?? null} onChange={(v) => setCoderParams({ ...coderParams, topK: v })} onEmpty={() => setCoderParams({ ...coderParams, topK: undefined })} empty />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  seed <NumberField value={coderParams.seed ?? null} onChange={(v) => setCoderParams({ ...coderParams, seed: v })} onEmpty={() => setCoderParams({ ...coderParams, seed: undefined })} empty />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Optional model id for the critic (defaults to the supervisor's model). Empty = same model reviews the diff.">
-                  critic
-                  <input
-                    value={coderParams.criticModel ?? ''}
-                    onChange={(e) => setCoderParams({ ...coderParams, criticModel: e.target.value })}
-                    placeholder="same model"
-                    className="w-28 bg-inset border border-line rounded px-1.5 py-0.5 text-[11px] outline-none focus:border-accent/50"
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Rewrite the agent's user-facing summaries to sound human — no em dashes, no buzzwords, no empty framing. Content-only replies that trip the tell-gate are silently re-written.">
-                  <Toggle checked={!!coderParams.humanize} onChange={(v) => setCoderParams({ ...coderParams, humanize: v })} /> humanize
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  voice
-                  <SelectField
-                    value={(coderParams.voiceProfile as VoiceProfile) || 'technical'}
-                    onChange={(v) => setCoderParams({ ...coderParams, voiceProfile: v })}
-                    disabled={!coderParams.humanize}
-                    options={VOICE_PROFILES.map((p) => ({ value: p.value, label: p.label }))}
-                  />
-                </label>
-                <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                  lens
-                  <SelectField
-                    value={coderParams.reviewLens || ''}
-                    onChange={(v) => setCoderParams({ ...coderParams, reviewLens: v })}
-                    options={CODING_LENSES.map((l) => ({ value: l.value, label: l.label }))}
-                  />
-                </label>
-                <button type="button" onClick={() => setCoderParams({ ...DEFAULT_CODER_PARAMS })} className="ml-auto text-[11px] text-faint hover:text-ink">reset</button>
-              </div>
-            </div>
-          )}
-          <div className="flex gap-2">
-            <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files">
-              <Paperclip size={14} />
-            </Button>
-            <Button variant="ghost" onClick={() => setShowCoderParams((v) => !v)} disabled={!activeWs} title="Sampling params (thinking, temperature, top_p, top_k, seed)">
-              <SlidersHorizontal size={14} />
-            </Button>
-            <input
-              className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50"
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && onSubmit()}
-              placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent..."}
-              disabled={!activeWs || pendingQuestion !== null}
-            />
-            {running ? (
-              <>
-                <Button variant="ghost" onClick={onSubmit} disabled={!input.trim() && attachments.length === 0} title="Queue this for when the current run finishes"><Plus size={14} /> Queue</Button>
-                <Button variant="danger" onClick={stop} disabled={runElsewhere}
-                  title={runElsewhere && runConv
-                    ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
-                    : 'Stop the running agent'}><Square size={14} /> Stop</Button>
-              </>
-            ) : (
-               <Button variant="primary" onClick={onSubmit} disabled={!activeWs && attachments.length === 0 || pendingQuestion !== null}><Play size={14} /> Run</Button>
-            )}
-          </div>
-          {activeConv && (queued[activeConv]?.length ?? 0) > 0 && (
-            <div className="mt-2 space-y-1">
-              {queued[activeConv].map((item, i) => (
-                <div key={i} className="flex items-center gap-2 rounded border border-line bg-inset px-2 py-1 text-[11.5px] text-mute">
-                  <span className="shrink-0 font-mono text-[10px] text-faint">#{i + 1} queued</span>
-                  <span className="min-w-0 flex-1 truncate">{item.text}</span>
-                  <button
-                    type="button"
-                    title="Remove from queue"
-                    onClick={() => setQueued((q) => ({ ...q, [activeConv]: q[activeConv].filter((_, j) => j !== i) }))}
-                    className="shrink-0 rounded p-0.5 text-faint hover:bg-panel hover:text-danger"
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          {activeWs && (
-            <div className={cn('mt-2 text-[10.5px]', coderSafeMode ? 'text-faint' : 'font-medium text-danger')}>
-              {coderSafeMode
-                ? `Agent runs shell commands locally in ${baseName(activeWs)} — destructive commands are blocked by Safe Mode.`
-                : `Agent runs shell commands locally in ${baseName(activeWs)} — Safe Mode is OFF, destructive commands are allowed.`}
-            </div>
-          )}
-        </div>
-          </div>
-          {tabs.tabs.map((t) => (
-            <div key={t.id} style={{ display: tabs.activeTabId === t.id ? undefined : 'none' }} className="flex h-full min-h-0 flex-col">
-              <Suspense fallback={<div className="flex h-full items-center justify-center text-[11.5px] text-faint">Loading editor…</div>}>
-                <LazyEditorPane
-                  tab={t}
-                  active={tabs.activeTabId === t.id}
-                  onDocChange={(id, doc) => tabs.onDocChange(id, doc)}
-                  onSave={(id) => { void tabs.saveTab(id); }}
-                  onReload={(id) => { void tabs.reloadTab(id); }}
-                  onUndo={() => tabs.undoEdit(t.id)}
-                  onDiff={(path) => setFileDiffPath(path)}
-                  onResolve={(id, kind) => tabs.resolveConflict(id, kind)}
-                  undoDisabled={running}
-                />
-              </Suspense>
-            </div>
-          ))}
-        </div>
-      </div>
+        <CoderTranscriptView
+          transcriptRef={transcriptRef}
+          tabsActiveTabId={tabs.activeTabId}
+          transcriptStick={transcriptStick}
+          planMode={planMode}
+          coderSafeMode={coderSafeMode}
+          activeWs={activeWs}
+          messageGroups={messageGroups}
+          running={running}
+          pendingQuestion={pendingQuestion}
+          onFollowUp={onFollowUp}
+          TrajectoryBlock={TrajectoryBlock}
+          ReportBlock={ReportBlock}
+          Markdown={Markdown}
+        />
+        <CoderComposer
+          llmPhase={llmPhase}
+          nowTick={nowTick}
+          attachments={attachments}
+          removeAttachment={removeAttachment}
+          showCoderParams={showCoderParams}
+          setShowCoderParams={setShowCoderParams}
+          coderParams={coderParams}
+          setCoderParams={setCoderParams}
+          appConfig={appConfig}
+          openPicker={openPicker}
+          running={running}
+          activeWs={activeWs}
+          input={input}
+          setInput={setInput}
+          onSubmit={onSubmit}
+          pendingQuestion={pendingQuestion}
+          stop={stop}
+          runElsewhere={runElsewhere}
+          runConv={runConv}
+          activeConv={activeConv}
+          queued={queued}
+          setQueued={setQueued}
+          coderSafeMode={coderSafeMode}
+          baseName={baseName}
+          store={store}
+          defaultMaxAgentSteps={DEFAULT_MAX_AGENT_STEPS}
+        />
+      </CoderWorkspaceTabs>
 
-      {/* Right: todos (agent-maintained via todo_write; the user can also
-          edit directly — edits reach the agent on its next LLM call via the
-          per-turn system-prompt injection) */}
-      <div className={cn("flex w-64 flex-col border-l border-line bg-panel", todosJustCreated && "todo-flash")}>
-        <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
-          <CheckSquare size={14} /> Todos
-          {todosUpdatedAt != null && (
-            <span className="ml-auto font-mono text-[10px] font-normal text-faint" title="Last updated (agent todo_write or your edit)">
-              {new Date(todosUpdatedAt).toLocaleTimeString([], { hour12: false })}
-            </span>
-          )}
-        </div>
-        <div className="flex-1 p-2 text-[11.5px] text-mute overflow-auto">
-          {todos.length === 0 ? 'No pending tasks.' : (
-            <div className="space-y-1.5">
-              {todos.map((t, i) => (
-                <div key={i} className={cn("group flex items-start gap-2", t.status === 'completed' ? 'opacity-50 line-through' : '')}>
-                  <button
-                    type="button"
-                    className="mt-0.5 shrink-0 cursor-pointer hover:opacity-70"
-                    title={`${t.status} — click to advance to ${t.status === 'pending' ? 'in_progress' : t.status === 'in_progress' ? 'completed' : 'pending'}`}
-                    onClick={() => cycleTodo(i)}
-                  >
-                    {t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '⏳' : '☐'}
-                  </button>
-                  <span className={cn('min-w-0 flex-1 break-words', t.status === 'in_progress' ? 'text-accent font-medium' : '')}>{t.content}</span>
-                  <button
-                    type="button"
-                    className="shrink-0 rounded p-0.5 text-faint opacity-0 group-hover:opacity-100 hover:text-danger"
-                    title="Remove task (takes effect on the agent's next step)"
-                    onClick={() => removeTodo(i)}
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="shrink-0 border-t border-line p-2">
-          <form className="flex items-center gap-1.5" onSubmit={(e) => { e.preventDefault(); addTodo(todoDraft); setTodoDraft(''); }}>
-            <input
-              value={todoDraft}
-              onChange={(e) => setTodoDraft(e.target.value)}
-              placeholder="add a task…"
-              className="min-w-0 flex-1 rounded border border-line bg-inset px-2 py-1 text-[11px] outline-none focus:border-accent/50"
-            />
-            <Button size="sm" variant="ghost" type="submit" disabled={!todoDraft.trim()} title="Add a task to the agent's plan — visible to it on its next step">
-              <Plus size={13} /> add
-            </Button>
-          </form>
-          <p className="mt-1 text-[10px] text-faint">Click a status to cycle it · your edits reach the agent on its next step</p>
-        </div>
-      </div>
+      <CoderTodoSidebar
+        todos={todos}
+        todosUpdatedAt={todosUpdatedAt}
+        todosJustCreated={todosJustCreated}
+        todoDraft={todoDraft}
+        setTodoDraft={setTodoDraft}
+        cycleTodo={cycleTodo}
+        removeTodo={removeTodo}
+        addTodo={addTodo}
+      />
 
-      {pendingQuestion && (
-        <HitlDialog
-          tone="accent"
-          icon={<HelpCircle size={15} />}
-          title="Agent is waiting for your input"
-          subtitle="Review the request, then approve or disapprove to continue the run."
-          footer={
-            <>
-              <Button variant="ghost" size="sm" onClick={() => resumeFromAsk(askNote.trim() ? `Disapproved. ${askNote.trim()}` : 'Disapproved.')}>
-                Disapprove
-              </Button>
-              <Button variant="primary" size="sm" onClick={() => resumeFromAsk(askNote.trim() ? `Approved. ${askNote.trim()}` : 'Approved.')}>
-                Approve
-              </Button>
-            </>
-          }
-        >
-          <div className="whitespace-pre-wrap text-ink/90">{pendingQuestion}</div>
-          <textarea
-            value={askNote}
-            onChange={(e) => setAskNote(e.target.value)}
-            placeholder="Optional note to send back with your decision…"
-            rows={2}
-            className="mt-2 w-full resize-y rounded-md border border-line bg-inset px-2 py-1.5 text-[12px] outline-none focus:border-accent/50"
-          />
-        </HitlDialog>
-      )}
-      {pendingApproval && (
-        <HitlDialog
-          tone="warn"
-          width={480}
-          icon={<Shield size={15} />}
-          title="Agent requests approval"
-          subtitle={<span><span className="font-mono text-accent">{pendingApproval.name}</span> is set to <span className="font-mono">ask</span> in this workspace.</span>}
-          footer={
-            <>
-              <Button variant="ghost" size="sm" onClick={() => approvalResolveRef.current?.(false)}>
-                Deny
-              </Button>
-              <Button variant="primary" size="sm" onClick={() => approvalResolveRef.current?.(true)}>
-                Approve once
-              </Button>
-            </>
-          }
-        >
-          <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{redactSecrets(pendingApproval.detail) || '(no details)'}</pre>
-        </HitlDialog>
-      )}
-      {riskyApproval && (
-        <HitlDialog
-          tone="warn"
-          icon={<Shield size={15} />}
-          title="Risky command — approval required"
-          subtitle={
-            <span>
-              {riskyApproval.fromSubagent && <strong className="text-accent">A subagent is requesting permission to run this command. </strong>}
-              This command {riskyApproval.reason}. Approve it for this run, or remember it for this workspace so it won&apos;t prompt again.
-            </span>
-          }
-          footer={
-            <>
-              <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('deny')}>
-                Deny
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => riskyResolveRef.current?.('once')}>
-                Approve once
-              </Button>
-              <Button variant="primary" size="sm" onClick={() => riskyResolveRef.current?.('remember')}>
-                Approve &amp; remember
-              </Button>
-            </>
-          }
-        >
-          <pre className="m-0 whitespace-pre-wrap break-all font-mono text-[12px] text-ink">{redactSecrets(riskyApproval.command) || '(no command)'}</pre>
-        </HitlDialog>
-      )}
-
-      {/* Diff-review viewer: working-tree vs HEAD, opened from the toolbar "Diff" button. */}
-      <DiffReviewModal
-        open={diffViewOpen}
-        mode="view"
-        title="Working tree vs HEAD"
-        onClose={() => setDiffViewOpen(false)}
-        fetchDiff={coderDiff}
-      />
-      {/* Commit-approval gate: the agent asked to commit while the gate is ON. */}
-      <DiffReviewModal
-        open={commitReviewOpen}
-        mode="approve"
-        title="Approve commit?"
-        banner={commitApprovalFromSubagent ? 'A subagent is requesting permission to commit.' : undefined}
-        onClose={() => commitResolveRef.current?.(false)}
-        onApprove={() => commitResolveRef.current?.(true)}
-        fetchDiff={coderDiff}
-      />
-      {/* Per-file diff vs HEAD (opened from a file tab's Diff button; staged
-          changes included — `git diff HEAD`). */}
-      <DiffReviewModal
-        open={fileDiffPath !== null}
-        mode="view"
-        title={fileDiffPath ?? undefined}
-        onClose={() => setFileDiffPath(null)}
-        fetchDiff={() => (fileDiffPath ? fetchFileDiff(fileDiffPath) : Promise.resolve({ files: [], diff: '' }))}
-      />
-      {/* Self-improving memory: intent continuity rules */}
-      <MemoryModal
-        open={memOpen}
-        onClose={() => setMemOpen(false)}
+      <CoderModals
+        pendingQuestion={pendingQuestion}
+        askNote={askNote}
+        setAskNote={setAskNote}
+        resumeFromAsk={resumeFromAsk}
+        pendingApproval={pendingApproval}
+        approvalResolveRef={approvalResolveRef}
+        riskyApproval={riskyApproval}
+        riskyResolveRef={riskyResolveRef}
+        diffViewOpen={diffViewOpen}
+        setDiffViewOpen={setDiffViewOpen}
+        commitReviewOpen={commitReviewOpen}
+        commitApprovalFromSubagent={commitApprovalFromSubagent}
+        commitResolveRef={commitResolveRef}
+        fileDiffPath={fileDiffPath}
+        setFileDiffPath={setFileDiffPath}
+        memOpen={memOpen}
+        setMemOpen={setMemOpen}
         memory={memory}
-        onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => adoptMemory(m))}
-        onChanged={() => loadMemory()}
+        adoptMemory={adoptMemory}
+        loadMemory={loadMemory}
+        showDir={showDir}
+        setShowDir={setShowDir}
+        handleAddWorkspace={handleAddWorkspace}
+        showPicker={showPicker}
+        setShowPicker={setShowPicker}
+        pickerNodes={pickerNodes}
+        pickerLoading={pickerLoading}
+        pickerExpanded={pickerExpanded}
+        pickerSelected={pickerSelected}
+        toggleNode={toggleNode}
+        setPickerSelected={setPickerSelected}
+        attachSelected={attachSelected}
+        attachments={attachments}
+        ATTACH_MAX_BYTES={ATTACH_MAX_BYTES}
       />
-      {showDir && (
-        <DirBrowser
-          initialPath="~"
-          onPick={(p) => { handleAddWorkspace(p); setShowDir(false); }}
-          onClose={() => setShowDir(false)}
-        />
-      )}
-
-      {showPicker && (
-        <FilePickerModal
-          nodes={pickerNodes}
-          loading={pickerLoading}
-          expanded={pickerExpanded}
-          selected={pickerSelected}
-          onToggle={toggleNode}
-          onToggleSelect={(p) => setPickerSelected((s) => ({ ...s, [p]: !s[p] }))}
-          onAttachSelected={attachSelected}
-          onClose={() => setShowPicker(false)}
-          attached={attachments}
-          maxBytes={ATTACH_MAX_BYTES}
-        />
-      )}
 
     </div>
   );
