@@ -36,7 +36,9 @@ import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type To
 import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
 import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, filterToolsByConfig, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
-import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
+import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';import { CODER_SYSTEM, WORKER_SYSTEM, CRITIC_SYSTEM } from '../lib/coderPrompts';
+import { SidebarSection } from '../components/coder/CoderSidebar';
+import { useCoderCheckpoints } from '../hooks/useCoderCheckpoints';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
@@ -45,87 +47,6 @@ const isGitCommitCommand = (cmd: string): boolean => {
   const c = cmd.replace(/^\s*(sudo|env|time|setsid|nice)\s+/, '').trim();
   return /^git\b/.test(c) && /\bcommit\b/.test(c);
 };
-const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
-Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
-
-# CRITICAL INSTRUCTION 1: TOOL SELECTION
-You have specialized native tools (\`read\`, \`grep\`, \`glob\`, \`edit\`, \`apply_patch\`, \`udiff_edit\`). You MUST ALWAYS prioritize these specific tools over the generic \`bash\` tool.
-- DO NOT use \`bash\` with \`cat\`, \`head\`, \`tail\`, or \`less\` to view files. Use the \`read\` tool.
-- DO NOT use \`bash\` with \`grep\`, \`find\`, or \`ls\` to search for content or list files. Use the \`grep\` and \`glob\` tools.
-- DO NOT use \`bash\` with \`sed\`, \`awk\`, or \`echo >\` to modify files. Use the \`edit\` / \`udiff_edit\` / \`apply_patch\` tools.
-- ONLY use \`bash\` for executing builds, test suites, starting servers, running git commands (other than commit/diff which have tools), or running complex scripts that native tools cannot handle.
-
-# CRITICAL INSTRUCTION 2: THOUGHT PROCESS
-Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
-
-# Core Directives
-1. **Research First**: ALWAYS investigate before writing code. 
-   - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
-   - For pages that only render via JavaScript, use the built-in \`browser\` tool: \`navigate\` then \`snapshot\` (plus \`click\`/\`fill\`/\`wait_for\`/\`evaluate\` when you must interact). Prefer \`web_fetch\` for static pages. Call the \`close\` action when done so the session is freed.
-   - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
-   - Use \`git_commit\` to save your work in logical commits when a goal or module is completed, and \`git_diff\` to review changes before committing.
-    - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
-    - Trivial lookups (current git branch, a version number, whether a file exists, a config value) deserve ONE direct tool call and an immediate answer. Never delegate them to a subagent and never chain extra tool calls once you have the answer — reply at once.
-2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
-3. **Verify Everything**: After editing, use \`bash\` to run compilers, linters, or test suites. If an error occurs, do not ask the user for help—use your tools to read the logs, search the web for the error, and fix it yourself. For long-running commands (builds, test suites), pass \`background:true\` to \`bash\` and poll the returned job with \`bash_poll\` until \`done:true\` instead of blocking.
-4. **Track Progress**: Use \`todo_write\` to maintain a structured plan. Mark steps as \`in_progress\` while working, and \`completed\` when done. This helps you and the user stay aligned.
-5. **Completion**: Only emit a final conversational response when the ENTIRE task is fully complete, tested, and verified.
-6. **Context is managed for you**: this harness automatically compacts the conversation when it nears the model's context limit, replacing earlier turns with a concise summary checkpoint. You do NOT need to summarize manually — keep working normally and rely on the checkpoint to preserve prior context.
- 7. **You have a memory that persists across sessions**. The system prompt above injects the repository's *Memory Bank* (a curated markdown file the user maintains) and the most relevant recent *Learnings* extracted from prior runs. Consult them before acting — they encode hard-won conventions, gotchas, and working commands. When you discover something non-obvious mid-work (a working build/test command, a project convention, a fix that worked, or a mistake to avoid), record it with the \`memory_update\` tool so future runs start smarter. Pass kind='success' for a working approach, 'tip' for a convention/fact/command, and 'avoid' for a mistake or anti-pattern. Only a handful of learnings fit in the injected context — if you suspect an older one exists that isn't shown, search the full history with \`memory_recall\`.
-`;
-
-// Worker subagent (implementation): a focused agent that shares the workspace and
-// writes real code but leaves version control + human interaction to the supervisor.
-const WORKER_SYSTEM = `You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
-- Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
-- CRITICAL INSTRUCTION 1: DO NOT use \`bash\` for \`cat\`, \`head\`, \`tail\`, \`less\`, \`grep\`, \`find\`, \`ls\`, \`sed\`, or \`awk\`. ALWAYS use the native \`read\`, \`grep\`, \`glob\`, \`edit\`, and \`apply_patch\` tools instead.
-- CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
-- Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
-- Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
-- If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
-- When the task is complete, STOP calling tools and reply with a concise summary: what you changed, the files touched, and any build/test commands you ran.
-- Stay strictly scoped to the assigned task.`;
-
-// Critic: reviews a working-tree-vs-HEAD diff against the task and decides approve / reject.
-const CRITIC_SYSTEM = `You are a meticulous senior code reviewer. You are given a task and a unified diff (working tree vs HEAD). Decide whether the changes are acceptable.
-Respond with EXACTLY one verdict line, then (only when rejecting) a short prioritized list of issues:
-VERDICT: APPROVED
-or
-VERDICT: CHANGES_REQUESTED
-<issue 1 — file:line, suggested fix>
-<issue 2 — ...>
-Do not rewrite code. Be precise and concise, and prefer specific file:line references.
-
-After the verdict, you MAY append reusable learnings, one per line, to make future runs smarter. Only include learnings that are genuinely reusable and non-obvious; none is fine:
-LEARNING: <a working approach, command, or convention worth repeating — something to DO>
-AVOID: <a mistake or anti-pattern to steer future runs away from — something NOT to do>`;
-
-
-
-
-
-
-/** Collapsible sidebar section: chevron toggles a bounded region so no single
- *  panel can push the rest of the sidebar out of view. */
-function SidebarSection({
-  title, icon, defaultOpen = false, children,
-}: { title: string; icon?: React.ReactNode; defaultOpen?: boolean; children: React.ReactNode }) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <div className="mb-3">
-      <button
-        type="button"
-        className="mb-1.5 flex w-full items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-faint hover:text-ink"
-        onClick={() => setOpen((o) => !o)}
-      >
-        {icon}
-        {title}
-        <ChevronDown size={12} className={`ml-auto shrink-0 transition-transform ${open ? '' : '-rotate-90'}`} />
-      </button>
-      {open && children}
-    </div>
-  );
-}
 
 export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [store, setStore] = useState<CoderStore>(loadStore);
@@ -1021,84 +942,29 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   }, [running, activeWsDir, git, refreshRepoMap]);
   const [showBranchMenu, setShowBranchMenu] = useState(false);
   const branchMenuRef = useRef<HTMLDivElement>(null);
-  const [showCheckpoints, setShowCheckpoints] = useState(false);
+  const {
+    showCheckpoints,
+    setShowCheckpoints,
+    createCheckpoint,
+    restoreCheckpoint,
+    deleteCheckpoint,
+  } = useCoderCheckpoints({
+    activeWs,
+    activeConv,
+    activeWsDir,
+    messages,
+    ledger,
+    todos,
+    running,
+    setStore,
+    setMessages,
+    setLedger,
+    applyTodos,
+    addLog,
+    loadGitCommits: git.loadCommits,
+    refreshRepoMap,
+  });
   const checkpoints: Checkpoint[] = store.workspaces[activeWs]?.conversations[activeConv]?.checkpoints ?? [];
-  /** Most auto-checkpoints a conversation keeps at once — old ones are dropped
-   *  as new ones are taken; manual checkpoints are never touched by this cap. */
-  const MAX_AUTO_CHECKPOINTS = 5;
-  /** Snapshot the transcript/todos plus the workspace HEAD (transcript-only outside git).
-   *  `auto: true` is used for the once-per-turn safety snapshot taken right before the
-   *  first mutating tool call — silent (doesn't pop the panel open) and capped. */
-  const createCheckpoint = async (opts?: { auto?: boolean }) => {
-    if (!activeWs || !activeConv) return;
-    let commit = '';
-    try {
-      const r = await coderExec('git rev-parse HEAD', undefined, 10000, activeWsDir, false, undefined, activeWsDir);
-      if (r.exitCode === 0 && /^[0-9a-f]{5,40}$/i.test((r.stdout || '').trim())) commit = (r.stdout || '').trim();
-    } catch { /* not a git repo — transcript-only checkpoint */ }
-    const auto = opts?.auto ?? false;
-    const cp: Checkpoint = {
-      id: 'cp-' + crypto.randomUUID(),
-      time: Date.now(), label: commit ? commit.slice(0, 7) : 'transcript',
-      commit, messages: messages.length, ledger: ledger.length, todos, auto,
-    };
-    setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
-      const meta = wsd?.conversations[activeConv];
-      if (!wsd || !meta) return prev;
-      let list = [...(meta.checkpoints ?? []), cp];
-      if (auto) {
-        const autoIds = list.filter((c) => c.auto).map((c) => c.id);
-        if (autoIds.length > MAX_AUTO_CHECKPOINTS) {
-          const drop = new Set(autoIds.slice(0, autoIds.length - MAX_AUTO_CHECKPOINTS));
-          list = list.filter((c) => !drop.has(c.id));
-        }
-      }
-      const next = { ...meta, checkpoints: list };
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: next } } } };
-    });
-    addLog({ type: 'compact', label: auto ? 'checkpoint (auto)' : 'checkpoint', detail: `saved (${cp.messages} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})` });
-    if (!auto) setShowCheckpoints(true);
-  };
-  /** Restore a checkpoint: hard-reset the workspace, then truncate transcript + todos. */
-  const restoreCheckpoint = async (cp: Checkpoint) => {
-    if (running || !activeWs || !activeConv) return;
-    const wsFiles = cp.commit
-      ? `Workspace files reset to ${cp.label} (git reset --hard). Uncommitted changes will be lost.`
-      : 'No git commit recorded — only the transcript will be truncated.';
-    if (!window.confirm(`Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${cp.messages} messages.`)) return;
-    if (cp.commit) {
-      if (!/^[0-9a-f]{5,40}$/i.test(cp.commit)) return;
-      const r = await coderExec(`git reset --hard ${cp.commit}`, undefined, 30000, activeWsDir, false, undefined, activeWsDir);
-      if (r.exitCode !== 0) {
-        addLog({ type: 'error', label: 'restore', detail: (r.stderr || r.stdout || 'reset failed').slice(0, 300) });
-      }
-      git.loadCommits();
-      refreshRepoMap();
-    }
-    const keptMessages = messages.slice(0, cp.messages);
-    const keptLedger = ledger.slice(0, cp.ledger);
-    setMessages(keptMessages);
-    applyTodos(cp.todos, null);
-    setLedger([...keptLedger, { id: crypto.randomUUID(), time: Date.now(), type: 'compact', label: 'restore', detail: `restored checkpoint ${cp.label}` }]);
-    // Write the store explicitly: restoring to an empty transcript would trip
-    // the L1 anti-clobber guard in the persist effect and lose the restore.
-    setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
-      const meta = wsd?.conversations[activeConv];
-      if (!wsd || !meta) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, messages: keptMessages, todos: cp.todos, todosUpdatedAt: undefined, updatedAt: Date.now() } } } } };
-    });
-  };
-  const deleteCheckpoint = (id: string) => {
-    if (!activeWs || !activeConv) return;
-    setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
-      const meta = wsd?.conversations[activeConv];
-      if (!wsd || !meta) return prev;
-      return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, conversations: { ...wsd.conversations, [activeConv]: { ...meta, checkpoints: (meta.checkpoints ?? []).filter((c) => c.id !== id) } } } } };
-    });
-  };
   /** undoFileEdit is defined before the tabs hook (which needs it as its
    *  onUndoEdit); this ref keeps the refresh path one-way (no cyclic dep). */
   const tabsRefreshRef = useRef<() => void>(() => {});
