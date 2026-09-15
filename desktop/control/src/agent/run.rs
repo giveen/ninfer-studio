@@ -722,10 +722,10 @@ impl futures_util::Stream for SseStream {
         // Ensure a drain future is in flight (it registers the waker with
         // the channel and wakes us on the next send).
         if self.recv.is_none() {
-            let Some(rx) = self.rx.take() else {
+            let Some(rx) = self.rx.as_ref() else {
                 return Poll::Ready(None);
             };
-            self.recv = Some(Box::pin(recv_next(rx)));
+            self.recv = Some(Box::pin(recv_next(rx.clone())));
         }
         let fut = self.recv.as_mut().unwrap();
         match std::future::Future::poll(fut.as_mut(), cx) {
