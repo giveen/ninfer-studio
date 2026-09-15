@@ -342,7 +342,7 @@ impl RunShared {
 // HTTP endpoints
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct StartBody {
     #[serde(default = "default_kind")]
