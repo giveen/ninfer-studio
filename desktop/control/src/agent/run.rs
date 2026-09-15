@@ -12,7 +12,7 @@ use crate::engine::S;
 use axum::extract::{Path, State as AxumState};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get as get_route, post as post_route};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
