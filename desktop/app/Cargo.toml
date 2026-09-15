@@ -1,8 +1,8 @@
 [package]
 name = "ninfier-studio"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2024"
-description = "NInfer Studio — native Linux desktop shell (Tauri 2) hosting the NInfer control plane + web UI."
+description = "NInfer Studio UI — native Linux desktop shell (Tauri 2) hosting the NInfer control plane + web UI."
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

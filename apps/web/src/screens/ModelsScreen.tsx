@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
-import { downloadModel, saveConfig } from '../lib/api';
+import { convertModel, downloadModel, saveConfig } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
 import type { DownloadRec, StatusPayload } from '../lib/types';
@@ -86,6 +86,87 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
     setHfTokenDraft('');
   };
 
+  const RECIPE_PRESETS: Record<string, any> = {
+    'qwen3_6_27b': {
+      name: 'qwen3.6-27b',
+      outName: 'qwen3_6_27b.ninfer',
+      defaultComponents: ['text', 'vision', 'mtp'],
+      warning: 'Requires Qwen3.5 Dense mathematics.',
+      hasMtp: true,
+    },
+    'qwen3_6_27b_nvfp4': {
+      name: 'qwen3.6-27b-nvfp4',
+      outName: 'qwen3_6_27b_nvfp4.ninfer',
+      defaultComponents: ['text', 'vision', 'mtp'],
+      warning: 'Requires Qwen3.5 Dense mathematics. Requires a quantized source.',
+      hasMtp: true,
+      needsQuantized: true,
+    },
+    'qwen3_8_27b': {
+      name: 'qwen3.8-27b',
+      outName: 'qwen3_8_27b.ninfer',
+      defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
+      warning: 'Requires Qwen3.5 Dense mathematics.',
+      hasMtp: true,
+      hasDflash2: true,
+    },
+    'qwen3_8_27b_nvfp4': {
+      name: 'qwen3.8-27b-nvfp4',
+      outName: 'qwen3_8_27b_nvfp4.ninfer',
+      defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
+      warning: 'Requires Qwen3.5 Dense mathematics. Requires a quantized source.',
+      hasMtp: true,
+      hasDflash2: true,
+      needsQuantized: true,
+    },
+    'qwen3_6_35b_a3b': {
+      name: 'qwen3.6-35b-a3b',
+      outName: 'qwen3_6_35b_a3b.ninfer',
+      defaultComponents: ['text', 'vision', 'mtp', 'dflash'],
+      warning: 'Requires Qwen3.5 MoE mathematics.',
+      hasMtp: true,
+      hasDflash: true,
+    }
+  };
+
+  const [convRecipe, setConvRecipe] = useState('qwen3_6_27b');
+  const [convModelPath, setConvModelPath] = useState('');
+  const [convName, setConvName] = useState('qwen3.6-27b');
+  const [convOutName, setConvOutName] = useState('qwen3_6_27b.ninfer');
+  const [convDflash, setConvDflash] = useState('');
+  const [convDflash2, setConvDflash2] = useState('');
+  const [convMtp, setConvMtp] = useState('');
+  const [convQuantized, setConvQuantized] = useState('');
+  const [convExtraArgs, setConvExtraArgs] = useState('--proposal');
+  const [convError, setConvError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const preset = RECIPE_PRESETS[convRecipe];
+    if (preset) {
+      setConvName(preset.name);
+      setConvOutName(preset.outName);
+    }
+  }, [convRecipe]);
+
+  const startConvert = async () => {
+    if (!convModelPath) return;
+    setConvError(null);
+    try {
+      const preset = RECIPE_PRESETS[convRecipe];
+      let args = `--components ${preset.defaultComponents.join(',')}`;
+      if (preset.hasDflash && convDflash) args += ` --source dflash=${convDflash}`;
+      if (preset.hasDflash2 && convDflash2) args += ` --source dflash2=${convDflash2}`;
+      if (preset.hasMtp && convMtp) args += ` --source mtp=${convMtp}`;
+      if (preset.needsQuantized && convQuantized) args += ` --source quantized=${convQuantized}`;
+      if (convExtraArgs) args += ` ${convExtraArgs}`;
+
+      const r = await convertModel(convModelPath, convRecipe, convName, convOutName, args);
+      if (!r.ok) setConvError(r.message || 'conversion failed to start');
+    } catch (e) {
+      setConvError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const catalog = status?.artifacts ? status.artifacts : [];
   const catalogEntries = (status && (status as any).catalog) || [];
 
@@ -142,6 +223,21 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                             source <ExternalLink size={10} />
                           </a>
                         )}
+                        {a.version !== undefined && a.version < 3 && (
+                          <Button
+                            variant="primary"
+                            size="sm"
+                            className="ml-auto"
+                            onClick={async () => {
+                              const r = await import('../lib/api').then(m => m.upgradeModel(a.path));
+                              if (!r.ok) {
+                                alert(r.message || 'Upgrade failed');
+                              }
+                            }}
+                          >
+                            Upgrade to v3
+                          </Button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -154,6 +250,73 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
               ))}
             </div>
           )}
+        </SectionCard>
+
+        <SectionCard
+          title="Bring Your Own Model (BYOM)"
+          description="Convert an existing local model using Ninfer tools to create a new .ninfer artifact."
+          icon={<Play size={15} />}
+          collapsible
+        >
+          {convError && <p className="mb-2.5 text-[12px] text-danger">{convError}</p>}
+          {RECIPE_PRESETS[convRecipe]?.warning && (
+            <p className="mb-4 text-[13px] text-amber-500">⚠️ {RECIPE_PRESETS[convRecipe].warning}</p>
+          )}
+          <div className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2">
+            <Field label="Recipe">
+              <select
+                className="w-full rounded border border-line bg-inset px-2.5 py-1.5 text-[13px] text-ink outline-none focus:border-accent"
+                value={convRecipe}
+                onChange={(e) => setConvRecipe(e.target.value)}
+              >
+                <option value="qwen3_6_27b">qwen3_6_27b</option>
+                <option value="qwen3_6_27b_nvfp4">qwen3_6_27b_nvfp4</option>
+                <option value="qwen3_8_27b">qwen3_8_27b</option>
+                <option value="qwen3_8_27b_nvfp4">qwen3_8_27b_nvfp4</option>
+                <option value="qwen3_6_35b_a3b">qwen3_6_35b_a3b</option>
+              </select>
+            </Field>
+            <Field label="Output .ninfer Filename" hint="Saved in your models dir">
+              <TextField value={convOutName} onChange={setConvOutName} placeholder="my_model.ninfer" />
+            </Field>
+            <div className="md:col-span-2">
+              <Field label="Base Model Path" hint="Absolute path to base model weights on disk">
+                <TextField value={convModelPath} onChange={setConvModelPath} placeholder="/path/to/Qwen-27B" />
+              </Field>
+            </div>
+            
+            {RECIPE_PRESETS[convRecipe]?.hasMtp && (
+              <Field label="MTP Source (Optional)" hint="Path to MTP weights if not in base model">
+                <TextField value={convMtp} onChange={setConvMtp} placeholder="/path/to/mtp" />
+              </Field>
+            )}
+            {RECIPE_PRESETS[convRecipe]?.hasDflash && (
+              <Field label="DFlash Source (Optional)" hint="Path to DFlash weights">
+                <TextField value={convDflash} onChange={setConvDflash} placeholder="/path/to/dflash" />
+              </Field>
+            )}
+            {RECIPE_PRESETS[convRecipe]?.hasDflash2 && (
+              <Field label="DFlash2 Source (Optional)" hint="Path to DFlash2 weights">
+                <TextField value={convDflash2} onChange={setConvDflash2} placeholder="/path/to/dflash2" />
+              </Field>
+            )}
+            {RECIPE_PRESETS[convRecipe]?.needsQuantized && (
+              <Field label="Quantized Source" hint="Path to quantized weights">
+                <TextField value={convQuantized} onChange={setConvQuantized} placeholder="/path/to/quantized" />
+              </Field>
+            )}
+
+            <Field label="Artifact Name" hint="Identity metadata tag">
+              <TextField value={convName} onChange={setConvName} placeholder="qwen3.6-27b" />
+            </Field>
+            <Field label="Additional Arguments" hint="e.g. --proposal">
+              <TextField value={convExtraArgs} onChange={setConvExtraArgs} placeholder="--proposal" />
+            </Field>
+
+            <div className="md:col-span-2">
+              <Button variant="primary" onClick={startConvert} disabled={!convModelPath}>Start Conversion</Button>
+            </div>
+          </div>
         </SectionCard>
 
         <SectionCard

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use crate::engine::S;
 use crate::gpu::{gpu_stats, gpu_value};
-use crate::models::{list_models, start_download};
+use crate::models::list_models;
 use crate::read_json;
 use crate::types::ARTIFACTS;
 use crate::LOG_TAIL_WINDOW_BYTES;
@@ -64,7 +64,17 @@ pub(crate) async fn api_models(AxumState(state): AxumState<S>) -> Json<Value> {
 
 pub(crate) async fn models_download(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
-    Ok(Json(start_download(&state, body).await))
+    Ok(Json(crate::models::start_download(&state, body).await))
+}
+
+pub(crate) async fn models_upgrade(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+    let body = read_json(req).await?;
+    Ok(Json(crate::models::upgrade_model(&state, body).await))
+}
+
+pub(crate) async fn models_convert(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+    let body = read_json(req).await?;
+    Ok(Json(crate::models::start_conversion(&state, body).await))
 }
 
 pub(crate) async fn gpu(AxumState(state): AxumState<S>) -> Json<Value> {

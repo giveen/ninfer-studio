@@ -33,6 +33,14 @@ pub async fn list_models(state: &State) -> Value {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let mut version = 0;
+        if let Ok(mut f) = tokio::fs::File::open(&full).await {
+            use tokio::io::AsyncReadExt;
+            let mut magic = [0u8; 8];
+            if f.read_exact(&mut magic).await.is_ok() && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0")) {
+                version = magic[7] as u32;
+            }
+        }
         let known = ARTIFACTS.iter().find(|a| a.file == name).cloned();
         artifacts.push(ModelArtifact {
             file: name.clone(),
@@ -44,6 +52,7 @@ pub async fn list_models(state: &State) -> Value {
             weights: known.as_ref().map(|k| k.weights.to_string()),
             repo: known.as_ref().map(|k| k.repo.to_string()),
             known,
+            version,
         });
     }
     json!({ "dir": dir, "artifacts": artifacts })
@@ -291,4 +300,161 @@ pub async fn downloads_public(state: &State) -> Vec<Value> {
     d.values()
         .filter_map(|r| serde_json::to_value(r).ok())
         .collect()
+}
+
+pub async fn upgrade_model(state: &Arc<State>, body: Value) -> Value {
+    let file = body.get("file").and_then(|v| v.as_str()).unwrap_or("");
+    if file.is_empty() {
+        return json!({ "ok": false, "message": "file is required" });
+    }
+    let cfg = state.config.read().await.clone();
+    let ninfer_path = std::path::Path::new(&cfg.ninfer_path);
+    let upgrade_script = ninfer_path.join("tools").join("upgrade_ninfer_v2_to_v3.py");
+    if !upgrade_script.exists() {
+        return json!({ "ok": false, "message": "upgrade script not found in ninfer path" });
+    }
+    let target = std::path::Path::new(&file);
+    if !target.exists() || !target.is_file() {
+        return json!({ "ok": false, "message": "target file does not exist" });
+    }
+    let out_file = target.with_extension("v3.ninfer");
+    
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.arg(&upgrade_script).arg(target).arg(&out_file).current_dir(ninfer_path);
+    crate::clear_appimage_env(&mut cmd);
+    
+    match cmd.output().await {
+        Ok(out) => {
+            if out.status.success() {
+                // Rename v3 file over the original
+                if let Err(e) = tokio::fs::rename(&out_file, target).await {
+                    return json!({ "ok": false, "message": format!("Upgrade succeeded but rename failed: {}", e) });
+                }
+                json!({ "ok": true })
+            } else {
+                json!({ "ok": false, "message": String::from_utf8_lossy(&out.stderr).to_string() })
+            }
+        }
+        Err(e) => json!({ "ok": false, "message": e.to_string() })
+    }
+}
+
+pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
+    let model_path = body.get("modelPath").and_then(|v| v.as_str()).unwrap_or("");
+    let recipe = body.get("recipe").and_then(|v| v.as_str()).unwrap_or("");
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let out_name = body.get("outName").and_then(|v| v.as_str()).unwrap_or("");
+    let extra_args = body.get("extraArgs").and_then(|v| v.as_str()).unwrap_or("");
+
+    if model_path.is_empty() || recipe.is_empty() || name.is_empty() || out_name.is_empty() {
+        return json!({ "ok": false, "message": "modelPath, recipe, name, and outName are required" });
+    }
+
+    let cfg = state.config.read().await.clone();
+    let models_dir = cfg.models_dir.clone();
+    let _ = tokio::fs::create_dir_all(&models_dir).await;
+    let out_path = std::path::Path::new(&models_dir).join(out_name);
+
+    let ninfer_path = std::path::Path::new(&cfg.ninfer_path);
+    
+    let id = format!(
+        "conv_{:x}_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        std::process::id()
+    );
+
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.arg("-m").arg("tools.convert")
+        .arg("--model").arg(model_path)
+        .arg("--recipe").arg(recipe)
+        .arg("--name").arg(name)
+        .arg("--out").arg(&out_path)
+        .current_dir(ninfer_path);
+        
+    // Parse extra_args simply by splitting by whitespace (ignoring quotes for simplicity in this PoC)
+    if !extra_args.trim().is_empty() {
+        for arg in extra_args.split_whitespace() {
+            cmd.arg(arg);
+        }
+    }
+
+    cmd.stdout(std::process::Stdio::piped())
+       .stderr(std::process::Stdio::piped());
+    crate::clear_appimage_env(&mut cmd);
+
+    let Ok(mut child) = cmd.spawn() else {
+        return json!({ "ok": false, "message": "could not spawn python3 tools.convert" });
+    };
+    let pid = child.id();
+
+    {
+        let mut d = state.downloads.lock().await;
+        d.insert(
+            id.clone(),
+            JobRec {
+                id: id.clone(),
+                action: Some("convert".to_string()),
+                cmd: Some(format!("python3 -m tools.convert --model {} ...", model_path)),
+                repo: None,
+                file: Some(out_name.to_string()),
+                local_dir: Some(models_dir),
+                pid,
+                out: String::new(),
+                exit_code: None,
+                done: false,
+                failed: false,
+                total_bytes: None,
+                downloaded_bytes: None,
+                speed_bps: None,
+                started_at: crate::types::now_ms(),
+            },
+        );
+    }
+
+    let state_c = state.clone();
+    let id_c = id.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let mut buf_out = [0; 4096];
+        let mut buf_err = [0; 4096];
+        
+        // Read output dynamically
+        loop {
+            tokio::select! {
+                Ok(n) = stdout.read(&mut buf_out) => {
+                    if n == 0 { break; }
+                    let chunk = String::from_utf8_lossy(&buf_out[..n]).to_string();
+                    let mut d = state_c.downloads.lock().await;
+                    if let Some(j) = d.get_mut(&id_c) {
+                        j.out.push_str(&chunk);
+                    }
+                }
+                Ok(n) = stderr.read(&mut buf_err) => {
+                    if n == 0 { break; }
+                    let chunk = String::from_utf8_lossy(&buf_err[..n]).to_string();
+                    let mut d = state_c.downloads.lock().await;
+                    if let Some(j) = d.get_mut(&id_c) {
+                        j.out.push_str(&chunk);
+                    }
+                }
+            }
+        }
+        
+        let status = child.wait().await.ok();
+        let code = status.and_then(|s| s.code());
+        let success = status.map(|s| s.success()).unwrap_or(false);
+        let mut d = state_c.downloads.lock().await;
+        if let Some(j) = d.get_mut(&id_c) {
+            j.done = true;
+            j.exit_code = code;
+            j.failed = !success;
+        }
+    });
+
+    json!({ "ok": true, "id": id })
 }
