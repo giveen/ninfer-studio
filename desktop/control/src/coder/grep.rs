@@ -4,24 +4,40 @@
 //! repo and `glob` path matching (ripgrep's `globset` matcher), both
 //! gitignore-aware via the `ignore` crate and gated by `common::enforce_perm`.
 
-use super::common::{enforce_perm, perm_scope, rel_of, resolve_ws, within_ws, CODER_IGNORE};
+use super::common::{CODER_IGNORE, enforce_perm, perm_scope, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
+use axum::Json;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
-pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn grep(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
 
     let pattern = req.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
     if pattern.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "pattern required"})),
+        ));
     }
-    enforce_perm(&state, &perm_scope(&req), "grep", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "grep",
+        None,
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
 
-    let ignore_case = req.get("ignoreCase").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ignore_case = req
+        .get("ignoreCase")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let regex_pattern = if ignore_case {
         format!("(?i){}", pattern)
@@ -31,10 +47,18 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
 
     let re = match regex::RegexBuilder::new(&regex_pattern).build() {
         Ok(r) => r,
-        Err(e) => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": format!("invalid regex: {}", e)})))),
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid regex: {}", e)})),
+            ));
+        }
     };
 
-    let max_matches = req.get("maxMatches").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+    let max_matches = req
+        .get("maxMatches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as usize;
 
     let result = tokio::task::spawn_blocking(move || {
         let mut matches = Vec::new();
@@ -52,7 +76,11 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
 
                 let path = entry.path();
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
+                    let rel_path = path
+                        .strip_prefix(&ws)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
 
                     for (i, line) in content.lines().enumerate() {
                         if matches.len() >= max_matches {
@@ -82,30 +110,59 @@ pub async fn grep(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Res
             "truncated": truncated,
             "count": count
         })
-    }).await.unwrap_or_else(|_| json!({"error": "task panicked"}));
+    })
+    .await
+    .unwrap_or_else(|_| json!({"error": "task panicked"}));
 
     Ok(Json(result))
 }
 
-pub async fn glob(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn glob(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pattern = match req.get("pattern").and_then(|v| v.as_str()) {
         Some(p) if !p.is_empty() => p.to_string(),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "pattern required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "pattern required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "glob", req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "glob",
+        req.get("path")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty()),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let base = if rel_root.is_empty() { ws_root.clone() } else { within_ws(&ws_root, rel_root)? };
+    let base = if rel_root.is_empty() {
+        ws_root.clone()
+    } else {
+        within_ws(&ws_root, rel_root)?
+    };
     let base_rel = rel_of(&ws_root, &base);
     // `globset` (ripgrep's matcher) with `literal_separator`, so `*` never
     // crosses `/` — the same semantics as the sidecar's translator — plus
     // real `[...]` classes and `{a,b}` alternates.
-    let matcher = glob_matcher(&pattern)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("invalid glob: {e}")}))))?;
+    let matcher = glob_matcher(&pattern).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid glob: {e}")})),
+        )
+    })?;
     let files = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         walk_files(&ws_root, &base_rel, &mut out, 4000);
-        out.into_iter().filter(|f| matcher.is_match(f)).collect::<Vec<_>>()
+        out.into_iter()
+            .filter(|f| matcher.is_match(f))
+            .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
@@ -129,7 +186,11 @@ fn walk_files(root: &Path, rel: &str, out: &mut Vec<String>, cap: usize) {
     if out.len() >= cap {
         return;
     }
-    let dir = if rel == "." { root.to_path_buf() } else { root.join(rel) };
+    let dir = if rel == "." {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -143,7 +204,11 @@ fn walk_files(root: &Path, rel: &str, out: &mut Vec<String>, cap: usize) {
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        let child = if rel == "." { name.clone() } else { format!("{rel}/{name}") };
+        let child = if rel == "." {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         if ft.is_dir() {
             if CODER_IGNORE.contains(&name.as_str()) {
                 continue;

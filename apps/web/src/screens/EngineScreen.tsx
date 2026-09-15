@@ -15,14 +15,16 @@ import { PerformanceTab } from './engine/PerformanceTab';
 import { AdvancedTab } from './engine/AdvancedTab';
 import { ProfilesTab } from './engine/ProfilesTab';
 import { UsageTrackerTab } from './engine/UsageTrackerTab';
+import { CloudTab } from './engine/CloudTab';
 
-type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage';
+type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage' | 'cloud';
 
 const TABS: Array<{ id: EngineTab; label: string }> = [
   { id: 'basics', label: 'Basics' },
   { id: 'performance', label: 'Performance' },
   { id: 'advanced', label: 'Advanced' },
   { id: 'profiles', label: 'Profiles' },
+  { id: 'cloud', label: 'Cloud' },
   { id: 'usage', label: 'Usage' },
 ];
 
@@ -54,6 +56,11 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const [saveName, setSaveName] = useState('');
   const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
   const [tab, setTab] = useState<EngineTab>('basics');
 
   // Global request-default settings (reasoning effort). The Engine screen is
@@ -129,6 +136,11 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   const onReasoningEffort = (v: string) => {
     setSettings((s) => (s ? { ...s, reasoningEffort: v } : s));
     saveConfig({ reasoningEffort: v }).catch(() => undefined);
+  };
+
+  const onUpdateSettings = (patch: Partial<AppSettings>) => {
+    setSettings((s) => (s ? { ...s, ...patch } : s));
+    saveConfig(patch).catch(() => undefined);
   };
 
   // Persist the engine profile, chosen artifact, and saved named profiles to the
@@ -526,6 +538,9 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
             saved={saved}
             setSaved={setSaved}
           />
+        </div>
+        <div className={cn(tab !== 'cloud' && 'hidden')}>
+          <CloudTab settings={settings} onUpdate={onUpdateSettings} />
         </div>
         <div className={cn(tab !== 'usage' && 'hidden')}>
           <UsageTrackerTab />

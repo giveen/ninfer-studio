@@ -13,7 +13,10 @@ const NVSMI_TIMEOUT_MS: u64 = 5_000;
 
 /// Wait for a spawned child, collecting its output, giving up (and killing
 /// it) if it does not exit by `deadline`. Runs on a blocking thread.
-fn wait_capped(mut child: std::process::Child, deadline: std::time::Instant) -> Option<std::process::Output> {
+fn wait_capped(
+    mut child: std::process::Child,
+    deadline: std::time::Instant,
+) -> Option<std::process::Output> {
     loop {
         match child.try_wait().ok().flatten() {
             Some(_) => return child.wait_with_output().ok(),
@@ -46,11 +49,15 @@ type GpuCsvLine = (String, Option<u64>, Option<u64>, Option<u64>, Option<f64>);
 fn parse_gpu_csv(stdout: &str) -> Option<GpuCsvLine> {
     let line = stdout.lines().next()?;
     let cols = line.split(',').map(|s| s.trim());
-    let (name, used, total, util) =
-        match (cols.clone().next(), cols.clone().nth(1), cols.clone().nth(2), cols.clone().nth(3)) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => return None,
-        };
+    let (name, used, total, util) = match (
+        cols.clone().next(),
+        cols.clone().nth(1),
+        cols.clone().nth(2),
+        cols.clone().nth(3),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return None,
+    };
     let power_w = cols.clone().nth(4).and_then(|s| s.parse::<f64>().ok());
     Some((
         name.to_string(),
@@ -127,7 +134,8 @@ pub async fn gpu_stats() -> GpuStats {
             .spawn()
             .ok();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(NVSMI_TIMEOUT_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(NVSMI_TIMEOUT_MS);
         let Some(gpu_out) = wait_capped(gpu_child, deadline).filter(|o| o.status.success()) else {
             return fallback;
         };
@@ -194,9 +202,13 @@ mod tests {
 
     #[test]
     fn parse_gpu_csv_multi_gpu_first_line_wins() {
-        let (name, used, total, util, power) = parse_gpu_csv("GPU A, 1, 2, 3, 4\nGPU B, 5, 6, 7, 8\n").unwrap();
+        let (name, used, total, util, power) =
+            parse_gpu_csv("GPU A, 1, 2, 3, 4\nGPU B, 5, 6, 7, 8\n").unwrap();
         assert_eq!(name, "GPU A");
-        assert_eq!((used, total, util, power), (Some(1), Some(2), Some(3), Some(4.0)));
+        assert_eq!(
+            (used, total, util, power),
+            (Some(1), Some(2), Some(3), Some(4.0))
+        );
     }
 
     #[test]
@@ -233,8 +245,14 @@ mod tests {
     fn parse_apps_csv_skips_blank_and_short_lines() {
         let apps = parse_apps_csv("1234, python3, 512\n\n5678, node, 256\nmalformed\n");
         assert_eq!(apps.len(), 2);
-        assert_eq!((apps[0].pid, apps[0].name.as_str(), apps[0].mem_mib), (1234, "python3", 512));
-        assert_eq!((apps[1].pid, apps[1].name.as_str(), apps[1].mem_mib), (5678, "node", 256));
+        assert_eq!(
+            (apps[0].pid, apps[0].name.as_str(), apps[0].mem_mib),
+            (1234, "python3", 512)
+        );
+        assert_eq!(
+            (apps[1].pid, apps[1].name.as_str(), apps[1].mem_mib),
+            (5678, "node", 256)
+        );
     }
 
     #[test]
@@ -278,7 +296,11 @@ mod tests {
             mem_total_mib: Some(2),
             util_pct: Some(3),
             power_draw_w: Some(250.5),
-            apps: vec![GpuApp { pid: 9, name: "x".into(), mem_mib: 4 }],
+            apps: vec![GpuApp {
+                pid: 9,
+                name: "x".into(),
+                mem_mib: 4,
+            }],
         };
         let v = gpu_value(&g);
         assert_eq!(v["available"], true);

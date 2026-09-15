@@ -11,12 +11,12 @@
 //! stop request `select!`s against every engine/tool await so it cancels
 //! in-flight reads rather than just the next loop iteration.
 
-use crate::agent::run::{now_ms, AgentEvent, HookDecision, HookMode, RunShared, RunStatus};
+use crate::agent::run::{AgentEvent, HookDecision, HookMode, RunShared, RunStatus, now_ms};
 use crate::agent::tools;
 use crate::engine::S;
-use futures_util::{future::join_all, StreamExt};
+use futures_util::{StreamExt, future::join_all};
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -126,12 +126,16 @@ pub fn build_request(
                     match a.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
                         "image" => {
                             if let Some(url) = a.get("dataUrl").and_then(|v| v.as_str()) {
-                                content.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                                content.push(
+                                    json!({ "type": "image_url", "image_url": { "url": url } }),
+                                );
                             }
                         }
                         "video" => {
                             if let Some(url) = a.get("dataUrl").and_then(|v| v.as_str()) {
-                                content.push(json!({ "type": "video_url", "video_url": { "url": url } }));
+                                content.push(
+                                    json!({ "type": "video_url", "video_url": { "url": url } }),
+                                );
                             }
                         }
                         _ => {
@@ -235,7 +239,11 @@ pub fn build_request(
     }
     // Order matters: greedy must win over a lingering temperature value, not
     // the other way round, or "deterministic" silently turns into "sampled".
-    if params.get("greedy").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if params
+        .get("greedy")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         body["temperature"] = json!(0);
     }
     for (key, wire) in [
@@ -292,14 +300,14 @@ fn re_tool_call() -> &'static Regex {
 }
 /// Fenced ```json / ```tool_call / ```tool_call blocks.
 fn re_fence() -> &'static Regex {
-    RE_FENCE
-        .get_or_init(|| Regex::new(r"(?s)```(?:json|tool_?call)\s*\n?(.*?)\n?```").expect("static regex"))
+    RE_FENCE.get_or_init(|| {
+        Regex::new(r"(?s)```(?:json|tool_?call)\s*\n?(.*?)\n?```").expect("static regex")
+    })
 }
 /// Trailing commas — a common small-model JSON mistake — stripped before
 /// parsing (`,}` → `}`, `,]` → `]`).
 fn re_trailing_comma() -> &'static Regex {
-    RE_TRAILING_COMMA
-        .get_or_init(|| Regex::new(r"(,(\s*[}\]]))").expect("static regex"))
+    RE_TRAILING_COMMA.get_or_init(|| Regex::new(r"(,(\s*[}\]]))").expect("static regex"))
 }
 
 /// Parse a candidate JSON body into an array of item objects.
@@ -363,22 +371,28 @@ pub fn parse_markup_tool_calls(text: &str) -> (Vec<Tc>, Vec<String>) {
     let mut consumed: Vec<String> = Vec::new();
 
     // One item may yield a call; push (call, raw) pairs as we find them.
-    let push_items = |items: &Vec<Value>, raw: &str, calls: &mut Vec<Tc>, consumed: &mut Vec<String>| {
-        for o in items {
-            if let Some((name, arguments)) = coerce(o) {
-                calls.push(Tc {
-                    id: format!("markup_{:x}_{}", now_ms(), calls.len()),
-                    name,
-                    arguments,
-                });
-                consumed.push(raw.to_string());
+    let push_items =
+        |items: &Vec<Value>, raw: &str, calls: &mut Vec<Tc>, consumed: &mut Vec<String>| {
+            for o in items {
+                if let Some((name, arguments)) = coerce(o) {
+                    calls.push(Tc {
+                        id: format!("markup_{:x}_{}", now_ms(), calls.len()),
+                        name,
+                        arguments,
+                    });
+                    consumed.push(raw.to_string());
+                }
             }
-        }
-    };
+        };
 
     for cap in re_tool_call().captures_iter(text) {
         if let Some(items) = parse_items(cap.get(1).map(|m| m.as_str()).unwrap_or("")) {
-            push_items(&items, cap.get(0).unwrap().as_str(), &mut calls, &mut consumed);
+            push_items(
+                &items,
+                cap.get(0).unwrap().as_str(),
+                &mut calls,
+                &mut consumed,
+            );
         }
     }
     if !calls.is_empty() {
@@ -386,7 +400,12 @@ pub fn parse_markup_tool_calls(text: &str) -> (Vec<Tc>, Vec<String>) {
     }
     for cap in re_fence().captures_iter(text) {
         if let Some(items) = parse_items(cap.get(1).map(|m| m.as_str()).unwrap_or("")) {
-            push_items(&items, cap.get(0).unwrap().as_str(), &mut calls, &mut consumed);
+            push_items(
+                &items,
+                cap.get(0).unwrap().as_str(),
+                &mut calls,
+                &mut consumed,
+            );
         }
     }
     if !calls.is_empty() {
@@ -449,7 +468,11 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut selected: Vec<&str> = Vec::new();
     let mut selected_bytes = 0usize;
-    let mut index = if from_end { lines.len().saturating_sub(1) } else { 0 };
+    let mut index = if from_end {
+        lines.len().saturating_sub(1)
+    } else {
+        0
+    };
     loop {
         if from_end {
             if index == 0 {
@@ -468,7 +491,11 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
             selected.push(line);
         }
         selected_bytes += line.len();
-        index = if from_end { index.saturating_sub(1) } else { index + 1 };
+        index = if from_end {
+            index.saturating_sub(1)
+        } else {
+            index + 1
+        };
     }
     selected.concat()
 }
@@ -507,7 +534,9 @@ fn extract_tool_result_text(res: &Map<String, Value>) -> Option<String> {
         let err = res.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
         Some(format!("{out}\n{err}"))
     } else if has_content {
-        res.get("content").and_then(|v| v.as_str()).map(String::from)
+        res.get("content")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     } else {
         None
     }
@@ -624,17 +653,39 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
 /// calls over SSE, then fall back to markup recovery when the model emitted
 /// calls as text. `Err(STOP_ERR)` when a stop won the race; other errors
 /// are the engine's fault (bad status, transport, …).
-pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) -> Result<Turn, String> {
+pub(crate) async fn stream_turn(
+    state: &S,
+    shared: &Arc<RunShared>,
+    raw: &[u8],
+) -> Result<Turn, String> {
     let port = crate::proxy::route_port(state, raw).await?;
-    let api_key = state.config.read().await.api_key.clone();
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let api_key = shared.meta.api_key.clone().unwrap_or_else(|| {
+        if let Ok(c) = state.config.try_read() {
+            c.api_key.clone()
+        } else {
+            String::new()
+        }
+    });
+    let url = shared
+        .meta
+        .base_url
+        .clone()
+        .map(|u| format!("{}/chat/completions", u.trim_end_matches('/')))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1/chat/completions"));
 
-    let mut req = shared.client.post(&url).header("content-type", "application/json").body(raw.to_vec());
+    let mut req = shared
+        .client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(raw.to_vec());
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key.as_str());
     }
     let started = Instant::now();
-    let resp = req.send().await.map_err(|e| format!("engine request failed: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("engine request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -689,32 +740,34 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
             };
             // Timings (SGLang-style engine extensions), usage, and deltas.
             if let Some(t) = chunk_v.get("timings").and_then(|v| v.as_object())
-                && first_chunk.is_some() && meta.get("promptTokPerSec").is_none() {
-                    if let Some(v) = t.get("prompt_per_second").cloned() {
-                        meta.insert("promptTokPerSec".into(), v);
-                    }
-                    if let Some(v) = t.get("predicted_per_second").cloned() {
-                        meta.insert("decodeTokPerSec".into(), v);
-                    }
-                    if let Some(v) = t.get("cache_n").cloned() {
-                        meta.insert("cachedTokens".into(), v);
-                    }
-                    if let Some(v) = t.get("prompt_n").and_then(|p| p.as_u64())
-                        && let Some(c) = t.get("cache_n").and_then(|c| c.as_u64())
-                    {
-                        prompt_tokens = c + v;
-                        meta.insert("promptTokens".into(), json!(prompt_tokens));
-                    }
-                    if let Some(v) = t.get("predicted_n").and_then(|p| p.as_u64()) {
-                        completion_tokens = v;
-                        meta.insert("completionTokens".into(), json!(completion_tokens));
-                    }
-                    if let Some(v) = t.get("draft_n").cloned() {
-                        meta.insert("draftN".into(), v);
-                    }
-                    if let Some(v) = t.get("draft_n_accepted").cloned() {
-                        meta.insert("draftNAccepted".into(), v);
-                    }
+                && first_chunk.is_some()
+                && meta.get("promptTokPerSec").is_none()
+            {
+                if let Some(v) = t.get("prompt_per_second").cloned() {
+                    meta.insert("promptTokPerSec".into(), v);
+                }
+                if let Some(v) = t.get("predicted_per_second").cloned() {
+                    meta.insert("decodeTokPerSec".into(), v);
+                }
+                if let Some(v) = t.get("cache_n").cloned() {
+                    meta.insert("cachedTokens".into(), v);
+                }
+                if let Some(v) = t.get("prompt_n").and_then(|p| p.as_u64())
+                    && let Some(c) = t.get("cache_n").and_then(|c| c.as_u64())
+                {
+                    prompt_tokens = c + v;
+                    meta.insert("promptTokens".into(), json!(prompt_tokens));
+                }
+                if let Some(v) = t.get("predicted_n").and_then(|p| p.as_u64()) {
+                    completion_tokens = v;
+                    meta.insert("completionTokens".into(), json!(completion_tokens));
+                }
+                if let Some(v) = t.get("draft_n").cloned() {
+                    meta.insert("draftN".into(), v);
+                }
+                if let Some(v) = t.get("draft_n_accepted").cloned() {
+                    meta.insert("draftNAccepted".into(), v);
+                }
             }
             if let Some(u) = chunk_v.get("usage").and_then(|v| v.as_object()) {
                 if let Some(p) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
@@ -741,19 +794,29 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
                 && !d.is_empty()
             {
                 content.push_str(d);
-                let _ = shared.tx.send(AgentEvent::Delta { kind: "content", text: d.to_string() });
+                let _ = shared.tx.send(AgentEvent::Delta {
+                    kind: "content",
+                    text: d.to_string(),
+                });
             }
             if let Some(d) = delta.get("reasoning_content").and_then(|v| v.as_str())
                 && !d.is_empty()
             {
                 reasoning.push_str(d);
-                let _ = shared.tx.send(AgentEvent::Delta { kind: "reasoning", text: d.to_string() });
+                let _ = shared.tx.send(AgentEvent::Delta {
+                    kind: "reasoning",
+                    text: d.to_string(),
+                });
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     while tool_calls.len() <= idx {
-                        tool_calls.push(Tc { id: String::new(), name: String::new(), arguments: String::new() });
+                        tool_calls.push(Tc {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        });
                     }
                     let slot = &mut tool_calls[idx];
                     if let Some(v) = tc.get("id").and_then(|v| v.as_str()) {
@@ -776,7 +839,11 @@ pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) 
     // engine's structured field. Conservative (see parse_markup_tool_calls).
     let mut dropped: Vec<String> = Vec::new();
     if tool_calls.is_empty() {
-        let source = if !content.trim().is_empty() { content.as_str() } else { reasoning.as_str() };
+        let source = if !content.trim().is_empty() {
+            content.as_str()
+        } else {
+            reasoning.as_str()
+        };
         if !source.is_empty() {
             let (parsed, consumed) = parse_markup_tool_calls(source);
             if !parsed.is_empty() {
@@ -836,6 +903,35 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
     let max_steps = meta.max_steps;
     let mut turns = 0usize;
 
+    if meta.plan {
+        let task = {
+            let live = lock_live(&shared);
+            live.messages
+                .last()
+                .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let c = chat_once(
+            &shared.client,
+            &state,
+            &meta.model,
+            meta.base_url.as_deref(),
+            meta.api_key.as_deref(),
+            "You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.",
+            &task,
+            Some(0.4),
+            Some(1024),
+            Duration::from_secs(30)
+        ).await;
+        if let Ok(plan_text) = c {
+            shared.append(json!({
+                "role": "assistant",
+                "content": format!("[Ideation / Plan]\n{plan_text}")
+            }));
+        }
+    }
+
     loop {
         if turns >= max_steps || shared.status().is_terminal() {
             finish(&shared, "steps");
@@ -856,12 +952,19 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             live.todo_base_rev = live.todo_rev;
             let mut sys = meta.system.clone().unwrap_or_default();
             if meta.kind == "coder"
-                && let Some(t) = live.todo.as_ref().filter(|t| !t.is_null()) {
+                && let Some(t) = live.todo.as_ref().filter(|t| !t.is_null())
+            {
                 sys.push_str(&todo_system_block(t));
             }
             sys
         };
-        let req = build_request(&meta.model, Some(&system), &context, &meta.params, &meta.tools_spec);
+        let req = build_request(
+            &meta.model,
+            Some(&system),
+            &context,
+            &meta.params,
+            &meta.tools_spec,
+        );
         let raw = serde_json::to_vec(&req).unwrap_or_default();
         // Token estimate of this request for the client's compaction gate.
         let est_tokens = (raw.len() as f64 / CHARS_PER_TOKEN).round() as u64;
@@ -922,6 +1025,23 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 && !turn.content.trim().is_empty()
                 && matches!(meta.kind.as_str(), "worker" | "coder")
             {
+                let snippet = turn.content.clone();
+                let sum = chat_once(
+                    &shared.client,
+                    &state,
+                    &shared.meta.model,
+                    shared.meta.base_url.as_deref(),
+                    shared.meta.api_key.as_deref(),
+                    "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
+                    &snippet,
+                    None,
+                    Some(512),
+                    Duration::from_secs(30)
+                ).await.unwrap_or_else(|e| format!("(summarization failed: {e})"));
+                shared.append(json!({
+                    "role": "user",
+                    "content": format!("[Worker partial summary: {sum}]")
+                }));
                 // Token limit mid-turn: hand the next step a continuation
                 // note (the partial reply above stays in the transcript).
                 shared.append(json!({ "role": "user", "content": CUTOFF_NOTE }));
@@ -929,7 +1049,10 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 continue;
             }
             if turn.content.trim().is_empty() && turn.reasoning.trim().is_empty() {
-                finish_err(&shared, "engine returned an empty reply (no content, no tool calls)");
+                finish_err(
+                    &shared,
+                    "engine returned an empty reply (no content, no tool calls)",
+                );
                 return;
             }
             match await_turn_hook(&shared, &turn, turns, est_tokens).await {
@@ -946,9 +1069,11 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         }
 
         for tc in &turn.tool_calls {
-            let _ = shared
-                .tx
-                .send(AgentEvent::ToolCall { id: tc.id.clone(), name: tc.name.clone(), args: tc.arguments.clone() });
+            let _ = shared.tx.send(AgentEvent::ToolCall {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                args: tc.arguments.clone(),
+            });
         }
 
         // Dispatch in parallel (the client's Promise.all), each leg racing
@@ -962,7 +1087,8 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 let run = shared.clone();
                 let (name, args) = (tc.name.clone(), tc.arguments.clone());
                 async move {
-                    let parsed: Value = serde_json::from_str(&args).unwrap_or(Value::Object(Map::new()));
+                    let parsed: Value =
+                        serde_json::from_str(&args).unwrap_or(Value::Object(Map::new()));
                     tokio::select! {
                         r = tools::dispatch(&state, &run, &name, &parsed) => r,
                         _ = run.wait_stop() => json!({ "error": "run stopped" }),
@@ -976,9 +1102,12 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             let text = result.to_string();
             let is_error = result.get("error").is_some();
             let preview: String = text.chars().take(400).collect();
-            let _ = shared
-                .tx
-                .send(AgentEvent::ToolResult { id: tc.id.clone(), name: tc.name.clone(), preview, error: is_error });
+            let _ = shared.tx.send(AgentEvent::ToolResult {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                preview,
+                error: is_error,
+            });
             shared.append(json!({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -995,10 +1124,35 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 "role": "system",
                 "content": format!(
                     "You called tools that are not available in this session: {names}. \
-Use only the tools listed above."
+            Use only the tools listed above."
                 ),
             }));
         }
+
+        if let Some(ref critic_model) = meta.critic {
+            let turn_input = format!("Turn {} completed. Content: {}", turns, turn.content);
+            let critic_sys = "You are a CRITIC reviewing the agent's progress. Evaluate whether the agent is making progress toward the goal or going in circles.";
+            let c = chat_once(
+                &shared.client,
+                &state,
+                critic_model.as_str().unwrap_or_default(),
+                shared.meta.base_url.as_deref(),
+                shared.meta.api_key.as_deref(),
+                critic_sys,
+                &turn_input,
+                Some(0.4),
+                Some(2048),
+                Duration::from_secs(45),
+            )
+            .await;
+            if let Ok(critique) = c {
+                shared.append(json!({
+                    "role": "system",
+                    "content": format!("[Critic Review]\n{critique}")
+                }));
+            }
+        }
+
         // Tool-call turn end: a client-hook screen may still want its gate
         // (e.g. the compaction pass before the next engine call).
         match await_turn_hook(&shared, &turn, turns, est_tokens).await {
@@ -1040,10 +1194,19 @@ enum HookOutcome {
 /// decision to `/runs/{id}/hooks/{hid}`. A client that never answers gets
 /// the webview default after [`HOOK_TIMEOUT`]: done on a tool-less turn,
 /// continue on a tool turn.
-async fn await_turn_hook(shared: &Arc<RunShared>, turn: &Turn, turns: usize, est_tokens: u64) -> HookOutcome {
+async fn await_turn_hook(
+    shared: &Arc<RunShared>,
+    turn: &Turn,
+    turns: usize,
+    est_tokens: u64,
+) -> HookOutcome {
     let had_tool_calls = !turn.tool_calls.is_empty();
     if *shared.hook_mode.lock().unwrap_or_else(|p| p.into_inner()) != HookMode::Client {
-        return if had_tool_calls { HookOutcome::Continue } else { HookOutcome::Finish };
+        return if had_tool_calls {
+            HookOutcome::Continue
+        } else {
+            HookOutcome::Finish
+        };
     }
     let hid = format!("hk_{:x}_{turns}", now_ms());
     let (tx, rx) = oneshot::channel();
@@ -1077,9 +1240,16 @@ async fn await_turn_hook(shared: &Arc<RunShared>, turn: &Turn, turns: usize, est
             }
         }
     };
-    shared.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
+    shared
+        .hook_wait
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
     lock_live(shared).pending_hook = None;
-    let _ = shared.tx.send(AgentEvent::HookResolved { id: hid, action: decision.action_name().to_string() });
+    let _ = shared.tx.send(AgentEvent::HookResolved {
+        id: hid,
+        action: decision.action_name().to_string(),
+    });
 
     match decision {
         HookDecision::Done => {
@@ -1091,7 +1261,11 @@ async fn await_turn_hook(shared: &Arc<RunShared>, turn: &Turn, turns: usize, est
             shared.set_status(RunStatus::Running);
             HookOutcome::Finish
         }
-        HookDecision::Continue { content, note, transcript } => {
+        HookDecision::Continue {
+            content,
+            note,
+            transcript,
+        } => {
             if let Some(t) = transcript {
                 lock_live(shared).messages = t;
             }
@@ -1139,7 +1313,10 @@ pub(crate) fn todo_system_block(todos: &Value) -> String {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let content = t.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+                let content = t
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let mark = match t.get("status").and_then(|v| v.as_str()) {
                     Some("completed") => "x",
                     Some("in_progress") => "~",
@@ -1163,6 +1340,8 @@ pub(crate) async fn chat_once(
     client: &reqwest::Client,
     state: &S,
     model: &str,
+    base_url: Option<&str>,
+    api_key_override: Option<&str>,
     system: &str,
     user: &str,
     temperature: Option<f64>,
@@ -1185,14 +1364,29 @@ pub(crate) async fn chat_once(
     }
     let raw = serde_json::to_vec(&body).unwrap_or_default();
     let port = crate::proxy::route_port(state, &raw).await?;
-    let api_key = state.config.read().await.api_key.clone();
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let api_key = api_key_override.map(|s| s.to_string()).unwrap_or_else(|| {
+        if let Ok(c) = state.config.try_read() {
+            c.api_key.clone()
+        } else {
+            String::new()
+        }
+    });
+    let url = base_url
+        .map(|u| format!("{}/chat/completions", u.trim_end_matches('/')))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1/chat/completions"));
 
-    let mut req = client.post(&url).header("content-type", "application/json").body(raw);
+    let mut req = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(raw);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key.as_str());
     }
-    let resp = req.timeout(timeout).send().await.map_err(|e| format!("engine request failed: {e}"))?;
+    let resp = req
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("engine request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("engine returned HTTP {}", resp.status()));
     }
@@ -1216,7 +1410,11 @@ pub(crate) async fn chat_once(
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
-            let Some(d) = v["choices"].get(0).and_then(|c| c["delta"].get("content")).and_then(|x| x.as_str()) else {
+            let Some(d) = v["choices"]
+                .get(0)
+                .and_then(|c| c["delta"].get("content"))
+                .and_then(|x| x.as_str())
+            else {
                 continue;
             };
             content.push_str(d);
@@ -1276,7 +1474,10 @@ mod tests {
         assert_eq!(req["messages"][2]["role"], "assistant");
         assert_eq!(req["messages"][2]["reasoning_content"], "hmm");
         // system messages inside the transcript are skipped
-        let msgs2 = vec![json!({ "role": "system", "content": "OLD" }), json!({ "role": "user", "content": "x" })];
+        let msgs2 = vec![
+            json!({ "role": "system", "content": "OLD" }),
+            json!({ "role": "user", "content": "x" }),
+        ];
         let req2 = build_request("m", None, &msgs2, &json!({}), &json!([]));
         assert_eq!(req2["messages"].as_array().unwrap().len(), 1);
         assert!(req2.get("tools").is_none());
@@ -1291,7 +1492,12 @@ mod tests {
         let req = build_request("m", None, std::slice::from_ref(&m), &json!({}), &json!([]));
         let content = req["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["text"], "look");
-        assert!(content[1]["text"].as_str().unwrap().contains("[Attached file: /tmp/a.txt]"));
+        assert!(
+            content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[Attached file: /tmp/a.txt]")
+        );
         assert_eq!(req["messages"][0]["role"], "user");
         // The client's ChatAttachment shape (kind/dataUrl/content keys).
         let m2 = json!({
@@ -1368,7 +1574,12 @@ mod tests {
         ];
         let ctx = compacted_context(&msgs);
         assert_eq!(ctx.len(), 2);
-        assert!(ctx[0]["content"].as_str().unwrap().contains("compacted-summary"));
+        assert!(
+            ctx[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("compacted-summary")
+        );
         let msgs2 = vec![json!({ "role": "user", "content": "no checkpoint" })];
         assert_eq!(compacted_context(&msgs2).len(), 1);
     }
@@ -1395,6 +1606,8 @@ mod tests {
                 params: Value::Null,
                 parent: None,
                 plan: false,
+                api_key: None,
+                base_url: None,
                 critic: None,
             },
             live: std::sync::Mutex::new(crate::agent::run::RunLive {
@@ -1435,14 +1648,27 @@ mod tests {
         let msgs = vec![
             tool_msg("bash", "1", &old.to_string()),
             json!({ "role": "assistant", "content": "…" }),
-            tool_msg("grep", "2", &format!("{{\"results\": \"{}\"}}", "x".repeat(9000))),
+            tool_msg(
+                "grep",
+                "2",
+                &format!("{{\"results\": \"{}\"}}", "x".repeat(9000)),
+            ),
             json!({ "role": "assistant", "content": "…" }),
-            tool_msg("bash", "3", &format!("{{\"stdout\": \"{}\", \"stderr\": \"\"}}", "y".repeat(9000))),
+            tool_msg(
+                "bash",
+                "3",
+                &format!("{{\"stdout\": \"{}\", \"stderr\": \"\"}}", "y".repeat(9000)),
+            ),
         ];
         let packed = pack_transcript(&shared, &msgs);
         // old bash packed: placeholder + recall handle, stderr cleared
         let p1: Value = serde_json::from_str(packed[0]["content"].as_str().unwrap()).unwrap();
-        assert!(p1["stdout"].as_str().unwrap().starts_with("[large bash result"));
+        assert!(
+            p1["stdout"]
+                .as_str()
+                .unwrap()
+                .starts_with("[large bash result")
+        );
         assert!(p1["stdout"].as_str().unwrap().contains("obs_recall"));
         assert_eq!(p1["stderr"], "");
         let id = p1["stdout"]
@@ -1521,7 +1747,9 @@ mod tests {
                             "{sse}data: {{\"choices\":[{{\"delta\":{{\"content\":\"<tool_call>{{\\\"name\\\":\\\"read\\\",\\\"arguments\\\":{{\\\"path\\\":\\\"a.txt\\\"}}}}</tool_call>\"}}}}]}}\n\n{done}"
                         )
                     } else {
-                        format!("{sse}data: {{\"choices\":[{{\"delta\":{{\"content\":\"The file contains: hello.\"}},\"finish_reason\":\"stop\"}}]}}\n\n{done}")
+                        format!(
+                            "{sse}data: {{\"choices\":[{{\"delta\":{{\"content\":\"The file contains: hello.\"}},\"finish_reason\":\"stop\"}}]}}\n\n{done}"
+                        )
                     };
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{payload}",
@@ -1549,6 +1777,8 @@ mod tests {
             params: Value::Null,
             parent: None,
             plan: false,
+            api_key: None,
+            base_url: None,
             critic: None,
         };
         let live = crate::agent::run::RunLive {
@@ -1603,9 +1833,15 @@ mod tests {
         // transcript: user, assistant(markup stripped), tool(read result), assistant(final)
         assert_eq!(snap.messages.len(), 4, "{:?}", snap.messages);
         assert_eq!(snap.messages[1]["role"], "assistant");
-        assert!(!snap.messages[1]["content"].as_str().unwrap().contains("<tool_call>"));
+        assert!(
+            !snap.messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<tool_call>")
+        );
         assert_eq!(snap.messages[2]["role"], "tool");
-        let tool_content: Value = serde_json::from_str(snap.messages[2]["content"].as_str().unwrap()).unwrap();
+        let tool_content: Value =
+            serde_json::from_str(snap.messages[2]["content"].as_str().unwrap()).unwrap();
         assert_eq!(tool_content["content"], "hello");
         assert_eq!(snap.messages[3]["content"], "The file contains: hello.");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1655,6 +1891,8 @@ mod tests {
             params: Value::Null,
             parent: None,
             plan: false,
+            api_key: None,
+            base_url: None,
             critic: None,
         };
         let shared = Arc::new(crate::agent::run::RunShared {

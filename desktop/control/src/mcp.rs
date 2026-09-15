@@ -31,10 +31,10 @@ use crate::coder::PanicGuard;
 use crate::coder::{enforce_perm, perm_scope, tier_for};
 use crate::engine::S;
 use crate::types::{AppSettings, McpServerSpec};
-use axum::extract::{Path as AxumPath, Query, State as AxumState};
-use axum::http::header::{HeaderName, HeaderValue};
-use axum::http::StatusCode;
 use axum::Json;
+use axum::extract::{Path as AxumPath, Query, State as AxumState};
+use axum::http::StatusCode;
+use axum::http::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientInfo,
     ContentBlock, Implementation, InitializeRequestParams, ProtocolVersion, Tool,
@@ -44,14 +44,14 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceError};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::LocalSet;
 use tokio::time::timeout;
 
@@ -183,13 +183,7 @@ pub struct McpManager {
 
 impl fmt::Debug for McpManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let keys: Vec<String> = self
-            .meta
-            .lock()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
+        let keys: Vec<String> = self.meta.lock().unwrap().keys().cloned().collect();
         f.debug_struct("McpManager")
             .field("running", &self.started.load(Ordering::Relaxed))
             .field("servers", &keys)
@@ -261,7 +255,13 @@ fn sanitize_server_name(raw: &str) -> String {
 fn sanitize_tool_name(raw: &str) -> String {
     let mut out: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.is_empty() {
         out.push_str("tool");
@@ -330,10 +330,15 @@ fn validate_spec(spec: &McpServerSpec) -> Result<(), (StatusCode, Json<Value>)> 
     // Both transports set is ambiguous (`transport()` would silently prefer
     // stdio and ignore the url) — reject so a misconfigured server surfaces
     // immediately instead of connecting over the wrong transport.
-    let has_cmd = spec.command.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let has_cmd = spec
+        .command
+        .as_deref()
+        .is_some_and(|c| !c.trim().is_empty());
     let has_url = spec.url.as_deref().is_some_and(|u| !u.trim().is_empty());
     if has_cmd && has_url {
-        return Err(err("server needs exactly one of a stdio command or an http(s) url, not both".into()));
+        return Err(err(
+            "server needs exactly one of a stdio command or an http(s) url, not both".into(),
+        ));
     }
     if matches!(spec.transport(), Some("http")) {
         let url = spec.url.as_deref().unwrap_or("").trim();
@@ -387,98 +392,100 @@ async fn connect(spec: &McpServerSpec) -> Result<(McpService, Option<Value>, Opt
     // `spec.transport()` returns `Option<&str>` — `&str` cannot be matched
     // exhaustively, so the wildcard arm catches any future transport kind
     // the same way `None` (no transport configured) does.
-    let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> =
-        match spec.transport() {
-            Some("stdio") => {
-                let cmd = spec.command.clone().unwrap_or_default();
-                let mut c = tokio::process::Command::new(&cmd);
-                c.args(&spec.args);
-                for (k, v) in &spec.env {
-                    c.env(k, v);
-                }
-                if let Some(dir) = spec.cwd.as_deref() {
-                    c.current_dir(dir);
-                }
-                // The control plane may run inside the AppImage, which poisons
-                // PYTHONHOME/PYTHONPATH for spawned interpreters (see
-                // clear_appimage_env) — an MCP server installed via a uv tool
-                // would otherwise fail to bootstrap.
-                crate::clear_appimage_env(&mut c);
-                let transport = TokioChildProcess::new(c)
-                    .map_err(|e| format!("failed to spawn MCP server '{cmd}': {e}"))?;
-                pid = transport.id();
-                Box::pin(async move {
-                    timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
-                        .await
-                        .map_err(|_| {
-                            format!(
-                                "timed out after {}s connecting to MCP server '{cmd}'",
-                                INIT_TIMEOUT.as_secs()
-                            )
-                        })?
-                        .map_err(|e| format!("MCP initialize failed for '{cmd}': {e}"))
-                })
+    let fut: Pin<Box<dyn Future<Output = Result<McpService, String>>>> = match spec.transport() {
+        Some("stdio") => {
+            let cmd = spec.command.clone().unwrap_or_default();
+            let mut c = tokio::process::Command::new(&cmd);
+            c.args(&spec.args);
+            for (k, v) in &spec.env {
+                c.env(k, v);
             }
-            Some("http") => {
-                let url = spec.url.clone().unwrap_or_default();
-                let mut custom = HashMap::new();
-                for (k, v) in &spec.headers {
-                    // `Authorization` travels through `auth_header` — the SDK
-                    // rejects it as a reserved header in `custom_headers`, so
-                    // drop a duplicated entry here (it would also double-send
-                    // the value).
-                    if k.eq_ignore_ascii_case("authorization") {
-                        continue;
-                    }
-                    match (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
-                        (Ok(name), Ok(value)) => {
-                            custom.insert(name, value);
-                        }
-                        _ => {
-                            tracing::warn!("mcp: skipping invalid header {k:?} for server '{url}'");
-                        }
-                    }
-                }
-                let mut config = StreamableHttpClientTransportConfig::with_uri(url.trim());
-                if let Some(auth) = spec
-                    .authorization
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                {
-                    // rmcp sends `Authorization: Bearer <value>` (reqwest's
-                    // `bearer_auth`), so a user pasting a full header value
-                    // would end up with a doubled prefix — normalize it.
-                    let token = auth
-                        .strip_prefix("Bearer ")
-                        .or_else(|| auth.strip_prefix("bearer "))
-                        .unwrap_or(auth);
-                    config = config.auth_header(token.to_string());
-                }
-                if !custom.is_empty() {
-                    config = config.custom_headers(custom);
-                }
-                let transport = StreamableHttpClientTransport::from_config(config);
-                Box::pin(async move {
-                    timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
-                        .await
-                        .map_err(|_| {
-                            format!(
-                                "timed out after {}s connecting to MCP server '{url}'",
-                                INIT_TIMEOUT.as_secs()
-                            )
-                        })?
-                        .map_err(|e| format!("MCP initialize failed for '{url}': {e}"))
-                })
+            if let Some(dir) = spec.cwd.as_deref() {
+                c.current_dir(dir);
             }
-            // `None` means "neither command nor url" — validate_spec and the
-            // ensure_conn callers both reject that before we get here, but a
-            // future caller might not: a broken config is a per-server error
-            // string, never a panic in the actor thread.
-            _ => Box::pin(async {
-                Err("MCP server has no transport configured (needs `command` or `url`)".to_string())
-            }),
-        };
+            // The control plane may run inside the AppImage, which poisons
+            // PYTHONHOME/PYTHONPATH for spawned interpreters (see
+            // clear_appimage_env) — an MCP server installed via a uv tool
+            // would otherwise fail to bootstrap.
+            crate::clear_appimage_env(&mut c);
+            let transport = TokioChildProcess::new(c)
+                .map_err(|e| format!("failed to spawn MCP server '{cmd}': {e}"))?;
+            pid = transport.id();
+            Box::pin(async move {
+                timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "timed out after {}s connecting to MCP server '{cmd}'",
+                            INIT_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .map_err(|e| format!("MCP initialize failed for '{cmd}': {e}"))
+            })
+        }
+        Some("http") => {
+            let url = spec.url.clone().unwrap_or_default();
+            let mut custom = HashMap::new();
+            for (k, v) in &spec.headers {
+                // `Authorization` travels through `auth_header` — the SDK
+                // rejects it as a reserved header in `custom_headers`, so
+                // drop a duplicated entry here (it would also double-send
+                // the value).
+                if k.eq_ignore_ascii_case("authorization") {
+                    continue;
+                }
+                match (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    (Ok(name), Ok(value)) => {
+                        custom.insert(name, value);
+                    }
+                    _ => {
+                        tracing::warn!("mcp: skipping invalid header {k:?} for server '{url}'");
+                    }
+                }
+            }
+            let mut config = StreamableHttpClientTransportConfig::with_uri(url.trim());
+            if let Some(auth) = spec
+                .authorization
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                // rmcp sends `Authorization: Bearer <value>` (reqwest's
+                // `bearer_auth`), so a user pasting a full header value
+                // would end up with a doubled prefix — normalize it.
+                let token = auth
+                    .strip_prefix("Bearer ")
+                    .or_else(|| auth.strip_prefix("bearer "))
+                    .unwrap_or(auth);
+                config = config.auth_header(token.to_string());
+            }
+            if !custom.is_empty() {
+                config = config.custom_headers(custom);
+            }
+            let transport = StreamableHttpClientTransport::from_config(config);
+            Box::pin(async move {
+                timeout(INIT_TIMEOUT, info.serve_with_lifecycle(transport, lc))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "timed out after {}s connecting to MCP server '{url}'",
+                            INIT_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .map_err(|e| format!("MCP initialize failed for '{url}': {e}"))
+            })
+        }
+        // `None` means "neither command nor url" — validate_spec and the
+        // ensure_conn callers both reject that before we get here, but a
+        // future caller might not: a broken config is a per-server error
+        // string, never a panic in the actor thread.
+        _ => Box::pin(async {
+            Err("MCP server has no transport configured (needs `command` or `url`)".to_string())
+        }),
+    };
     let svc = fut.await?;
     let peer: Option<Value> = svc.peer_info().and_then(|p| {
         let v = serde_json::to_value(p.as_ref()).ok()?;
@@ -505,7 +512,9 @@ async fn fetch_tools(server: &str, svc: &McpService) -> Result<Vec<ToolDef>, Str
 /// so the `!Send` rmcp services can exist (mirrors the Obscura browser
 /// driver in `coder/browser.rs`). Runs until the process exits.
 fn actor_entry(rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>)>) {
-    let res = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let res = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
     match res {
         Ok(rt) => {
             rt.block_on(async {
@@ -528,8 +537,7 @@ fn actor_entry(rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>)>) {
 /// `tools/list` on another. Sessions live in a plain `Mutex` map — guards
 /// are only ever held across synchronous code, never across an `.await`.
 async fn dispatcher(mut rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>)>) {
-    let conns: Arc<Mutex<HashMap<String, Arc<McpService>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let conns: Arc<Mutex<HashMap<String, Arc<McpService>>>> = Arc::new(Mutex::new(HashMap::new()));
     while let Some((cmd, reply)) = rx.recv().await {
         let conns = conns.clone();
         tokio::task::spawn_local(async move {
@@ -542,10 +550,7 @@ async fn dispatcher(mut rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>
                         Ok((svc, peer, pid)) => {
                             let tools = fetch_tools(&server, &svc).await.unwrap_or_default();
                             let svc = Arc::new(svc);
-                            conns
-                                .lock()
-                                .unwrap()
-                                .insert(server.clone(), svc);
+                            conns.lock().unwrap().insert(server.clone(), svc);
                             let _ = reply.send(McpReply::Connect {
                                 error: None,
                                 peer,
@@ -603,8 +608,7 @@ async fn dispatcher(mut rx: UnboundedReceiver<(McpCmd, UnboundedSender<McpReply>
                             // `CallToolRequestParams::new` wants a
                             // `Cow<'static, str>` — `tool` is an owned
                             // String, so hand it over by value.
-                            let params =
-                                CallToolRequestParams::new(tool).with_arguments(arguments);
+                            let params = CallToolRequestParams::new(tool).with_arguments(arguments);
                             match timeout(CALL_TIMEOUT, svc.call_tool_once(params)).await {
                                 Ok(Ok(CallToolResponse::Complete(result))) => {
                                     let failed = result.is_error == Some(true);
@@ -865,9 +869,7 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
             );
             Ok(())
         }
-        Ok(McpReply::Connect {
-            error: Some(e), ..
-        }) => {
+        Ok(McpReply::Connect { error: Some(e), .. }) => {
             state.mcp.read().await.meta_set(
                 name,
                 ConnMeta {
@@ -915,7 +917,9 @@ fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
         Some(m) if m.alive && m.error.is_none() => "connected".to_string(),
         Some(m) => format!(
             "error: {}",
-            m.error.clone().unwrap_or_else(|| "connection closed".into())
+            m.error
+                .clone()
+                .unwrap_or_else(|| "connection closed".into())
         ),
         None => "disconnected".to_string(),
     };
@@ -1153,7 +1157,11 @@ pub async fn tools_get(
             let m = state.mcp.read().await;
             m.meta_get(&spec.name)
                 .filter(|meta| meta.alive)
-                .map(|meta| meta.tools_at.map(|t| t.elapsed() > TOOLS_TTL).unwrap_or(true))
+                .map(|meta| {
+                    meta.tools_at
+                        .map(|t| t.elapsed() > TOOLS_TTL)
+                        .unwrap_or(true)
+                })
                 .unwrap_or(false)
         };
         if stale {
@@ -1166,10 +1174,7 @@ pub async fn tools_get(
             )
             .await
             {
-                Ok(McpReply::ListTools {
-                    error: None,
-                    tools,
-                }) => {
+                Ok(McpReply::ListTools { error: None, tools }) => {
                     let m = state.mcp.read().await;
                     let mut meta = m.meta_get(&spec.name).unwrap_or_default();
                     meta.tools = tools;
@@ -1177,10 +1182,7 @@ pub async fn tools_get(
                     meta.alive = true;
                     m.meta_set(&spec.name, meta);
                 }
-                Ok(McpReply::ListTools {
-                    error: Some(e),
-                    ..
-                }) => {
+                Ok(McpReply::ListTools { error: Some(e), .. }) => {
                     mark_dead(&state, &spec.name, e).await;
                     continue;
                 }
@@ -1189,8 +1191,7 @@ pub async fn tools_get(
                     continue;
                 }
                 Ok(_) => {
-                    mark_dead(&state, &spec.name, "unexpected MCP actor reply".to_string())
-                        .await;
+                    mark_dead(&state, &spec.name, "unexpected MCP actor reply".to_string()).await;
                     continue;
                 }
             }
@@ -1230,8 +1231,7 @@ async fn call_tool(
             let m = state.mcp.read().await;
             m.meta_get(&server)
         };
-        let Some(def) = meta
-            .and_then(|mt| mt.tools.iter().find(|d| d.mangled == name).cloned())
+        let Some(def) = meta.and_then(|mt| mt.tools.iter().find(|d| d.mangled == name).cloned())
         else {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1255,7 +1255,8 @@ async fn call_tool(
                 transport_dead: false,
             }) => return Ok((ok, output)),
             Ok(McpReply::Call {
-                transport_dead: true, ..
+                transport_dead: true,
+                ..
             }) => {
                 // Transport died mid-call: mark dead and reconnect once.
                 mark_dead(
@@ -1270,7 +1271,9 @@ async fn call_tool(
                 }
                 return Err((
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": "MCP connection dropped during the tool call and the retry failed" })),
+                    Json(
+                        json!({ "error": "MCP connection dropped during the tool call and the retry failed" }),
+                    ),
                 ));
             }
             Err(e) => {
@@ -1298,11 +1301,17 @@ pub async fn mcp_call(
     AxumState(state): AxumState<S>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let Some((server, _)) = split_mcp_name(&name) else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("'{name}' is not an MCP tool name (expected mcp__<server>__<tool>)") })),
+            Json(
+                json!({ "error": format!("'{name}' is not an MCP tool name (expected mcp__<server>__<tool>)") }),
+            ),
         ));
     };
     let server = server.to_string();
@@ -1341,7 +1350,10 @@ pub async fn mcp_call(
     // burn up to the init timeout on every call).
     {
         let m = state.mcp.read().await;
-        if let Some(meta) = m.meta_get(&server) && !meta.alive && failed_recently(&meta) {
+        if let Some(meta) = m.meta_get(&server)
+            && !meta.alive
+            && failed_recently(&meta)
+        {
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": meta
@@ -1482,7 +1494,8 @@ done
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let script = write_fake_server(&tmp);
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         let ws = || AxumState(state.clone());
 
         // Upsert → persisted + connected, with peer info, pid and tool count.
@@ -1506,7 +1519,9 @@ done
 
         // A spec with neither transport is rejected up front (400) and not
         // saved.
-        let e = servers_upsert(ws(), Json(json!({ "name": "notr" }))).await.unwrap_err();
+        let e = servers_upsert(ws(), Json(json!({ "name": "notr" })))
+            .await
+            .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
         let r = servers_get(ws()).await.0;
         assert_eq!(r.get("servers").unwrap().as_array().unwrap().len(), 1);
@@ -1584,9 +1599,12 @@ done
             .await
             .unwrap_err();
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
-        let e = mcp_call(ws(), Json(json!({ "name": "mcp__nope__x", "arguments": {} })))
-            .await
-            .unwrap_err();
+        let e = mcp_call(
+            ws(),
+            Json(json!({ "name": "mcp__nope__x", "arguments": {} })),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.0, StatusCode::NOT_FOUND);
 
         // A broken stdio command fails the connect (502) but the spec stays
@@ -1604,7 +1622,13 @@ done
             .iter()
             .find(|s| s.get("name").unwrap() == "bad")
             .unwrap();
-        assert!(bad.get("status").unwrap().as_str().unwrap().starts_with("error:"));
+        assert!(
+            bad.get("status")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("error:")
+        );
 
         // The dead server must not leak tools into the catalog.
         let t = tools_get(ws(), Query(HashMap::new())).await.0;
@@ -1631,7 +1655,10 @@ done
         .await; // connection fails fast (nothing on :9) — the spec stays saved
         let r = servers_get(ws()).await.0;
         let list = r.get("servers").unwrap().as_array().unwrap();
-        let auth = list.iter().find(|s| s.get("name").unwrap() == "auth").unwrap();
+        let auth = list
+            .iter()
+            .find(|s| s.get("name").unwrap() == "auth")
+            .unwrap();
         assert_eq!(auth.get("authorization").unwrap(), "***");
         let _ = servers_upsert(
             ws(),
@@ -1654,13 +1681,19 @@ done
         assert_eq!(stored.authorization.as_deref(), Some("Bearer abc123"));
 
         // Restart reopens the session (fake is still healthy).
-        let r = server_restart(ws(), AxumPath(String::from("fake"))).await.unwrap().0;
+        let r = server_restart(ws(), AxumPath(String::from("fake")))
+            .await
+            .unwrap()
+            .0;
         let one = r.get("servers").unwrap().as_array().unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].get("status").unwrap(), "connected");
 
         // Delete kills the session and removes the spec; a second delete 404s.
-        let d = server_delete(ws(), AxumPath(String::from("fake"))).await.unwrap().0;
+        let d = server_delete(ws(), AxumPath(String::from("fake")))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(d.get("ok").unwrap(), true);
         assert_eq!(d.get("removed").unwrap(), true);
         let r = servers_get(ws()).await.0;
@@ -1673,7 +1706,9 @@ done
             .map(|s| s.get("name").unwrap().as_str().unwrap())
             .collect();
         assert!(!names.contains(&"fake"));
-        let e = server_delete(ws(), AxumPath(String::from("fake"))).await.unwrap_err();
+        let e = server_delete(ws(), AxumPath(String::from("fake")))
+            .await
+            .unwrap_err();
         assert_eq!(e.0, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&tmp);

@@ -25,15 +25,14 @@
 //! new files the sandbox creates are low-labeled and stay writable. This
 //! matches the model codex runs on Windows.
 
-use super::{is_secret_env_var, ExecChild, SpawnReq};
+use super::{ExecChild, SpawnReq, is_secret_env_var};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_SUCCESS, GENERIC_READ, GetLastError, HANDLE_FLAG_INHERIT, HLOCAL, LocalFree,
-    SetHandleInformation,
+    BOOL, CloseHandle, ERROR_SUCCESS, GENERIC_READ, GetLastError, HANDLE_FLAG_INHERIT, HLOCAL,
+    LocalFree, SetHandleInformation,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT,
@@ -50,15 +49,17 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW, STARTF_USESTDHANDLES, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW, UpdateProcThreadAttribute,
 };
+use windows_sys::core::PCWSTR;
 /// `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL` — winnt.h value `0x00020012`,
 /// which windows-sys 0.59 does not export as a named constant.
 const PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL: usize = 0x0002_0012;
@@ -79,7 +80,10 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 fn last_os_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("Win32 error {}", unsafe { GetLastError() }))
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("Win32 error {}", unsafe { GetLastError() }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -107,15 +111,10 @@ fn pick_shell() -> &'static Shell {
             .arg("--version")
             .output()
             .map(|o| {
-                o.status.success()
-                    && !String::from_utf8_lossy(&o.stdout).contains("linux-gnu")
+                o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("linux-gnu")
             })
             .unwrap_or(false);
-        if native_bash {
-            Shell::Bash
-        } else {
-            Shell::Cmd
-        }
+        if native_bash { Shell::Bash } else { Shell::Cmd }
     });
     &SHELL
 }
@@ -136,7 +135,11 @@ pub fn shell_is_bash() -> bool {
 /// would make bash treat it as one program name, not a command line).
 fn command_line(shell: &Shell, script: &str) -> String {
     match shell {
-        Shell::Bash => format!("{} -lc {}", super::arg_quote("bash"), super::arg_quote(script)),
+        Shell::Bash => format!(
+            "{} -lc {}",
+            super::arg_quote("bash"),
+            super::arg_quote(script)
+        ),
         // `cmd /d /s /c` runs everything between the outer quotes verbatim
         // (degraded fallback only: POSIX-specific scripts need git-bash).
         Shell::Cmd => format!("{} /d /s /c \"{}\"", super::arg_quote("cmd"), script),
@@ -241,9 +244,7 @@ impl Drop for AclGuard {
 /// matched for deletion by permission mask + trustee, so removal is
 /// idempotent.
 fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
-    use windows_sys::Win32::Security::Authorization::{
-        NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_W,
-    };
+    use windows_sys::Win32::Security::Authorization::{NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_W};
     use windows_sys::Win32::Security::{ACL, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, PSID};
 
     let wide = to_wide(&path.to_string_lossy());
@@ -410,11 +411,14 @@ impl WinChild {
                         windows_sys::Win32::System::Threading::INFINITE,
                     );
                     let mut code: u32 = 0;
-                    let _ =
-                        windows_sys::Win32::System::Threading::GetExitCodeProcess(
-                            handle, &mut code,
-                        );
-                    if code == STILL_ACTIVE { -1 } else { code as i32 }
+                    let _ = windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                        handle, &mut code,
+                    );
+                    if code == STILL_ACTIVE {
+                        -1
+                    } else {
+                        code as i32
+                    }
                 };
                 let _ = tx.send(code);
             });
@@ -816,7 +820,9 @@ mod tests {
             "expected the kept var in: {entries:?}"
         );
         assert!(
-            !entries.iter().any(|e| e.starts_with("NINFIER_TEST_SECRET_XYZ=")),
+            !entries
+                .iter()
+                .any(|e| e.starts_with("NINFIER_TEST_SECRET_XYZ=")),
             "credential var leaked into the child env: {entries:?}"
         );
         unsafe {

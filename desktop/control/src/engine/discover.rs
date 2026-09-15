@@ -2,7 +2,11 @@
 
 /// Scan /proc for running `ninfer-serve` processes (Linux).
 pub async fn find_external_serve_pids() -> Vec<u32> {
-    discover_engines().await.into_iter().map(|d| d.pid).collect()
+    discover_engines()
+        .await
+        .into_iter()
+        .map(|d| d.pid)
+        .collect()
 }
 
 /// A locally-running ninfer-serve process discovered via /proc.
@@ -45,7 +49,11 @@ async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
         let Ok(cmdline) = tokio::fs::read_to_string(format!("/proc/{name}/cmdline")).await else {
             continue;
         };
-        let parts: Vec<String> = cmdline.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let parts: Vec<String> = cmdline
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         let is_serve = parts
             .first()
             .map(|p| p.ends_with("ninfer-serve"))
@@ -76,10 +84,7 @@ async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
             {
                 port = Some(p);
             }
-            if artifact.is_none()
-                && !args[i].starts_with('-')
-                && args[i].ends_with(".ninfer")
-            {
+            if artifact.is_none() && !args[i].starts_with('-') && args[i].ends_with(".ninfer") {
                 artifact = Some(args[i].clone());
             }
             i += 1;
@@ -132,7 +137,10 @@ fn discover_engines_windows() -> Vec<DiscoveredEngine> {
 
 #[cfg(windows)]
 fn tasklist_serve_pids() -> Vec<u32> {
-    let out = match std::process::Command::new("tasklist").args(["/FO", "CSV", "/NH"]).output() {
+    let out = match std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return Vec::new(),
     };
@@ -141,7 +149,10 @@ fn tasklist_serve_pids() -> Vec<u32> {
 
 #[cfg(windows)]
 fn netstat_listeners() -> Vec<(u16, u32)> {
-    let out = match std::process::Command::new("netstat").args(["-ano", "-p", "tcp"]).output() {
+    let out = match std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return Vec::new(),
     };
@@ -215,7 +226,10 @@ mod discovery_tests {
 
     #[test]
     fn tasklist_handles_garbage_lines() {
-        assert_eq!(parse_tasklist_serve_pids("INFO: No Task running\n\n"), Vec::<u32>::new());
+        assert_eq!(
+            parse_tasklist_serve_pids("INFO: No Task running\n\n"),
+            Vec::<u32>::new()
+        );
         // missing/invalid pid is skipped
         assert_eq!(
             parse_tasklist_serve_pids("\"ninfer-serve.exe\",\"\",\"Console\",\"1\",\"5 K\"\n"),
@@ -243,4 +257,3 @@ Active Connections
         assert_eq!(ls.len(), 3);
     }
 }
-

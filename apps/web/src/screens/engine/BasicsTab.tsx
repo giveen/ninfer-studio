@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Box, ChevronDown, Rocket } from 'lucide-react';
-import { Field, NumberField, SectionCard, SelectField, TextField, cn } from '../../components/ui';
+import { Field, NumberField, SectionCard, SelectField, TextField, Toggle, cn } from '../../components/ui';
 import { PRESETS } from '../../lib/presets';
 import type { EngineProfile, ModelArtifact } from '../../lib/types';
 
@@ -71,6 +71,14 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
           </Field>
           <Field label="API key" hint="When set, requests must send it as Bearer token or x-api-key. Studio injects it on proxied requests.">
             <TextField value={profile.apiKey || ''} onChange={(v) => setU('apiKey', v || undefined)} placeholder="unset (open)" />
+          </Field>
+          <Field label="Chat template" hint="Jinja chat template. Defaults to the artifact's embedded template.">
+            <Toggle checked={profile.chatTemplate !== undefined} onChange={(v) => { if (v) setU('chatTemplate', ''); else setU('chatTemplate', undefined); }} label="Custom template" />
+            {profile.chatTemplate !== undefined && (
+              <div className="mt-2">
+                <TextField value={profile.chatTemplate || ''} onChange={(v) => setU('chatTemplate', v || undefined)} placeholder="/path/to/template.jinja" />
+              </div>
+            )}
           </Field>
           <Field label="Listen host">
             <TextField value={profile.host || ''} onChange={(v) => setU('host', v || undefined)} placeholder="127.0.0.1" />

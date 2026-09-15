@@ -4,18 +4,28 @@
 //! resolution and the per-tool permission tier enforced at every endpoint.
 
 use crate::engine::S;
+use axum::Json;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Directories never descended into by tree/walk (mirrors the sidecar).
 pub(crate) const CODER_IGNORE: &[&str] = &[
-    "node_modules", ".git", "target", "dist", "build", ".next", ".turbo", ".cache", "vendor",
-    "__pycache__", ".venv", "venv",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
 ];
 
 /// Whether `base` is safe to use as a config-write directory: absolute and
@@ -30,7 +40,10 @@ pub(crate) fn is_safe_base_dir(base: &Path) -> bool {
 /// Canonical workspace root, or a 400 when none is configured.
 pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     if ws.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "no workspace configured"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no workspace configured"})),
+        ));
     }
     let p = PathBuf::from(ws);
     Ok(p.canonicalize().unwrap_or(p))
@@ -47,7 +60,10 @@ pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)>
 /// omitting it preserves the old fallback-to-global behavior for any caller
 /// not yet updated. Mirrors `memory.rs`'s `resolve_mem_dir`, which already
 /// used this pattern for the self-improving memory store.
-pub(crate) async fn resolve_ws(state: &S, override_path: Option<&str>) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+pub(crate) async fn resolve_ws(
+    state: &S,
+    override_path: Option<&str>,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     let ws = match override_path.map(str::trim).filter(|w| !w.is_empty()) {
         Some(w) => w.to_string(),
         None => state.config.read().await.coder_workspace.clone(),
@@ -78,14 +94,20 @@ pub(crate) fn within_ws(root: &Path, rel: &str) -> Result<PathBuf, (StatusCode, 
             Component::CurDir => {}
             Component::ParentDir => {
                 if !norm.pop() {
-                    return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path escapes workspace"}))));
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "path escapes workspace"})),
+                    ));
                 }
             }
             c => norm.push(c.as_os_str()),
         }
     }
     if !norm.starts_with(root) {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path escapes workspace"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path escapes workspace"})),
+        ));
     }
     Ok(joined)
 }
@@ -171,7 +193,9 @@ pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
         return *t;
     }
     if let Some((server, _)) = crate::mcp::split_mcp_name(name)
-        && let Some(t) = perms.tools.get(&format!("{}{server}", crate::mcp::MCP_PREFIX))
+        && let Some(t) = perms
+            .tools
+            .get(&format!("{}{server}", crate::mcp::MCP_PREFIX))
     {
         return *t;
     }
@@ -183,10 +207,18 @@ pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
 /// `ask`-tiered tool call, in addition to (not instead of) resolving that
 /// dialog's own in-memory promise. Returns `{token}`, which the client then
 /// attaches to the actual tool-call request as `approvalToken`.
-pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn perms_approve(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tool = match req.get("tool").and_then(|v| v.as_str()) {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "tool required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "tool required"})),
+            ));
+        }
     };
     let scope = perm_scope(&req);
     let rel = req
@@ -194,11 +226,25 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
         .and_then(|v| v.as_str())
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
-    let token = format!("apr_{:x}_{}", crate::types::now_ms(), state.coder_approval_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let token = format!(
+        "apr_{:x}_{}",
+        crate::types::now_ms(),
+        state
+            .coder_approval_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
     let now = Instant::now();
     let mut approvals = state.coder_approvals.lock().await;
     approvals.retain(|_, t| t.expires_at > now); // opportunistic cleanup
-    approvals.insert(token.clone(), ApprovalTicket { scope, tool, rel, expires_at: now + APPROVAL_TTL });
+    approvals.insert(
+        token.clone(),
+        ApprovalTicket {
+            scope,
+            tool,
+            rel,
+            expires_at: now + APPROVAL_TTL,
+        },
+    );
     Ok(Json(json!({"token": token})))
 }
 
@@ -211,7 +257,13 @@ pub async fn perms_approve(AxumState(state): AxumState<S>, Json(req): Json<Value
 /// `scope` selects which caller's tier bucket applies (see `perm_scope`) —
 /// two independent callers (e.g. Coder and Chat's Computer Use) using
 /// different scopes never see or affect each other's tiers.
-pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option<&str>, approval_token: Option<&str>) -> Result<(), (StatusCode, Json<Value>)> {
+pub(crate) async fn enforce_perm(
+    state: &S,
+    scope: &str,
+    tool: &str,
+    rel: Option<&str>,
+    approval_token: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     let all_perms = state.coder_perms.read().await;
     let perms = all_perms.get(scope).cloned().unwrap_or_default();
     drop(all_perms);
@@ -225,16 +277,18 @@ pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option
     if tier == PermTier::Ask {
         let now = Instant::now();
         let mut approvals = state.coder_approvals.lock().await;
-        let matches = approval_token.and_then(|t| approvals.get(t)).is_some_and(|tk| {
-            tk.expires_at > now
-                && tk.scope == scope
-                && tk.tool == tool
-                && match (&tk.rel, rel) {
-                    (None, _) => true,
-                    (Some(tr), Some(r)) => r == tr || r.starts_with(&format!("{tr}/")),
-                    (Some(_), None) => false,
-                }
-        });
+        let matches = approval_token
+            .and_then(|t| approvals.get(t))
+            .is_some_and(|tk| {
+                tk.expires_at > now
+                    && tk.scope == scope
+                    && tk.tool == tool
+                    && match (&tk.rel, rel) {
+                        (None, _) => true,
+                        (Some(tr), Some(r)) => r == tr || r.starts_with(&format!("{tr}/")),
+                        (Some(_), None) => false,
+                    }
+            });
         if matches {
             // Single-use: an approval covers exactly the one call it was granted for.
             if let Some(t) = approval_token {
@@ -243,7 +297,9 @@ pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option
         } else {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("'{tool}' requires interactive approval (no valid approval token)")})),
+                Json(
+                    json!({"error": format!("'{tool}' requires interactive approval (no valid approval token)")}),
+                ),
             ));
         }
     }
@@ -262,10 +318,16 @@ pub(crate) async fn enforce_perm(state: &S, scope: &str, tool: &str, rel: Option
     Ok(())
 }
 
-pub async fn perms_get(AxumState(state): AxumState<S>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+pub async fn perms_get(
+    AxumState(state): AxumState<S>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
     let scope = q.get("scope").map(String::as_str).unwrap_or("default");
     let all_perms = state.coder_perms.read().await;
-    Json(serde_json::to_value(all_perms.get(scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+    Json(
+        serde_json::to_value(all_perms.get(scope).cloned().unwrap_or_default())
+            .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
+    )
 }
 
 pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
@@ -273,8 +335,14 @@ pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
     if let Ok(parsed) = serde_json::from_value::<CoderPerms>(req) {
         let mut all_perms = state.coder_perms.write().await;
         all_perms.insert(scope.clone(), parsed);
-        return Json(serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})));
+        return Json(
+            serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default())
+                .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
+        );
     }
     let all_perms = state.coder_perms.read().await;
-    Json(serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default()).unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})))
+    Json(
+        serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default())
+            .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
+    )
 }

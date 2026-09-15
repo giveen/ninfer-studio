@@ -1,14 +1,15 @@
 //! Engine spawn / stop / signal + the public engine view.
-use crate::types::{
-    build_serve_args, AppEvent, AppSettings, EngineInner, EngineProfile, EngineState, LastStart, State, now_ms,
-};
-use serde_json::{json, Value};
-use std::time::Duration;
+use super::S;
 use super::discover::discover_engines;
 use super::health::{argv_max_context, engine_health, engine_model_info};
 use super::log::{log_path_for, rotate_log_if_large};
 use super::status::{adopt_external, resolve_external_pid};
-use super::S;
+use crate::types::{
+    AppEvent, AppSettings, EngineInner, EngineProfile, EngineState, LastStart, State,
+    build_serve_args, now_ms,
+};
+use serde_json::{Value, json};
+use std::time::Duration;
 
 /// Startup grace period (ms): how long a freshly spawned engine has to report
 /// healthy before it's marked failed.
@@ -45,7 +46,8 @@ async fn validate_launch(state: &S, cfg: &AppSettings) -> Result<std::path::Path
     // ninfer-serve before the engine can start.
     let ninfer_path = cfg.ninfer_path.trim();
     if ninfer_path.is_empty() {
-        let reason = "Ninfer path not configured — open Settings and set the Ninfer path.".to_string();
+        let reason =
+            "Ninfer path not configured — open Settings and set the Ninfer path.".to_string();
         let mut eng = state.engine.write().await;
         fail_and_emit(
             &mut eng,
@@ -142,7 +144,9 @@ async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Res
     if let Ok(mut f) = std::fs::File::open(artifact_path) {
         use std::io::Read;
         let mut magic = [0u8; 8];
-        if f.read_exact(&mut magic).is_ok() && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0")) {
+        if f.read_exact(&mut magic).is_ok()
+            && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0"))
+        {
             let version = magic[7] as u32;
             if version < 3 {
                 return Err(json!({
@@ -360,7 +364,11 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         };
         *state.last_start.write().await = Some(last_start.clone());
         let path = state.data_dir.join("last-start.json");
-        let _ = crate::atomic_write(&path, serde_json::to_string(&last_start).unwrap_or_default()).await;
+        let _ = crate::atomic_write(
+            &path,
+            serde_json::to_string(&last_start).unwrap_or_default(),
+        )
+        .await;
     }
 
     let (log_file_path, log) = match open_engine_log(state, port).await {
@@ -368,7 +376,16 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         Err(resp) => return resp,
     };
 
-    spawn_and_attach(state, &engine_binary, &artifact, &args, port, log_file_path, log).await
+    spawn_and_attach(
+        state,
+        &engine_binary,
+        &artifact,
+        &args,
+        port,
+        log_file_path,
+        log,
+    )
+    .await
 }
 
 pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
@@ -491,4 +508,3 @@ pub fn public_engine(eng: &EngineInner) -> Value {
         "failReason": eng.fail_reason,
     })
 }
-

@@ -1,9 +1,9 @@
 //! Reconcile in-memory engine state with reality (health, child liveness, external adoption).
-use crate::types::{AppEvent, EngineInner, EngineState, State, now_ms};
 use super::discover::{DiscoveredEngine, discover_engines};
 use super::health::{engine_health, engine_model_info};
 use super::launch::{ENGINE_START_TIMEOUT_MS, start_timeout_message};
 use super::log::log_path_for;
+use crate::types::{AppEvent, EngineInner, EngineState, State, now_ms};
 
 /// Reconcile in-memory state with reality (health, child liveness, external adoption).
 pub async fn refresh_engine_status(state: &State) {
@@ -112,7 +112,11 @@ pub async fn refresh_engine_status(state: &State) {
 /// netstat failed) and only when the port is the configured default — never
 /// a process bound to a *different* port, which would record (and later let
 /// Stop kill) somebody else's engine.
-pub fn resolve_external_pid(all: &[DiscoveredEngine], port: Option<u16>, cfg_port: u16) -> Option<u32> {
+pub fn resolve_external_pid(
+    all: &[DiscoveredEngine],
+    port: Option<u16>,
+    cfg_port: u16,
+) -> Option<u32> {
     all.iter()
         .find(|d| d.port == port)
         .map(|d| d.pid)
@@ -138,7 +142,10 @@ pub async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
     eng.port = Some(port);
     eng.pid = resolve_external_pid(&all, Some(port), cfg_port);
     eng.argv = disc.map(|d| d.argv.clone());
-    eng.artifact = eng.artifact.clone().or_else(|| disc.and_then(|d| d.artifact.clone()));
+    eng.artifact = eng
+        .artifact
+        .clone()
+        .or_else(|| disc.and_then(|d| d.artifact.clone()));
     let (mid, mctx) = engine_model_info(state, port).await;
     eng.assign_model_info(mid, mctx);
     eng.fail_reason = None;
@@ -147,10 +154,15 @@ pub async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
 
 #[cfg(test)]
 mod adopt_policy_tests {
-    use super::{resolve_external_pid, DiscoveredEngine};
+    use super::{DiscoveredEngine, resolve_external_pid};
 
     fn disc(pid: u32, port: Option<u16>) -> DiscoveredEngine {
-        DiscoveredEngine { pid, port, argv: vec![], artifact: None }
+        DiscoveredEngine {
+            pid,
+            port,
+            argv: vec![],
+            artifact: None,
+        }
     }
 
     #[test]
@@ -188,8 +200,10 @@ mod adopt_policy_tests {
             (crate::types::EngineState::Stopping, "stopping"),
             (crate::types::EngineState::Failed, "failed"),
         ] {
-            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::Value::String(wire.into()));
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::Value::String(wire.into())
+            );
         }
     }
 }
-

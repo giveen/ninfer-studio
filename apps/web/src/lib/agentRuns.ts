@@ -104,6 +104,8 @@ export interface StartRunBody {
   kind?: string;
   label?: string;
   model?: string;
+  baseUrl?: string;
+  apiKey?: string;
   system?: string | null;
   maxSteps?: number;
   /** 'chat' | 'coder' — selects the tool table the server enforces. */

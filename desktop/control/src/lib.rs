@@ -25,19 +25,19 @@ pub mod routes_engine;
 pub mod sandbox;
 pub mod types;
 pub mod usage;
-use crate::engine::{engine_health, refresh_engine_status, S};
-use crate::types::{strip_extended_prefix, AppEvent, AppSettings, LastStart, State};
-use tokio::sync::mpsc::UnboundedSender;
+use crate::engine::{S, engine_health, refresh_engine_status};
+use crate::types::{AppEvent, AppSettings, LastStart, State, strip_extended_prefix};
+use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Router;
-use serde_json::{json, Value};
-use tokio::io::AsyncBufReadExt;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Cap on a request body this control plane will buffer in memory — large
 /// enough for chat/coder payloads (file attachments, long conversations)
@@ -115,15 +115,27 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
     // Tag every request on this router with its listener, read back by
     // `proxy::proxy` for usage logging (see `usage.rs`) — the loopback
     // listener passes `restrict_to_local: true`, Remote Access `false`.
-    let request_source =
-        if restrict_to_local { crate::usage::RequestSource::Local } else { crate::usage::RequestSource::Remote };
+    let request_source = if restrict_to_local {
+        crate::usage::RequestSource::Local
+    } else {
+        crate::usage::RequestSource::Remote
+    };
     let router = Router::new()
         .route("/api/usage", get(usage::usage_stats))
         .route("/api/health", get(routes_engine::health))
         .route("/api/status", get(routes_engine::status))
-        .route("/api/config", get(routes_config::get_config).post(routes_config::set_config))
-        .route("/api/profile-state", get(routes_config::profile_state_get).post(routes_config::profile_state_set))
-        .route("/api/conversations", get(routes_config::conversations_get).post(routes_config::conversations_set))
+        .route(
+            "/api/config",
+            get(routes_config::get_config).post(routes_config::set_config),
+        )
+        .route(
+            "/api/profile-state",
+            get(routes_config::profile_state_get).post(routes_config::profile_state_set),
+        )
+        .route(
+            "/api/conversations",
+            get(routes_config::conversations_get).post(routes_config::conversations_set),
+        )
         .route("/api/engine/start", post(routes_engine::engine_start))
         .route("/api/engine/stop", post(routes_engine::engine_stop))
         .route("/api/logs", get(routes_data::logs))
@@ -135,7 +147,10 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/engine/args", post(routes_engine::engine_args))
         .route("/api/gpu", get(routes_data::gpu))
         // Coding harness — control-plane endpoints
-        .route("/api/coder/workspace", get(coder::workspace_get).post(coder::workspace_set))
+        .route(
+            "/api/coder/workspace",
+            get(coder::workspace_get).post(coder::workspace_set),
+        )
         .route("/api/coder/tree", get(coder::tree))
         .route("/api/coder/dirs", get(coder::dirs))
         .route("/api/coder/repo_map", get(coder::repo_map))
@@ -145,22 +160,52 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/coder/exec", post(coder::exec))
         .route("/api/coder/jobs/{id}", get(coder::job_get))
         .route("/api/coder/jobs/{id}/kill", post(coder::job_kill))
-        .route("/api/coder/safe-mode", get(coder::safe_mode_get).post(coder::safe_mode_set))
-        .route("/api/coder/commit-approval", get(coder::commit_approval_get).post(coder::commit_approval_set))
-        .route("/api/chat/agent-research", get(chat::agent_research_get).post(chat::agent_research_set))
-        .route("/api/chat/memory-enabled", get(chat::memory_enabled_get).post(chat::memory_enabled_set))
-        .route("/api/chat/reflection-enabled", get(chat::reflection_enabled_get).post(chat::reflection_enabled_set))
-        .route("/api/chat/deep-research-enabled", get(chat::deep_research_enabled_get).post(chat::deep_research_enabled_set))
-        .route("/api/coder/sandbox", get(coder::sandbox_get).post(coder::sandbox_set))
+        .route(
+            "/api/coder/safe-mode",
+            get(coder::safe_mode_get).post(coder::safe_mode_set),
+        )
+        .route(
+            "/api/coder/commit-approval",
+            get(coder::commit_approval_get).post(coder::commit_approval_set),
+        )
+        .route(
+            "/api/chat/agent-research",
+            get(chat::agent_research_get).post(chat::agent_research_set),
+        )
+        .route(
+            "/api/chat/memory-enabled",
+            get(chat::memory_enabled_get).post(chat::memory_enabled_set),
+        )
+        .route(
+            "/api/chat/reflection-enabled",
+            get(chat::reflection_enabled_get).post(chat::reflection_enabled_set),
+        )
+        .route(
+            "/api/chat/deep-research-enabled",
+            get(chat::deep_research_enabled_get).post(chat::deep_research_enabled_set),
+        )
+        .route(
+            "/api/coder/sandbox",
+            get(coder::sandbox_get).post(coder::sandbox_set),
+        )
         .route("/api/coder/search", get(coder::search))
         .route("/api/coder/diff", get(coder::diff))
-        .route("/api/coder/perms", get(coder::perms_get).post(coder::perms_set))
+        .route(
+            "/api/coder/perms",
+            get(coder::perms_get).post(coder::perms_set),
+        )
         .route("/api/coder/perms/approve", post(coder::perms_approve))
         .route("/api/coder/fs/b64", post(coder::fs_b64))
         .route("/api/coder/fs/patch", post(coder::fs_patch))
         .route("/api/coder/grep", post(coder::grep))
-        .route("/api/coder/memory", get(coder::memory_get).post(coder::memory_set))
-        .route("/api/chat/memory", get(chat::memory_get).post(chat::memory_set))
+        .route(
+            "/api/coder/memory",
+            get(coder::memory_get).post(coder::memory_set),
+        )
+        .route(
+            "/api/chat/memory",
+            get(chat::memory_get).post(chat::memory_set),
+        )
         .route("/api/coder/glob", post(coder::glob))
         .route("/api/coder/web/fetch", post(coder::web_fetch))
         .route("/api/coder/browser", post(coder::browser))
@@ -168,7 +213,10 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         // MCP — external tool servers (stdio / streamable-HTTP); their tools
         // reach the agent loop as `mcp__<server>__<tool>` through the same
         // allow/ask/deny tiers as the built-in tools (see `mcp.rs`).
-        .route("/api/mcp/servers", get(mcp::servers_get).post(mcp::servers_upsert))
+        .route(
+            "/api/mcp/servers",
+            get(mcp::servers_get).post(mcp::servers_upsert),
+        )
         .route("/api/mcp/servers/{name}", post(mcp::server_delete))
         .route("/api/mcp/servers/{name}/restart", post(mcp::server_restart))
         .route("/api/mcp/tools", get(mcp::tools_get))
@@ -183,9 +231,7 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))
         .layer(axum::extract::Extension(request_source))
         .with_state(state)
-        .fallback_service(
-            tower_http::services::ServeDir::new(dist).not_found_service(spa),
-        );
+        .fallback_service(tower_http::services::ServeDir::new(dist).not_found_service(spa));
     if !restrict_to_local {
         return router;
     }
@@ -215,12 +261,26 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
 /// attacker page rebinds its own domain to 127.0.0.1 and the browser sends
 /// same-origin requests with the attacker's Host header. Checking Host closes
 /// that vector for every route at once.
-async fn guard_local_host(req: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
-    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+async fn guard_local_host(
+    req: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
     // Strip the port ("[::1]:8787" -> "[::1]"); IPv6 literals keep brackets.
     let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    let host_ok = matches!(bare, "127.0.0.1" | "localhost" | "[::1]" | "::1" | "tauri.localhost");
-    let origin_ok = match req.headers().get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+    let host_ok = matches!(
+        bare,
+        "127.0.0.1" | "localhost" | "[::1]" | "::1" | "tauri.localhost"
+    );
+    let origin_ok = match req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+    {
         Some(o) => {
             let bare = o
                 .trim_start_matches("http://")
@@ -279,7 +339,13 @@ pub async fn boot_adopt(state: &S) {
     let port = state.config.read().await.engine_port;
     let mut eng = state.engine.write().await;
     eng.port = Some(port);
-    eng.log_path = Some(state.data_dir.join(format!("engine-{port}.log")).to_string_lossy().to_string());
+    eng.log_path = Some(
+        state
+            .data_dir
+            .join(format!("engine-{port}.log"))
+            .to_string_lossy()
+            .to_string(),
+    );
     drop(eng);
     if engine_health(port).await {
         refresh_engine_status(state).await;
@@ -442,24 +508,33 @@ mod log_pump_tests {
         assert_eq!(lines.len(), LOG_TAIL_LINES);
         // Oldest lines dropped, newest kept, in order.
         assert_eq!(lines[0], "line-5");
-        assert_eq!(lines.last().unwrap(), &format!("line-{}", LOG_TAIL_LINES + 4));
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("line-{}", LOG_TAIL_LINES + 4)
+        );
     }
 
     #[tokio::test]
     async fn pump_log_lines_truncates_long_lines_and_stops_at_eof() {
         let input = format!("short\n{}\nend\n", "x".repeat(LOG_TAIL_LINE_CHARS + 100));
         let mut out = String::new();
-        pump_log_lines(tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes())), |line| {
-            // read_line hands each line WITH its trailing newline; EOF ends
-            // the loop with no extra empty line (3 lines in → 3 invocations).
-            out.push_str(&line);
-            async {}
-        })
+        pump_log_lines(
+            tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            |line| {
+                // read_line hands each line WITH its trailing newline; EOF ends
+                // the loop with no extra empty line (3 lines in → 3 invocations).
+                out.push_str(&line);
+                async {}
+            },
+        )
         .await;
         // Truncating the 2100-char line to 2000 chars chops off its trailing
         // newline, so the next line concatenates onto it (pre-existing
         // behavior of the original pumps; only a cosmetic edge case for
         // abnormally long lines).
-        assert_eq!(out, format!("short\n{}end\n", "x".repeat(LOG_TAIL_LINE_CHARS)));
+        assert_eq!(
+            out,
+            format!("short\n{}end\n", "x".repeat(LOG_TAIL_LINE_CHARS))
+        );
     }
 }

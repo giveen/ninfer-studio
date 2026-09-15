@@ -112,6 +112,7 @@ export async function streamChat(
   body: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
+  opts?: { baseUrl?: string; apiKey?: string }
 ): Promise<void> {
   const t0 = performance.now();
   const meta: MessageMeta = {};
@@ -166,9 +167,18 @@ export async function streamChat(
   };
 
   try {
-    const r = await fetch(API_BASE + '/v1/chat/completions', {
+    const endpoint = API_BASE + '/v1/chat/completions';
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (opts?.baseUrl) {
+      headers['x-ninfer-base-url'] = opts.baseUrl;
+    }
+    if (opts?.apiKey) {
+      headers['x-ninfer-api-key'] = opts.apiKey;
+    }
+    
+    const r = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
       signal,
     });
@@ -345,6 +355,8 @@ export function frameCompactedSummary(summary: string): string {
  */
 export function summarizeConversation(opts: {
   model: string;
+  baseUrl?: string;
+  apiKey?: string;
   systemPrompt?: string;
   history: ChatMessage[];
   onDelta?: (text: string) => void;
@@ -380,7 +392,7 @@ export function summarizeConversation(opts: {
         resolve(acc.trim());
       },
       onError: (m) => reject(new Error(m)),
-    });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
   });
 }
 
@@ -430,6 +442,8 @@ export function parseReflectionVerdict(raw: string): string | null {
 
 export function critiqueChatReply(opts: {
   model: string;
+  baseUrl?: string;
+  apiKey?: string;
   history: ChatMessage[];
   reply: string;
   maxTokens?: number;
@@ -445,7 +459,7 @@ export function critiqueChatReply(opts: {
       onContentDelta: (d) => { acc += d; },
       onDone: () => resolve(signal.aborted ? null : parseReflectionVerdict(acc)),
       onError: () => resolve(null),
-    });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
   });
 }
 
@@ -455,6 +469,8 @@ export function critiqueChatReply(opts: {
  *  on failure/abort/empty output so the caller keeps the original reply. */
 export function regenerateChatReply(opts: {
   model: string;
+  baseUrl?: string;
+  apiKey?: string;
   system: string | undefined;
   history: ChatMessage[];
   originalReply: string;
@@ -475,7 +491,7 @@ export function regenerateChatReply(opts: {
       onContentDelta: (d) => { acc += d; },
       onDone: () => resolve(signal.aborted ? null : (acc.trim() || null)),
       onError: () => resolve(null),
-    });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
   });
 }
 
@@ -662,7 +678,7 @@ function parseFollowUps(raw: string): string[] {
 
 /** Ask the engine for 3 suggested follow-up questions given `history` (which
  *  should already end in the assistant's just-completed reply). */
-export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
+export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey?: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
   const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
   const params: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 200 };
   const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
@@ -674,7 +690,7 @@ export function suggestFollowUps(opts: { model: string; history: ChatMessage[]; 
       },
       onDone: () => resolve(parseFollowUps(acc)),
       onError: (m) => reject(new Error(m)),
-    });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
   });
 }
 

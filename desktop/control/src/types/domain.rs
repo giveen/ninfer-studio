@@ -185,4 +185,3 @@ pub struct JobRec {
     pub speed_bps: Option<f64>,
     pub started_at: u64,
 }
-

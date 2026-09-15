@@ -4,7 +4,7 @@
 
 import { frameCompactedSummary } from './api';
 import { effectiveSystemPrompt } from './notai';
-import type { ChatMessage, ChatParams, Conversation } from './types';
+import type { ChatMessage, ChatParams, Conversation, AppSettings } from './types';
 import type { CoderMemory } from './api/coder';
 import { TOOLS, mcpToolTier, type PermConfig } from './coderTools';
 
@@ -286,4 +286,29 @@ export function normalizeParams(raw: unknown): ChatParams {
     return { ...DEFAULT_PARAMS, ...p, maxTokens: undefined, ...pickDefined(p) };
   }
   return { ...DEFAULT_PARAMS, maxTokens: undefined, greedy: undefined, seed: undefined, temperature: undefined, topP: undefined, topK: undefined, minP: undefined, presencePenalty: undefined, frequencyPenalty: undefined };
+}
+
+/**
+ * Resolves the effective provider configuration (baseUrl, apiKey, and model)
+ * based on the requested role (primary or subagent).
+ */
+export function resolveProviderConfig(
+  role: 'primary' | 'subagent',
+  appConfig: AppSettings | null,
+  params: Record<string, any>,
+  fallbackModel?: string
+): { baseUrl?: string; apiKey?: string; model: string } {
+  const isCloud = appConfig?.cloudProviderEnabled && params[`${role}Provider`] === 'cloud';
+  
+  if (isCloud) {
+    return {
+      baseUrl: appConfig.cloudProviderBaseUrl,
+      apiKey: appConfig.cloudProviderApiKey,
+      model: params[`${role}CloudModel`] || 'gpt-4o',
+    };
+  }
+  
+  return {
+    model: fallbackModel || 'ninfer',
+  };
 }

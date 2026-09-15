@@ -24,27 +24,27 @@ pub(crate) mod search;
 pub(crate) mod web;
 pub(crate) mod workspace;
 
-pub use browser::{browser, BrowserSlot};
 /// The actor's panic guard — reused by `mcp` (its sessions are `!Send` for
 /// the same reason `BrowserSlot`'s Page is).
 pub(crate) use browser::PanicGuard;
-pub use common::{perms_approve, perms_get, perms_set, ApprovalTicket, CoderPerms, PermTier};
+pub use browser::{BrowserSlot, browser};
+pub use common::{ApprovalTicket, CoderPerms, PermTier, perms_approve, perms_get, perms_set};
 /// Internal permission machinery, reused by `mcp` (tool calls go through the
 /// same allow/ask/deny gate as the built-in coder tools).
 pub(crate) use common::{enforce_perm, is_safe_base_dir, perm_scope, tier_for};
-pub use exec::{
-    commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
-    safe_mode_set, sandbox_get, sandbox_set, BgJob,
-};
 /// Crate-internal only — reused by `chat`'s Agent Mode toggles so they don't
 /// duplicate the read-merge-write shape.
 pub(crate) use exec::persist_bool_setting;
+pub use exec::{
+    BgJob, commit_approval_get, commit_approval_set, exec, job_get, job_kill, safe_mode_get,
+    safe_mode_set, sandbox_get, sandbox_set,
+};
 pub use fs::{fs_b64, fs_edit, fs_patch, fs_read, fs_write, tree};
 pub use grep::{glob, grep};
-pub use memory::{memory_get, memory_set, MemQuery};
-pub use search::{diff, repo_map, search, SearchQuery, SymHit};
+pub use memory::{MemQuery, memory_get, memory_set};
+pub use search::{SearchQuery, SymHit, diff, repo_map, search};
 pub use web::{web_fetch, web_search};
-pub use workspace::{dirs, workspace_get, workspace_set, WorkspaceReq, WorkspaceResp};
+pub use workspace::{WorkspaceReq, WorkspaceResp, dirs, workspace_get, workspace_set};
 
 #[cfg(test)]
 mod tests {
@@ -62,36 +62,55 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("ninfier-coder-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
         let ws = || AxumState(state.clone());
 
         // write (creates parents) then read back
-        let w = fs_write(ws(), Json(json!({"path": "sub/hello.txt", "content": "line1\nline2\n"})))
+        let w = fs_write(
+            ws(),
+            Json(json!({"path": "sub/hello.txt", "content": "line1\nline2\n"})),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(w.get("created").and_then(|v| v.as_bool()), Some(true));
+        let r = fs_read(ws(), Json(json!({"path": "sub/hello.txt"})))
             .await
             .unwrap()
             .0;
-        assert_eq!(w.get("created").and_then(|v| v.as_bool()), Some(true));
-        let r = fs_read(ws(), Json(json!({"path": "sub/hello.txt"}))).await.unwrap().0;
-        assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("line1\nline2\n"));
+        assert_eq!(
+            r.get("content").and_then(|v| v.as_str()),
+            Some("line1\nline2\n")
+        );
         assert_eq!(r.get("truncated").and_then(|v| v.as_bool()), Some(false));
 
         // exact edit, then a whitespace-fuzzy edit
-        let e = fs_edit(ws(), Json(json!({"path": "sub/hello.txt", "old": "line2", "new": "LINE2"})))
-            .await
-            .unwrap()
-            .0;
+        let e = fs_edit(
+            ws(),
+            Json(json!({"path": "sub/hello.txt", "old": "line2", "new": "LINE2"})),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(e.get("replacements").and_then(|v| v.as_u64()), Some(1));
-        let e2 = fs_edit(ws(), Json(json!({"path": "sub/hello.txt", "old": "\n  LINE2  \n", "new": "done"})))
-            .await
-            .unwrap()
-            .0;
+        let e2 = fs_edit(
+            ws(),
+            Json(json!({"path": "sub/hello.txt", "old": "\n  LINE2  \n", "new": "done"})),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(e2.get("replacements").and_then(|v| v.as_u64()), Some(1));
         // ambiguous exact edit is refused, not silently applied
-        let e3 = fs_edit(ws(), Json(json!({"path": "sub/hello.txt", "old": "e", "new": "x"})))
-            .await
-            .unwrap()
-            .0;
+        let e3 = fs_edit(
+            ws(),
+            Json(json!({"path": "sub/hello.txt", "old": "e", "new": "x"})),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(e3.get("replacements").and_then(|v| v.as_u64()), Some(0));
 
         // tree lists the new dir; glob `**` crosses directories, `*` does not
@@ -106,7 +125,10 @@ mod tests {
             .filter_map(|n| n.get("name").and_then(|v| v.as_str()))
             .collect();
         assert!(names.contains(&"sub"));
-        let g = glob(ws(), Json(json!({"pattern": "**/*.txt"}))).await.unwrap().0;
+        let g = glob(ws(), Json(json!({"pattern": "**/*.txt"})))
+            .await
+            .unwrap()
+            .0;
         let files: Vec<&str> = g
             .get("files")
             .and_then(|v| v.as_array())
@@ -115,34 +137,102 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(files.contains(&"sub/hello.txt"));
-        let g2 = glob(ws(), Json(json!({"pattern": "*.txt"}))).await.unwrap().0;
-        assert!(g2.get("files").and_then(|v| v.as_array()).unwrap().is_empty());
+        let g2 = glob(ws(), Json(json!({"pattern": "*.txt"})))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            g2.get("files")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .is_empty()
+        );
 
         // stateful exec: cd persists within a session id
-        let x = exec(ws(), Json(json!({"command": "echo hi", "sessionId": "t1"}))).await.unwrap().0;
+        let x = exec(ws(), Json(json!({"command": "echo hi", "sessionId": "t1"})))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(x.get("exitCode").and_then(|v| v.as_i64()), Some(0));
-        assert!(x.get("stdout").and_then(|v| v.as_str()).unwrap().contains("hi"));
-        let _ = exec(ws(), Json(json!({"command": "cd sub", "sessionId": "t1"}))).await.unwrap();
-        let x2 = exec(ws(), Json(json!({"command": "pwd", "sessionId": "t1"}))).await.unwrap().0;
-        assert!(x2.get("stdout").and_then(|v| v.as_str()).unwrap().trim().ends_with("sub"));
+        assert!(
+            x.get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("hi")
+        );
+        let _ = exec(ws(), Json(json!({"command": "cd sub", "sessionId": "t1"})))
+            .await
+            .unwrap();
+        let x2 = exec(ws(), Json(json!({"command": "pwd", "sessionId": "t1"})))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            x2.get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .trim()
+                .ends_with("sub")
+        );
         // traversal escapes the workspace
-        assert!(fs_read(ws(), Json(json!({"path": "../escape"}))).await.is_err());
+        assert!(
+            fs_read(ws(), Json(json!({"path": "../escape"})))
+                .await
+                .is_err()
+        );
         // safe mode blocks, and can be toggled
-        let b = exec(ws(), Json(json!({"command": "rm -rf /"}))).await.unwrap().0;
+        let b = exec(ws(), Json(json!({"command": "rm -rf /"})))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(b.get("blocked").and_then(|v| v.as_bool()), Some(true));
         let _ = safe_mode_set(ws(), Json(json!({"enabled": false}))).await;
-        assert_eq!(safe_mode_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            safe_mode_get(ws())
+                .await
+                .0
+                .get("enabled")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
         let _ = safe_mode_set(ws(), Json(json!({"enabled": true}))).await;
 
         // commit approval defaults off, and can be toggled (mirrors safe mode)
-        assert_eq!(commit_approval_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            commit_approval_get(ws())
+                .await
+                .0
+                .get("enabled")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
         let _ = commit_approval_set(ws(), Json(json!({"enabled": true}))).await;
-        assert_eq!(commit_approval_get(ws()).await.0.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            commit_approval_get(ws())
+                .await
+                .0
+                .get("enabled")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         // b64 + dirs
-        let b64 = fs_b64(ws(), Json(json!({"path": "sub/hello.txt"}))).await.unwrap().0;
-        assert!(b64.get("dataUrl").and_then(|v| v.as_str()).unwrap().starts_with("data:application/octet-stream;base64,"));
-        let d = dirs(Query(HashMap::from([("root".to_string(), tmp.to_string_lossy().into_owned())]))).await.0;
+        let b64 = fs_b64(ws(), Json(json!({"path": "sub/hello.txt"})))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            b64.get("dataUrl")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("data:application/octet-stream;base64,")
+        );
+        let d = dirs(Query(HashMap::from([(
+            "root".to_string(),
+            tmp.to_string_lossy().into_owned(),
+        )])))
+        .await
+        .0;
         let dirs: Vec<&str> = d
             .get("dirs")
             .and_then(|v| v.as_array())
@@ -165,7 +255,8 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("ninfier-perms-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
         let ws = || AxumState(state.clone());
 
@@ -173,21 +264,51 @@ mod tests {
 
         // Defaults: nothing denied.
         let got = perms_get(ws(), no_scope()).await.0;
-        assert_eq!(got.get("tools").and_then(|v| v.as_object()).map(|m| m.len()), Some(0));
+        assert_eq!(
+            got.get("tools")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len()),
+            Some(0)
+        );
 
         // Push a policy: bash denied outright, anything under "secret" denied by path.
-        let _ = perms_set(ws(), Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]}))).await;
+        let _ = perms_set(
+            ws(),
+            Json(json!({"tools": {"bash": "deny"}, "denyPaths": ["secret"]})),
+        )
+        .await;
         let got = perms_get(ws(), no_scope()).await.0;
-        assert_eq!(got.get("tools").and_then(|v| v.get("bash")).and_then(|v| v.as_str()), Some("deny"));
+        assert_eq!(
+            got.get("tools")
+                .and_then(|v| v.get("bash"))
+                .and_then(|v| v.as_str()),
+            Some("deny")
+        );
 
         // bash is denied even though safe mode alone would have allowed "echo hi".
-        assert!(exec(ws(), Json(json!({"command": "echo hi"}))).await.is_err());
+        assert!(
+            exec(ws(), Json(json!({"command": "echo hi"})))
+                .await
+                .is_err()
+        );
 
         // write under the denied prefix is rejected; a sibling path still works.
-        assert!(fs_write(ws(), Json(json!({"path": "secret/x.txt", "content": "no"}))).await.is_err());
-        assert!(fs_write(ws(), Json(json!({"path": "ok/x.txt", "content": "yes"}))).await.is_ok());
+        assert!(
+            fs_write(ws(), Json(json!({"path": "secret/x.txt", "content": "no"})))
+                .await
+                .is_err()
+        );
+        assert!(
+            fs_write(ws(), Json(json!({"path": "ok/x.txt", "content": "yes"})))
+                .await
+                .is_ok()
+        );
         // exact-match on the denied prefix itself (no trailing content) is also rejected.
-        assert!(fs_read(ws(), Json(json!({"path": "secret"}))).await.is_err());
+        assert!(
+            fs_read(ws(), Json(json!({"path": "secret"})))
+                .await
+                .is_err()
+        );
         // unrelated read-only tools are unaffected.
         assert!(grep(ws(), Json(json!({"pattern": "yes"}))).await.is_ok());
 
@@ -205,18 +326,31 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("ninfier-scope-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         let ws = || AxumState(state.clone());
 
         // "coder" scope denies bash; "chat" scope leaves it at the default (allow).
-        let _ = perms_set(ws(), Json(json!({"scope": "coder", "tools": {"bash": "deny"}, "denyPaths": []}))).await;
-        let _ = perms_set(ws(), Json(json!({"scope": "chat", "tools": {}, "denyPaths": []}))).await;
+        let _ = perms_set(
+            ws(),
+            Json(json!({"scope": "coder", "tools": {"bash": "deny"}, "denyPaths": []})),
+        )
+        .await;
+        let _ = perms_set(
+            ws(),
+            Json(json!({"scope": "chat", "tools": {}, "denyPaths": []})),
+        )
+        .await;
 
         assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "coder"}))).await.is_err());
         assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "chat"}))).await.is_ok());
 
         // Re-tightening "chat" alone must not affect "coder" (already denied) or leak across.
-        let _ = perms_set(ws(), Json(json!({"scope": "chat", "tools": {"bash": "deny"}, "denyPaths": []}))).await;
+        let _ = perms_set(
+            ws(),
+            Json(json!({"scope": "chat", "tools": {"bash": "deny"}, "denyPaths": []})),
+        )
+        .await;
         assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "chat"}))).await.is_err());
         assert!(exec(ws(), Json(json!({"command": "echo hi", "workspace": tmp.to_string_lossy(), "scope": "coder"}))).await.is_err());
 
@@ -235,29 +369,65 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("ninfier-ask-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = tmp.to_string_lossy().into_owned();
         let ws = || AxumState(state.clone());
 
-        let _ = perms_set(ws(), Json(json!({"tools": {"write": "ask"}, "denyPaths": []}))).await;
+        let _ = perms_set(
+            ws(),
+            Json(json!({"tools": {"write": "ask"}, "denyPaths": []})),
+        )
+        .await;
 
         // No token at all: rejected.
-        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x"}))).await.is_err());
+        assert!(
+            fs_write(ws(), Json(json!({"path": "a.txt", "content": "x"})))
+                .await
+                .is_err()
+        );
         assert!(!tmp.join("a.txt").exists());
 
         // Wrong tool's token: still rejected.
-        let bash_token = perms_approve(ws(), Json(json!({"tool": "bash"}))).await.unwrap().0;
+        let bash_token = perms_approve(ws(), Json(json!({"tool": "bash"})))
+            .await
+            .unwrap()
+            .0;
         let bash_token = bash_token.get("token").and_then(|v| v.as_str()).unwrap();
-        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x", "approvalToken": bash_token}))).await.is_err());
+        assert!(
+            fs_write(
+                ws(),
+                Json(json!({"path": "a.txt", "content": "x", "approvalToken": bash_token}))
+            )
+            .await
+            .is_err()
+        );
 
         // A matching approval lets the call through...
-        let r = perms_approve(ws(), Json(json!({"tool": "write"}))).await.unwrap().0;
+        let r = perms_approve(ws(), Json(json!({"tool": "write"})))
+            .await
+            .unwrap()
+            .0;
         let token = r.get("token").and_then(|v| v.as_str()).unwrap().to_string();
-        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "x", "approvalToken": token}))).await.is_ok());
+        assert!(
+            fs_write(
+                ws(),
+                Json(json!({"path": "a.txt", "content": "x", "approvalToken": token}))
+            )
+            .await
+            .is_ok()
+        );
         assert!(tmp.join("a.txt").exists());
 
         // ...but only once: the same token is rejected on a second use.
-        assert!(fs_write(ws(), Json(json!({"path": "a.txt", "content": "y", "approvalToken": token}))).await.is_err());
+        assert!(
+            fs_write(
+                ws(),
+                Json(json!({"path": "a.txt", "content": "y", "approvalToken": token}))
+            )
+            .await
+            .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

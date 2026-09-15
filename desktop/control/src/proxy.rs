@@ -2,16 +2,15 @@
 
 // Rust guideline compliant 2026-07-28
 
+use crate::MAX_REQUEST_BODY_BYTES;
+use crate::engine::{S, discover_engines, engine_model_info};
+use crate::usage::{RequestSource, is_loggable_completion_path, wrap_for_usage_logging};
 use axum::body::Body;
 use axum::extract::{Request, State as AxumState};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use std::time::Duration;
-use crate::engine::{discover_engines, engine_model_info, S};
-use crate::usage::{is_loggable_completion_path, wrap_for_usage_logging, RequestSource};
-use crate::MAX_REQUEST_BODY_BYTES;
-
 
 /// Timeout for the `/v1/*` proxy to the engine — generation requests can run
 /// long (large max_tokens, slow hardware), so this is much longer than a
@@ -25,16 +24,20 @@ pub(crate) const ENGINE_PROXY_TIMEOUT_SECS: u64 = 3600;
 /// model, route to the engine that serves it; otherwise fall back to the
 /// primary engine (or the single discovered one, or the configured port).
 pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
-    let model: Option<String> = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()));
+    let model: Option<String> = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+        v.get("model")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+    });
     let mut cands: Vec<(u16, Option<String>)> = Vec::new();
     {
         let primary = state.engine.read().await;
         if let Some(p) = primary.port
             && matches!(
                 primary.state,
-                crate::types::EngineState::Running | crate::types::EngineState::External | crate::types::EngineState::Starting
+                crate::types::EngineState::Running
+                    | crate::types::EngineState::External
+                    | crate::types::EngineState::Starting
             )
         {
             cands.push((p, primary.model_id.clone()));
@@ -53,7 +56,10 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
         }
     }
     if let Some(m) = model {
-        if let Some((p, _)) = cands.iter().find(|(_, cm)| cm.as_deref() == Some(m.as_str())) {
+        if let Some((p, _)) = cands
+            .iter()
+            .find(|(_, cm)| cm.as_deref() == Some(m.as_str()))
+        {
             return Ok(*p);
         }
         if cands.len() > 1 {
@@ -95,7 +101,8 @@ pub(crate) fn merge_default_request_params(
 
     // 1. generic top-level defaults (client fields win)
     if !defaults_trimmed.is_empty()
-        && let serde_json::Value::Object(defaults_map) = serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
+        && let serde_json::Value::Object(defaults_map) =
+            serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
         && let serde_json::Value::Object(body_map) = &mut body_val
     {
         for (k, v) in defaults_map {
@@ -123,7 +130,11 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let headers = req.headers().clone();
     // Set once per listener by `build_router` (loopback vs Remote Access) —
     // read before the request is consumed below.
-    let source = req.extensions().get::<RequestSource>().copied().unwrap_or(RequestSource::Local);
+    let source = req
+        .extensions()
+        .get::<RequestSource>()
+        .copied()
+        .unwrap_or(RequestSource::Local);
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
@@ -137,10 +148,11 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         let c = state.config.read().await;
         (c.default_request_params.clone(), c.reasoning_effort.clone())
     };
-    let body_bytes = match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
-        Some(v) => v.into(),
-        None => body_bytes,
-    };
+    let body_bytes =
+        match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
+            Some(v) => v.into(),
+            None => body_bytes,
+        };
 
     // Usage logging is best-effort and only cares about completion-shaped
     // endpoints; the request model (if named) seeds the logged event when the
@@ -149,14 +161,31 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let request_model: Option<String> = if should_log {
         serde_json::from_slice::<Value>(&body_bytes)
             .ok()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
     } else {
         None
     };
 
-    let port = match route_port(&state, &body_bytes).await {
-        Ok(p) => p,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    let base_url = headers
+        .get("x-ninfer-base-url")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let api_key_override = headers
+        .get("x-ninfer-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let port_opt = if base_url.is_none() {
+        match route_port(&state, &body_bytes).await {
+            Ok(p) => Some(p),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        }
+    } else {
+        None
     };
     // Usage logging should attribute a request to the actual model artifact
     // (e.g. "qwen3_8_27b_nvfp4.ninfer") rather than the OpenAI-facing public
@@ -168,8 +197,16 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     // artifact info available, so it keeps the alias (see `route_port`).
     let request_model = {
         let eng = state.engine.read().await;
-        if eng.port == Some(port) {
-            eng.artifact.as_deref().map(crate::types::base_name).map(str::to_string).or(request_model)
+        if let Some(port) = port_opt {
+            if eng.port == Some(port) {
+                eng.artifact
+                    .as_deref()
+                    .map(crate::types::base_name)
+                    .map(str::to_string)
+                    .or(request_model)
+            } else {
+                request_model
+            }
         } else {
             request_model
         }
@@ -189,9 +226,22 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     } else {
         (None, false)
     };
-    let api_key = { state.config.read().await.api_key.clone() };
-    let target = format!("http://127.0.0.1:{port}{}", uri.path());
+    let api_key = match api_key_override {
+        Some(k) => k,
+        None => state.config.read().await.api_key.clone(),
+    };
 
+    let target = if let Some(base) = base_url {
+        let path = uri.path();
+        let path = if path.starts_with("/v1/") {
+            &path[3..]
+        } else {
+            path
+        }; // Trim /v1/ for raw base urls
+        format!("{}{}", base.trim_end_matches('/'), path)
+    } else {
+        format!("http://127.0.0.1:{}{}", port_opt.unwrap(), uri.path())
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(ENGINE_PROXY_TIMEOUT_SECS))
         .build()
@@ -225,7 +275,11 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let request_id = resp
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let mut resp_headers = HeaderMap::new();
     if let Some(ct) = content_type {
@@ -240,7 +294,14 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     // for usage logging on completion-shaped endpoints only.
     let stream = futures_util::StreamExt::boxed(resp.bytes_stream());
     let stream = if should_log {
-        wrap_for_usage_logging(state.clone(), request_model, source, usage_streaming, usage_started, stream)
+        wrap_for_usage_logging(
+            state.clone(),
+            request_model,
+            source,
+            usage_streaming,
+            usage_started,
+            stream,
+        )
     } else {
         stream
     };
@@ -253,4 +314,3 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response").into_response())
 }
-

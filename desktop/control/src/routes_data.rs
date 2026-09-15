@@ -2,25 +2,28 @@
 
 // Rust guideline compliant 2026-07-28
 
-use axum::body::Body;
-use axum::extract::{Query, Request, State as AxumState};
-use axum::http::StatusCode;
-use axum::Json;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use crate::LOG_TAIL_WINDOW_BYTES;
 use crate::engine::S;
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::list_models;
 use crate::read_json;
 use crate::types::ARTIFACTS;
-use crate::LOG_TAIL_WINDOW_BYTES;
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Query, Request, State as AxumState};
+use axum::http::StatusCode;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 #[derive(Deserialize)]
 pub(crate) struct LogsQuery {
     n: Option<usize>,
 }
 
-pub(crate) async fn logs(AxumState(state): AxumState<S>, Query(q): Query<LogsQuery>) -> Json<Value> {
+pub(crate) async fn logs(
+    AxumState(state): AxumState<S>,
+    Query(q): Query<LogsQuery>,
+) -> Json<Value> {
     let n = q.n.unwrap_or(400);
     let log_path = state.engine.read().await.log_path.clone();
     let Some(path) = log_path else {
@@ -39,7 +42,15 @@ pub(crate) async fn tail_file(path: &str, lines: usize) -> (Vec<String>, u64) {
         let Ok(text) = tokio::fs::read_to_string(path).await else {
             return (vec![], size);
         };
-        let lines: Vec<String> = text.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().map(|l| l.to_string()).collect();
+        let lines: Vec<String> = text
+            .lines()
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|l| l.to_string())
+            .collect();
         return (lines, size);
     }
     let mut buf = vec![0u8; LOG_TAIL_WINDOW_BYTES];
@@ -52,7 +63,15 @@ pub(crate) async fn tail_file(path: &str, lines: usize) -> (Vec<String>, u64) {
     };
     let _ = f.read_exact(&mut buf).await;
     let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<String> = text.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev().map(|l| l.to_string()).collect();
+    let lines: Vec<String> = text
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|l| l.to_string())
+        .collect();
     (lines, size)
 }
 
@@ -62,17 +81,26 @@ pub(crate) async fn api_models(AxumState(state): AxumState<S>) -> Json<Value> {
     Json(v)
 }
 
-pub(crate) async fn models_download(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn models_download(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
     Ok(Json(crate::models::start_download(&state, body).await))
 }
 
-pub(crate) async fn models_upgrade(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn models_upgrade(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
     Ok(Json(crate::models::upgrade_model(&state, body).await))
 }
 
-pub(crate) async fn models_convert(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn models_convert(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
     Ok(Json(crate::models::start_conversion(&state, body).await))
 }
@@ -81,4 +109,3 @@ pub(crate) async fn gpu(AxumState(state): AxumState<S>) -> Json<Value> {
     let _ = state;
     Json(gpu_value(&gpu_stats().await))
 }
-

@@ -4,20 +4,27 @@
 //! read/write/edit/patch, and base64 attachment reads — all confined to the
 //! workspace root by `common::within_ws` and gated by `common::enforce_perm`.
 
-use super::common::{enforce_perm, perm_scope, rel_of, resolve_ws, within_ws, CODER_IGNORE};
+use super::common::{CODER_IGNORE, enforce_perm, perm_scope, rel_of, resolve_ws, within_ws};
 use crate::engine::S;
+use axum::Json;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
-use axum::Json;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 const MAX_READ_BYTES: usize = 256 * 1024;
 
-pub async fn tree(AxumState(state): AxumState<S>, Query(params): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn tree(
+    AxumState(state): AxumState<S>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, params.get("workspace").map(String::as_str)).await?;
-    let depth = params.get("depth").and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 6);
+    let depth = params
+        .get("depth")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, 6);
     let rel = params.get("root").map(|s| s.as_str()).unwrap_or(".");
     let base = within_ws(&ws_root, rel)?;
     let root_rel = rel_of(&ws_root, &base);
@@ -25,7 +32,9 @@ pub async fn tree(AxumState(state): AxumState<S>, Query(params): Query<std::coll
     let nodes = tokio::task::spawn_blocking(move || tree_nodes(&ws_owned, &root_rel, 1, depth))
         .await
         .unwrap_or_default();
-    Ok(Json(json!({ "root": rel_of(&ws_root, &base), "nodes": nodes })))
+    Ok(Json(
+        json!({ "root": rel_of(&ws_root, &base), "nodes": nodes }),
+    ))
 }
 
 /// Recursive directory listing (blocking): dirs first, then files, both by
@@ -34,7 +43,11 @@ fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Val
     if depth > max_depth {
         return Vec::new();
     }
-    let dir = if rel == "." { root.to_path_buf() } else { root.join(rel) };
+    let dir = if rel == "." {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
@@ -60,7 +73,11 @@ fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Val
     items
         .into_iter()
         .map(|(name, is_dir, size)| {
-            let child_rel = if rel == "." { name.clone() } else { format!("{rel}/{name}") };
+            let child_rel = if rel == "." {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
             if is_dir {
                 let children = if depth == max_depth {
                     None
@@ -68,7 +85,9 @@ fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Val
                     Some(tree_nodes(root, &child_rel, depth + 1, max_depth))
                 };
                 match children {
-                    Some(c) => json!({"name": name, "path": child_rel, "kind": "dir", "children": c}),
+                    Some(c) => {
+                        json!({"name": name, "path": child_rel, "kind": "dir", "children": c})
+                    }
                     None => json!({"name": name, "path": child_rel, "kind": "dir"}),
                 }
             } else {
@@ -81,27 +100,52 @@ fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Val
         .collect()
 }
 
-pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_read(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "read", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "read",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
-    let buf = tokio::fs::read(&full)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
+    let buf = tokio::fs::read(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
     if buf.iter().take(8000).any(|&b| b == 0) {
-        return Ok(Json(json!({"path": rel, "binary": true, "note": "binary file — not shown"})));
+        return Ok(Json(
+            json!({"path": rel, "binary": true, "note": "binary file — not shown"}),
+        ));
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
     let total_lines = text.split('\n').count();
     let mut content = text;
-    if req.get("offset").and_then(|v| v.as_u64()).is_some() || req.get("limit").and_then(|v| v.as_u64()).is_some() {
+    if req.get("offset").and_then(|v| v.as_u64()).is_some()
+        || req.get("limit").and_then(|v| v.as_u64()).is_some()
+    {
         let lines: Vec<&str> = content.split('\n').collect();
         let off = req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let lim = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(lines.len() as u64) as usize;
+        let lim = req
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(lines.len() as u64) as usize;
         let off = off.min(lines.len());
         let end = off.saturating_add(lim).min(lines.len());
         content = lines[off..end].join("\n");
@@ -116,55 +160,119 @@ pub async fn fs_read(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         truncated = true;
     }
     let line_count = content.split('\n').count();
-    Ok(Json(json!({"path": rel, "content": content, "totalLines": total_lines, "truncated": truncated, "lineCount": line_count})))
+    Ok(Json(
+        json!({"path": rel, "content": content, "totalLines": total_lines, "truncated": truncated, "lineCount": line_count}),
+    ))
 }
 
-pub async fn fs_write(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_write(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "write", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "write",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
     let content = match req.get("content").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
-        None => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "content must be a string"})))),
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "content must be a string"})),
+            ));
+        }
     };
     if let Some(parent) = full.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("mkdir failed: {e}")}))))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("mkdir failed: {e}")})),
+            )
+        })?;
     }
-    let existed = tokio::fs::metadata(&full).await.map(|m| m.is_file()).unwrap_or(false);
-    tokio::fs::write(&full, &content)
+    let existed = tokio::fs::metadata(&full)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
-    Ok(Json(json!({"path": rel, "bytes": content.len(), "created": !existed})))
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    tokio::fs::write(&full, &content).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write failed: {e}")})),
+        )
+    })?;
+    Ok(Json(
+        json!({"path": rel, "bytes": content.len(), "created": !existed}),
+    ))
 }
 
-pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_edit(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "edit",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
-    let (old, new) = match (req.get("old").and_then(|v| v.as_str()), req.get("new").and_then(|v| v.as_str())) {
+    let (old, new) = match (
+        req.get("old").and_then(|v| v.as_str()),
+        req.get("new").and_then(|v| v.as_str()),
+    ) {
         (Some(o), Some(n)) => (o.to_string(), n.to_string()),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "old and new strings required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "old and new strings required"})),
+            ));
+        }
     };
-    let replace_all = req.get("replaceAll").and_then(|v| v.as_bool()).unwrap_or(false);
-    let file_text = tokio::fs::read_to_string(&full)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
+    let replace_all = req
+        .get("replaceAll")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
 
     // Exact path first, with the same uniqueness guard as the sidecar.
     let occurrences = file_text.match_indices(&old).count();
     let (replaced, count) = if occurrences > 0 {
         if !replace_all && occurrences > 1 {
-            return Ok(Json(json!({"path": rel, "replacements": 0, "error": "old_string is not unique — pass replaceAll:true to replace all"})));
+            return Ok(Json(
+                json!({"path": rel, "replacements": 0, "error": "old_string is not unique — pass replaceAll:true to replace all"}),
+            ));
         }
         let count = if replace_all { occurrences } else { 1 };
         let replaced = if replace_all {
@@ -186,40 +294,61 @@ pub async fn fs_edit(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
             v
         };
         if old_lines.is_empty() {
-            return Ok(Json(json!({"path": rel, "replacements": 0, "error": "old_string is empty or only whitespace"})));
+            return Ok(Json(
+                json!({"path": rel, "replacements": 0, "error": "old_string is empty or only whitespace"}),
+            ));
         }
         let file_lines: Vec<&str> = file_text.split('\n').collect();
         let is_match_at = |i: usize| {
             file_lines.len() - i >= old_lines.len()
-                && old_lines.iter().enumerate().all(|(j, o)| file_lines[i + j].trim() == o.trim())
+                && old_lines
+                    .iter()
+                    .enumerate()
+                    .all(|(j, o)| file_lines[i + j].trim() == o.trim())
         };
         let hits: Vec<usize> = (0..=file_lines.len().saturating_sub(old_lines.len()))
             .filter(|&i| is_match_at(i))
             .collect();
         if hits.is_empty() {
-            return Ok(Json(json!({"path": rel, "replacements": 0, "error": "old_string not found (even with fuzzy whitespace matching)"})));
+            return Ok(Json(
+                json!({"path": rel, "replacements": 0, "error": "old_string not found (even with fuzzy whitespace matching)"}),
+            ));
         }
         if hits.len() > 1 && !replace_all {
-            return Ok(Json(json!({"path": rel, "replacements": 0, "error": "old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true"})));
+            return Ok(Json(
+                json!({"path": rel, "replacements": 0, "error": "old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true"}),
+            ));
         }
         let mut out: Vec<String> = file_lines.iter().map(|s| s.to_string()).collect();
         // Splice back-to-front so earlier indices stay valid.
-        let targets: Vec<usize> = if replace_all { hits.clone() } else { vec![hits[0]] };
+        let targets: Vec<usize> = if replace_all {
+            hits.clone()
+        } else {
+            vec![hits[0]]
+        };
         for &i in targets.iter().rev() {
             out.splice(i..i + old_lines.len(), [new.clone()]);
         }
         (out.join("\n"), targets.len())
     };
 
-    tokio::fs::write(&full, &replaced)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
+    tokio::fs::write(&full, &replaced).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write failed: {e}")})),
+        )
+    })?;
     Ok(Json(json!({"path": rel, "replacements": count})))
 }
 /// Apply one old→new replacement: exact match first (with the uniqueness
 /// guard), then a whitespace-agnostic line-window fallback. Pure helper for
 /// atomic multi-hunk patches — every hunk must match or nothing is written.
-fn apply_edit_hunk(file_text: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), String> {
+fn apply_edit_hunk(
+    file_text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
     let occurrences = file_text.match_indices(old).count();
     if occurrences > 0 {
         if !replace_all && occurrences > 1 {
@@ -246,7 +375,10 @@ fn apply_edit_hunk(file_text: &str, old: &str, new: &str, replace_all: bool) -> 
     let file_lines: Vec<&str> = file_text.split('\n').collect();
     let is_match_at = |i: usize| {
         file_lines.len() - i >= old_lines.len()
-            && old_lines.iter().enumerate().all(|(j, o)| file_lines[i + j].trim() == o.trim())
+            && old_lines
+                .iter()
+                .enumerate()
+                .all(|(j, o)| file_lines[i + j].trim() == o.trim())
     };
     let hits: Vec<usize> = (0..=file_lines.len().saturating_sub(old_lines.len()))
         .filter(|&i| is_match_at(i))
@@ -266,32 +398,67 @@ fn apply_edit_hunk(file_text: &str, old: &str, new: &str, replace_all: bool) -> 
     Ok((out.join("\n"), count))
 }
 
-pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_patch(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "apply_patch", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "apply_patch",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
     let hunks = match req.get("edits").and_then(|v| v.as_array()) {
         Some(h) if !h.is_empty() => h.clone(),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "edits must be a non-empty array of {old, new}"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "edits must be a non-empty array of {old, new}"})),
+            ));
+        }
     };
     let mut validated: Vec<(String, String, bool)> = Vec::with_capacity(hunks.len());
     for (i, h) in hunks.iter().enumerate() {
-        match (h.get("old").and_then(|v| v.as_str()), h.get("new").and_then(|v| v.as_str())) {
+        match (
+            h.get("old").and_then(|v| v.as_str()),
+            h.get("new").and_then(|v| v.as_str()),
+        ) {
             (Some(o), Some(n)) => validated.push((
                 o.to_string(),
                 n.to_string(),
-                h.get("replaceAll").and_then(|v| v.as_bool()).unwrap_or(false),
+                h.get("replaceAll")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             )),
-            _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": format!("edits[{i}].old and edits[{i}].new strings required")})))),
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({"error": format!("edits[{i}].old and edits[{i}].new strings required")}),
+                    ),
+                ));
+            }
         }
     }
-    let file_text = tokio::fs::read_to_string(&full)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
+    let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
     // All-or-nothing: every hunk applies against the evolving text first.
     let mut working = file_text;
     let mut total = 0usize;
@@ -301,62 +468,117 @@ pub async fn fs_patch(AxumState(state): AxumState<S>, Json(req): Json<Value>) ->
                 working = t;
                 total += c;
             }
-            Err(e) => return Ok(Json(json!({"path": rel, "replacements": 0, "error": format!("hunk {i}: {e}")}))),
+            Err(e) => {
+                return Ok(Json(
+                    json!({"path": rel, "replacements": 0, "error": format!("hunk {i}: {e}")}),
+                ));
+            }
         }
     }
-    tokio::fs::write(&full, &working)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
+    tokio::fs::write(&full, &working).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write failed: {e}")})),
+        )
+    })?;
     Ok(Json(json!({"path": rel, "replacements": total})))
 }
 
-pub async fn fs_udiff(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_udiff(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "udiff_edit", Some(rel), req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "udiff_edit",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
-    
+
     let diff = match req.get("diff").and_then(|v| v.as_str()) {
         Some(d) if !d.trim().is_empty() => d,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "diff string required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "diff string required"})),
+            ));
+        }
     };
-    
-    let file_text = tokio::fs::read_to_string(&full)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
-        
+
+    let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
+
     let patch = diffy::Patch::from_str(diff).map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("invalid unified diff format: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid unified diff format: {e}")})),
+        )
     })?;
-    
+
     let applied = diffy::apply(&file_text, &patch).map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": format!("failed to apply patch: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("failed to apply patch: {e}")})),
+        )
     })?;
-    
-    tokio::fs::write(&full, &applied)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))))?;
-        
+
+    tokio::fs::write(&full, &applied).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write failed: {e}")})),
+        )
+    })?;
+
     Ok(Json(json!({"path": rel, "replacements": 1})))
 }
 
 /// Base64 file read for image/file attachments (mirrors `/api/coder/fs/b64`).
-pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn fs_b64(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const MAX_ATTACH_BYTES: usize = 50 * 1024 * 1024;
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "path required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path required"})),
+            ));
+        }
     };
     let full = within_ws(&ws_root, rel)?;
-    let buf = tokio::fs::read(&full)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({"error": format!("file not found: {rel}")}))))?;
+    let buf = tokio::fs::read(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
     if buf.len() > MAX_ATTACH_BYTES {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error": format!("file is {} bytes; attachment limit is 50 MB", buf.len())}))));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(
+                json!({"error": format!("file is {} bytes; attachment limit is 50 MB", buf.len())}),
+            ),
+        ));
     }
     let ext = rel.rsplit('.').next().unwrap_or("").to_lowercase();
     let mime = match ext.as_str() {
@@ -370,8 +592,13 @@ pub async fn fs_b64(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> R
         _ => "application/octet-stream",
     };
     // `base64` 0.22 engine: STANDARD alphabet with padding, like Node's toString('base64').
-    let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&buf));
-    Ok(Json(json!({"path": rel, "mime": mime, "dataUrl": data_url, "size": buf.len()})))
+    let data_url = format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&buf)
+    );
+    Ok(Json(
+        json!({"path": rel, "mime": mime, "dataUrl": data_url, "size": buf.len()}),
+    ))
 }
 
 #[cfg(test)]
@@ -391,13 +618,17 @@ mod tests {
         std::fs::create_dir_all(&global_ws).unwrap();
         std::fs::create_dir_all(&other_ws).unwrap();
 
-        let state: S = std::sync::Arc::new(crate::types::State::new(base.clone(), base.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(base.clone(), base.clone(), None));
         state.config.write().await.coder_workspace = global_ws.to_string_lossy().into_owned();
 
         // No override: lands in the global pointer's workspace.
-        let _ = fs_write(AxumState(state.clone()), Json(json!({"path": "a.txt", "content": "global"})))
-            .await
-            .unwrap();
+        let _ = fs_write(
+            AxumState(state.clone()),
+            Json(json!({"path": "a.txt", "content": "global"})),
+        )
+        .await
+        .unwrap();
         assert!(global_ws.join("a.txt").exists());
         assert!(!other_ws.join("a.txt").exists());
 
@@ -411,7 +642,10 @@ mod tests {
         .unwrap();
         assert!(other_ws.join("b.txt").exists());
         assert!(!global_ws.join("b.txt").exists());
-        assert_eq!(state.config.read().await.coder_workspace, global_ws.to_string_lossy());
+        assert_eq!(
+            state.config.read().await.coder_workspace,
+            global_ws.to_string_lossy()
+        );
 
         let r = fs_read(
             AxumState(state.clone()),

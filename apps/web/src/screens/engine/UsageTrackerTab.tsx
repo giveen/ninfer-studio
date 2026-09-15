@@ -155,13 +155,13 @@ export function UsageTrackerTab() {
         <Stat label="Avg prefill" value={fmtTps(totals?.avgPrefillTps)} sub="prompt tok/s, streamed" />
         <Stat label="Avg generation" value={fmtTps(totals?.avgGenerationTps)} sub="completion tok/s, streamed" />
         <Stat label="Most used model" value={totals?.mostUsedModel ?? '—'} />
-        <Stat label="Energy used" value={totals ? `${totals.energyKwh.toFixed(2)} kWh` : '—'} />
+        <Stat label="Energy used" value={source === 'remote' ? '—' : (totals ? `${totals.energyKwh.toFixed(2)} kWh` : '—')} />
         <Stat
           label="Est. cost"
-          value={totals && costPerKwh > 0 ? `${currencySymbol}${estCost.toFixed(2)}` : '—'}
-          sub={costPerKwh === 0 ? 'set cost/kWh in Settings' : undefined}
+          value={source === 'remote' ? '—' : (totals && costPerKwh > 0 ? `${currencySymbol}${estCost.toFixed(2)}` : '—')}
+          sub={source === 'remote' ? 'Not applicable for remote' : (costPerKwh === 0 ? 'set cost/kWh in Settings' : undefined)}
         />
-        <Stat label="Cost / 1M tokens" value={costPerMillionTokens !== null ? `${currencySymbol}${formatSmallCost(costPerMillionTokens)}` : '—'} />
+        <Stat label="Cost / 1M tokens" value={source === 'remote' ? '—' : (costPerMillionTokens !== null ? `${currencySymbol}${formatSmallCost(costPerMillionTokens)}` : '—')} />
       </div>
       <p className="text-[11.5px] text-faint">
         Energy reflects total GPU power draw while an engine is running — not power isolated to a single request, or a specific

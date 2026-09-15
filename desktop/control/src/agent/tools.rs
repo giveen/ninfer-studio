@@ -13,13 +13,16 @@
 //! mints the usual one-shot token via `/api/coder/perms/approve`, which we
 //! inject and `enforce_perm` consumes — the existing security model.
 
-use crate::agent::run::{now_ms, AgentEvent, ApprovalDecision, GateDecision, GateKind, GateSlot, PendingApproval, PendingGate, PendingQuestion, RunShared, RunStatus};
-use regex::Regex;
+use crate::agent::run::{
+    AgentEvent, ApprovalDecision, GateDecision, GateKind, GateSlot, PendingApproval, PendingGate,
+    PendingQuestion, RunShared, RunStatus, now_ms,
+};
 use crate::coder::{browser, exec, fs, grep, memory, search, web};
 use crate::engine::S;
-use axum::extract::{Path as AxumPath, Query, State as AxumState};
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::{Path as AxumPath, Query, State as AxumState};
+use regex::Regex;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -27,14 +30,52 @@ use tokio::sync::oneshot;
 /// Tools the server can dispatch in-process (per tool-set). Anything else
 /// gets the same "unknown tool" error the client's registry returned.
 const CODER_TOOLS: &[&str] = &[
-    "read", "write", "edit", "apply_patch", "udiff_edit", "grep", "glob", "tree", "bash", "bash_poll",
-    "git_diff", "git_commit", "ast_grep", "repo_search", "repo_map", "web_fetch", "web_search",
-    "browser", "memory", "obs_recall", "delegate", "subagent",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "udiff_edit",
+    "grep",
+    "glob",
+    "tree",
+    "bash",
+    "bash_poll",
+    "git_diff",
+    "git_commit",
+    "ast_grep",
+    "repo_search",
+    "repo_map",
+    "web_fetch",
+    "web_search",
+    "browser",
+    "memory",
+    "obs_recall",
+    "delegate",
+    "subagent",
 ];
 const CHAT_TOOLS: &[&str] = &[
-    "read", "write", "edit", "apply_patch", "udiff_edit", "grep", "glob", "tree", "bash", "bash_poll",
-    "git_diff", "ast_grep", "repo_search", "web_fetch", "web_search", "browser",
-    "set_directory", "memory_update", "memory_recall", "ask_user", "todo_write", "obs_recall",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "udiff_edit",
+    "grep",
+    "glob",
+    "tree",
+    "bash",
+    "bash_poll",
+    "git_diff",
+    "ast_grep",
+    "repo_search",
+    "web_fetch",
+    "web_search",
+    "browser",
+    "set_directory",
+    "memory_update",
+    "memory_recall",
+    "ask_user",
+    "todo_write",
+    "obs_recall",
     "delegate",
 ];
 
@@ -46,6 +87,9 @@ grep/glob/search the repo, fetch web docs, and run read-only inspection
 commands. You must NOT modify anything — no writes, edits, patches, git
 writes, or destructive commands.
 
+CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, or `ls`. ALWAYS use the native `read`, `grep`, and `glob` tools instead.
+CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
+
 Work autonomously: if the task is ambiguous, pick the most reasonable
 interpretation and note it in one line.
 
@@ -56,24 +100,62 @@ importance. No preamble, no restating the task."#;
 /// Scout filter set — a model-supplied `tools` list is intersected with the
 /// client's READONLY_TOOL_NAMES (the server can dispatch every one of them).
 const SCOUT_FILTER_TOOLS: &[&str] = &[
-    "todo_write", "read", "grep", "glob", "ast_grep", "web_fetch", "web_search",
-    "git_diff", "ask_user", "bash_poll", "delegate", "repo_search", "obs_recall",
+    "todo_write",
+    "read",
+    "grep",
+    "glob",
+    "ast_grep",
+    "web_fetch",
+    "web_search",
+    "git_diff",
+    "ask_user",
+    "bash_poll",
+    "delegate",
+    "repo_search",
+    "obs_recall",
     "memory_recall",
 ];
 /// Coder-run scout default tool set — the client's runSubagent default when
 /// the model supplies no allow-list.
 const SCOUT_DEFAULT_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser",
+    "read",
+    "grep",
+    "glob",
+    "ast_grep",
+    "web_fetch",
+    "web_search",
+    "browser",
 ];
 /// Chat-run scout default + filter set (ChatScreen's `readOnlyNames`).
 const SCOUT_CHAT_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "ast_grep", "repo_search", "git_diff", "web_fetch",
-    "web_search", "browser",
+    "read",
+    "grep",
+    "glob",
+    "ast_grep",
+    "repo_search",
+    "git_diff",
+    "web_fetch",
+    "web_search",
+    "browser",
 ];
 /// Implementation set for `subagent` child runs (mirrors WORKER_TOOL_NAMES).
 const SUBAGENT_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "ast_grep", "web_fetch", "web_search", "browser", "repo_search",
-    "write", "edit", "apply_patch", "udiff_edit", "bash", "bash_poll", "git_diff", "delegate",
+    "read",
+    "grep",
+    "glob",
+    "ast_grep",
+    "web_fetch",
+    "web_search",
+    "browser",
+    "repo_search",
+    "write",
+    "edit",
+    "apply_patch",
+    "udiff_edit",
+    "bash",
+    "bash_poll",
+    "git_diff",
+    "delegate",
 ];
 
 /// Worker child-run system prompt — the verbatim port of the client's
@@ -81,6 +163,8 @@ const SUBAGENT_TOOLS: &[&str] = &[
 /// the loop, not the webview.
 pub(crate) const WORKER_SYSTEM: &str = r#"You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
+- CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, or `awk`. ALWAYS use the native `read`, `grep`, `glob`, `edit`, and `apply_patch` tools instead.
+- CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
 - If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
@@ -137,7 +221,8 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             // stringified) and discard updates the user superseded mid-run
             // (a user edit bumps `todo_rev` past the rev captured at request
             // build time — `todo_base_rev`).
-            let items = crate::agent::run::clean_todo_items(args.get("todos").unwrap_or(&Value::Null));
+            let items =
+                crate::agent::run::clean_todo_items(args.get("todos").unwrap_or(&Value::Null));
             let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
             if live.todo_rev != live.todo_base_rev {
                 let current = live.todo.clone().unwrap_or(Value::Array(vec![]));
@@ -151,11 +236,18 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             live.todo = Some(Value::Array(items.clone()));
             live.todo_rev += 1;
             drop(live);
-            let _ = run.tx.send(AgentEvent::Todo { items: Value::Array(items.clone()) });
+            let _ = run.tx.send(AgentEvent::Todo {
+                items: Value::Array(items.clone()),
+            });
             return json!({ "success": true, "count": items.len() });
         }
         "set_directory" => {
-            let requested = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let requested = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if requested.is_empty() {
                 return json!({ "error": "path is required" });
             }
@@ -176,9 +268,18 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             return json!({ "ok": true, "scope": canon.to_string_lossy().into_owned() });
         }
         "obs_recall" => {
-            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let text = run.recall.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned();
+            let text = run
+                .recall
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .cloned();
             let Some(text) = text else {
                 return json!({ "error": format!("unknown observation id: {id}") });
             };
@@ -213,7 +314,12 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
         "delegate" => return delegate(state, run, args).await,
         "subagent" => return subagent(state, run, args).await,
         "memory_update" => {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("tip");
             if text.is_empty() {
                 return json!({ "error": "text is required" });
@@ -231,17 +337,42 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             };
         }
         "memory_recall" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
             let kind = args.get("kind").and_then(|v| v.as_str());
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 30) as usize;
-            let mem = crate::chat::memory_get(axum::extract::State(state.clone())).await.0;
-            let learnings = mem.get("learnings").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .clamp(1, 30) as usize;
+            let mem = crate::chat::memory_get(axum::extract::State(state.clone()))
+                .await
+                .0;
+            let learnings = mem
+                .get("learnings")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let mut matches: Vec<Value> = learnings
                 .into_iter()
                 .filter(|l| {
-                    let kind_ok = kind.map(|k| l.get("kind").and_then(|v| v.as_str()) == Some(k)).unwrap_or(true);
-                    let text = l.get("text").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    let task = l.get("task").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    let kind_ok = kind
+                        .map(|k| l.get("kind").and_then(|v| v.as_str()) == Some(k))
+                        .unwrap_or(true);
+                    let text = l
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let task = l
+                        .get("task")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
                     kind_ok && (text.contains(&query) || task.contains(&query))
                 })
                 .collect();
@@ -269,7 +400,11 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 .map(|t| if t.starts_with("-") { t.clone() } else { q(t) })
                 .collect::<Vec<_>>()
                 .join(" ");
-            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("Agent commit").to_string();
+            let message = args
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Agent commit")
+                .to_string();
             let mut body = json!({ "command": format!("git add {file_args} && git commit -m {} && git rev-parse HEAD", q(&message)) });
             if let Some(scope) = run.scope_opt() {
                 body["cwd"] = json!(scope);
@@ -279,8 +414,16 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
         }
         "ast_grep" => {
             // Same invocation the client made through exec: `sg -p '…' -l lang`.
-            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let lang = args.get("lang").and_then(|v| v.as_str()).unwrap_or("rust").to_string();
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let lang = args
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rust")
+                .to_string();
             let mut body = json!({ "command": format!("sg -p '{}' -l {lang}", pattern.replace('\'', "'\\''")) });
             if let Some(scope) = run.scope_opt() {
                 body["cwd"] = json!(scope);
@@ -296,9 +439,22 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // MCP tools are disabled, and bash is locked to inspection commands — so
     // a surviving plan run stays read-only even with no client attached.
     if run.meta.plan {
-        const MUTATING: &[&str] = &["write", "edit", "apply_patch", "udiff_edit", "git_commit", "git_branch", "git_worktree", "subagent"];
+        const MUTATING: &[&str] = &[
+            "write",
+            "edit",
+            "apply_patch",
+            "udiff_edit",
+            "git_commit",
+            "git_branch",
+            "git_worktree",
+            "subagent",
+        ];
         if name == "bash" {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
             if !is_read_only_command(cmd) {
                 return json!({
                     "error": "Plan mode is read-only — bash may only run inspection commands (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show, …); redirection, pipes, and chaining are rejected. Turn Plan off to execute anything that changes state."
@@ -326,7 +482,9 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     let tier = {
         let perms = state.coder_perms.read().await;
         crate::coder::common::tier_for(
-            perms.get(&scope).unwrap_or(&crate::coder::CoderPerms::default()),
+            perms
+                .get(&scope)
+                .unwrap_or(&crate::coder::CoderPerms::default()),
             name,
         )
     };
@@ -358,7 +516,11 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // (risky) or approve/deny (commit) decision instead of executing. Runs
     // without the flags behave exactly as before.
     if name == "bash" {
-        let command = body.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let command = body
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let (risky_on, commit_on) = {
             let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
             (gs.opts.risky, gs.opts.commit)
@@ -368,9 +530,15 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
                 is_approved_command(&command, &gs.opts.approved)
             };
-            if !approved
-                && let Some(reason) = detect_risky(&command) {
-                match await_gate(run, GateKind::Risky, command.clone(), Some(reason.to_string())).await {
+            if !approved && let Some(reason) = detect_risky(&command) {
+                match await_gate(
+                    run,
+                    GateKind::Risky,
+                    command.clone(),
+                    Some(reason.to_string()),
+                )
+                .await
+                {
                     GateDecision::Deny => {
                         return json!({
                             "error": format!("Risky command denied by the user: {reason}. Use a safer alternative or ask.")
@@ -399,8 +567,12 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     }
 
     // endpoint-dispatchable; everything else must be in the tool-set's table.
-    let family = if run.meta.tool_set == "chat" { CHAT_TOOLS } else { CODER_TOOLS };
-    
+    let family = if run.meta.tool_set == "chat" {
+        CHAT_TOOLS
+    } else {
+        CODER_TOOLS
+    };
+
     let config = state.config.read().await;
     let mut allowed_family: Vec<&str> = family.to_vec();
     if !config.coder_udiff_edit_enabled {
@@ -430,7 +602,8 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
         return;
     };
     match name {
-        "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree" | "memory" => {
+        "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree"
+        | "memory" => {
             if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) {
                 body["workspace"] = json!(scope);
             }
@@ -444,7 +617,8 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
             }
         }
         "repo_search" | "repo_map" | "git_diff" | "web_fetch" | "web_search" | "browser"
-            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) => {
+            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) =>
+        {
             body["workspace"] = json!(scope);
         }
         _ => {}
@@ -483,13 +657,27 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
         return flatten(crate::mcp::mcp_call(AxumState(state.clone()), Json(req)).await);
     }
     let res: Result<Value, (axum::http::StatusCode, Json<Value>)> = match name {
-        "read" => fs::fs_read(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "write" => fs::fs_write(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "edit" => fs::fs_edit(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "apply_patch" => fs::fs_patch(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "udiff_edit" => fs::fs_udiff(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "grep" => grep::grep(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "glob" => grep::glob(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "read" => fs::fs_read(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "write" => fs::fs_write(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "edit" => fs::fs_edit(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "apply_patch" => fs::fs_patch(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "udiff_edit" => fs::fs_udiff(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "grep" => grep::grep(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "glob" => grep::glob(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
         "tree" => {
             let mut q = std::collections::HashMap::new();
             if let Some(v) = body.get("depth").and_then(|v| v.as_u64()) {
@@ -501,45 +689,75 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
             if let Some(v) = body.get("workspace").and_then(|v| v.as_str()) {
                 q.insert("workspace".into(), v.to_string());
             }
-            fs::tree(AxumState(state.clone()), Query(q)).await.map(|j| j.0)
+            fs::tree(AxumState(state.clone()), Query(q))
+                .await
+                .map(|j| j.0)
         }
-        "bash" => exec::exec(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "bash" => exec::exec(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
         "bash_poll" => {
-            let id = body.get("jobId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            exec::job_get(AxumState(state.clone()), AxumPath(id)).await.map(|j| j.0)
+            let id = body
+                .get("jobId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            exec::job_get(AxumState(state.clone()), AxumPath(id))
+                .await
+                .map(|j| j.0)
         }
         "git_diff" => search::diff(
             AxumState(state.clone()),
-            Query(search::WsQuery { workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from) }),
+            Query(search::WsQuery {
+                workspace: body
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }),
         )
         .await
         .map(|j| j.0),
         // `search` is non-Result (it degrades to empty results) — wrap.
-        "repo_search" => Ok(
-            search::search(
-                AxumState(state.clone()),
-                Query(search::SearchQuery {
-                    q: body.get("query").and_then(|v| v.as_str()).map(String::from),
-                    limit: body.get("limit").and_then(|v| v.as_u64()),
-                    workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
-                }),
-            )
-            .await
-            .0,
-        ),
+        "repo_search" => Ok(search::search(
+            AxumState(state.clone()),
+            Query(search::SearchQuery {
+                q: body.get("query").and_then(|v| v.as_str()).map(String::from),
+                limit: body.get("limit").and_then(|v| v.as_u64()),
+                workspace: body
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }),
+        )
+        .await
+        .0),
         "repo_map" => search::repo_map(
             AxumState(state.clone()),
-            Query(search::WsQuery { workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from) }),
+            Query(search::WsQuery {
+                workspace: body
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }),
         )
         .await
         .map(|j| j.0),
-        "web_fetch" => web::web_fetch(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "web_search" => web::web_search(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
-        "browser" => browser::browser(AxumState(state.clone()), Json(body.clone())).await.map(|j| j.0),
+        "web_fetch" => web::web_fetch(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "web_search" => web::web_search(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
+        "browser" => browser::browser(AxumState(state.clone()), Json(body.clone()))
+            .await
+            .map(|j| j.0),
         "memory" => memory::memory_get(
             AxumState(state.clone()),
             Query(memory::MemQuery {
-                workspace: body.get("workspace").and_then(|v| v.as_str()).map(String::from),
+                workspace: body
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             }),
         )
         .await
@@ -565,10 +783,17 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
 async fn await_approval(run: &Arc<RunShared>, name: &str, args: &Value) -> Option<String> {
     let aid = format!("appr_{:x}_{}", now_ms(), std::process::id());
     let rel = rel_detail(name, args);
-    let preview: String = serde_json::to_string(args).unwrap_or_default().chars().take(400).collect();
+    let preview: String = serde_json::to_string(args)
+        .unwrap_or_default()
+        .chars()
+        .take(400)
+        .collect();
 
     let (tx, rx) = oneshot::channel();
-    run.approvals.lock().unwrap_or_else(|p| p.into_inner()).insert(aid.clone(), tx);
+    run.approvals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(aid.clone(), tx);
     {
         let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
         live.pending_approvals.push(PendingApproval {
@@ -612,7 +837,9 @@ fn rel_detail(name: &str, args: &Value) -> Option<String> {
         "grep" | "glob" => get("pattern"),
         "web_fetch" | "browser" => get("url"),
         "web_search" | "repo_search" => get("query"),
-        "bash" | "ast_grep" | "git_commit" => get("command").or_else(|| get("pattern")).or_else(|| get("message")),
+        "bash" | "ast_grep" | "git_commit" => get("command")
+            .or_else(|| get("pattern"))
+            .or_else(|| get("message")),
         _ => None,
     }
 }
@@ -621,7 +848,12 @@ fn rel_detail(name: &str, args: &Value) -> Option<String> {
 /// the tool result. (The client used to render its own prompt; now any
 /// attached client can — the run survives either way.)
 async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
-    let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let question = args
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if question.is_empty() {
         return json!({ "error": "question is required" });
     }
@@ -637,7 +869,10 @@ async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
         });
     }
     run.set_status(RunStatus::AwaitingUser);
-    let _ = run.tx.send(AgentEvent::UserQuestionRequested { id: qid.clone(), question: question.clone() });
+    let _ = run.tx.send(AgentEvent::UserQuestionRequested {
+        id: qid.clone(),
+        question: question.clone(),
+    });
 
     let answer = tokio::select! {
         a = rx => a.unwrap_or_default(),
@@ -658,34 +893,68 @@ async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
 // ---------------------------------------------------------------------------
 
 static RISKY_PATTERNS_SRC: &[(&str, &str)] = &[
-    (r"(?i)\bgit\s+push\b(?s:.*?)(--force|-f\b|--delete)\b", "force-pushes or deletes remote refs"),
+    (
+        r"(?i)\bgit\s+push\b(?s:.*?)(--force|-f\b|--delete)\b",
+        "force-pushes or deletes remote refs",
+    ),
     (r"(?i)\bgit\s+push\b", "pushes commits to a remote"),
-    (r"(?i)\b(npm|pnpm|yarn)\s+publish\b", "publishes a package to a registry"),
+    (
+        r"(?i)\b(npm|pnpm|yarn)\s+publish\b",
+        "publishes a package to a registry",
+    ),
     (r"(?i)\bcargo\s+publish\b", "publishes a crate"),
     (r"(?i)\btwine\s+upload\b", "uploads a release to PyPI"),
-    (r"(?i)\bgh\s+(pr|release|api)\b", "creates a GitHub release/PR via gh"),
-    (r"(?i)\b(sudo|su|doas)\b", "runs a command as another user (root)"),
+    (
+        r"(?i)\bgh\s+(pr|release|api)\b",
+        "creates a GitHub release/PR via gh",
+    ),
+    (
+        r"(?i)\b(sudo|su|doas)\b",
+        "runs a command as another user (root)",
+    ),
     // No lookahead in Rust regex: `ssh` followed by a non-dash,
     // non-word char (or end) — matches `ssh host`, not `ssh-keygen`.
-    (r"(?i)\bssh(?:[^-\w]|$)", "opens an SSH connection to a remote host"),
-    (r"(?i)\b(scp|rsync|sftp)\b", "transfers files to/from a remote host"),
+    (
+        r"(?i)\bssh(?:[^-\w]|$)",
+        "opens an SSH connection to a remote host",
+    ),
+    (
+        r"(?i)\b(scp|rsync|sftp)\b",
+        "transfers files to/from a remote host",
+    ),
     (r"(?i)\b(docker|podman)\b", "runs containers"),
-    (r"(?i)\b(kubectl|helm|terraform\s+apply|ansible)\b", "applies infrastructure changes"),
-    (r"(?i)\b(aws|gcloud|az)\b(?s:.*?)\b(ec2|s3|deploy|apply|create|delete|update|push)\b", "mutates cloud resources"),
-    (r"(?i)\b(apt|apt-get|yum|dnf|apk)\b\s+(install|remove|upgrade|update)\b", "changes system packages"),
-    (r"(?i)\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b", "installs a global package"),
+    (
+        r"(?i)\b(kubectl|helm|terraform\s+apply|ansible)\b",
+        "applies infrastructure changes",
+    ),
+    (
+        r"(?i)\b(aws|gcloud|az)\b(?s:.*?)\b(ec2|s3|deploy|apply|create|delete|update|push)\b",
+        "mutates cloud resources",
+    ),
+    (
+        r"(?i)\b(apt|apt-get|yum|dnf|apk)\b\s+(install|remove|upgrade|update)\b",
+        "changes system packages",
+    ),
+    (
+        r"(?i)\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b",
+        "installs a global package",
+    ),
 ];
 
-static RISKY_PATTERNS: std::sync::LazyLock<Vec<(Regex, &'static str)>> = std::sync::LazyLock::new(|| {
-    RISKY_PATTERNS_SRC
-        .iter()
-        .map(|(re, why)| (Regex::new(re).expect("static risky pattern"), *why))
-        .collect()
-});
+static RISKY_PATTERNS: std::sync::LazyLock<Vec<(Regex, &'static str)>> =
+    std::sync::LazyLock::new(|| {
+        RISKY_PATTERNS_SRC
+            .iter()
+            .map(|(re, why)| (Regex::new(re).expect("static risky pattern"), *why))
+            .collect()
+    });
 
 /// First matching risky reason, or `None` (the client's `detectRisky`).
 pub(crate) fn detect_risky(cmd: &str) -> Option<&'static str> {
-    RISKY_PATTERNS.iter().find(|(re, _)| re.is_match(cmd)).map(|(_, why)| *why)
+    RISKY_PATTERNS
+        .iter()
+        .find(|(re, _)| re.is_match(cmd))
+        .map(|(_, why)| *why)
 }
 
 /// Cheap guard for the commit-approval gate (the client's
@@ -700,7 +969,11 @@ pub(crate) fn is_git_commit_command(cmd: &str) -> bool {
     let Some(rest) = c.strip_prefix("git") else {
         return false;
     };
-    if !rest.chars().next().is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '-')) {
+    if !rest
+        .chars()
+        .next()
+        .is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_' || ch == '-'))
+    {
         return false;
     }
     Regex::new(r"\bcommit\b").expect("static").is_match(c)
@@ -719,7 +992,12 @@ pub(crate) fn is_approved_command(cmd: &str, approved: &[String]) -> bool {
 /// Returns how to proceed; `Deny` on denial, stop, or a second concurrent
 /// pause on the same run (dispatch is sequential, so that means a bug —
 /// fail closed rather than orphan a waiter).
-async fn await_gate(run: &Arc<RunShared>, kind: GateKind, command: String, reason: Option<String>) -> GateDecision {
+async fn await_gate(
+    run: &Arc<RunShared>,
+    kind: GateKind,
+    command: String,
+    reason: Option<String>,
+) -> GateDecision {
     let gid = format!("gate_{:x}_{}", now_ms(), std::process::id());
     let (tx, rx) = oneshot::channel();
     {
@@ -728,12 +1006,22 @@ async fn await_gate(run: &Arc<RunShared>, kind: GateKind, command: String, reaso
             return GateDecision::Deny;
         }
         gs.slot = Some(GateSlot {
-            pending: PendingGate { id: gid.clone(), kind, command: command.clone(), reason: reason.clone() },
+            pending: PendingGate {
+                id: gid.clone(),
+                kind,
+                command: command.clone(),
+                reason: reason.clone(),
+            },
             tx,
         });
     }
     run.set_status(RunStatus::AwaitingGate);
-    let _ = run.tx.send(AgentEvent::GateRequested { id: gid.clone(), kind, command, reason });
+    let _ = run.tx.send(AgentEvent::GateRequested {
+        id: gid.clone(),
+        kind,
+        command,
+        reason,
+    });
     let decision = tokio::select! {
         d = rx => d.unwrap_or(GateDecision::Deny),
         _ = run.wait_stop() => {
@@ -766,7 +1054,12 @@ fn run_depth(state: &S, run: &Arc<RunShared>) -> usize {
 // ---------------------------------------------------------------------------
 
 async fn delegate(state: &S, run: &Arc<RunShared>, args: &Value) -> Value {
-    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if task.is_empty() {
         return json!({ "error": "task is required" });
     }
@@ -778,16 +1071,47 @@ async fn delegate(state: &S, run: &Arc<RunShared>, args: &Value) -> Value {
     // Per-family scout semantics (CoderScreen's runSubagent vs ChatScreen's
     // runNested — different seeds, different default tool sets).
     if run.meta.tool_set == "chat" {
-        let prompt = format!("Task: {task}\n\nWhen finished, reply with a concise final summary — you cannot ask the user anything.");
-        return spawn_child(state, run, "delegate", "scout", &prompt, SCOUT_CHAT_TOOLS, SCOUT_CHAT_TOOLS, 6, args).await;
+        let prompt = format!(
+            "Task: {task}\n\nWhen finished, reply with a concise final summary — you cannot ask the user anything."
+        );
+        return spawn_child(
+            state,
+            run,
+            "delegate",
+            "scout",
+            &prompt,
+            SCOUT_CHAT_TOOLS,
+            SCOUT_CHAT_TOOLS,
+            6,
+            args,
+        )
+        .await;
     }
     // The client's exact scout seed (the task is wrapped the same way).
-    let prompt = format!("Task: {task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.");
-    spawn_child(state, run, "delegate", "scout", &prompt, SCOUT_DEFAULT_TOOLS, SCOUT_FILTER_TOOLS, 6, args).await
+    let prompt = format!(
+        "Task: {task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code."
+    );
+    spawn_child(
+        state,
+        run,
+        "delegate",
+        "scout",
+        &prompt,
+        SCOUT_DEFAULT_TOOLS,
+        SCOUT_FILTER_TOOLS,
+        6,
+        args,
+    )
+    .await
 }
 
 async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
-    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let task = args
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if task.is_empty() {
         return json!({ "error": "task is required" });
     }
@@ -802,7 +1126,18 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
             .map(String::as_str)
             .filter(|n| !matches!(*n, "delegate" | "subagent" | "ask_user" | "todo_write"))
             .collect();
-        return spawn_child(state, parent, "subagent", "worker", &task, &defaults[..], &defaults[..], 20, args).await;
+        return spawn_child(
+            state,
+            parent,
+            "subagent",
+            "worker",
+            &task,
+            &defaults[..],
+            &defaults[..],
+            20,
+            args,
+        )
+        .await;
     }
     let wmodel = args
         .get("model")
@@ -820,6 +1155,8 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         &parent.client,
         state,
         &wmodel,
+        parent.meta.base_url.as_deref(),
+        parent.meta.api_key.as_deref(),
         IDEATION_SYSTEM,
         &format!("TASK:\n{task}"),
         Some(0.4),
@@ -835,17 +1172,13 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
     // `critic_approved` is tri-state: None = the critic never actually
     // reviewed anything (spec off, or every attempt had an empty diff) —
     // distinct from an explicit rejection.
-    let critic = parent
-        .meta
-        .critic
-        .clone()
-        .filter(|c| {
-            c.get("model")
-                .and_then(|m| m.as_str())
-                .map(str::trim)
-                .map(|m| !m.is_empty())
-                .unwrap_or(false)
-        });
+    let critic = parent.meta.critic.clone().filter(|c| {
+        c.get("model")
+            .and_then(|m| m.as_str())
+            .map(str::trim)
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+    });
     let mut prompt = format!("TASK (implement now):\n{task}");
     if !ideation.is_empty() {
         prompt.push_str(&format!(
@@ -867,13 +1200,26 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
                 "TASK (revise your previous implementation):\n{task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n{critique}"
             );
         }
-        let res = spawn_child(state, parent, "subagent", "worker", &prompt, SUBAGENT_TOOLS, SUBAGENT_TOOLS, 12, args).await;
+        let res = spawn_child(
+            state,
+            parent,
+            "subagent",
+            "worker",
+            &prompt,
+            SUBAGENT_TOOLS,
+            SUBAGENT_TOOLS,
+            12,
+            args,
+        )
+        .await;
         summary = res["summary"].as_str().unwrap_or_default().to_string();
         res_ok = res["ok"].as_bool().unwrap_or(false);
         exhausted = res["stop"].as_str() == Some("steps");
         // Net diff across attempts (git write-tree before/after) — the critic
         // reviews the working-tree diff, not the worker's self-report.
-        diff = net_diff(parent.scope_opt().as_deref(), pre.as_deref()).await.unwrap_or_default();
+        diff = net_diff(parent.scope_opt().as_deref(), pre.as_deref())
+            .await
+            .unwrap_or_default();
         // No critic spec (or an empty diff) → no review gate for this attempt.
         let Some(spec) = critic.as_ref().filter(|_| !diff.trim().is_empty()) else {
             res_ok = true; // unreviewed attempt stands (the client's gate is off)
@@ -882,7 +1228,18 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         match run_critic(state, parent, spec, &diff, &task).await {
             Ok((approved, issues, learnings)) => {
                 if !learnings.is_empty() {
-                    persist_learnings(state, parent, &learnings, if approved { "critic:approve" } else { "critic:reject" }, &task).await;
+                    persist_learnings(
+                        state,
+                        parent,
+                        &learnings,
+                        if approved {
+                            "critic:approve"
+                        } else {
+                            "critic:reject"
+                        },
+                        &task,
+                    )
+                    .await;
                 }
                 critic_approved = Some(approved);
                 if approved || attempt == MAX_WORKER_CRIT {
@@ -892,7 +1249,10 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
                 // twice means the worker isn't converging — stop burning the
                 // remaining retries on a repeat.
                 let issues_t = issues.trim();
-                if attempt > 0 && !issues_t.is_empty() && issues_t.eq_ignore_ascii_case(prev_critique.trim()) {
+                if attempt > 0
+                    && !issues_t.is_empty()
+                    && issues_t.eq_ignore_ascii_case(prev_critique.trim())
+                {
                     break;
                 }
                 prev_critique = issues.clone();
@@ -943,9 +1303,16 @@ async fn spawn_child(
     let requested: Vec<String> = args
         .get("tools")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let filtered: Vec<String> = requested.into_iter().filter(|t| allowed_set.contains(t.as_str())).collect();
+    let filtered: Vec<String> = requested
+        .into_iter()
+        .filter(|t| allowed_set.contains(t.as_str()))
+        .collect();
     let tool_names: Vec<String> = if filtered.is_empty() {
         default_tools.iter().map(|s| s.to_string()).collect()
     } else {
@@ -957,8 +1324,12 @@ async fn spawn_child(
     let mut tools_spec = Vec::new();
     if let Some(arr) = parent.meta.tools_spec.as_array() {
         for t in arr {
-            if let Some(n) = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str())
-                && tool_names.iter().any(|x| x == n) {
+            if let Some(n) = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                && tool_names.iter().any(|x| x == n)
+            {
                 tools_spec.push(t.clone());
             }
         }
@@ -978,7 +1349,9 @@ async fn spawn_child(
     let id = format!(
         "run_{:x}_{}",
         now_ms(),
-        state.bg_job_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        state
+            .bg_job_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
 
     let meta = crate::agent::run::RunMeta {
@@ -986,6 +1359,8 @@ async fn spawn_child(
         kind: kind.into(),
         label: format!("{tool}: {}", prompt.chars().take(60).collect::<String>()),
         model,
+        base_url: parent.meta.base_url.clone(),
+        api_key: parent.meta.api_key.clone(),
         system: {
             if kind == "worker" && parent.meta.tool_set != "chat" {
                 Some(WORKER_SYSTEM.to_string())
@@ -1002,7 +1377,13 @@ async fn spawn_child(
             } else {
                 // Coder scouts run under the parent's (coder) system, like the
                 // client's runSubagent (dynamicSystemRef.current).
-                Some(parent.meta.system.clone().unwrap_or_else(|| SCOUT_SYSTEM.to_string()))
+                Some(
+                    parent
+                        .meta
+                        .system
+                        .clone()
+                        .unwrap_or_else(|| SCOUT_SYSTEM.to_string()),
+                )
             }
         },
         max_steps,
@@ -1015,8 +1396,12 @@ async fn spawn_child(
             // The client's per-kind maxTokens (worker 4096, scout 2048); chat
             // runs keep the chat screen's own params untouched.
             if parent.meta.tool_set != "chat"
-                && let Value::Object(o) = &mut p {
-                o.insert("maxTokens".to_string(), json!(if kind == "worker" { 4096 } else { 2048 }));
+                && let Value::Object(o) = &mut p
+            {
+                o.insert(
+                    "maxTokens".to_string(),
+                    json!(if kind == "worker" { 4096 } else { 2048 }),
+                );
             }
             p
         },
@@ -1047,8 +1432,17 @@ async fn spawn_child(
     // Human gates follow the run family (the client's worker/scout inherited
     // the supervisor's dialogs the same way, via closure).
     {
-        let opts = parent.gate_state.lock().unwrap_or_else(|p| p.into_inner()).opts.clone();
-        child.gate_state.lock().unwrap_or_else(|p| p.into_inner()).opts = opts;
+        let opts = parent
+            .gate_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .opts
+            .clone();
+        child
+            .gate_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .opts = opts;
     }
     let run_id = child.meta.id.clone();
     // Tell attached clients the child exists (they can attach to it live).
@@ -1111,8 +1505,11 @@ async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Optio
     if let Some(s) = scope {
         c.current_dir(s);
     }
-    c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output()).await {
+    c.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output())
+        .await
+    {
         Ok(Ok(out)) => out,
         _ => return None,
     };
@@ -1167,6 +1564,8 @@ async fn run_critic(
         &parent.client,
         state,
         &model,
+        parent.meta.base_url.as_deref(),
+        parent.meta.api_key.as_deref(),
         &system,
         &prompt,
         None,
@@ -1222,8 +1621,9 @@ static RE_AVOID: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 /// FIRST occurrence out of the issue text with a single
 /// `.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '')`.
 fn re_verdict_token() -> &'static Regex {
-    RE_VERDICT_TOKEN
-        .get_or_init(|| Regex::new(r"(?i)VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*").expect("static regex"))
+    RE_VERDICT_TOKEN.get_or_init(|| {
+        Regex::new(r"(?i)VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*").expect("static regex")
+    })
 }
 
 /// `LEARNING:` / `AVOID:` line extraction (case-insensitive, optional leading
@@ -1238,7 +1638,13 @@ fn re_avoid() -> &'static Regex {
 /// Persist critic/agent learnings to the per-repo memory store (in-process
 /// call of the same handler the HTTP route uses). A failure on one learning
 /// never breaks the run loop.
-async fn persist_learnings(state: &S, run: &Arc<RunShared>, learnings: &[(String, String)], provenance: &str, task: &str) {
+async fn persist_learnings(
+    state: &S,
+    run: &Arc<RunShared>,
+    learnings: &[(String, String)],
+    provenance: &str,
+    task: &str,
+) {
     for (kind, text) in learnings {
         let mut body = json!({
             "learning": { "text": text, "kind": kind },
@@ -1248,7 +1654,9 @@ async fn persist_learnings(state: &S, run: &Arc<RunShared>, learnings: &[(String
         if let Some(scope) = run.scope_opt() {
             body["workspace"] = json!(scope);
         }
-        let _ = crate::coder::memory::memory_set(axum::extract::State(state.clone()), axum::Json(body)).await;
+        let _ =
+            crate::coder::memory::memory_set(axum::extract::State(state.clone()), axum::Json(body))
+                .await;
     }
 }
 
@@ -1274,13 +1682,48 @@ pub fn known_tool(tool_set: &str, name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 const READONLY_BASH: &[&str] = &[
-    "find", "ls", "cat", "head", "tail", "wc", "grep", "rg", "fd", "file", "stat", "du", "df", "tree", "pwd",
-    "which", "uname", "date", "sort", "uniq", "diff", "nl", "basename", "dirname", "realpath", "readlink",
-    "md5sum", "sha256sum",
+    "find",
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "rg",
+    "fd",
+    "file",
+    "stat",
+    "du",
+    "df",
+    "tree",
+    "pwd",
+    "which",
+    "uname",
+    "date",
+    "sort",
+    "uniq",
+    "diff",
+    "nl",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "md5sum",
+    "sha256sum",
 ];
 /// Read-only git subcommands allowed in plan mode.
 const READONLY_GIT: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "tag", "remote", "blame", "shortlog", "describe", "ls-files",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "tag",
+    "remote",
+    "blame",
+    "shortlog",
+    "describe",
+    "ls-files",
     "rev-parse",
 ];
 
@@ -1289,8 +1732,7 @@ static RE_SHELL_CONTROL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new()
 /// Redirection, pipes, chaining, command substitution, or a paren group make
 /// a command non-inspection.
 fn re_shell_control() -> &'static Regex {
-    RE_SHELL_CONTROL
-        .get_or_init(|| Regex::new(r#"[>|;&`\(]"#).expect("static regex"))
+    RE_SHELL_CONTROL.get_or_init(|| Regex::new(r#"[>|;&`\(]"#).expect("static regex"))
 }
 
 /// Would this shell command only inspect state? (The client's
@@ -1321,14 +1763,17 @@ mod tests {
     fn fresh_state() -> S {
         static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("ninfier-agent-tools-{}-{n}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ninfier-agent-tools-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         Arc::new(State::new(tmp.clone(), tmp, None))
     }
 
     /// Drive one pause/resume round-trip: the run pauses with a pending
     /// approval, the "client" resolves it, the waiter gets the outcome.
-    async fn round_trip(decision: ApprovalDecision) -> (Option<String>, crate::agent::run::RunSnapshot) {
+    async fn round_trip(
+        decision: ApprovalDecision,
+    ) -> (Option<String>, crate::agent::run::RunSnapshot) {
         let state = fresh_state();
         let shared = crate::agent::run::test_run(&state, "coder", &["bash"], None);
         let args = serde_json::json!({"command": "rm -rf /"});
@@ -1337,7 +1782,8 @@ mod tests {
         let aid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let snap = shared.snapshot();
-                if snap.status == RunStatus::AwaitingApproval && !snap.pending_approvals.is_empty() {
+                if snap.status == RunStatus::AwaitingApproval && !snap.pending_approvals.is_empty()
+                {
                     return snap.pending_approvals[0].id.clone();
                 }
                 tokio::task::yield_now().await;
@@ -1360,29 +1806,64 @@ mod tests {
 
     #[tokio::test]
     async fn approval_pause_approves_with_token() {
-        let (out, snap) = round_trip(ApprovalDecision::Approved { token: Some("tok123".into()) }).await;
+        let (out, snap) = round_trip(ApprovalDecision::Approved {
+            token: Some("tok123".into()),
+        })
+        .await;
         assert_eq!(out.as_deref(), Some("tok123"));
         assert!(snap.pending_approvals.is_empty());
     }
 
-
     #[test]
     fn risky_patterns_mirror_client() {
-        assert_eq!(detect_risky("git push --force origin main"), Some("force-pushes or deletes remote refs"));
+        assert_eq!(
+            detect_risky("git push --force origin main"),
+            Some("force-pushes or deletes remote refs")
+        );
         assert_eq!(detect_risky("git push"), Some("pushes commits to a remote"));
-        assert_eq!(detect_risky("npm publish"), Some("publishes a package to a registry"));
+        assert_eq!(
+            detect_risky("npm publish"),
+            Some("publishes a package to a registry")
+        );
         assert_eq!(detect_risky("cargo publish"), Some("publishes a crate"));
-        assert_eq!(detect_risky("twine upload dist/*"), Some("uploads a release to PyPI"));
-        assert_eq!(detect_risky("gh release create v1"), Some("creates a GitHub release/PR via gh"));
-        assert_eq!(detect_risky("sudo rm -rf /"), Some("runs a command as another user (root)"));
-        assert_eq!(detect_risky("ssh user@host"), Some("opens an SSH connection to a remote host"));
+        assert_eq!(
+            detect_risky("twine upload dist/*"),
+            Some("uploads a release to PyPI")
+        );
+        assert_eq!(
+            detect_risky("gh release create v1"),
+            Some("creates a GitHub release/PR via gh")
+        );
+        assert_eq!(
+            detect_risky("sudo rm -rf /"),
+            Some("runs a command as another user (root)")
+        );
+        assert_eq!(
+            detect_risky("ssh user@host"),
+            Some("opens an SSH connection to a remote host")
+        );
         assert_eq!(detect_risky("ssh-keygen -t ed25519"), None);
-        assert_eq!(detect_risky("scp a b"), Some("transfers files to/from a remote host"));
+        assert_eq!(
+            detect_risky("scp a b"),
+            Some("transfers files to/from a remote host")
+        );
         assert_eq!(detect_risky("docker ps"), Some("runs containers"));
-        assert_eq!(detect_risky("kubectl apply -f x"), Some("applies infrastructure changes"));
-        assert_eq!(detect_risky("aws s3 rm s3://b/k"), Some("mutates cloud resources"));
-        assert_eq!(detect_risky("apt install foo"), Some("changes system packages"));
-        assert_eq!(detect_risky("npm install -g foo"), Some("installs a global package"));
+        assert_eq!(
+            detect_risky("kubectl apply -f x"),
+            Some("applies infrastructure changes")
+        );
+        assert_eq!(
+            detect_risky("aws s3 rm s3://b/k"),
+            Some("mutates cloud resources")
+        );
+        assert_eq!(
+            detect_risky("apt install foo"),
+            Some("changes system packages")
+        );
+        assert_eq!(
+            detect_risky("npm install -g foo"),
+            Some("installs a global package")
+        );
         assert_eq!(detect_risky("ls -la"), None);
         assert_eq!(detect_risky("cargo test"), None);
     }
@@ -1439,12 +1920,19 @@ mod tests {
         let resp = crate::agent::run::gate_decide(
             axum::extract::State(state.clone()),
             axum::extract::Path((shared.meta.id.clone(), gid)),
-            axum::Json(crate::agent::run::GateDecideBody { decision: "deny".into() }),
+            axum::Json(crate::agent::run::GateDecideBody {
+                decision: "deny".into(),
+            }),
         )
         .await;
         drop(resp);
         let out = waiter.await.expect("waiter joins");
-        assert!(out.get("error").and_then(|v| v.as_str()).unwrap_or("").contains("denied by the user"));
+        assert!(
+            out.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("denied by the user")
+        );
         assert!(shared.snapshot().pending_gate.is_none());
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
@@ -1482,11 +1970,18 @@ mod tests {
         crate::agent::run::gate_decide(
             axum::extract::State(state.clone()),
             axum::extract::Path((shared.meta.id.clone(), gid)),
-            axum::Json(crate::agent::run::GateDecideBody { decision: "once".into() }),
+            axum::Json(crate::agent::run::GateDecideBody {
+                decision: "once".into(),
+            }),
         )
         .await;
         let out = waiter.await.expect("waiter joins");
-        assert!(out.get("error").and_then(|v| v.as_str()).is_none_or(|e| !e.contains("denied by the user")), "{out}");
+        assert!(
+            out.get("error")
+                .and_then(|v| v.as_str())
+                .is_none_or(|e| !e.contains("denied by the user")),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
     async fn approval_pause_denies_to_none() {

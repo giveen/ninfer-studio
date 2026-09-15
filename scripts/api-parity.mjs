@@ -57,13 +57,13 @@ function uiEndpoints() {
 function rustRoutes() {
   const routes = new Set();
   const lib = read('desktop/control/src/lib.rs');
-  for (const m of lib.matchAll(/\.route\("([^"]+)"/g)) {
+  for (const m of lib.matchAll(/\.route\(\s*"([^"]+)"/g)) {
     routes.add(m[1].replace(/\{[^}]*\}/g, '*'));
   }
   // /api/agent is a nested router (agent/run.rs); its routes register there,
   // prefixed by the nest point in lib.rs.
   const runs = read('desktop/control/src/agent/run.rs');
-  for (const m of runs.matchAll(/\.route\("([^"]+)"/g)) {
+  for (const m of runs.matchAll(/\.route\(\s*"([^"]+)"/g)) {
     routes.add(('/api/agent' + m[1]).replace(/\{[^}]*\}/g, '*'));
   }
   return [...routes];

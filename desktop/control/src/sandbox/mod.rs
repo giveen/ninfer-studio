@@ -55,8 +55,7 @@ pub(crate) fn arg_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
     }
-    if s
-        .bytes()
+    if s.bytes()
         .all(|b| b != b' ' && b != b'\t' && b != b'"' && b != b'\\')
     {
         return s.to_string();

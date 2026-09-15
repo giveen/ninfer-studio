@@ -4,7 +4,7 @@
 
 use crate::clear_appimage_env;
 use crate::types::{AppEvent, State, now_ms};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub type S = Arc<State>;
@@ -61,7 +61,7 @@ pub async fn start_update(state: &S, action: &str) -> Value {
                     return json!({
                         "ok": false,
                         "message": format!("{repo} is not a git work tree")
-                    })
+                    });
                 }
             }
             format!("git -C {repo} pull --ff-only")
@@ -80,7 +80,12 @@ pub async fn start_update(state: &S, action: &str) -> Value {
     if action == "build" {
         let running = {
             let eng = state.engine.read().await;
-            matches!(eng.state, crate::types::EngineState::Running | crate::types::EngineState::Starting | crate::types::EngineState::Stopping) && eng.pid.is_some()
+            matches!(
+                eng.state,
+                crate::types::EngineState::Running
+                    | crate::types::EngineState::Starting
+                    | crate::types::EngineState::Stopping
+            ) && eng.pid.is_some()
         };
         if running {
             crate::engine::stop_engine(state, None).await;

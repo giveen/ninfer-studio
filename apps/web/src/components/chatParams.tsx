@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import { Gauge, Save, X } from 'lucide-react';
-import type { ChatParams, SavedChatParams } from '../lib/types';
+import type { ChatParams, SavedChatParams, AppSettings } from '../lib/types';
 import { VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { formatTokens } from '../lib/format';
 import { DEFAULT_PARAMS } from '../lib/chatHelpers';
@@ -22,6 +22,7 @@ export function ParamsPopover({
   onSavePreset,
   onLoadPreset,
   onDeletePreset,
+  appConfig,
 }: {
   params: ChatParams;
   setParams: (p: ChatParams) => void;
@@ -32,6 +33,7 @@ export function ParamsPopover({
   onSavePreset: (name: string) => void;
   onLoadPreset: (id: string) => void;
   onDeletePreset: (id: string) => void;
+  appConfig?: AppSettings | null;
 }) {
   const set = (patch: Partial<ChatParams>) => setParams({ ...params, ...patch });
   const row = 'grid grid-cols-[150px_1fr] items-center gap-3';
@@ -41,6 +43,56 @@ export function ParamsPopover({
   return (
     <div className="w-[430px] rounded-xl border border-line bg-panel p-4 shadow-2xl">
       <div className="space-y-3.5">
+        {appConfig?.cloudProviderEnabled && (
+          <div className="space-y-3 pb-3 border-b border-line/50 mb-3">
+            <div className={row}>
+              <span className={lab}>Primary Agent</span>
+              <SelectField
+                value={params.primaryProvider || 'ninfer'}
+                onChange={(v) => set({ primaryProvider: v as 'ninfer' | 'cloud' })}
+                options={[
+                  { value: 'ninfer', label: 'Local (ninfer)' },
+                  { value: 'cloud', label: 'Cloud API' },
+                ]}
+              />
+            </div>
+            {params.primaryProvider === 'cloud' && (
+              <div className={row}>
+                <span className={lab}>Primary Model</span>
+                <input
+                  type="text"
+                  value={params.primaryCloudModel || ''}
+                  onChange={(e) => set({ primaryCloudModel: e.target.value })}
+                  placeholder="e.g. gpt-4o"
+                  className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                />
+              </div>
+            )}
+            <div className={row}>
+              <span className={lab}>Subagent</span>
+              <SelectField
+                value={params.subagentProvider || 'ninfer'}
+                onChange={(v) => set({ subagentProvider: v as 'ninfer' | 'cloud' })}
+                options={[
+                  { value: 'ninfer', label: 'Local (ninfer)' },
+                  { value: 'cloud', label: 'Cloud API' },
+                ]}
+              />
+            </div>
+            {params.subagentProvider === 'cloud' && (
+              <div className={row}>
+                <span className={lab}>Subagent Model</span>
+                <input
+                  type="text"
+                  value={params.subagentCloudModel || ''}
+                  onChange={(e) => set({ subagentCloudModel: e.target.value })}
+                  placeholder="e.g. gpt-4o-mini"
+                  className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
+        )}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Toggle checked={params.thinking} onChange={(v) => set({ thinking: v, ...(v ? {} : { reasoningEffort: '' }) })} label="Thinking" hint="Chain-of-thought before the answer. The engine streams reasoning_content separately from the response text." />

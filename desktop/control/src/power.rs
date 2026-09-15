@@ -41,7 +41,9 @@ async fn read_power_log(state: &S) -> BTreeMap<String, f64> {
         #[serde(default, rename = "byDay")]
         by_day: BTreeMap<String, f64>,
     }
-    serde_json::from_str::<Doc>(&raw).map(|d| d.by_day).unwrap_or_default()
+    serde_json::from_str::<Doc>(&raw)
+        .map(|d| d.by_day)
+        .unwrap_or_default()
 }
 
 pub(crate) async fn write_power_log(state: &S, by_day: &BTreeMap<String, f64>) {
@@ -56,7 +58,11 @@ pub(crate) async fn write_power_log(state: &S, by_day: &BTreeMap<String, f64>) {
 /// lexicographic — `YYYY-MM-DD` sorts chronologically). Used by
 /// `usage::usage_stats` to fold energy into the same window as token usage.
 pub(crate) async fn energy_kwh_by_day(state: &S, cutoff_day: &str) -> BTreeMap<String, f64> {
-    read_power_log(state).await.into_iter().filter(|(day, _)| day.as_str() >= cutoff_day).collect()
+    read_power_log(state)
+        .await
+        .into_iter()
+        .filter(|(day, _)| day.as_str() >= cutoff_day)
+        .collect()
 }
 
 /// Spawn the background sampling loop. Fire-and-forget: started once at boot
@@ -85,13 +91,18 @@ pub(crate) async fn run_power_sampler(state: S) {
         tokio::time::sleep(SAMPLE_INTERVAL).await;
         let (running, log_path) = {
             let eng = state.engine.read().await;
-            (matches!(eng.state, EngineState::Running | EngineState::External), eng.log_path.clone())
+            (
+                matches!(eng.state, EngineState::Running | EngineState::External),
+                eng.log_path.clone(),
+            )
         };
         if !running {
             continue;
         }
         let Some(log_path) = log_path else { continue };
-        let Ok(meta) = tokio::fs::metadata(&log_path).await else { continue };
+        let Ok(meta) = tokio::fs::metadata(&log_path).await else {
+            continue;
+        };
         let len = meta.len();
         let flowing = log_is_flowing(&last_log, &log_path, len);
         last_log = Some((log_path, len));
@@ -102,7 +113,9 @@ pub(crate) async fn run_power_sampler(state: S) {
         if !g.available {
             continue;
         }
-        let Some(watts) = g.power_draw_w else { continue };
+        let Some(watts) = g.power_draw_w else {
+            continue;
+        };
         if watts <= 0.0 {
             continue;
         }
@@ -126,15 +139,30 @@ mod tests {
     #[test]
     fn flow_only_when_the_same_log_changed_size() {
         let last = Some(("/data/engine-8080.log".to_string(), 100));
-        assert!(!log_is_flowing(&last, "/data/engine-8080.log", 100), "unchanged size is idle, not flow");
-        assert!(log_is_flowing(&last, "/data/engine-8080.log", 150), "grew — a request was served");
-        assert!(log_is_flowing(&last, "/data/engine-8080.log", 10), "shrank via rotation — still activity");
-        assert!(!log_is_flowing(&last, "/data/engine-8081.log", 999), "a different log (restart) has no baseline yet");
+        assert!(
+            !log_is_flowing(&last, "/data/engine-8080.log", 100),
+            "unchanged size is idle, not flow"
+        );
+        assert!(
+            log_is_flowing(&last, "/data/engine-8080.log", 150),
+            "grew — a request was served"
+        );
+        assert!(
+            log_is_flowing(&last, "/data/engine-8080.log", 10),
+            "shrank via rotation — still activity"
+        );
+        assert!(
+            !log_is_flowing(&last, "/data/engine-8081.log", 999),
+            "a different log (restart) has no baseline yet"
+        );
     }
     use std::sync::Arc;
 
     fn temp_state() -> S {
-        let dir = std::env::temp_dir().join(format!("ninfier-power-test-{}", crate::memstore::mem_rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "ninfier-power-test-{}",
+            crate::memstore::mem_rand_suffix()
+        ));
         Arc::new(State::new(dir, PathBuf::from("."), None))
     }
 

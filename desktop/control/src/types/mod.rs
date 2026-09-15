@@ -19,7 +19,9 @@ mod settings;
 mod state;
 mod util;
 
-pub use domain::{CatalogEntry, EngineState, EngineStatus, GpuApp, GpuStats, JobRec, ModelArtifact, ARTIFACTS};
+pub use domain::{
+    ARTIFACTS, CatalogEntry, EngineState, EngineStatus, GpuApp, GpuStats, JobRec, ModelArtifact,
+};
 pub use serve_args::{args_equal, build_serve_args};
 pub use settings::{AppSettings, EngineProfile, McpServerSpec, NumberOrAuto};
 pub use state::{AppEvent, EngineInner, LastStart, ProfileState, SavedProfile, State};
