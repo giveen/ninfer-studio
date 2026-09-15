@@ -62,7 +62,7 @@ jobs:
 
       - name: Set Windows CFLAGS for aws-lc-sys C11 atomics
         if: matrix.os == 'windows-latest'
-        run: echo "CFLAGS=/std:c11" >> $env:GITHUB_ENV
+        run: echo "CFLAGS=/std:c11 /experimental:c11atomics" >> $env:GITHUB_ENV
 
       - name: Setup Node
         uses: actions/setup-node@v4
