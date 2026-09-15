@@ -1138,7 +1138,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 critic_model.as_str().unwrap_or_default(),
                 shared.meta.base_url.as_deref(),
                 shared.meta.api_key.as_deref(),
-                &critic_sys,
+                critic_sys,
                 &turn_input,
                 Some(0.4),
                 Some(2048),
