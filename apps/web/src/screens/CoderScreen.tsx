@@ -63,7 +63,7 @@ Before making tool calls T, think and explicitly list out any related tools for 
    - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
    - For pages that only render via JavaScript, use the built-in \`browser\` tool: \`navigate\` then \`snapshot\` (plus \`click\`/\`fill\`/\`wait_for\`/\`evaluate\` when you must interact). Prefer \`web_fetch\` for static pages. Call the \`close\` action when done so the session is freed.
    - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
-   - Use \`git_commit\` to save your work in logical commits and \`git_diff\` to review changes before committing. The harness also auto-commits writes/edits, but you should make intentional, well-messaged commits too.
+   - Use \`git_commit\` to save your work in logical commits when a goal or module is completed, and \`git_diff\` to review changes before committing.
     - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
     - Trivial lookups (current git branch, a version number, whether a file exists, a config value) deserve ONE direct tool call and an immediate answer. Never delegate them to a subagent and never chain extra tool calls once you have the answer — reply at once.
 2. **Best Practices**: Write clean, modular, and maintainable code. Match the existing project conventions perfectly.
@@ -1453,13 +1453,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   };
 
-  /** Stage + auto-commit one file, returning a bounded unified-diff preview. */
-  const commitFile = async (path: string, message: string, signal?: AbortSignal): Promise<{ ok: boolean; preview: string }> => {
+  /** Return a bounded unified-diff preview of uncommitted changes in one file against HEAD. */
+  const getFilePreview = async (path: string, signal?: AbortSignal): Promise<{ ok: boolean; preview: string }> => {
     const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-    const c = await coderExec(`git add ${q(path)} && git commit -m ${q(message)}`, undefined, 10000, undefined, false, signal, activeWsDir);
-    if (c.exitCode !== 0) return { ok: false, preview: '' };
-    const d = await coderExec(`git show --format= --unified=3 HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal, activeWsDir);
-    return { ok: true, preview: (d.stdout || '').slice(0, 4000) };
+    const d = await coderExec(`git diff HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal, activeWsDir);
+    return { ok: d.exitCode === 0, preview: (d.stdout || '').slice(0, 4000) };
   };
   /** Post-edit verification: lint (falls back to build) then test, each bounded.
    * Returns extra result fields; the first failure stops the chain so the
@@ -1717,10 +1715,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             readPathsRef.current.add(wpath);
             mutated = true;
             if (commitApproval) {
-              // Gate ON: don't auto-commit; let the human review + approve a real commit.
               result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
-              const { preview } = await commitFile(args.path, `Agent auto-commit: wrote ${args.path}`, toolSignal);
+              const { preview } = await getFilePreview(args.path, toolSignal);
               result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
@@ -1735,7 +1732,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             if (commitApproval) {
               result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
-              const { preview } = await commitFile(args.path, `Agent auto-commit: edited ${args.path}`, toolSignal);
+              const { preview } = await getFilePreview(args.path, toolSignal);
               result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }
@@ -1752,7 +1749,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             if (commitApproval) {
               result = JSON.stringify(await runPostEditChecks(res, '', toolSignal));
             } else {
-              const { preview } = await commitFile(args.path, `Agent auto-commit: patched ${args.path}`, toolSignal);
+              const { preview } = await getFilePreview(args.path, toolSignal);
               result = JSON.stringify(await runPostEditChecks(res, preview, toolSignal));
             }
           }

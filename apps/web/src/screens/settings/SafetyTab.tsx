@@ -387,8 +387,8 @@ export function SafetyTab() {
 
       <SectionCard title="Commit approval" icon={<GitCommit size={15} />} description="Gate: the agent cannot commit without human sign-off.">
         <div className="flex items-center justify-between gap-3">
-          <p className="text-[12.5px] text-faint">When ON, the agent cannot commit until you review the working-tree-vs-HEAD diff and approve. Auto-commits on write/edit are paused so only intentional, reviewed commits land.</p>
-          <ToggleRow on={commitApproval} onToggle={setCommitApproval} onTitle="Agent commits require your approval of the working-tree diff" offTitle="Agent may commit freely (auto-commits on every write)" />
+          <p className="text-[12.5px] text-faint">When ON, the agent cannot commit until you review the working-tree-vs-HEAD diff and approve. Intentional commits via git_commit require human sign-off.</p>
+          <ToggleRow on={commitApproval} onToggle={setCommitApproval} onTitle="Agent commits require your approval of the working-tree diff" offTitle="Agent may commit freely when goals/modules complete" />
         </div>
       </SectionCard>
 
