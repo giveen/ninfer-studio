@@ -17,7 +17,6 @@ use crate::engine::S;
 use futures_util::{future::join_all, StreamExt};
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,7 +42,7 @@ const PACK_EXCLUDED: &[&str] = &["grep", "glob", "repo_search", "obs_recall"];
 
 /// A tool call recovered from markup text (native calls get engine ids).
 #[derive(Debug, Clone)]
-struct Tc {
+pub struct Tc {
     id: String,
     name: String,
     /// Raw JSON arguments string, exactly as the model sent them.
@@ -58,7 +57,7 @@ impl Tc {
 
 /// One streamed assistant turn.
 #[derive(Debug, Default)]
-struct Turn {
+pub(crate) struct Turn {
     content: String,
     reasoning: String,
     tool_calls: Vec<Tc>,
@@ -239,22 +238,25 @@ pub fn compacted_context(messages: &[Value]) -> &[Value] {
 // Markup tool-call recovery (small models paste calls into text)
 // ---------------------------------------------------------------------------
 
-fn lazy(pattern: &str) -> &'static Regex {
-    std::sync::OnceLock::get_or_init(|| Regex::new(pattern).expect("static regex"))
-}
+static RE_TOOL_CALL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static RE_FENCE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static RE_TRAILING_COMMA: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
 /// `<tool_call>…</tool_call>` (JSON body, or the XML-ish function form).
 fn re_tool_call() -> &'static Regex {
-    lazy(r"(?s)<tool_call>(.*?)</tool_call>")
+    RE_TOOL_CALL
+        .get_or_init(|| Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").expect("static regex"))
 }
 /// Fenced ```json / ```tool_call / ```tool_call blocks.
 fn re_fence() -> &'static Regex {
-    lazy(r"(?s)```(?:json|tool_?call)\s*\n?(.*?)\n?```")
+    RE_FENCE
+        .get_or_init(|| Regex::new(r"(?s)```(?:json|tool_?call)\s*\n?(.*?)\n?```").expect("static regex"))
 }
 /// Trailing commas — a common small-model JSON mistake — stripped before
 /// parsing (`,}` → `}`, `,]` → `]`).
 fn re_trailing_comma() -> &'static Regex {
-    lazy(r"(,(\s*[}\]]))")
+    RE_TRAILING_COMMA
+        .get_or_init(|| Regex::new(r"(,(\s*[}\]]))").expect("static regex"))
 }
 
 /// Parse a candidate JSON body into an array of item objects.
@@ -559,8 +561,13 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
                 .packed_cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .insert(content, packed_str);
-            out[idx] = packed;
+                .insert(content, packed_str.clone());
+            out[idx] = json!({
+                "role": "tool",
+                "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                "name": m.get("name").cloned().unwrap_or(Value::Null),
+                "content": packed_str,
+            });
         }
     }
     out
@@ -574,7 +581,7 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
 /// calls over SSE, then fall back to markup recovery when the model emitted
 /// calls as text. `Err(STOP_ERR)` when a stop won the race; other errors
 /// are the engine's fault (bad status, transport, …).
-pub async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) -> Result<Turn, String> {
+pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) -> Result<Turn, String> {
     let port = crate::proxy::route_port(state, raw).await?;
     let api_key = state.config.read().await.api_key.clone();
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
@@ -804,7 +811,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         let _ = shared.tx.send(AgentEvent::TurnStarted { turns });
         let turn = match stream_turn(&state, &shared, &raw).await {
             Ok(t) => t,
-            Err(STOP_ERR) => {
+            Err(e) if e == STOP_ERR => {
                 // stop_run already marked the run terminal — just unwind.
                 return;
             }
@@ -1085,16 +1092,17 @@ mod tests {
                 stop: None,
                 pending_approvals: vec![],
                 user_question: None,
+        pending_hook: None,
                 todo: None,
                 scope: Some(tmp.join("ws").to_string_lossy().into_owned()),
                 usage: Default::default(),
                 last_meta: None,
             }),
             tx,
-            approvals: std::sync::Mutex::new(HashMap::new()),
+            approvals: std::sync::Mutex::new(std::collections::HashMap::new()),
             question_tx: std::sync::Mutex::new(None),
-            recall: std::sync::Mutex::new(HashMap::new()),
-            packed_cache: std::sync::Mutex::new(HashMap::new()),
+            recall: std::sync::Mutex::new(std::collections::HashMap::new()),
+            packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
             client: reqwest::Client::new(),
@@ -1130,7 +1138,7 @@ mod tests {
             .to_string();
         // recall store has the full text under that id
         let recall = shared.recall.lock().unwrap();
-        assert_eq!(recall.get(&id).map(String::len), Some(big.len()));
+        assert_eq!(recall.get(&id).map(String::len), Some(big.len() + 1)); // stdout + "\n" + stderr
         // grep result: excluded tool — untouched
         assert_eq!(packed[2]["content"], msgs[2]["content"]);
         // fresh bash result: within the full-send window — untouched
@@ -1159,7 +1167,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         {
             let mut eng = state.engine.write().await;
-            eng.port = Some(port as u16);
+            eng.port = Some(port);
             eng.state = crate::types::EngineState::Running;
         }
 
@@ -1230,6 +1238,7 @@ mod tests {
             stop: None,
             pending_approvals: vec![],
             user_question: None,
+        pending_hook: None,
             todo: None,
             scope: Some(tmp.join("ws").to_string_lossy().into_owned()),
             usage: Default::default(),
@@ -1239,10 +1248,10 @@ mod tests {
             meta,
             live: std::sync::Mutex::new(live),
             tx,
-            approvals: std::sync::Mutex::new(HashMap::new()),
+            approvals: std::sync::Mutex::new(std::collections::HashMap::new()),
             question_tx: std::sync::Mutex::new(None),
-            recall: std::sync::Mutex::new(HashMap::new()),
-            packed_cache: std::sync::Mutex::new(HashMap::new()),
+            recall: std::sync::Mutex::new(std::collections::HashMap::new()),
+            packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
             client: reqwest::Client::new(),
@@ -1285,7 +1294,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         {
             let mut eng = state.engine.write().await;
-            eng.port = Some(port as u16);
+            eng.port = Some(port);
             eng.state = crate::types::EngineState::Running;
         }
         let srv = listener;
@@ -1330,16 +1339,17 @@ mod tests {
                 stop: None,
                 pending_approvals: vec![],
                 user_question: None,
+        pending_hook: None,
                 todo: None,
                 scope: None,
                 usage: Default::default(),
                 last_meta: None,
             }),
             tx,
-            approvals: std::sync::Mutex::new(HashMap::new()),
+            approvals: std::sync::Mutex::new(std::collections::HashMap::new()),
             question_tx: std::sync::Mutex::new(None),
-            recall: std::sync::Mutex::new(HashMap::new()),
-            packed_cache: std::sync::Mutex::new(HashMap::new()),
+            recall: std::sync::Mutex::new(std::collections::HashMap::new()),
+            packed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             stop_tx,
             stop_rx,
             client: reqwest::Client::new(),
