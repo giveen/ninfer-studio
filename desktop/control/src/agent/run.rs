@@ -285,8 +285,8 @@ fn lock<'a>(m: &'a Mutex<RunLive>) -> MutexGuard<'a, RunLive> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn shared_hook_mode(r: &RunShared) -> &HookMode {
-    &*r.hook_mode.lock().unwrap_or_else(|p| p.into_inner())
+fn shared_hook_mode(r: &RunShared) -> HookMode {
+    *r.hook_mode.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl RunShared {
