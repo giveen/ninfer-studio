@@ -139,92 +139,96 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
       {showCoderParams && (
         <div className="rounded-md border border-line bg-panel2 px-3 py-2 mb-2">
           <div className="flex items-center gap-4 flex-wrap">
-            {appConfig?.cloudProviderEnabled && (
-              <>
-                <div className="flex w-full items-center gap-4 flex-wrap pb-1 border-b border-line/50">
-                  <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Primary Agent</span>
-                  <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                    provider
-                    <SelectField
-                      value={coderParams.primaryProvider || 'ninfer'}
-                      onChange={(v: string) => setCoderParams({ ...coderParams, primaryProvider: v as 'ninfer' | 'cloud' })}
-                      options={[
-                        { value: 'ninfer', label: 'Local (ninfer)' },
-                        { value: 'cloud', label: 'Cloud API' },
-                      ]}
-                    />
-                  </label>
-                  {coderParams.primaryProvider === 'cloud' && (
+            {appConfig?.cloudProviderEnabled && (() => {
+              const effectivePrimaryProvider = coderParams.primaryProvider || (appConfig?.cloudUseForPrimary ? 'cloud' : 'ninfer');
+              const effectiveSubagentProvider = coderParams.subagentProvider || (appConfig?.cloudUseForSubagent ? 'cloud' : 'ninfer');
+              return (
+                <>
+                  <div className="flex w-full items-center gap-4 flex-wrap pb-1 border-b border-line/50">
+                    <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Primary Agent</span>
                     <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                      cloud model
+                      provider
                       <SelectField
-                        value={coderParams.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                        onChange={(v: string) => setCoderParams({ ...coderParams, primaryCloudModel: v })}
-                        options={Array.from(
-                          new Set([
-                            'gpt-4o',
-                            'gpt-4o-mini',
-                            'gpt-4-turbo',
-                            'o1',
-                            'o3-mini',
-                            ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                            ...(coderParams.primaryCloudModel ? [coderParams.primaryCloudModel] : []),
-                          ])
-                        ).map((m) => ({ value: m, label: m }))}
-                      />
-                      <input
-                        type="text"
-                        value={coderParams.primaryCloudModel || ''}
-                        onChange={(e) => setCoderParams({ ...coderParams, primaryCloudModel: e.target.value })}
-                        placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                        className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                        value={effectivePrimaryProvider}
+                        onChange={(v: string) => setCoderParams({ ...coderParams, primaryProvider: v as 'ninfer' | 'cloud' })}
+                        options={[
+                          { value: 'ninfer', label: 'Local (ninfer)' },
+                          { value: 'cloud', label: 'Cloud API' },
+                        ]}
                       />
                     </label>
-                  )}
-                </div>
-                <div className="flex w-full items-center gap-4 flex-wrap pb-2 border-b border-line/50">
-                  <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Subagent (Worker)</span>
-                  <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                    provider
-                    <SelectField
-                      value={coderParams.subagentProvider || 'ninfer'}
-                      onChange={(v: string) => setCoderParams({ ...coderParams, subagentProvider: v as 'ninfer' | 'cloud' })}
-                      options={[
-                        { value: 'ninfer', label: 'Local (ninfer)' },
-                        { value: 'cloud', label: 'Cloud API' },
-                      ]}
-                    />
-                  </label>
-                  {coderParams.subagentProvider === 'cloud' && (
+                    {effectivePrimaryProvider === 'cloud' && (
+                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                        cloud model
+                        <SelectField
+                          value={coderParams.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                          onChange={(v: string) => setCoderParams({ ...coderParams, primaryCloudModel: v })}
+                          options={Array.from(
+                            new Set([
+                              'gpt-4o',
+                              'gpt-4o-mini',
+                              'gpt-4-turbo',
+                              'o1',
+                              'o3-mini',
+                              ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                              ...(coderParams.primaryCloudModel ? [coderParams.primaryCloudModel] : []),
+                            ])
+                          ).map((m) => ({ value: m, label: m }))}
+                        />
+                        <input
+                          type="text"
+                          value={coderParams.primaryCloudModel || ''}
+                          onChange={(e) => setCoderParams({ ...coderParams, primaryCloudModel: e.target.value })}
+                          placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                          className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                        />
+                      </label>
+                    )}
+                  </div>
+                  <div className="flex w-full items-center gap-4 flex-wrap pb-2 border-b border-line/50">
+                    <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Subagent (Worker)</span>
                     <label className="flex items-center gap-1.5 text-[12px] text-mute">
-                      cloud model
+                      provider
                       <SelectField
-                        value={coderParams.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                        onChange={(v: string) => setCoderParams({ ...coderParams, subagentCloudModel: v })}
-                        options={Array.from(
-                          new Set([
-                            'gpt-4o-mini',
-                            'gpt-4o',
-                            'gpt-4-turbo',
-                            'o1-mini',
-                            'o3-mini',
-                            ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                            ...(coderParams.subagentCloudModel ? [coderParams.subagentCloudModel] : []),
-                          ])
-                        ).map((m) => ({ value: m, label: m }))}
-                      />
-                      <input
-                        type="text"
-                        value={coderParams.subagentCloudModel || ''}
-                        onChange={(e) => setCoderParams({ ...coderParams, subagentCloudModel: e.target.value })}
-                        placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                        className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                        value={effectiveSubagentProvider}
+                        onChange={(v: string) => setCoderParams({ ...coderParams, subagentProvider: v as 'ninfer' | 'cloud' })}
+                        options={[
+                          { value: 'ninfer', label: 'Local (ninfer)' },
+                          { value: 'cloud', label: 'Cloud API' },
+                        ]}
                       />
                     </label>
-                  )}
-                </div>
-              </>
-            )}
+                    {effectiveSubagentProvider === 'cloud' && (
+                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                        cloud model
+                        <SelectField
+                          value={coderParams.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                          onChange={(v: string) => setCoderParams({ ...coderParams, subagentCloudModel: v })}
+                          options={Array.from(
+                            new Set([
+                              'gpt-4o-mini',
+                              'gpt-4o',
+                              'gpt-4-turbo',
+                              'o1-mini',
+                              'o3-mini',
+                              ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                              ...(coderParams.subagentCloudModel ? [coderParams.subagentCloudModel] : []),
+                            ])
+                          ).map((m) => ({ value: m, label: m }))}
+                        />
+                        <input
+                          type="text"
+                          value={coderParams.subagentCloudModel || ''}
+                          onChange={(e) => setCoderParams({ ...coderParams, subagentCloudModel: e.target.value })}
+                          placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                          className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                        />
+                      </label>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
             <label className="flex items-center gap-1.5 text-[12px] text-mute">
               <Toggle checked={coderParams.thinking} onChange={(v: boolean) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
             </label>

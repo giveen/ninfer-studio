@@ -91,6 +91,21 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
 
           {settings.cloudProviderEnabled && (
             <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 pt-1 border-t border-line/50">
+                <Toggle
+                  checked={!!settings.cloudUseForPrimary}
+                  onChange={(v) => onUpdate({ cloudUseForPrimary: v })}
+                  label="Cloud as Main Agent"
+                  hint="Automatically use the cloud provider for primary chat and code agents."
+                />
+                <Toggle
+                  checked={!!settings.cloudUseForSubagent}
+                  onChange={(v) => onUpdate({ cloudUseForSubagent: v })}
+                  label="Cloud as Subagent"
+                  hint="Automatically use the cloud provider for background subagent workers."
+                />
+              </div>
+
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-2">
                 <Field label="Base URL" hint="The API endpoint URL for the cloud provider (e.g., https://api.openai.com/v1).">
                   <TextField

@@ -112,6 +112,8 @@ export interface AppSettings {
   cloudProviderBaseUrl?: string;
   cloudProviderApiKey?: string;
   cloudProviderDefaultModel?: string;
+  cloudUseForPrimary?: boolean;
+  cloudUseForSubagent?: boolean;
 }
 
 interface UpdateJob {

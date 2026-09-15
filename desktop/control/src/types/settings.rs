@@ -170,6 +170,12 @@ pub struct AppSettings {
     /// Default cloud model selected by the user.
     #[serde(default)]
     pub cloud_provider_default_model: String,
+    /// Automatically use cloud provider for primary main agent turns.
+    #[serde(default)]
+    pub cloud_use_for_primary: bool,
+    /// Automatically use cloud provider for subagent worker turns.
+    #[serde(default)]
+    pub cloud_use_for_subagent: bool,
 }
 
 /// One configured MCP server. Exactly one of `command` (stdio transport —
@@ -277,6 +283,8 @@ impl Default for AppSettings {
             cloud_provider_base_url: String::new(),
             cloud_provider_api_key: String::new(),
             cloud_provider_default_model: String::new(),
+            cloud_use_for_primary: false,
+            cloud_use_for_subagent: false,
         }
     }
 }

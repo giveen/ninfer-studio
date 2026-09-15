@@ -43,90 +43,94 @@ export function ParamsPopover({
   return (
     <div className="w-[430px] rounded-xl border border-line bg-panel p-4 shadow-2xl">
       <div className="space-y-3.5">
-        {appConfig?.cloudProviderEnabled && (
-          <div className="space-y-3 pb-3 border-b border-line/50 mb-3">
-            <div className={row}>
-              <span className={lab}>Primary Agent</span>
-              <SelectField
-                value={params.primaryProvider || 'ninfer'}
-                onChange={(v) => set({ primaryProvider: v as 'ninfer' | 'cloud' })}
-                options={[
-                  { value: 'ninfer', label: 'Local (ninfer)' },
-                  { value: 'cloud', label: 'Cloud API' },
-                ]}
-              />
-            </div>
-            {params.primaryProvider === 'cloud' && (
+        {appConfig?.cloudProviderEnabled && (() => {
+          const effectivePrimaryProvider = params.primaryProvider || (appConfig?.cloudUseForPrimary ? 'cloud' : 'ninfer');
+          const effectiveSubagentProvider = params.subagentProvider || (appConfig?.cloudUseForSubagent ? 'cloud' : 'ninfer');
+          return (
+            <div className="space-y-3 pb-3 border-b border-line/50 mb-3">
               <div className={row}>
-                <span className={lab}>Primary Model</span>
-                <div className="flex flex-col gap-1 w-full">
-                  <SelectField
-                    value={params.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                    onChange={(v) => set({ primaryCloudModel: v })}
-                    options={Array.from(
-                      new Set([
-                        'gpt-4o',
-                        'gpt-4o-mini',
-                        'gpt-4-turbo',
-                        'o1',
-                        'o3-mini',
-                        ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                        ...(params.primaryCloudModel ? [params.primaryCloudModel] : []),
-                      ])
-                    ).map((m) => ({ value: m, label: m }))}
-                  />
-                  <input
-                    type="text"
-                    value={params.primaryCloudModel || ''}
-                    onChange={(e) => set({ primaryCloudModel: e.target.value })}
-                    placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                    className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                  />
-                </div>
+                <span className={lab}>Primary Agent</span>
+                <SelectField
+                  value={effectivePrimaryProvider}
+                  onChange={(v) => set({ primaryProvider: v as 'ninfer' | 'cloud' })}
+                  options={[
+                    { value: 'ninfer', label: 'Local (ninfer)' },
+                    { value: 'cloud', label: 'Cloud API' },
+                  ]}
+                />
               </div>
-            )}
-            <div className={row}>
-              <span className={lab}>Subagent</span>
-              <SelectField
-                value={params.subagentProvider || 'ninfer'}
-                onChange={(v) => set({ subagentProvider: v as 'ninfer' | 'cloud' })}
-                options={[
-                  { value: 'ninfer', label: 'Local (ninfer)' },
-                  { value: 'cloud', label: 'Cloud API' },
-                ]}
-              />
-            </div>
-            {params.subagentProvider === 'cloud' && (
+              {effectivePrimaryProvider === 'cloud' && (
+                <div className={row}>
+                  <span className={lab}>Primary Model</span>
+                  <div className="flex flex-col gap-1 w-full">
+                    <SelectField
+                      value={params.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                      onChange={(v) => set({ primaryCloudModel: v })}
+                      options={Array.from(
+                        new Set([
+                          'gpt-4o',
+                          'gpt-4o-mini',
+                          'gpt-4-turbo',
+                          'o1',
+                          'o3-mini',
+                          ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                          ...(params.primaryCloudModel ? [params.primaryCloudModel] : []),
+                        ])
+                      ).map((m) => ({ value: m, label: m }))}
+                    />
+                    <input
+                      type="text"
+                      value={params.primaryCloudModel || ''}
+                      onChange={(e) => set({ primaryCloudModel: e.target.value })}
+                      placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                      className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
               <div className={row}>
-                <span className={lab}>Subagent Model</span>
-                <div className="flex flex-col gap-1 w-full">
-                  <SelectField
-                    value={params.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                    onChange={(v) => set({ subagentCloudModel: v })}
-                    options={Array.from(
-                      new Set([
-                        'gpt-4o-mini',
-                        'gpt-4o',
-                        'gpt-4-turbo',
-                        'o1-mini',
-                        'o3-mini',
-                        ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                        ...(params.subagentCloudModel ? [params.subagentCloudModel] : []),
-                      ])
-                    ).map((m) => ({ value: m, label: m }))}
-                  />
-                  <input
-                    type="text"
-                    value={params.subagentCloudModel || ''}
-                    onChange={(e) => set({ subagentCloudModel: e.target.value })}
-                    placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                    className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                  />
-                </div>
+                <span className={lab}>Subagent</span>
+                <SelectField
+                  value={effectiveSubagentProvider}
+                  onChange={(v) => set({ subagentProvider: v as 'ninfer' | 'cloud' })}
+                  options={[
+                    { value: 'ninfer', label: 'Local (ninfer)' },
+                    { value: 'cloud', label: 'Cloud API' },
+                  ]}
+                />
               </div>
-            )}
-          </div>
-        )}
+              {effectiveSubagentProvider === 'cloud' && (
+                <div className={row}>
+                  <span className={lab}>Subagent Model</span>
+                  <div className="flex flex-col gap-1 w-full">
+                    <SelectField
+                      value={params.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                      onChange={(v) => set({ subagentCloudModel: v })}
+                      options={Array.from(
+                        new Set([
+                          'gpt-4o-mini',
+                          'gpt-4o',
+                          'gpt-4-turbo',
+                          'o1-mini',
+                          'o3-mini',
+                          ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                          ...(params.subagentCloudModel ? [params.subagentCloudModel] : []),
+                        ])
+                      ).map((m) => ({ value: m, label: m }))}
+                    />
+                    <input
+                      type="text"
+                      value={params.subagentCloudModel || ''}
+                      onChange={(e) => set({ subagentCloudModel: e.target.value })}
+                      placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                      className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Toggle checked={params.thinking} onChange={(v) => set({ thinking: v, ...(v ? {} : { reasoningEffort: '' }) })} label="Thinking" hint="Chain-of-thought before the answer. The engine streams reasoning_content separately from the response text." />
