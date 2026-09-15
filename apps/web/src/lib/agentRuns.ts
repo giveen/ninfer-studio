@@ -267,7 +267,7 @@ export class RunStream {
     }
   }
 
-  private async consume(snap: RunSnapshot): Promise<void> {
+  private async consume(): Promise<void> {
     const r = await fetch(`${API_BASE}/api/agent/runs/${encodeURIComponent(this.runId)}/events`, {
       signal: this.ctrl.signal,
     });
