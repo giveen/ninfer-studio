@@ -104,7 +104,9 @@ fn memory_dir(data_dir: &Path, ws: &str) -> PathBuf {
 /// `coderWorkspace` pointer).
 #[derive(Debug, Deserialize)]
 pub struct MemQuery {
-    workspace: Option<String>,
+    // pub(crate): the in-process agent dispatch (src/agent/tools.rs) builds
+    // these extractors directly instead of round-tripping through HTTP.
+    pub workspace: Option<String>,
 }
 
 /// Resolve this request's memory dir. An explicit `workspace` (GET query

@@ -46,6 +46,21 @@ struct UsageEvent {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    /// Streaming-request timing, in ms, when the response was streamed:
+    /// `prefill_ms` is request-forwarded → first chunk, `total_ms` is
+    /// request-forwarded → stream end. Both feed the average prefill /
+    /// generation speed stats. `None` for non-streaming responses (a single
+    /// blob gives no prefill/decode split) and older log lines.
+    prefill_ms: Option<u64>,
+    total_ms: Option<u64>,
+}
+
+/// Artifact filenames carry a format extension ("qwen3_8_27b_nvfp4.ninfer")
+/// that is meaningless in the Usage tab and overflows its stat box — drop it
+/// when reading events so the tab shows "qwen3_8_27b_nvfp4". Applied at read
+/// time (not log time) so pre-existing log lines get the short name too.
+fn display_model_name(raw: &str) -> String {
+    raw.strip_suffix(".ninfer").unwrap_or(raw).to_string()
 }
 
 fn usage_log_path(state: &S) -> PathBuf {
@@ -56,16 +71,21 @@ fn usage_log_path(state: &S) -> PathBuf {
 /// lock map `coder::memory`/`chat::memory` use (keyed "usage" here) so
 /// concurrent requests can't interleave partial lines.
 async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
-    let line = json!({
-        "ts": evt.ts_ms,
-        "day": day_string(evt.ts_ms),
-        "model": evt.model,
-        "source": evt.source.as_str(),
-        "promptTokens": evt.prompt_tokens,
-        "completionTokens": evt.completion_tokens,
-        "cachedTokens": evt.cached_tokens,
-    })
-    .to_string();
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".into(), json!(evt.ts_ms));
+    obj.insert("day".into(), json!(day_string(evt.ts_ms)));
+    obj.insert("model".into(), json!(evt.model));
+    obj.insert("source".into(), json!(evt.source.as_str()));
+    obj.insert("promptTokens".into(), json!(evt.prompt_tokens));
+    obj.insert("completionTokens".into(), json!(evt.completion_tokens));
+    obj.insert("cachedTokens".into(), json!(evt.cached_tokens));
+    // Timing is optional and only present for streamed responses — omit the
+    // keys entirely when absent so the log line shape stays clean.
+    if let (Some(prefill), Some(total)) = (evt.prefill_ms, evt.total_ms) {
+        obj.insert("prefillMs".into(), json!(prefill));
+        obj.insert("totalMs".into(), json!(total));
+    }
+    let line = Value::Object(obj).to_string();
     let lock = mem_lock(state, "usage");
     let _guard = lock.lock().await;
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
@@ -134,6 +154,13 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
     let mut completion_total = 0u64;
     let mut cached_total = 0u64;
     let mut requests = 0u64;
+    // Weighted speed accumulators (streamed requests only): avg speed is
+    // total tokens / total time across events, so long responses dominate
+    // instead of short 1-token streams skewing a plain per-request mean.
+    let mut speed_prompt_tokens = 0u64;
+    let mut speed_prefill_secs = 0.0f64;
+    let mut speed_completion_tokens = 0u64;
+    let mut speed_decode_secs = 0.0f64;
     let mut days_seen: BTreeSet<String> = BTreeSet::new();
     let mut by_day: BTreeMap<String, DayAgg> = BTreeMap::new();
     let mut by_model: HashMap<String, u64> = HashMap::new(); // model -> tokens
@@ -143,8 +170,26 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
         let completion = e.get("completionTokens").and_then(Value::as_u64).unwrap_or(0);
         let cached = e.get("cachedTokens").and_then(Value::as_u64).unwrap_or(0);
         let day = e.get("day").and_then(Value::as_str).unwrap_or("").to_string();
-        let model = e.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string();
+        let model = display_model_name(e.get("model").and_then(Value::as_str).unwrap_or("unknown"));
         let tokens = prompt + completion;
+
+        if let (Some(prefill_ms), Some(total_ms)) = (
+            e.get("prefillMs").and_then(Value::as_u64),
+            e.get("totalMs").and_then(Value::as_u64),
+        ) {
+            let prefill_s = prefill_ms as f64 / 1000.0;
+            let decode_ms = total_ms.saturating_sub(prefill_ms);
+            if prefill_s > 0.0 && prompt > 0 {
+                speed_prompt_tokens += prompt;
+                speed_prefill_secs += prefill_s;
+            }
+            // A minimum decode window keeps degenerate events (single-chunk
+            // "streams", near-zero timing jitter) from producing absurd tok/s.
+            if decode_ms >= 50 && completion > 0 {
+                speed_completion_tokens += completion;
+                speed_decode_secs += decode_ms as f64 / 1000.0;
+            }
+        }
 
         prompt_total += prompt;
         completion_total += completion;
@@ -164,6 +209,16 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
 
     let most_used_model = by_model.iter().max_by_key(|(_, tok)| **tok).map(|(m, _)| m.clone());
     let cache_hit_rate = if prompt_total > 0 { cached_total as f64 / prompt_total as f64 } else { 0.0 };
+    let avg_prefill_tps = if speed_prefill_secs > 0.0 {
+        Some(speed_prompt_tokens as f64 / speed_prefill_secs)
+    } else {
+        None
+    };
+    let avg_generation_tps = if speed_decode_secs > 0.0 {
+        Some(speed_completion_tokens as f64 / speed_decode_secs)
+    } else {
+        None
+    };
 
     let daily_series: Vec<Value> = by_day
         .iter()
@@ -194,6 +249,8 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
             "activeDays": days_seen.len(),
             "avgCacheHitRate": cache_hit_rate,
             "mostUsedModel": most_used_model,
+            "avgPrefillTps": avg_prefill_tps,
+            "avgGenerationTps": avg_generation_tps,
             "energyKwh": energy_total_kwh,
         },
         "dailySeries": daily_series,
@@ -222,12 +279,20 @@ struct UsageLogCtx {
     state: S,
     model: Option<String>,
     source: RequestSource,
+    /// True when the client requested a streamed response (`"stream": true`)
+    /// — only those give a meaningful prefill/decode split to measure.
+    streaming: bool,
 }
 
 struct UsageTapStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
     buf: Vec<u8>,
     ctx: Option<UsageLogCtx>,
+    /// When `proxy::proxy` handed the request to the engine, captured just
+    /// before `send()`; `None` disables timing entirely.
+    started: Option<std::time::Instant>,
+    /// When the first response chunk arrived ≈ end of prefill.
+    first_chunk: Option<std::time::Instant>,
 }
 
 impl Stream for UsageTapStream {
@@ -239,12 +304,28 @@ impl Stream for UsageTapStream {
                 if this.buf.len() < MAX_USAGE_TAP_BYTES {
                     this.buf.extend_from_slice(&chunk);
                 }
+                if this.first_chunk.is_none() {
+                    this.first_chunk = Some(std::time::Instant::now());
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(None) => {
                 if let Some(ctx) = this.ctx.take() {
                     let buf = std::mem::take(&mut this.buf);
-                    tokio::spawn(async move { log_from_response_bytes(ctx, &buf).await });
+                    // Pre-fill/decode timing is only meaningful for streamed
+                    // responses (a single blob has no prefill/decode split).
+                    let (prefill_ms, total_ms) = if ctx.streaming {
+                        match (this.started, this.first_chunk) {
+                            (Some(started), Some(first)) => (
+                                Some(first.saturating_duration_since(started).as_millis() as u64),
+                                Some(std::time::Instant::now().saturating_duration_since(started).as_millis() as u64),
+                            ),
+                            _ => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    tokio::spawn(async move { log_from_response_bytes(ctx, &buf, prefill_ms, total_ms).await });
                 }
                 Poll::Ready(None)
             }
@@ -262,9 +343,18 @@ pub(crate) fn wrap_for_usage_logging(
     state: S,
     model: Option<String>,
     source: RequestSource,
+    streaming: bool,
+    started: Option<std::time::Instant>,
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
 ) -> BoxStream<'static, reqwest::Result<Bytes>> {
-    UsageTapStream { inner, buf: Vec::new(), ctx: Some(UsageLogCtx { state, model, source }) }.boxed()
+    UsageTapStream {
+        inner,
+        buf: Vec::new(),
+        ctx: Some(UsageLogCtx { state, model, source, streaming }),
+        started,
+        first_chunk: None,
+    }
+    .boxed()
 }
 
 /// Best-effort: find the OpenAI-style `usage` object in a completed proxied
@@ -272,7 +362,12 @@ pub(crate) fn wrap_for_usage_logging(
 /// responses, or the whole body for a plain JSON completion — and log it.
 /// Silently does nothing when no `usage` object is found (e.g. the engine
 /// doesn't report usage for this call, or the request failed).
-async fn log_from_response_bytes(ctx: UsageLogCtx, buf: &[u8]) {
+async fn log_from_response_bytes(
+    ctx: UsageLogCtx,
+    buf: &[u8],
+    prefill_ms: Option<u64>,
+    total_ms: Option<u64>,
+) {
     let text = String::from_utf8_lossy(buf);
     let mut usage_obj: Option<Value> = None;
     let mut resp_model: Option<String> = None;
@@ -306,7 +401,7 @@ async fn log_from_response_bytes(ctx: UsageLogCtx, buf: &[u8]) {
         .unwrap_or(0);
     let _ = log_usage_event(
         &ctx.state,
-        UsageEvent { ts_ms: now_ms(), model, source: ctx.source, prompt_tokens, completion_tokens, cached_tokens },
+        UsageEvent { ts_ms: now_ms(), model, source: ctx.source, prompt_tokens, completion_tokens, cached_tokens, prefill_ms, total_ms },
     )
     .await;
 }
@@ -342,19 +437,19 @@ mod tests {
         let recent = now - margin_ms;
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: two_days_ago, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 50, cached_tokens: 20 },
+            UsageEvent { ts_ms: two_days_ago, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 50, cached_tokens: 20, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: one_day_ago, model: "model-b".into(), source: RequestSource::Remote, prompt_tokens: 200, completion_tokens: 100, cached_tokens: 0 },
+            UsageEvent { ts_ms: one_day_ago, model: "model-b".into(), source: RequestSource::Remote, prompt_tokens: 200, completion_tokens: 100, cached_tokens: 0, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: recent, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 300, completion_tokens: 150, cached_tokens: 300 },
+            UsageEvent { ts_ms: recent, model: "model-a".into(), source: RequestSource::Local, prompt_tokens: 300, completion_tokens: 150, cached_tokens: 300, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
@@ -365,6 +460,9 @@ mod tests {
         assert_eq!(all["totals"]["tokenUsage"], 100 + 50 + 200 + 100 + 300 + 150);
         assert_eq!(all["totals"]["mostUsedModel"], "model-a");
         assert_eq!(all["modelBreakdown"].as_array().unwrap().len(), 2);
+        // No streamed events logged (no timing) → speed stats are null.
+        assert_eq!(all["totals"]["avgPrefillTps"], Value::Null);
+        assert_eq!(all["totals"]["avgGenerationTps"], Value::Null);
 
         let Json(local_only) =
             usage_stats(AxumState(state.clone()), Query(UsageQuery { days: Some(30), source: Some("local".into()) })).await;
@@ -385,8 +483,10 @@ mod tests {
         let state = temp_state();
         let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         log_from_response_bytes(
-            UsageLogCtx { state: state.clone(), model: Some("qwen3_8_27b_nvfp4.ninfer".into()), source: RequestSource::Local },
+            UsageLogCtx { state: state.clone(), model: Some("qwen3_8_27b_nvfp4.ninfer".into()), source: RequestSource::Local, streaming: false },
             body,
+            None,
+            None,
         )
         .await;
         let events = read_usage_events(&state).await;
@@ -401,7 +501,7 @@ mod tests {
     async fn logged_model_falls_back_to_response_alias_when_artifact_unknown() {
         let state = temp_state();
         let body = br#"{"model":"qwen3.8-27b","usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        log_from_response_bytes(UsageLogCtx { state: state.clone(), model: None, source: RequestSource::Local }, body).await;
+        log_from_response_bytes(UsageLogCtx { state: state.clone(), model: None, source: RequestSource::Local, streaming: false }, body, None, None).await;
         let events = read_usage_events(&state).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["model"].as_str(), Some("qwen3.8-27b"));
@@ -416,7 +516,7 @@ mod tests {
         crate::power::write_power_log(&state, &by_day).await;
         log_usage_event(
             &state,
-            UsageEvent { ts_ms: now_ms(), model: "model-a".into(), source: RequestSource::Remote, prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0 },
+            UsageEvent { ts_ms: now_ms(), model: "model-a".into(), source: RequestSource::Remote, prompt_tokens: 10, completion_tokens: 5, cached_tokens: 0, prefill_ms: None, total_ms: None },
         )
         .await
         .unwrap();
@@ -430,5 +530,58 @@ mod tests {
             usage_stats(AxumState(state), Query(UsageQuery { days: Some(7), source: Some("local".into()) })).await;
         assert_eq!(local_only["totals"]["requests"], 0);
         assert!((local_only["totals"]["energyKwh"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn display_model_name_strips_artifact_extension() {
+        assert_eq!(display_model_name("qwen3_8_27b_nvfp4.ninfer"), "qwen3_8_27b_nvfp4");
+        // OpenAI-facing aliases may contain dots — only the exact artifact
+        // extension is stripped.
+        assert_eq!(display_model_name("qwen3.8-27b"), "qwen3.8-27b");
+        assert_eq!(display_model_name("unknown"), "unknown");
+    }
+
+    /// Streamed events contribute to the average prefill / generation speeds
+    /// (weighted: total tokens / total time across events), non-streamed
+    /// events don't, and the artifact extension is stripped from the model
+    /// name everywhere it surfaces.
+    #[tokio::test]
+    async fn stream_timing_feeds_average_speeds_and_model_extension_is_stripped() {
+        let state = temp_state();
+        // 100 prompt / 200 completion over 500ms prefill + 2000ms decode, and
+        // 50 prompt / 100 completion over 500ms prefill + 1000ms decode:
+        // avgPrefillTps = 150 / 1.0 = 150, avgGenerationTps = 300 / 3.0 = 100.
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "qwen3_8_27b_nvfp4.ninfer".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 200, cached_tokens: 0, prefill_ms: Some(500), total_ms: Some(2500) },
+        )
+        .await
+        .unwrap();
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "qwen3_8_27b_nvfp4.ninfer".into(), source: RequestSource::Local, prompt_tokens: 50, completion_tokens: 100, cached_tokens: 0, prefill_ms: Some(500), total_ms: Some(1500) },
+        )
+        .await
+        .unwrap();
+        // No timing → counts toward tokens/requests but not the speeds.
+        log_usage_event(
+            &state,
+            UsageEvent { ts_ms: now_ms(), model: "model-b".into(), source: RequestSource::Local, prompt_tokens: 1, completion_tokens: 1, cached_tokens: 0, prefill_ms: None, total_ms: None },
+        )
+        .await
+        .unwrap();
+
+        let Json(all) = usage_stats(AxumState(state), Query(UsageQuery { days: Some(1), source: None })).await;
+        assert_eq!(all["totals"]["mostUsedModel"], "qwen3_8_27b_nvfp4");
+        assert!((all["totals"]["avgPrefillTps"].as_f64().unwrap() - 150.0).abs() < 1e-9);
+        assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+        let models: Vec<&str> = all["modelBreakdown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap())
+            .collect();
+        assert!(models.contains(&"qwen3_8_27b_nvfp4"));
+        assert!(models.iter().all(|m| !m.ends_with(".ninfer")));
     }
 }

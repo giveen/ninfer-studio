@@ -1,6 +1,6 @@
 [package]
 name = "ninfier-control"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 description = "NInfer Studio control plane: engine process supervision, model management, GPU stats, SSE-safe engine API proxy, static hosting. Framework-agnostic (no Tauri imports)."
 
@@ -23,6 +23,9 @@ base64 = "0.23"
 reqwest = { version = "0.13", features = ["stream", "json", "rustls"], default-features = false }
 ignore = "0.4"
 globset = "0.4"
+# SSE frame bytes for the agent run event stream (axum re-exports it, but
+# naming it directly keeps the run module free of `axum::body` noise).
+bytes = "1"
 # Embedded headless browser for the coder `browser` tool. Pinned to a rev:
 # the `obscura` name on crates.io belongs to an unrelated 0.0.2 raytracer, so
 # this is a git dependency. Re-pin deliberately when upgrading; `render`

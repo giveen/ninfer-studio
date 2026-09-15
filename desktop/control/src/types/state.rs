@@ -192,6 +192,12 @@ pub struct State {
     /// `None` when off; the persisted `remote_access_enabled`/`_port` in
     /// `config` describe the desired state, this is the actual running one.
     pub remote: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Server-side agent runs (the loop that used to live in the webview).
+    /// Runs keep going while no client is attached; a client attaches via
+    /// `GET /api/agent/runs/{id}/events` (SSE) and never owns the loop.
+    /// See `crate::agent::run` for the registry and `crate::agent` for the
+    /// architecture notes.
+    pub agent_runs: crate::agent::run::RunRegistry,
 }
 
 impl State {
@@ -225,6 +231,7 @@ impl State {
             data_dir,
             dist_dir,
             remote: tokio::sync::Mutex::new(None),
+            agent_runs: crate::agent::run::RunRegistry::default(),
         }
     }
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
-import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare } from 'lucide-react';
+import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare, Activity } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
 import { DirBrowser } from '../components/DirBrowser';
@@ -14,6 +14,7 @@ import { FilePickerModal } from '../components/coder/FilePickerModal';
 import { useCoderMemory } from '../components/coder/useCoderMemory';
 import { useCoderJobs } from '../components/coder/useCoderJobs';
 import { JobsPanel } from '../components/coder/JobsPanel';
+import { RunsPanel } from '../components/coder/RunsPanel';
 import { useCoderGit } from '../components/coder/useCoderGit';
 import { CommitsPanel } from '../components/coder/CommitsPanel';
 import { useConversationHandlers } from '../components/coder/useCoderConversations';
@@ -31,7 +32,8 @@ import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
 import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
-import { compactedContext, isCompactedMsg, humanizePassText, runToolLoop, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
+import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
+import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
 import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
 import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';
@@ -2235,50 +2237,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     } catch { /* unknown — fail closed below */ }
     return 1;
   };
-  const runReadOnlyCall = async (call: AgentToolCall, signal: AbortSignal, model: string): Promise<string> => {
-    try {
-      const args = JSON.parse(call.arguments);
-      // `deny` and denyPaths are enforced server-side regardless of caller
-      // (see coder.rs's enforce_perm), but `ask` can only be enforced here —
-      // the server has no way to pause and prompt a human. Without this, a
-      // tool the user tiered "ask" would silently run for a delegate/scout
-      // subagent while still correctly pausing for the supervisor.
-      const permVerdict = checkPerm(call.name, args);
-      let approvalToken: string | undefined;
-      if (permVerdict !== null) {
-        if (permVerdict === 'ask') {
-          const detail = String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
-          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
-          const ok = await requestApproval(call.name, detail);
-          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
-          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
-          try {
-            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
-          } catch { /* best-effort — enforce_perm rejects without a token */ }
-        } else {
-          return JSON.stringify({ error: permVerdict });
-        }
-      }
-      let result: string;
-      switch (call.name) {
-        case 'read': result = JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal, activeWsDir, approvalToken)); break;
-        case 'grep': result = JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken)); break;
-        case 'glob': result = JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken)); break;
-        case 'ast_grep': result = JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal, activeWsDir)); break;
-        case 'web_fetch': result = JSON.stringify(await coderWebFetch(args.url, signal, approvalToken)); break;
-        case 'web_search': result = JSON.stringify(await coderWebSearch(args.query, signal, approvalToken)); break;
-        case 'browser': result = JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal, approvalToken)); break;
-        case 'obs_recall': result = JSON.stringify(await readRecallChunk(String(args.id || ''), Number(args.offset) || 0)); break;
-        default: return JSON.stringify({ error: `scout cannot use tool: ${call.name}` });
-      }
-      // Same giant-output protection the supervisor's own loop gets — without
-      // it, a subagent's own multi-step context balloons on a big file read
-      // or verbose command with no compaction at all, unlike the top level.
-      return await maybeSummarizeTool(call.name, result, model, signal);
-    } catch (e) {
-      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-    }
-  };
   const runSubagent = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     // Track the run so it shows live in the Jobs panel.
@@ -2293,135 +2251,73 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const runSubagentInner = async (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps = 6, allowedTools?: string[], depth = 0): Promise<string> => {
     if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
     const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser']);
-    const tools = TOOLS.filter((t) => allowed.has(t.function.name));
-    // Read-only tools through the shared runner's registry; `delegate`
-    // recurses into runSubagent with a filtered allow-list.
-    const readOnly = (name: string): ToolHandler => (args, sig) =>
-      runReadOnlyCall({ id: crypto.randomUUID(), name, arguments: JSON.stringify(args) }, sig, model);
-    const registry: ToolRegistry = {
-      delegate: (args, sig) => runSubagent(`delegate-${depth}`, `Task: ${String(args.task ?? '')}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, sig, maxSteps, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1).then((r) => JSON.stringify({ summary: r })),
-    };
-    for (const t of TOOLS) {
-      const n = t.function.name;
-      if (n !== 'delegate' && !registry[n]) registry[n] = readOnly(n);
-    }
-    let res;
+    // The old readOnly registry only ever executed these (plus nested
+    // delegate) — anything else errored as "scout cannot use tool". Cap the
+    // allow-list the same way so the server can't dispatch what the scout
+    // could never do.
+    const SCOUT_CAPABLE = new Set(['read', 'grep', 'glob', 'ast_grep', 'web_fetch', 'web_search', 'browser', 'obs_recall']);
+    const names = [...allowed].filter((n) => SCOUT_CAPABLE.has(n));
+    if (!names.includes('delegate')) names.push('delegate');
+    const tools = TOOLS.filter((t) => names.includes(t.function.name));
+    // Server-side scout run: the control plane owns the loop and dispatches
+    // in-process (tiers enforced from the mirrored perms). Ask-tier tools
+    // pause the run — the same dialogs the old readOnly registry showed,
+    // tagged [subagent], resolve them here.
+    let id: string | null = null;
+    const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
     try {
-      res = await runToolLoop({
+      const started = await agentRunsApi.start({
+        messages: [{ role: 'user', content: prompt }],
+        kind: 'scout',
+        label: `scout: ${label}`,
         model,
         system: dynamicSystemRef.current,
-        messages: [{ role: 'user', content: prompt }],
-        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 } as ChatParams,
-        tools,
-        registry,
         maxSteps,
-        signal,
-        stream: (req, sig, cb) => trackedStream(req, sig, 'subagent ' + label, cb),
+        toolSet: 'coder',
+        toolNames: names,
+        tools,
+        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 2048 },
+        scope: activeWsDir,
       });
+      id = started.id;
+      if (signal.aborted) { stop(); return `(subagent ${label} aborted)`; }
+      signal.addEventListener('abort', stop, { once: true });
+      try {
+        const stream = new RunStream(
+          id,
+          () => {},
+          (ev) => {
+            if (signal.aborted || ev.type !== 'approval_requested') return;
+            const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
+            const detail = a.rel ?? a.args.slice(0, 160);
+            void (async () => {
+              addLog({ type: 'ask', label: a.tool, detail: `[subagent] ${detail}` });
+              const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
+              addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+              let token: string | undefined;
+              if (ok) {
+                try {
+                  token = (await coderPermsApprove(a.tool, undefined, activeWsDir)).token;
+                } catch { /* best-effort — enforce_perm rejects without a token */ }
+              }
+              await agentRunsApi.approve(id as string, a.id, ok ? 'approve' : 'deny', token).catch(() => {});
+            })();
+          },
+          () => {},
+        );
+        await stream.attach();
+        const snap = await agentRunsApi.get(id);
+        if (snap.stop === 'aborted' || snap.status === 'stopped' || signal.aborted) return `(subagent ${label} aborted)`;
+        if (snap.status === 'error') return `(subagent ${label} failed: ${snap.error ?? 'unknown error'})`;
+        if (snap.stop === 'steps') return '(subagent step budget reached)';
+        const last = [...snap.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
+        return ((last?.content as string) ?? '').trim() || '(no findings)';
+      } finally {
+        signal.removeEventListener('abort', stop);
+      }
     } catch (e) {
+      stop();
       return `(subagent ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
-    }
-    if (res.stop === 'aborted' || signal.aborted) return `(subagent ${label} aborted)`;
-    if (res.stop === 'steps') return '(subagent step budget reached)';
-    const last = [...res.messages].reverse().find((m) => m.role === 'assistant');
-    return last?.content.trim() || '(no findings)';
-  };
-
-  // Dispatch a single tool call for an IMPLEMENTATION worker subagent. This is a
-  // self-contained, dependency-free executor (it does NOT go through the main
-  // handleToolCalls, so it never pollutes the supervisor transcript or trips the
-  // commit/ask gates). Read-only fan-out (`delegate`) recurses into runSubagent.
-  const runWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
-    const raw = await dispatchWorkerCall(call, signal, model, depth);
-    // Same giant-output protection the supervisor's own loop gets. Cheap for
-    // every short-circuit path above (denials, errors, `{summary}` wrappers)
-    // — maybeSummarizeTool bails out immediately for anything without a
-    // stdout/stderr/content field or under its size threshold.
-    return maybeSummarizeTool(call.name, raw, model, signal);
-  };
-
-  const dispatchWorkerCall = async (call: AgentToolCall, signal: AbortSignal, model: string, depth: number): Promise<string> => {
-    try {
-      const args = JSON.parse(call.arguments);
-      // Same reasoning as runReadOnlyCall: `ask` can only be enforced
-      // client-side, and this dispatcher (a worker's own tool calls) never
-      // went through checkPerm at all, so an "ask"-tiered tool would
-      // silently execute for a worker even though the supervisor's own call
-      // to the same tool correctly pauses for a human.
-      const permVerdict = checkPerm(call.name, args);
-      let approvalToken: string | undefined;
-      if (permVerdict !== null) {
-        if (permVerdict === 'ask') {
-          const detail = call.name === 'bash' ? String(args.command ?? '') : String(args.path ?? args.pattern ?? args.query ?? args.url ?? '');
-          addLog({ type: 'ask', label: call.name, detail: `[subagent] ${detail}` });
-          const ok = await requestApproval(call.name, detail);
-          addLog({ type: ok ? 'bash' : 'error', label: call.name, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
-          if (!ok) return JSON.stringify({ error: `Denied by the user (${call.name}). Ask for an alternative or proceed without it.` });
-          try {
-            approvalToken = (await coderPermsApprove(call.name, typeof args.path === 'string' ? args.path : undefined, activeWsDir)).token;
-          } catch { /* best-effort — enforce_perm rejects without a token */ }
-        } else {
-          return JSON.stringify({ error: permVerdict });
-        }
-      }
-      switch (call.name) {
-        case 'read': return JSON.stringify(await coderRead(args.path, args.offset, args.limit, signal, activeWsDir, approvalToken));
-        case 'grep': return JSON.stringify(await coderGrep(args.pattern, undefined, args.include, args.ignoreCase, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken));
-        case 'glob': return JSON.stringify(await coderGlob(args.pattern, undefined, args.offset || 0, args.limit || 200, signal, activeWsDir, approvalToken));
-        case 'ast_grep': return JSON.stringify(await coderExec(`sg -p '${String(args.pattern ?? '').replace(/'/g, "'\\''")}' -l ${args.lang}`, undefined, 15000, undefined, false, signal, activeWsDir));
-        case 'web_fetch': return JSON.stringify(await coderWebFetch(args.url, signal, approvalToken));
-        case 'web_search': return JSON.stringify(await coderWebSearch(args.query, signal, approvalToken));
-        case 'browser': return JSON.stringify(await coderBrowser(String(args.action ?? 'status'), { url: args.url, selector: args.selector, value: args.value, key: args.key, expression: args.expression, wait_until: args.wait_until, timeout: args.timeout } as Record<string, string | number>, signal, approvalToken));
-        case 'repo_search': return JSON.stringify(await coderSearch(String(args.query || ''), typeof args.limit === 'number' ? args.limit : 15, signal, activeWsDir));
-        case 'write': return JSON.stringify(await coderWrite(args.path, args.content, signal, activeWsDir, approvalToken));
-        case 'edit': return JSON.stringify(await coderEdit(args.path, args.old, args.new, args.replaceAll, signal, activeWsDir, approvalToken));
-        case 'apply_patch': return JSON.stringify(await coderPatch(args.path, Array.isArray(args.edits) ? args.edits : [], signal, activeWsDir, approvalToken));
-        case 'bash': {
-          const command0 = String(args.command || '');
-          // Same risky-command + commit-approval HITL gates the supervisor's
-          // own bash tool goes through (handleToolCalls) — this dispatcher
-          // previously skipped both, so a worker could force-push, publish,
-          // ssh out, or commit with no human in the loop. `fromSubagent: true`
-          // flags the dialog so it's clear a subagent (not the supervisor) is
-          // asking. Truly destructive commands are still hard-blocked
-          // server-side by safe mode regardless of this check.
-          const riskyReason = detectRisky(command0);
-          if (riskyReason && !isApprovedCommand(command0, perms.approvedCommands || [])) {
-            const v = await requestRiskyApproval(command0, riskyReason, true);
-            if (v === 'deny') {
-              return JSON.stringify({ error: `Risky command denied by the user: ${riskyReason}. Use a safer alternative or ask.` });
-            }
-            if (v === 'remember') addApprovedCommand(command0);
-          }
-          if (commitApproval && isGitCommitCommand(command0)) {
-            const ok = await requestCommitApproval(true);
-            if (!ok) {
-              return JSON.stringify({ error: 'Commit denied by the user (commit approval gate is ON). Review the working-tree diff and adjust; the commit was not made.' });
-            }
-          }
-          // Foreground bash runs in a persistent per-workspace shell so cwd AND
-          // environment (export / venv / conda activation) survive across calls;
-          // background jobs get their own process and stay stateless.
-          const sid = !args.background && activeWsDir ? 'sh:' + activeWsDir : (args.background ? activeWsDir : undefined);
-          const res = await coderExec(command0, undefined, args.timeoutMs, sid, args.background === true, signal, activeWsDir, approvalToken);
-          // Register with the Jobs panel — previously a worker's background
-          // job had no panel entry and so no way to see or kill it.
-          if (res.jobId) {
-            const id = res.jobId;
-            jobs.registerJob(id, command0, activeWsDir);
-          }
-          return JSON.stringify(res);
-        }
-        case 'bash_poll': return JSON.stringify(await coderJob(String(args.jobId || ''), signal));
-        case 'git_diff': return JSON.stringify(await coderExec(`git --no-pager diff ${String(args.ref || '').trim()}`.replace(/\s+/g, ' ').trim(), undefined, 30000, undefined, false, signal, activeWsDir));
-        case 'delegate': {
-          const r = await runSubagent(`delegate-${depth}`, `Task: ${args.task}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, signal, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1);
-          return JSON.stringify({ summary: r });
-        }
-        default: return JSON.stringify({ error: `worker cannot use tool: ${call.name}` });
-      }
-    } catch (e) {
-      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
   };
 
@@ -2498,38 +2394,129 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // instead of silently returning ok:true with a thin/empty summary.
     let budgetReached = false;
     try {
-      const workerCall = (name: string): ToolHandler => (args, sig) =>
-        runWorkerCall({ id: crypto.randomUUID(), name, arguments: JSON.stringify(args) }, sig, model, depth);
-      const registry: ToolRegistry = {
-        delegate: (args, sig) => runSubagent(`delegate-${depth}`, `Task: ${String(args.task ?? '')}\n\nYou are a read-only subagent. Investigate and reply with a concise summary. Do not write code.`, model, sig, 6, filterToolAllowList(args.tools, READONLY_TOOL_NAMES), depth + 1).then((r) => JSON.stringify({ summary: r })),
-      };
-      for (const t of TOOLS) {
-        const n = t.function.name;
-        if (n !== 'delegate' && !registry[n]) registry[n] = workerCall(n);
-      }
-      const res = await runToolLoop({
+      // Server-side worker run: the control plane owns the loop and
+      // dispatches in-process (tiers enforced from the mirrored perms, plus
+      // the risky/commit gates passed below). Ask-tier approvals and gate
+      // pauses resolve through the same [subagent]-tagged dialogs the old
+      // worker dispatcher showed; the cutoff summarizer rides the turn hook.
+      const started = await agentRunsApi.start({
+        messages: [{ role: 'user', content: prompt }],
+        kind: 'worker',
+        label: `worker: ${label}`,
         model,
         system: WORKER_SYSTEM,
-        messages: [{ role: 'user', content: prompt }],
-        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 } as ChatParams,
-        tools,
-        registry,
         maxSteps,
-        signal,
-        stream: (req, sig, cb) => trackedStream(req, sig, 'worker', cb),
-        onAssistantTurn: async (msg, info) => {
-          if (info.finishReason === 'length' && (msg.tool_calls?.length ?? 0) === 0) {
-            // Cut off mid-generation with no tool call parsed — the raw text is
-            // likely a half-written code block or mid-sentence. Summarize it
-            // instead of feeding it back raw as the assistant turn.
-            const digest = await summarizeCutoff(msg.content, model, signal);
-            summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
-            return { proceed: true, inject: [{ role: 'assistant', content: `[cut off at the token limit — summary of the partial attempt]\n${digest}` }] };
-          }
-          summary = msg.content.trim() || summary;
-        },
+        toolSet: 'coder',
+        toolNames: [...allowed],
+        tools,
+        params: { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: coderParams.temperature, topP: coderParams.topP, topK: coderParams.topK, seed: coderParams.seed, maxTokens: 4096 },
+        scope: activeWsDir,
+        hookMode: 'client',
+        riskyGate: true,
+        commitGate: commitApproval,
+        approvedCommands: perms.approvedCommands ?? [],
       });
-      budgetReached = res.stop === 'steps';
+      const runId = started.id;
+      const stopRun = () => agentRunsApi.stop(runId).catch(() => {});
+      if (signal.aborted) { stopRun(); throw new Error('aborted'); }
+      signal.addEventListener('abort', stopRun, { once: true });
+      try {
+        const stream = new RunStream(
+          runId,
+          () => {},
+          (ev) => {
+            if (signal.aborted) return;
+            switch (ev.type) {
+              case 'approval_requested': {
+                const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
+                const aargs = JSON.parse(a.args) as Record<string, unknown>;
+                const detail = a.tool === 'bash' ? String(aargs.command ?? '') : String(aargs.path ?? aargs.pattern ?? aargs.query ?? aargs.url ?? '');
+                void (async () => {
+                  addLog({ type: 'ask', label: a.tool, detail: `[subagent] ${detail}` });
+                  const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
+                  addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+                  let token: string | undefined;
+                  if (ok) {
+                    try {
+                      const p = typeof aargs.path === 'string' ? aargs.path : undefined;
+                      token = (await coderPermsApprove(a.tool, p, activeWsDir)).token;
+                    } catch { /* best-effort — enforce_perm rejects without a token */ }
+                  } else {
+                    // Mirror the dispatcher's denial text so the model reacts the same way.
+                    await agentRunsApi.approve(runId, a.id, 'deny', undefined).catch(() => {});
+                    return;
+                  }
+                  await agentRunsApi.approve(runId, a.id, 'approve', token).catch(() => {});
+                })();
+                break;
+              }
+              case 'gate_requested': {
+                const g = ev as unknown as { id: string; kind: 'risky' | 'commit'; command: string; reason: string | null };
+                void (async () => {
+                  if (g.kind === 'risky') {
+                    const v = signal.aborted ? 'deny' : await requestRiskyApproval(g.command, g.reason ?? 'risky command', true);
+                    if (v === 'deny') {
+                      await agentRunsApi.decideGate(runId, g.id, 'deny').catch(() => {});
+                      return;
+                    }
+                    if (v === 'remember') addApprovedCommand(g.command);
+                    await agentRunsApi.decideGate(runId, g.id, v === 'remember' ? 'remember' : 'once').catch(() => {});
+                  } else {
+                    const ok = signal.aborted ? false : await requestCommitApproval(true);
+                    await agentRunsApi.decideGate(runId, g.id, ok ? 'approve' : 'deny').catch(() => {});
+                  }
+                })();
+                break;
+              }
+              case 'user_question_requested':
+                // The worker set never offers ask_user (and its system prompt
+                // forbids questions) — answer empty so the run keeps moving.
+                void agentRunsApi.answer(runId, ev.id as string, '').catch(() => {});
+                break;
+              case 'hook_requested': {
+                const h = ev as unknown as { id: string; had_tool_calls: boolean; finish_reason: string | null };
+                if (h.had_tool_calls) {
+                  void agentRunsApi.decideHook(runId, h.id, { action: 'continue' }).catch(() => {});
+                  break;
+                }
+                void (async () => {
+                  // Cut off mid-generation with no tool call parsed — the raw
+                  // text is likely a half-written code block or mid-sentence.
+                  // Summarize it instead of feeding it back raw.
+                  let content = '';
+                  try {
+                    const cur = await agentRunsApi.get(runId);
+                    const last = [...cur.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
+                    content = ((last?.content as string) ?? '').trim();
+                  } catch { /* fall through → plain continue */ }
+                  if (h.finish_reason !== 'length' || !content || signal.aborted) {
+                    await agentRunsApi.decideHook(runId, h.id, { action: signal.aborted ? 'abort' : 'continue' }).catch(() => {});
+                    return;
+                  }
+                  const digest = await summarizeCutoff(content, model, signal);
+                  summary = `worker was cut off at the token limit before finishing a step. ${digest}`;
+                  await agentRunsApi.decideHook(runId, h.id, {
+                    action: 'continue',
+                    content: `[cut off at the token limit — summary of the partial attempt]\n${digest}`,
+                  }).catch(() => {});
+                })();
+                break;
+              }
+              default:
+                break;
+            }
+          },
+          () => {},
+        );
+        await stream.attach();
+        const snap = await agentRunsApi.get(runId);
+        budgetReached = snap.stop === 'steps';
+        if (snap.status === 'error') throw new Error(snap.error ?? 'unknown error');
+        const last = [...snap.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
+        summary = ((last?.content as string) ?? '').trim();
+      } finally {
+        signal.removeEventListener('abort', stopRun);
+      }
     } catch (e) {
       summary = `(worker ${label} failed: ${e instanceof Error ? e.message : String(e)})`;
     }
@@ -3857,8 +3844,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           <JobsPanel jobs={jobs} activeWsDir={activeWsDir} />
         </div>
         </SidebarSection>
+        {/* Server Runs — every control-plane run, live or recent. Runs survive
+            window close and are multi-client: expand to attach read-only. */}
+        <SidebarSection title="Runs" icon={<Activity size={13} />} defaultOpen={false}>
+        <div className="shrink-0 border-t border-line p-2">
+          <RunsPanel />
+        </div>
+        </SidebarSection>
       </div>
-
       {/* Middle: file tree + system-prompt follow bindings */}
       {treeOpen ? (
         <div className="flex w-64 flex-col border-r border-line bg-panel">

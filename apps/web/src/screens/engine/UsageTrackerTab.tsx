@@ -101,6 +101,9 @@ export function UsageTrackerTab() {
 
   const totals = stats?.totals;
   const cacheHitPct = totals ? `${(totals.avgCacheHitRate * 100).toFixed(1)}%` : '—';
+  // Speed stats are weighted averages over streamed requests only; null until
+  // the window has timing data (older log lines carry none).
+  const fmtTps = (tps: number | null | undefined) => (tps != null ? `${Math.round(tps).toLocaleString()} tok/s` : '—');
 
   // Cost isn't in the usage payload itself — it's local-only math over the
   // reported energy and whatever rate the user configured in Settings. Kept
@@ -149,6 +152,8 @@ export function UsageTrackerTab() {
         <Stat label="Requests" value={totals ? totals.requests.toLocaleString() : '—'} />
         <Stat label="Active days" value={totals ? totals.activeDays.toLocaleString() : '—'} />
         <Stat label="Avg cache hit rate" value={cacheHitPct} />
+        <Stat label="Avg prefill" value={fmtTps(totals?.avgPrefillTps)} sub="prompt tok/s, streamed" />
+        <Stat label="Avg generation" value={fmtTps(totals?.avgGenerationTps)} sub="completion tok/s, streamed" />
         <Stat label="Most used model" value={totals?.mostUsedModel ?? '—'} />
         <Stat label="Energy used" value={totals ? `${totals.energyKwh.toFixed(2)} kWh` : '—'} />
         <Stat
