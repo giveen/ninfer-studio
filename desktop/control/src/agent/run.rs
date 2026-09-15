@@ -455,6 +455,11 @@ pub(crate) struct StartBody {
     /// Workspace / CU directory scope for permissions + tool resolution.
     scope: Option<String>,
     parent: Option<String>,
+    /// Read-only plan-mode run (bash locked to inspection commands).
+    #[serde(default)]
+    plan: bool,
+    /// Worker critic spec `{model, system?}` for subagent runs.
+    critic: Option<Value>,
 }
 
 fn default_kind() -> String {
