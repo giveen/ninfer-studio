@@ -23,41 +23,29 @@ pub(crate) const ENGINE_PROXY_TIMEOUT_SECS: u64 = 3600;
 /// Choose the engine port for a proxied request. When the JSON body names a
 /// model, route to the engine that serves it; otherwise fall back to the
 /// Wait until the engine on `port` is ready (or transition from Starting to Running once health passes).
+/// Only waits if the managed engine is actively in `Starting` state.
 pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), String> {
     let start_time = std::time::Instant::now();
     let max_wait = std::time::Duration::from_secs(120);
 
     loop {
-        let (eng_state, fail_reason) = {
+        let eng_state = {
             let eng = state.engine.read().await;
-            if eng.port == Some(port) {
-                (Some(eng.state.clone()), eng.fail_reason.clone())
-            } else {
-                (None, None)
-            }
+            eng.state.clone()
         };
 
-        if let Some(st) = eng_state {
-            match st {
-                crate::types::EngineState::Running | crate::types::EngineState::External => {
+        match eng_state {
+            crate::types::EngineState::Starting => {
+                if crate::engine::engine_health(port).await {
+                    let mut eng = state.engine.write().await;
+                    if eng.state == crate::types::EngineState::Starting {
+                        eng.state = crate::types::EngineState::Running;
+                    }
                     return Ok(());
                 }
-                crate::types::EngineState::Stopped | crate::types::EngineState::Failed | crate::types::EngineState::Stopping => {
-                    let reason = fail_reason.unwrap_or_else(|| "engine stopped before becoming ready".to_string());
-                    return Err(reason);
-                }
-                crate::types::EngineState::Starting => {
-                    if crate::engine::engine_health(port).await {
-                        let mut eng = state.engine.write().await;
-                        if eng.state == crate::types::EngineState::Starting {
-                            eng.state = crate::types::EngineState::Running;
-                        }
-                        return Ok(());
-                    }
-                }
             }
-        } else {
-            if crate::engine::engine_health(port).await {
+            _ => {
+                // Running, External, Stopped, Failed, Stopping — return immediately without waiting
                 return Ok(());
             }
         }
