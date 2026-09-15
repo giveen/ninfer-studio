@@ -384,7 +384,7 @@ fn default_max_steps() -> usize {
 /// `delegate`/`subagent` child runs (tools.rs). The run is registered
 /// before the loop task starts, so a client can attach within the same
 /// tick the run begins.
-pub fn spawn_run(state: S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
+pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
     let (tx, _rx) = broadcast::channel(512);
     let (stop_tx, stop_rx) = watch::channel(false);
     let shared = Arc::new(RunShared {
