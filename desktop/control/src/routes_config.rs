@@ -169,16 +169,28 @@ pub(crate) async fn set_config(
     {
         merged.cloud_provider_api_key = v.into();
     }
-    if let Some(v) = body.get("cloudProviderDefaultModel").and_then(|v| v.as_str()) {
+    if let Some(v) = body
+        .get("cloudProviderDefaultModel")
+        .and_then(|v| v.as_str())
+    {
         merged.cloud_provider_default_model = v.into();
     }
-    if let Some(v) = body.get("cloudProviderPrimaryModel").and_then(|v| v.as_str()) {
+    if let Some(v) = body
+        .get("cloudProviderPrimaryModel")
+        .and_then(|v| v.as_str())
+    {
         merged.cloud_provider_primary_model = v.into();
     }
-    if let Some(v) = body.get("cloudProviderSubagentModel").and_then(|v| v.as_str()) {
+    if let Some(v) = body
+        .get("cloudProviderSubagentModel")
+        .and_then(|v| v.as_str())
+    {
         merged.cloud_provider_subagent_model = v.into();
     }
-    if let Some(v) = body.get("cloudProviderExtraHeaders").and_then(|v| v.as_str()) {
+    if let Some(v) = body
+        .get("cloudProviderExtraHeaders")
+        .and_then(|v| v.as_str())
+    {
         merged.cloud_provider_extra_headers = v.into();
     }
     if let Some(v) = body.get("cloudFallbackToLocal").and_then(|v| v.as_bool()) {

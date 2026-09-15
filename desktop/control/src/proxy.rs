@@ -31,7 +31,7 @@ pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), St
     loop {
         let eng_state = {
             let eng = state.engine.read().await;
-            eng.state.clone()
+            eng.state
         };
 
         match eng_state {
@@ -51,7 +51,9 @@ pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), St
         }
 
         if start_time.elapsed() >= max_wait {
-            return Err(format!("timeout waiting for engine on port {port} to become ready"));
+            return Err(format!(
+                "timeout waiting for engine on port {port} to become ready"
+            ));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
