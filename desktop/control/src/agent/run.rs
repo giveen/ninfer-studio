@@ -9,12 +9,12 @@
 use crate::agent::engine_loop;
 use crate::engine::S;
 use axum::extract::{Path, State as AxumState};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get as get_route, post as post_route};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -33,18 +33,37 @@ pub(crate) const MAX_CONCURRENT_RUNS: usize = 16;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Full run snapshot, sent first on every SSE connection.
-    State { snapshot: Box<RunSnapshot> },
+    State {
+        snapshot: Box<RunSnapshot>,
+    },
     /// Streaming assistant content delta (kind: "content" or "reasoning").
-    Delta { kind: &'static str, text: String },
+    Delta {
+        kind: &'static str,
+        text: String,
+    },
     /// A new assistant turn is about to stream (turn index).
-    TurnStarted { turns: usize },
+    TurnStarted {
+        turns: usize,
+    },
     /// Transcript append: the assistant message, or one tool result.
-    Appended { message: Value, turns: usize },
+    Appended {
+        message: Value,
+        turns: usize,
+    },
     /// A tool call the model asked for (before dispatch).
-    ToolCall { id: String, name: String, args: String },
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
     /// A tool finished (result truncated for the event stream; the full
     /// result lives in the transcript).
-    ToolResult { id: String, name: String, preview: String, error: bool },
+    ToolResult {
+        id: String,
+        name: String,
+        preview: String,
+        error: bool,
+    },
     /// An `ask`-tier tool paused the run; a client should show its dialog.
     ApprovalRequested {
         id: String,
@@ -52,10 +71,19 @@ pub enum AgentEvent {
         rel: Option<String>,
         args: String,
     },
-    ApprovalResolved { id: String, approved: bool },
+    ApprovalResolved {
+        id: String,
+        approved: bool,
+    },
     /// The `ask_user` tool paused the run for a human answer.
-    UserQuestionRequested { id: String, question: String },
-    UserQuestionAnswered { id: String, answer: String },
+    UserQuestionRequested {
+        id: String,
+        question: String,
+    },
+    UserQuestionAnswered {
+        id: String,
+        answer: String,
+    },
     /// Paused at a turn end for a client's turn-hook decision (the run is
     /// in `awaiting_hook` status; the pending decision's id is here).
     HookRequested {
@@ -69,21 +97,46 @@ pub enum AgentEvent {
         /// request (the server's last request size / ~4 chars-per-token).
         est_tokens: u64,
     },
-    HookResolved { id: String, action: String },
+    HookResolved {
+        id: String,
+        action: String,
+    },
     /// A child run (`delegate`/`subagent`) was spawned; clients can attach
     /// to it for live progress.
-    ChildRun { id: String, kind: String, task: String },
+    ChildRun {
+        id: String,
+        kind: String,
+        task: String,
+    },
     /// The `todo_write` tool updated the run's todo list.
-    Todo { items: Value },
-    Status { status: RunStatus },
+    Todo {
+        items: Value,
+    },
+    Status {
+        status: RunStatus,
+    },
     /// Terminal: the loop finished (done/steps), errored, or was stopped.
-    Done { stop: Option<String>, status: RunStatus },
+    Done {
+        stop: Option<String>,
+        status: RunStatus,
+    },
     /// Loop error message (the run has moved to `error` status).
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// A risky shell command paused the run (risky gate); a client should
     /// show its allow/deny dialog.
-    GateRequested { id: String, kind: GateKind, command: String, reason: Option<String> },
-    GateResolved { id: String, kind: GateKind, decision: String },
+    GateRequested {
+        id: String,
+        kind: GateKind,
+        command: String,
+        reason: Option<String>,
+    },
+    GateResolved {
+        id: String,
+        kind: GateKind,
+        decision: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -417,7 +470,13 @@ impl RunShared {
                 HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
-            pending_gate: self.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot.as_ref().map(|s| s.pending.clone()),
+            pending_gate: self
+                .gate_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .slot
+                .as_ref()
+                .map(|s| s.pending.clone()),
             plan: meta.plan,
             todo_rev: live.todo_rev,
         }
@@ -459,7 +518,9 @@ impl RunShared {
             live.user_question = None;
         }
         if let Some(message) = &error {
-            let _ = self.tx.send(AgentEvent::Error { message: message.clone() });
+            let _ = self.tx.send(AgentEvent::Error {
+                message: message.clone(),
+            });
         }
         let _ = self.tx.send(AgentEvent::Done { stop, status });
     }
@@ -590,10 +651,18 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
 /// run via `GET /api/agent/runs/{id}/events` (SSE) or poll the snapshot.
 pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<StartBody>) -> Response {
     if body.messages.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "messages must not be empty"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "messages must not be empty"})),
+        )
+            .into_response();
     }
     if body.max_steps == 0 || body.max_steps > 500 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "maxSteps must be 1..=500"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "maxSteps must be 1..=500"})),
+        )
+            .into_response();
     }
     // Fail fast when no engine can serve the model — a run that can't stream
     // its first turn is a client error, not a zombie.
@@ -611,10 +680,7 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
     }
     {
         let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
-        let active = runs
-            .values()
-            .filter(|r| !r.status().is_terminal())
-            .count();
+        let active = runs.values().filter(|r| !r.status().is_terminal()).count();
         if active >= MAX_CONCURRENT_RUNS {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -646,7 +712,13 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
     let model = body.model.filter(|m| !m.is_empty()).unwrap_or_default();
     let model = if model.is_empty() {
         // Primary engine's model; "" → the engine's own default model.
-        state.engine.read().await.model_id.clone().unwrap_or_default()
+        state
+            .engine
+            .read()
+            .await
+            .model_id
+            .clone()
+            .unwrap_or_default()
     } else {
         model
     };
@@ -654,7 +726,9 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
     let id = format!(
         "run_{:x}_{}",
         now_ms(),
-        state.bg_job_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        state
+            .bg_job_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let live = RunLive {
         status: RunStatus::Running,
@@ -678,11 +752,20 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
     let critic = body
         .critic
         .as_ref()
-        .filter(|c| c.get("model").and_then(|m| m.as_str()).map(str::trim).map(|m| !m.is_empty()).unwrap_or(false))
+        .filter(|c| {
+            c.get("model")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+        })
         .map(|c| {
             let mut o = serde_json::Map::new();
             o.insert("model".into(), c["model"].clone());
-            if c.get("system").and_then(|s| s.as_str()).is_some_and(|s| !s.trim().is_empty()) {
+            if c.get("system")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+            {
                 o.insert("system".into(), c["system"].clone());
             }
             Value::Object(o)
@@ -717,7 +800,11 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         let mut gs = shared.gate_state.lock().unwrap_or_else(|p| p.into_inner());
         gs.opts.risky = body.risky_gate;
         gs.opts.commit = body.commit_gate;
-        gs.opts.approved = body.approved_commands.iter().map(|c| normalize_command(c)).collect();
+        gs.opts.approved = body
+            .approved_commands
+            .iter()
+            .map(|c| normalize_command(c))
+            .collect();
     }
     Json(json!({ "id": id, "status": "running" })).into_response()
 }
@@ -725,24 +812,26 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
 /// `GET /api/agent/runs` — list runs (newest first), light summaries.
 pub(crate) async fn list(AxumState(state): AxumState<S>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
-    let mut out: Vec<Value> = runs.values().map(|r| {
-        let snap = r.snapshot();
-        json!({
-            "id": snap.id,
-            "kind": snap.kind,
-            "label": snap.label,
-            "model": snap.model,
-            "status": snap.status,
-            "turns": snap.turns,
-            "maxSteps": snap.max_steps,
-            "createdAt": snap.created_at,
-            "updatedAt": snap.updated_at,
-            "stop": snap.stop,
-            "parent": snap.parent,
-            "pendingApprovals": snap.pending_approvals.len(),
+    let mut out: Vec<Value> = runs
+        .values()
+        .map(|r| {
+            let snap = r.snapshot();
+            json!({
+                "id": snap.id,
+                "kind": snap.kind,
+                "label": snap.label,
+                "model": snap.model,
+                "status": snap.status,
+                "turns": snap.turns,
+                "maxSteps": snap.max_steps,
+                "createdAt": snap.created_at,
+                "updatedAt": snap.updated_at,
+                "stop": snap.stop,
+                "parent": snap.parent,
+                "pendingApprovals": snap.pending_approvals.len(),
+            })
         })
-    })
-    .collect();
+        .collect();
     out.sort_by(|a, b| {
         let a = a.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
         let b = b.get("createdAt").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -757,7 +846,11 @@ pub(crate) async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) 
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     match runs.get(&id) {
         Some(r) => Json(serde_json::to_value(r.snapshot()).unwrap()).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -766,7 +859,11 @@ pub(crate) async fn get(AxumState(state): AxumState<S>, Path(id): Path<String>) 
 pub(crate) async fn stop(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     let status = r.status();
     if status.is_terminal() {
@@ -788,18 +885,38 @@ pub(crate) async fn approve(
 ) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     let approved = body.decision == "approve";
-    if approved && body.token.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if approved
+        && body
+            .token
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "approve requires a one-shot approvalToken from /api/coder/perms/approve"})),
         )
             .into_response();
     }
-    let Some(sender) = r.approvals.lock().unwrap_or_else(|p| p.into_inner()).remove(&aid) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no pending approval with that id"}))).into_response();
+    let Some(sender) = r
+        .approvals
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&aid)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no pending approval with that id"})),
+        )
+            .into_response();
     };
     let decision = if approved {
         ApprovalDecision::Approved { token: body.token }
@@ -808,7 +925,8 @@ pub(crate) async fn approve(
     };
     let _ = sender.send(decision);
     r.set_status(RunStatus::Running);
-    let _ = r.tx.send(AgentEvent::ApprovalResolved { id: aid, approved });
+    let _ =
+        r.tx.send(AgentEvent::ApprovalResolved { id: aid, approved });
     Json(json!({ "ok": true, "approved": approved })).into_response()
 }
 
@@ -832,15 +950,27 @@ pub(crate) async fn gate_decide(
 ) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     let mut gs = r.gate_state.lock().unwrap_or_else(|p| p.into_inner());
     let Some(slot) = gs.slot.take() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no pending gate with that id"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no pending gate with that id"})),
+        )
+            .into_response();
     };
     if slot.pending.id != gid {
         gs.slot = Some(slot);
-        return (StatusCode::CONFLICT, Json(json!({"error": "no pending gate with that id"}))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "no pending gate with that id"})),
+        )
+            .into_response();
     }
     let decision = match (slot.pending.kind, body.decision.as_str()) {
         (GateKind::Risky, "once") => GateDecision::Once,
@@ -872,7 +1002,11 @@ pub(crate) async fn gate_decide(
     let _ = slot.tx.send(decision);
     drop(gs);
     r.set_status(RunStatus::Running);
-    let _ = r.tx.send(AgentEvent::GateResolved { id: id_out, kind, decision: name.to_string() });
+    let _ = r.tx.send(AgentEvent::GateResolved {
+        id: id_out,
+        kind,
+        decision: name.to_string(),
+    });
     Json(json!({ "ok": true, "decision": name })).into_response()
 }
 #[derive(Debug, Deserialize)]
@@ -895,16 +1029,30 @@ pub(crate) async fn answer(
 ) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
-    let Some(sender) = r.question_tx.lock().unwrap_or_else(|p| p.into_inner()).take() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no pending question"}))).into_response();
+    let Some(sender) = r
+        .question_tx
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no pending question"})),
+        )
+            .into_response();
     };
     let _ = sender.send(body.answer.clone());
     r.set_status(RunStatus::Running);
-    let _ = r
-        .tx
-        .send(AgentEvent::UserQuestionAnswered { id: qid, answer: body.answer });
+    let _ = r.tx.send(AgentEvent::UserQuestionAnswered {
+        id: qid,
+        answer: body.answer,
+    });
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -921,7 +1069,11 @@ pub(crate) struct AnswerBody {
 pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     // One pump task per attached client: it owns a broadcast receiver and
     // forwards frames over an mpsc (a broadcast `recv()` future borrows the
@@ -947,13 +1099,23 @@ pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String
 async fn sse_pump(run: Arc<RunShared>, out: tokio::sync::mpsc::Sender<bytes::Bytes>) {
     let mut rx = run.tx.subscribe();
     let snap = run.snapshot();
-    let first = sse_frame("state", &serde_json::to_string(&AgentEvent::State { snapshot: Box::new(snap) }).unwrap_or_default());
+    let first = sse_frame(
+        "state",
+        &serde_json::to_string(&AgentEvent::State {
+            snapshot: Box::new(snap),
+        })
+        .unwrap_or_default(),
+    );
     if out.send(first).await.is_err() {
         return; // client is already gone
     }
     while let Ok(ev) = rx.recv().await {
         let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
-        let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
+        let name = v
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("event")
+            .to_string();
         if out.send(sse_frame(&name, &v.to_string())).await.is_err() {
             return;
         }
@@ -1013,14 +1175,19 @@ pub(crate) async fn set_hook_mode(
 ) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     let mode = match body.mode.as_str() {
         "client" => HookMode::Client,
         _ => HookMode::Auto,
     };
     *r.hook_mode.lock().unwrap_or_else(|p| p.into_inner()) = mode;
-    Json(json!({ "ok": true, "mode": if mode == HookMode::Client { "client" } else { "auto" } })).into_response()
+    Json(json!({ "ok": true, "mode": if mode == HookMode::Client { "client" } else { "auto" } }))
+        .into_response()
 }
 
 /// `POST /api/agent/runs/{id}/hooks/{hid}` — the client's turn-hook
@@ -1046,20 +1213,30 @@ pub(crate) async fn hook_decision(
 ) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "run not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "run not found"})),
+        )
+            .into_response();
     };
     // The id must be the pending one — a stale decision from an earlier pause
     // must not resolve the current one (two clients racing, a late reply).
     {
         let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
         if live.pending_hook.as_deref() != Some(hid.as_str()) {
-            return (StatusCode::CONFLICT, Json(json!({"error": "no pending hook decision with that id"}))).into_response();
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "no pending hook decision with that id"})),
+            )
+                .into_response();
         }
     }
     // The pending decision's id is whatever the loop posted; a stale/second
     // decision just finds nothing waiting and is a no-op.
     let decision = match body.action.as_str() {
-        "replace" => HookDecision::Replace { content: body.content.unwrap_or_default() },
+        "replace" => HookDecision::Replace {
+            content: body.content.unwrap_or_default(),
+        },
         "continue" => HookDecision::Continue {
             content: body.content,
             note: body.note,
@@ -1071,7 +1248,11 @@ pub(crate) async fn hook_decision(
     let action = decision.action_name().to_string();
     let sender = r.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
     let Some(sender) = sender else {
-        return (StatusCode::CONFLICT, Json(json!({"error": "no pending hook decision"}))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "no pending hook decision"})),
+        )
+            .into_response();
     };
     let _ = sender.send(decision);
     {
@@ -1109,10 +1290,18 @@ pub(crate) fn clean_todo_items(raw: &Value) -> Vec<Value> {
 
 /// User-edit the run's task list from the UI (bumps `todo_rev` so a stale
 /// `todo_write` snapshot the model is generating gets discarded).
-pub(crate) async fn todo_set(AxumState(state): AxumState<S>, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+pub(crate) async fn todo_set(
+    AxumState(state): AxumState<S>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
     let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(r) = runs.get(&id).cloned() else {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "run not found" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "run not found" })),
+        )
+            .into_response();
     };
     let items = clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
     let mut live = lock(&r.live);
@@ -1120,7 +1309,9 @@ pub(crate) async fn todo_set(AxumState(state): AxumState<S>, Path(id): Path<Stri
     live.todo_rev += 1;
     let rev = live.todo_rev;
     drop(live);
-    let _ = r.tx.send(AgentEvent::Todo { items: Value::Array(items.clone()) });
+    let _ = r.tx.send(AgentEvent::Todo {
+        items: Value::Array(items.clone()),
+    });
     Json(json!({ "ok": true, "count": items.len(), "rev": rev })).into_response()
 }
 
@@ -1156,7 +1347,12 @@ impl HookDecision {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-pub(crate) fn test_run(_state: &S, kind: &str, tool_names: &[&str], scope: Option<String>) -> Arc<RunShared> {
+pub(crate) fn test_run(
+    _state: &S,
+    kind: &str,
+    tool_names: &[&str],
+    scope: Option<String>,
+) -> Arc<RunShared> {
     let (tx, _rx) = broadcast::channel(64);
     let (stop_tx, stop_rx) = watch::channel(false);
     let meta = RunMeta {
@@ -1219,7 +1415,11 @@ mod tests {
     fn fresh() -> S {
         static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("ninfier-agent-{}-{}-{n}", std::process::id(), now_ms()));
+        let tmp = std::env::temp_dir().join(format!(
+            "ninfier-agent-{}-{}-{n}",
+            std::process::id(),
+            now_ms()
+        ));
         Arc::new(State::new(tmp.clone(), tmp, None))
     }
 
@@ -1251,10 +1451,26 @@ mod tests {
         let state = fresh();
         let dir = state.data_dir.clone();
         std::fs::create_dir_all(dir.join("ws")).unwrap();
-        let shared = test_run(&state, "coder", &["write", "read"], Some(dir.join("ws").to_string_lossy().into()));
-        let w = crate::agent::tools::dispatch(&state, &shared, "write", &json!({"path": "a.txt", "content": "hello"})).await;
-        assert_eq!(w.get("created").and_then(|v| v.as_bool()), Some(true), "write: {w}");
-        let r = crate::agent::tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
+        let shared = test_run(
+            &state,
+            "coder",
+            &["write", "read"],
+            Some(dir.join("ws").to_string_lossy().into()),
+        );
+        let w = crate::agent::tools::dispatch(
+            &state,
+            &shared,
+            "write",
+            &json!({"path": "a.txt", "content": "hello"}),
+        )
+        .await;
+        assert_eq!(
+            w.get("created").and_then(|v| v.as_bool()),
+            Some(true),
+            "write: {w}"
+        );
+        let r =
+            crate::agent::tools::dispatch(&state, &shared, "read", &json!({"path": "a.txt"})).await;
         assert_eq!(r.get("content").and_then(|v| v.as_str()), Some("hello"));
         let _ = std::fs::remove_dir_all(dir);
     }

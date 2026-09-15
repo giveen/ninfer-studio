@@ -73,4 +73,3 @@ mod vram_tests {
         assert!(parse_capacity_line("").is_none());
     }
 }
-

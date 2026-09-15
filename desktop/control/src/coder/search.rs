@@ -6,11 +6,11 @@
 
 use super::common::resolve_ws;
 use crate::engine::S;
+use axum::Json;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -23,8 +23,9 @@ use tokio::time::timeout;
 // content matches (lower score), deduped by file:line, sorted by score.
 // ---------------------------------------------------------------------------
 const SEARCH_SYMBOL_EXTS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "c", "cpp", "h", "hpp", "hh", "java", "rb", "php", "swift",
-    "kt", "kts", "scala", "sc", "cs", "sh", "bash", "zsh", "lua", "r", "ex", "exs", "erl", "elm", "hs", "dart", "sql",
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "c", "cpp", "h", "hpp", "hh", "java",
+    "rb", "php", "swift", "kt", "kts", "scala", "sc", "cs", "sh", "bash", "zsh", "lua", "r", "ex",
+    "exs", "erl", "elm", "hs", "dart", "sql",
 ];
 /// Symbol-declaration line, same pattern the sidecar feeds to `rg`.
 static SEARCH_SYMBOL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -226,7 +227,10 @@ pub struct WsQuery {
     pub workspace: Option<String>,
 }
 
-pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn repo_map(
+    AxumState(state): AxumState<S>,
+    Query(params): Query<WsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws = resolve_ws(&state, params.workspace.as_deref()).await?;
 
     let result = tokio::task::spawn_blocking(move || {
@@ -235,24 +239,27 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
 
         let mut parser = Parser::new();
         let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
-        
+
         let mut ref_counts: HashMap<String, HashSet<String>> = HashMap::new();
         let mut file_defs: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
         for entry in walker.flatten() {
-            if entry.file_type().is_none_or(|ft| ft.is_dir()) { continue; }
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+                continue;
+            }
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            
+
             let lang = match ext {
                 "rs" => tree_sitter_rust::LANGUAGE.into(),
                 "ts" | "tsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 "js" | "jsx" => tree_sitter_javascript::LANGUAGE.into(),
                 _ => continue,
             };
-            
+
             let query_str = match ext {
-                "rs" => r#"
+                "rs" => {
+                    r#"
                     (function_item name: (identifier) @def)
                     (struct_item name: (type_identifier) @def)
                     (enum_item name: (type_identifier) @def)
@@ -260,8 +267,10 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
                     (impl_item type: (type_identifier) @def)
                     (identifier) @ref
                     (type_identifier) @ref
-                "#,
-                "ts" | "tsx" | "js" | "jsx" => r#"
+                "#
+                }
+                "ts" | "tsx" | "js" | "jsx" => {
+                    r#"
                     (function_declaration name: (identifier) @def)
                     (class_declaration name: (identifier) @def)
                     (interface_declaration name: (type_identifier) @def)
@@ -270,21 +279,32 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
                     (identifier) @ref
                     (type_identifier) @ref
                     (property_identifier) @ref
-                "#,
+                "#
+                }
                 _ => continue,
             };
-            
-            let Ok(content) = std::fs::read_to_string(path) else { continue };
+
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
             parser.set_language(&lang).unwrap();
-            let Some(tree) = parser.parse(&content, None) else { continue };
-            
-            let Ok(query) = Query::new(&lang, query_str) else { continue };
+            let Some(tree) = parser.parse(&content, None) else {
+                continue;
+            };
+
+            let Ok(query) = Query::new(&lang, query_str) else {
+                continue;
+            };
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
-            
-            let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
+
+            let rel_path = path
+                .strip_prefix(&ws)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
             let mut local_defs = Vec::new();
-            
+
             while let Some(m) = matches.next() {
                 for capture in m.captures() {
                     let node = capture.node;
@@ -294,11 +314,15 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
                             if let Some(parent) = node.parent()
                                 && let Ok(parent_text) = parent.utf8_text(content.as_bytes())
                             {
-                                let sig = parent_text.lines().next().unwrap_or("").trim().to_string();
+                                let sig =
+                                    parent_text.lines().next().unwrap_or("").trim().to_string();
                                 local_defs.push((text.to_string(), sig));
                             }
                         } else if tag_name == "ref" {
-                            ref_counts.entry(text.to_string()).or_default().insert(rel_path.clone());
+                            ref_counts
+                                .entry(text.to_string())
+                                .or_default()
+                                .insert(rel_path.clone());
                         }
                     }
                 }
@@ -308,19 +332,23 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
             }
         }
 
-        let mut file_scores: Vec<(String, usize)> = file_defs.keys().map(|file| {
-            let score = file_defs[file].iter().map(|(sym, _)| {
-                ref_counts.get(sym).map(|set| set.len()).unwrap_or(0)
-            }).sum();
-            (file.clone(), score)
-        }).collect();
-        
+        let mut file_scores: Vec<(String, usize)> = file_defs
+            .keys()
+            .map(|file| {
+                let score = file_defs[file]
+                    .iter()
+                    .map(|(sym, _)| ref_counts.get(sym).map(|set| set.len()).unwrap_or(0))
+                    .sum();
+                (file.clone(), score)
+            })
+            .collect();
+
         file_scores.sort_by_key(|a| std::cmp::Reverse(a.1));
-        
+
         let mut map_out = String::new();
         let mut chars_used = 0;
         let char_limit = 20000;
-        
+
         for (file, _score) in file_scores {
             let defs = &file_defs[&file];
             let mut file_block = format!("{}:\n", file);
@@ -338,7 +366,9 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
             chars_used += file_block.len();
         }
         json!({"map": map_out})
-    }).await.unwrap_or_else(|_| json!({"error": "task panicked"}));
+    })
+    .await
+    .unwrap_or_else(|_| json!({"error": "task panicked"}));
 
     Ok(Json(result))
 }
@@ -349,7 +379,11 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
 async fn git_run(root: &Path, args: &[&str], secs: u64) -> Option<String> {
     let out = timeout(
         Duration::from_secs(secs),
-        Command::new("git").arg("--no-pager").args(args).current_dir(root).output(),
+        Command::new("git")
+            .arg("--no-pager")
+            .args(args)
+            .current_dir(root)
+            .output(),
     )
     .await
     .ok()
@@ -357,7 +391,10 @@ async fn git_run(root: &Path, args: &[&str], secs: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-pub async fn diff(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn diff(
+    AxumState(state): AxumState<S>,
+    Query(params): Query<WsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let root = resolve_ws(&state, params.workspace.as_deref()).await?;
     let stat = git_run(&root, &["diff", "HEAD", "--stat"], 15).await;
     let full = git_run(&root, &["diff", "HEAD"], 60).await;
@@ -366,7 +403,9 @@ pub async fn diff(AxumState(state): AxumState<S>, Query(params): Query<WsQuery>)
         // Either git call failing (no repo, timeout, git missing) means the
         // diff is unavailable — report it like the sidecar, don't error out.
         _ => {
-            return Ok(Json(json!({"files": [], "diff": "", "error": "diff failed — see server log"})));
+            return Ok(Json(
+                json!({"files": [], "diff": "", "error": "diff failed — see server log"}),
+            ));
         }
     };
     let stat_re = regex::Regex::new(r"^(.+?)\s*\|\s*\d+\s*([+-]*)$").unwrap();
@@ -405,27 +444,59 @@ mod tests {
             "pub async fn rank_symbols() {}\npub struct SymbolIndex {}\nlet mentions_ranking = 1;\n",
         )
         .unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
 
         // Empty query short-circuits (no walk at all).
-        let e = search(AxumState(state.clone()), Query(SearchQuery { q: Some("   ".into()), limit: None, workspace: None })).await;
+        let e = search(
+            AxumState(state.clone()),
+            Query(SearchQuery {
+                q: Some("   ".into()),
+                limit: None,
+                workspace: None,
+            }),
+        )
+        .await;
         assert!(e["results"].as_array().unwrap().is_empty());
 
         // Symbol name hits outrank plain content hits of the same term.
-        let r = search(AxumState(state.clone()), Query(SearchQuery { q: Some("SymbolIndex".into()), limit: Some(50), workspace: None })).await;
+        let r = search(
+            AxumState(state.clone()),
+            Query(SearchQuery {
+                q: Some("SymbolIndex".into()),
+                limit: Some(50),
+                workspace: None,
+            }),
+        )
+        .await;
         let res = r["results"].as_array().unwrap();
-        let symbol = res.iter().find(|x| x["kind"] == "symbol").expect("symbol hit for SymbolIndex");
+        let symbol = res
+            .iter()
+            .find(|x| x["kind"] == "symbol")
+            .expect("symbol hit for SymbolIndex");
         assert_eq!(symbol["file"], "src/handler.rs");
-        let content = res.iter().find(|x| x["kind"] == "content").unwrap_or(&Value::Null);
+        let content = res
+            .iter()
+            .find(|x| x["kind"] == "content")
+            .unwrap_or(&Value::Null);
         if !content.is_null() {
             assert!(symbol["score"].as_u64().unwrap() > content["score"].as_u64().unwrap());
         }
 
         // Content-only term: fixed-string match with a 300-char snippet.
-        let c = search(AxumState(state.clone()), Query(SearchQuery { q: Some("mentions_ranking".into()), limit: Some(50), workspace: None })).await;
+        let c = search(
+            AxumState(state.clone()),
+            Query(SearchQuery {
+                q: Some("mentions_ranking".into()),
+                limit: Some(50),
+                workspace: None,
+            }),
+        )
+        .await;
         let c_res = c["results"].as_array().unwrap();
-        assert!(c_res.iter().any(|x| x["file"] == "src/handler.rs" && x["snippet"].as_str().unwrap().contains("mentions_ranking")));
+        assert!(c_res.iter().any(|x| x["file"] == "src/handler.rs"
+            && x["snippet"].as_str().unwrap().contains("mentions_ranking")));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -445,14 +516,19 @@ mod tests {
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()?;
-            assert!(o.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&o.stderr));
+            assert!(
+                o.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
             Ok(o)
         };
         // No git (exotic runners) → skip the assertions; the no-repo path is
         // still exercised below and must return a soft error, not a 500.
         let have_git = git(&["init", "-q"]).is_ok();
 
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
 
         if have_git {
@@ -460,18 +536,33 @@ mod tests {
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "base"]).unwrap();
             std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
+                .await
+                .unwrap()
+                .0;
             let files = r["files"].as_array().unwrap();
-            assert!(files.iter().any(|f| f["path"] == "a.txt"), "changed file missing: {files:?}");
+            assert!(
+                files.iter().any(|f| f["path"] == "a.txt"),
+                "changed file missing: {files:?}"
+            );
             assert!(r["diff"].as_str().unwrap().contains("two"));
             // Clean tree → empty diff, no files.
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "b"]).unwrap();
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
+                .await
+                .unwrap()
+                .0;
             assert!(r["files"].as_array().unwrap().is_empty());
         } else {
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None })).await.unwrap().0;
-            assert!(r.get("error").is_some(), "no git, no repo → soft error: {r:?}");
+            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
+                .await
+                .unwrap()
+                .0;
+            assert!(
+                r.get("error").is_some(),
+                "no git, no repo → soft error: {r:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

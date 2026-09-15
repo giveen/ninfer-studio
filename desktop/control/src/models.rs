@@ -3,8 +3,8 @@
 // Rust guideline compliant 2026-07-28
 
 use crate::clear_appimage_env;
-use crate::types::{now_ms, AppEvent, ARTIFACTS, JobRec, ModelArtifact, State};
-use serde_json::{json, Value};
+use crate::types::{ARTIFACTS, AppEvent, JobRec, ModelArtifact, State, now_ms};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub async fn list_models(state: &State) -> Value {
@@ -37,7 +37,9 @@ pub async fn list_models(state: &State) -> Value {
         if let Ok(mut f) = tokio::fs::File::open(&full).await {
             use tokio::io::AsyncReadExt;
             let mut magic = [0u8; 8];
-            if f.read_exact(&mut magic).await.is_ok() && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0")) {
+            if f.read_exact(&mut magic).await.is_ok()
+                && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0"))
+            {
                 version = magic[7] as u32;
             }
         }
@@ -239,7 +241,9 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
     let (num, unit) = match s.chars().last() {
-        Some(c) if c.is_alphabetic() => (s[..s.len() - 1].trim(), c.to_ascii_lowercase().to_string()),
+        Some(c) if c.is_alphabetic() => {
+            (s[..s.len() - 1].trim(), c.to_ascii_lowercase().to_string())
+        }
         _ => (s, String::new()),
     };
     let v: f64 = num.parse().ok()?;
@@ -318,27 +322,34 @@ pub async fn upgrade_model(state: &Arc<State>, body: Value) -> Value {
         return json!({ "ok": false, "message": "target file does not exist" });
     }
     let out_file = target.with_extension("v3.ninfer");
-    
+
     let mut cmd = tokio::process::Command::new("python3");
-    cmd.arg(&upgrade_script).arg(target).arg(&out_file).current_dir(ninfer_path);
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.arg(&upgrade_script)
+        .arg(target)
+        .arg(&out_file)
+        .current_dir(ninfer_path);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     crate::clear_appimage_env(&mut cmd);
-    
+
     let Ok(mut child) = cmd.spawn() else {
         return json!({ "ok": false, "message": "could not spawn upgrade script" });
     };
     let pid = child.id();
-    
+
     let id = format!(
         "upg_{:x}_{:x}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
         std::process::id()
     );
-    
+
     let file_name = target.file_name().unwrap().to_string_lossy().to_string();
     let out_file_clone = out_file.clone();
     let target_clone = target.to_path_buf();
-    
+
     {
         let mut d = state.downloads.lock().await;
         d.insert(
@@ -359,20 +370,20 @@ pub async fn upgrade_model(state: &Arc<State>, body: Value) -> Value {
                 downloaded_bytes: None,
                 speed_bps: None,
                 started_at: crate::types::now_ms(),
-            }
+            },
         );
     }
-    
+
     let state_c = state.clone();
     let id_c = id.clone();
-    
+
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let mut buf_out = [0; 4096];
         let mut buf_err = [0; 4096];
-        
+
         loop {
             tokio::select! {
                 Ok(n) = stdout.read(&mut buf_out) => {
@@ -395,16 +406,16 @@ pub async fn upgrade_model(state: &Arc<State>, body: Value) -> Value {
                 }
             }
         }
-        
+
         let status = child.wait().await.ok();
         let success = status.map(|s| s.success()).unwrap_or(false);
-        
+
         if success {
             // Delete the old file first to ensure rename succeeds
             let _ = tokio::fs::remove_file(&target_clone).await;
             let _ = tokio::fs::rename(&out_file_clone, &target_clone).await;
         }
-        
+
         let mut d = state_c.downloads.lock().await;
         if let Some(j) = d.get_mut(&id_c) {
             j.done = true;
@@ -433,7 +444,7 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
     let out_path = std::path::Path::new(&models_dir).join(out_name);
 
     let ninfer_path = std::path::Path::new(&cfg.ninfer_path);
-    
+
     let id = format!(
         "conv_{:x}_{:x}",
         std::time::SystemTime::now()
@@ -444,13 +455,18 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
     );
 
     let mut cmd = tokio::process::Command::new("python3");
-    cmd.arg("-m").arg("tools.convert")
-        .arg("--model").arg(model_path)
-        .arg("--recipe").arg(recipe)
-        .arg("--name").arg(name)
-        .arg("--out").arg(&out_path)
+    cmd.arg("-m")
+        .arg("tools.convert")
+        .arg("--model")
+        .arg(model_path)
+        .arg("--recipe")
+        .arg(recipe)
+        .arg("--name")
+        .arg(name)
+        .arg("--out")
+        .arg(&out_path)
         .current_dir(ninfer_path);
-        
+
     // Parse extra_args simply by splitting by whitespace (ignoring quotes for simplicity in this PoC)
     if !extra_args.trim().is_empty() {
         for arg in extra_args.split_whitespace() {
@@ -459,7 +475,7 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
     }
 
     cmd.stdout(std::process::Stdio::piped())
-       .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped());
     crate::clear_appimage_env(&mut cmd);
 
     let Ok(mut child) = cmd.spawn() else {
@@ -474,7 +490,10 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
             JobRec {
                 id: id.clone(),
                 action: Some("convert".to_string()),
-                cmd: Some(format!("python3 -m tools.convert --model {} ...", model_path)),
+                cmd: Some(format!(
+                    "python3 -m tools.convert --model {} ...",
+                    model_path
+                )),
                 repo: None,
                 file: Some(out_name.to_string()),
                 local_dir: Some(models_dir),
@@ -499,7 +518,7 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
         let mut stderr = child.stderr.take().unwrap();
         let mut buf_out = [0; 4096];
         let mut buf_err = [0; 4096];
-        
+
         // Read output dynamically
         loop {
             tokio::select! {
@@ -521,7 +540,7 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
                 }
             }
         }
-        
+
         let status = child.wait().await.ok();
         let code = status.and_then(|s| s.code());
         let success = status.map(|s| s.success()).unwrap_or(false);

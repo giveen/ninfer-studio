@@ -2,14 +2,14 @@
 
 // Rust guideline compliant 2026-07-28
 
-use axum::body::Body;
-use axum::extract::{Request, State as AxumState};
-use axum::http::StatusCode;
-use axum::Json;
-use serde_json::{json, Value};
 use crate::engine::S;
 use crate::read_json;
 use crate::types::{AppSettings, EngineProfile, ProfileState, SavedProfile};
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Request, State as AxumState};
+use axum::http::StatusCode;
+use serde_json::{Value, json};
 
 pub(crate) async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
     let mut c = state.config.read().await.clone();
@@ -44,14 +44,26 @@ pub(crate) fn redact_config(mut v: Value) -> Value {
     let api_set = is_set("apiKey");
     let cloud_api_set = is_set("cloudProviderApiKey");
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("hfToken".into(), json!(if hf_set { SECRET_MASK } else { "" }));
-        obj.insert("apiKey".into(), json!(if api_set { SECRET_MASK } else { "" }));
-        obj.insert("cloudProviderApiKey".into(), json!(if cloud_api_set { SECRET_MASK } else { "" }));
+        obj.insert(
+            "hfToken".into(),
+            json!(if hf_set { SECRET_MASK } else { "" }),
+        );
+        obj.insert(
+            "apiKey".into(),
+            json!(if api_set { SECRET_MASK } else { "" }),
+        );
+        obj.insert(
+            "cloudProviderApiKey".into(),
+            json!(if cloud_api_set { SECRET_MASK } else { "" }),
+        );
     }
     v
 }
 
-pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn set_config(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
     let mut merged: AppSettings = state.config.read().await.clone();
     if let Some(v) = body.get("ninferPath").and_then(|v| v.as_str()) {
@@ -90,7 +102,10 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         merged.coder_sandbox = v;
     }
     if let Some(v) = body.get("sandboxBinds").and_then(|v| v.as_array()) {
-        merged.sandbox_binds = v.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+        merged.sandbox_binds = v
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
     }
     if let Some(v) = body.get("chatReflectionModel").and_then(|v| v.as_str()) {
         merged.chat_reflection_model = v.into();
@@ -105,17 +120,23 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
     {
         merged.chat_memory_tool_tier = v.into();
     }
-    if let Some(v) = body.get("chatDeepResearchMaxAngles").and_then(|v| v.as_u64())
+    if let Some(v) = body
+        .get("chatDeepResearchMaxAngles")
+        .and_then(|v| v.as_u64())
         && (1..=10).contains(&v)
     {
         merged.chat_deep_research_max_angles = v as u32;
     }
-    if let Some(v) = body.get("chatDeepResearchMaxSteps").and_then(|v| v.as_u64())
+    if let Some(v) = body
+        .get("chatDeepResearchMaxSteps")
+        .and_then(|v| v.as_u64())
         && (1..=30).contains(&v)
     {
         merged.chat_deep_research_max_steps = v as u32;
     }
-    if let Some(v) = body.get("chatReflectionCritiqueMaxTokens").and_then(|v| v.as_u64())
+    if let Some(v) = body
+        .get("chatReflectionCritiqueMaxTokens")
+        .and_then(|v| v.as_u64())
         && (50..=4000).contains(&v)
     {
         merged.chat_reflection_critique_max_tokens = v as u32;
@@ -155,7 +176,10 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
 /// Write `cfg` to `<data>/config.json` and install it as the live config.
 /// Shared by [`set_config`] and any other handler that mutates settings with
 /// a side effect beyond a plain field edit (e.g. `remote::start`/`stop`).
-pub(crate) async fn persist_config(state: &S, cfg: &AppSettings) -> Result<(), (StatusCode, String)> {
+pub(crate) async fn persist_config(
+    state: &S,
+    cfg: &AppSettings,
+) -> Result<(), (StatusCode, String)> {
     let path = state.data_dir.join("config.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(
@@ -165,9 +189,14 @@ pub(crate) async fn persist_config(state: &S, cfg: &AppSettings) -> Result<(), (
             data_dir = ?state.data_dir,
             "could not create data dir {{data_dir}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create data dir: {e}"),
+        ));
     }
-    if let Err(e) = crate::atomic_write_secret(&path, serde_json::to_string_pretty(cfg).unwrap()).await {
+    if let Err(e) =
+        crate::atomic_write_secret(&path, serde_json::to_string_pretty(cfg).unwrap()).await
+    {
         tracing::event!(
             name: "config.persist.failed",
             tracing::Level::ERROR,
@@ -175,7 +204,10 @@ pub(crate) async fn persist_config(state: &S, cfg: &AppSettings) -> Result<(), (
             path = ?path,
             "could not write config to {{path}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save config: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save config: {e}"),
+        ));
     }
     *state.config.write().await = cfg.clone();
     Ok(())
@@ -233,7 +265,10 @@ pub(crate) async fn profile_state_set(
             data_dir = ?state.data_dir,
             "could not create data dir {{data_dir}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create data dir: {e}"),
+        ));
     }
     if let Err(e) = crate::atomic_write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
         tracing::event!(
@@ -243,7 +278,10 @@ pub(crate) async fn profile_state_set(
             path = ?p,
             "could not write profile state to {{path}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save profile state: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save profile state: {e}"),
+        ));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -298,7 +336,10 @@ pub(crate) async fn conversations_set(
             data_dir = ?state.data_dir,
             "could not create data dir {{data_dir}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not create data dir: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create data dir: {e}"),
+        ));
     }
     if let Err(e) = crate::atomic_write(&p, serde_json::to_string_pretty(&current).unwrap()).await {
         tracing::event!(
@@ -308,8 +349,10 @@ pub(crate) async fn conversations_set(
             path = ?p,
             "could not write conversations to {{path}}: {{error}}",
         );
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("could not save conversations: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save conversations: {e}"),
+        ));
     }
     Ok(Json(json!({ "ok": true })))
 }
-

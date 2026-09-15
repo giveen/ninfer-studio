@@ -7,10 +7,10 @@
 
 use super::common::{enforce_perm, perm_scope};
 use crate::engine::S;
+use axum::Json;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -71,18 +71,29 @@ fn html_to_text(html: &str, base: &reqwest::Url) -> String {
         if images.len() >= 20 {
             break;
         }
-        let Some(src) = el.value().attr("src") else { continue };
+        let Some(src) = el.value().attr("src") else {
+            continue;
+        };
         let Ok(abs) = base.join(src) else { continue };
         let abs = abs.to_string();
         if !images.iter().any(|(_, u)| u == &abs) {
-            let alt = el.value().attr("alt").unwrap_or("").replace('[', "(").replace(']', ")");
+            let alt = el
+                .value()
+                .attr("alt")
+                .unwrap_or("")
+                .replace('[', "(")
+                .replace(']', ")");
             images.push((alt, abs));
         }
     }
     if !images.is_empty() {
         out.push_str("\n\n## Images on this page\n");
         for (i, (alt, src)) in images.iter().enumerate() {
-            let alt = if alt.is_empty() { format!("image {}", i + 1) } else { alt.clone() };
+            let alt = if alt.is_empty() {
+                format!("image {}", i + 1)
+            } else {
+                alt.clone()
+            };
             out.push_str(&format!("![{alt}]({src})\n"));
         }
     }
@@ -92,10 +103,18 @@ fn html_to_text(html: &str, base: &reqwest::Url) -> String {
         if links.len() >= 20 {
             break;
         }
-        let Some(href) = el.value().attr("href") else { continue };
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
         let Ok(abs) = base.join(href) else { continue };
-        let text = COLLAPSE_WS.replace_all(el.text().collect::<String>().trim(), " ").into_owned();
-        let text = if text.is_empty() { abs.to_string() } else { text };
+        let text = COLLAPSE_WS
+            .replace_all(el.text().collect::<String>().trim(), " ")
+            .into_owned();
+        let text = if text.is_empty() {
+            abs.to_string()
+        } else {
+            text
+        };
         let abs = abs.to_string();
         if !links.iter().any(|(_, u)| u == &abs) {
             links.push((text, abs));
@@ -104,7 +123,10 @@ fn html_to_text(html: &str, base: &reqwest::Url) -> String {
     if !links.is_empty() {
         out.push_str("\n\n## Links on this page\n");
         for (text, href) in &links {
-            out.push_str(&format!("- [{}]({href})\n", text.replace('[', "(").replace(']', ")")));
+            out.push_str(&format!(
+                "- [{}]({href})\n",
+                text.replace('[', "(").replace(']', ")")
+            ));
         }
     }
 
@@ -135,7 +157,7 @@ fn is_global_ipv4(ip: &Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || o[0] == 0                              // "this network"
-        || (o[0] == 100 && (o[1] & 0xc0) == 64))  // 100.64.0.0/10 CGNAT
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)) // 100.64.0.0/10 CGNAT
 }
 
 fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
@@ -151,48 +173,88 @@ fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
 /// globally-routable addresses — blocks fetching the loopback control plane
 /// (or any other internal/LAN service) via a tool an agent can call on
 /// untrusted content (fetched pages, files in the workspace).
-pub(crate) async fn ensure_public_http_url(url: &reqwest::Url) -> Result<(), (StatusCode, Json<Value>)> {
+pub(crate) async fn ensure_public_http_url(
+    url: &reqwest::Url,
+) -> Result<(), (StatusCode, Json<Value>)> {
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "only http/https URLs are allowed"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "only http/https URLs are allowed"})),
+        ));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "url has no host"}))))?;
+    let host = url.host_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "url has no host"})),
+        )
+    })?;
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_global_ip(&ip) {
             Ok(())
         } else {
-            Err((StatusCode::FORBIDDEN, Json(json!({"error": "refusing to fetch a private/loopback/link-local address"}))))
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "refusing to fetch a private/loopback/link-local address"})),
+            ))
         };
     }
     let port = url.port_or_known_default().unwrap_or(80);
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("dns lookup failed: {e}")}))))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("dns lookup failed: {e}")})),
+            )
+        })?
         .peekable();
     if addrs.peek().is_none() {
-        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "dns lookup returned no addresses"}))));
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "dns lookup returned no addresses"})),
+        ));
     }
     for addr in addrs {
         if !is_global_ip(&addr.ip()) {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")})),
+                Json(
+                    json!({"error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")}),
+                ),
             ));
         }
     }
     Ok(())
 }
 
-pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn web_fetch(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const MAX_REDIRECTS: u8 = 5;
     let raw = match req.get("url").and_then(|v| v.as_str()) {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "url required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "url required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "web_fetch", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
-    let mut url = reqwest::Url::parse(&raw)
-        .map_err(|_| (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid url"}))))?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "web_fetch",
+        None,
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
+    let mut url = reqwest::Url::parse(&raw).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid url"})),
+        )
+    })?;
     let client = reqwest::Client::builder()
         .user_agent("ninfier-studio/0.1")
         .timeout(Duration::from_secs(25))
@@ -201,26 +263,42 @@ pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
         // 302 straight into the loopback control plane or the LAN.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("client failed: {e}")}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("client failed: {e}")})),
+            )
+        })?;
     let mut redirects = 0u8;
     let resp = loop {
         ensure_public_http_url(&url).await?;
-        let resp = client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("fetch failed: {e}")}))))?;
+        let resp = client.get(url.clone()).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("fetch failed: {e}")})),
+            )
+        })?;
         if resp.status().is_redirection() {
-            let Some(location) = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()) else {
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
                 break resp;
             };
             if redirects >= MAX_REDIRECTS {
-                return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": "too many redirects"}))));
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "too many redirects"})),
+                ));
             }
             redirects += 1;
-            url = url
-                .join(location)
-                .map_err(|_| (StatusCode::BAD_GATEWAY, Json(json!({"error": "invalid redirect location"}))))?;
+            url = url.join(location).map_err(|_| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "invalid redirect location"})),
+                )
+            })?;
             continue;
         }
         break resp;
@@ -235,18 +313,29 @@ pub async fn web_fetch(AxumState(state): AxumState<S>, Json(req): Json<Value>) -
     let mut bytes = resp
         .bytes()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("read failed: {e}")}))))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("read failed: {e}")})),
+            )
+        })?
         .to_vec();
     bytes.truncate(2 * 1024 * 1024);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let (content, ct) = if content_type.contains("html") {
         (html_to_text(&text, &url), "text/markdown".to_string())
     } else {
-        let ct = if content_type.is_empty() { "text/plain".to_string() } else { content_type };
+        let ct = if content_type.is_empty() {
+            "text/plain".to_string()
+        } else {
+            content_type
+        };
         (text, ct)
     };
     let (content, truncated) = truncate_chars(&content, 200_000);
-    Ok(Json(json!({"url": url.to_string(), "status": status, "contentType": ct, "content": content, "truncated": truncated})))
+    Ok(Json(
+        json!({"url": url.to_string(), "status": status, "contentType": ct, "content": content, "truncated": truncated}),
+    ))
 }
 
 /// Percent-encode a query string (alphanumerics + `-_.~` pass through).
@@ -279,7 +368,6 @@ fn pct_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&bytes).into_owned()
 }
-
 
 /// Unwrap a DuckDuckGo `/l/?...&uddg=<target>&...` redirect, if present.
 fn resolve_ddg_href(href: &str) -> String {
@@ -314,11 +402,17 @@ fn parse_ddg(html: &str) -> Vec<Value> {
             Some(h) => h,
             None => continue,
         };
-        let title = COLLAPSE_WS.replace_all(a.text().collect::<String>().trim(), " ").into_owned();
+        let title = COLLAPSE_WS
+            .replace_all(a.text().collect::<String>().trim(), " ")
+            .into_owned();
         let snippet = res
             .select(&DDG_SNIP)
             .next()
-            .map(|s| COLLAPSE_WS.replace_all(s.text().collect::<String>().trim(), " ").into_owned())
+            .map(|s| {
+                COLLAPSE_WS
+                    .replace_all(s.text().collect::<String>().trim(), " ")
+                    .into_owned()
+            })
             .unwrap_or_default();
         let url = resolve_ddg_href(href);
         if title.is_empty() || url.is_empty() {
@@ -330,25 +424,58 @@ fn parse_ddg(html: &str) -> Vec<Value> {
     out
 }
 
-pub async fn web_search(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn web_search(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let query = match req.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-        _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "query required"})))),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "query required"})),
+            ));
+        }
     };
-    enforce_perm(&state, &perm_scope(&req), "web_search", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "web_search",
+        None,
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("client failed: {e}")}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("client failed: {e}")})),
+            )
+        })?;
     let html = client
-        .get(format!("https://html.duckduckgo.com/html/?q={}", pct_encode(&query)))
+        .get(format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            pct_encode(&query)
+        ))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("search failed: {e}")}))))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("search failed: {e}")})),
+            )
+        })?
         .text()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("read failed: {e}")}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("read failed: {e}")})),
+            )
+        })?;
     Ok(Json(json!({"results": parse_ddg(&html), "query": query})))
 }
 
@@ -359,18 +486,31 @@ mod tests {
     #[test]
     fn global_ip_classification_blocks_internal_ranges() {
         let blocked = [
-            "127.0.0.1", "127.53.0.1", "10.0.0.1", "172.16.5.1", "192.168.1.1",
+            "127.0.0.1",
+            "127.53.0.1",
+            "10.0.0.1",
+            "172.16.5.1",
+            "192.168.1.1",
             "169.254.169.254", // cloud metadata
             "100.64.0.1",      // CGNAT
-            "0.0.0.0", "255.255.255.255",
-            "::1", "fe80::1", "fc00::1", "fd12::1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "fd12::1",
             "::ffff:127.0.0.1", // IPv4-mapped loopback
         ];
         for ip in blocked {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(!is_global_ip(&parsed), "should block {ip}");
         }
-        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        let allowed = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ];
         for ip in allowed {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(is_global_ip(&parsed), "should allow {ip}");
@@ -387,7 +527,10 @@ mod tests {
             "file:///etc/passwd",
         ] {
             let parsed = reqwest::Url::parse(url).unwrap();
-            assert!(ensure_public_http_url(&parsed).await.is_err(), "should reject {url}");
+            assert!(
+                ensure_public_http_url(&parsed).await.is_err(),
+                "should reject {url}"
+            );
         }
     }
 
@@ -400,7 +543,10 @@ mod tests {
     #[test]
     fn html_to_text_strips_markup() {
         let base = reqwest::Url::parse("https://example.com/page").unwrap();
-        let out = html_to_text("<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>", &base);
+        let out = html_to_text(
+            "<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>",
+            &base,
+        );
         assert!(!out.contains('<'));
         assert!(!out.contains("evil()"));
         assert!(out.contains("Hi & bye"));
@@ -417,9 +563,18 @@ mod tests {
             r#"<html><body><p>See <a href="/about">the about page</a>.</p><img src="../cat.png" alt="A cat"><img src="https://cdn.example.com/dog.jpg"></body></html>"#,
             &base,
         );
-        assert!(out.contains("![A cat](https://example.com/cat.png)"), "{out}");
-        assert!(out.contains("![image 2](https://cdn.example.com/dog.jpg)"), "{out}");
-        assert!(out.contains("[the about page](https://example.com/about)"), "{out}");
+        assert!(
+            out.contains("![A cat](https://example.com/cat.png)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("![image 2](https://cdn.example.com/dog.jpg)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[the about page](https://example.com/about)"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -433,9 +588,18 @@ mod tests {
         let html = r#"<div class="result"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?kh=-1&amp;uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=x">Example <b>Title</b></a><a class="result__snippet" href="x">some snippet here</a></div>"#;
         let parsed = parse_ddg(html);
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].get("url").and_then(|v| v.as_str()), Some("https://example.com/page"));
-        assert_eq!(parsed[0].get("title").and_then(|v| v.as_str()), Some("Example Title"));
-        assert_eq!(parsed[0].get("snippet").and_then(|v| v.as_str()), Some("some snippet here"));
+        assert_eq!(
+            parsed[0].get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/page")
+        );
+        assert_eq!(
+            parsed[0].get("title").and_then(|v| v.as_str()),
+            Some("Example Title")
+        );
+        assert_eq!(
+            parsed[0].get("snippet").and_then(|v| v.as_str()),
+            Some("some snippet here")
+        );
         assert!(parse_ddg("<html><body>no results</body></html>").is_empty());
     }
 }

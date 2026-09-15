@@ -8,10 +8,10 @@
 use super::common::is_safe_base_dir;
 use crate::engine::S;
 use crate::types::strip_extended_prefix;
-use axum::extract::{Query, State as AxumState};
 use axum::Json;
+use axum::extract::{Query, State as AxumState};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize)]
@@ -27,7 +27,10 @@ pub async fn workspace_get(AxumState(state): AxumState<S>) -> Json<WorkspaceResp
     } else {
         Path::new(&ws).is_dir()
     };
-    Json(WorkspaceResp { workspace: ws, exists })
+    Json(WorkspaceResp {
+        workspace: ws,
+        exists,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,14 +75,21 @@ pub async fn workspace_set(
         let _ = crate::atomic_write_secret(&path, json).await;
     }
 
-    Json(WorkspaceResp { workspace: ws, exists })
+    Json(WorkspaceResp {
+        workspace: ws,
+        exists,
+    })
 }
 
 /// List subdirectories of a host path so the UI can browse for a workspace
 /// root. Deliberately NOT confined to the workspace (it picks the workspace).
 /// Unreadable roots return exists:false rather than an error, like the sidecar.
 pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
-    let raw = params.get("root").map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("~");
+    let raw = params
+        .get("root")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("~");
     // Empty or ~-prefixed roots resolve to the home directory (the picker's
     // natural start point); `root` in the response is always the RESOLVED
     // absolute path so the UI can navigate from it directly.
@@ -97,11 +107,15 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
                 }
                 dirs.sort();
                 Json(json!({"root": root, "exists": true, "isDir": true, "dirs": dirs}))
-            },
-            Err(e) => Json(json!({"root": root, "exists": false, "isDir": false, "dirs": [], "error": e.to_string()})),
+            }
+            Err(e) => Json(
+                json!({"root": root, "exists": false, "isDir": false, "dirs": [], "error": e.to_string()}),
+            ),
         },
         Ok(_) => Json(json!({"root": root, "exists": true, "isDir": false, "dirs": []})),
-        Err(e) => Json(json!({"root": root, "exists": false, "isDir": false, "dirs": [], "error": e.to_string()})),
+        Err(e) => Json(
+            json!({"root": root, "exists": false, "isDir": false, "dirs": [], "error": e.to_string()}),
+        ),
     }
 }
 

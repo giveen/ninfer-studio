@@ -40,14 +40,14 @@
 use super::common::{enforce_perm, perm_scope};
 use super::web::ensure_public_http_url;
 use crate::engine::S;
+use axum::Json;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
-use axum::Json;
 use obscura_browser::{BrowserContext, HTML_TO_MARKDOWN_JS, Page, WaitUntil};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use tokio::task::LocalSet;
@@ -70,14 +70,33 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(55);
 /// axum worker thread into the actor's dedicated driver thread.
 #[derive(Debug)]
 enum BrowserCmd {
-    Navigate { url: String, wait: WaitUntil },
+    Navigate {
+        url: String,
+        wait: WaitUntil,
+    },
     Snapshot,
-    Click { selector: String },
-    Fill { selector: String, value: String },
-    PressKey { selector: Option<String>, key: String },
-    SelectOption { selector: String, value: String },
-    Evaluate { expression: String },
-    WaitFor { selector: String, timeout_secs: u64 },
+    Click {
+        selector: String,
+    },
+    Fill {
+        selector: String,
+        value: String,
+    },
+    PressKey {
+        selector: Option<String>,
+        key: String,
+    },
+    SelectOption {
+        selector: String,
+        value: String,
+    },
+    Evaluate {
+        expression: String,
+    },
+    WaitFor {
+        selector: String,
+        timeout_secs: u64,
+    },
     Status,
     /// Answer, drop the page, and exit the actor (and its driver thread).
     Stop,
@@ -124,7 +143,9 @@ impl<F: std::future::Future<Output = ()>> std::future::Future for PanicGuard<F> 
 /// `!Send` crosses into this struct.
 #[derive(Debug)]
 pub struct BrowserSlot {
-    cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<(BrowserCmd, tokio::sync::mpsc::UnboundedSender<Reply>)>>,
+    cmd_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<(BrowserCmd, tokio::sync::mpsc::UnboundedSender<Reply>)>,
+    >,
     /// Set to false by the driver thread when the actor exits; lets us tell
     /// "running" apart from "dead but not yet observed".
     open: Option<Arc<AtomicBool>>,
@@ -133,7 +154,11 @@ pub struct BrowserSlot {
 
 impl BrowserSlot {
     pub(crate) fn new() -> Self {
-        Self { cmd_tx: None, open: None, last_used: Instant::now() }
+        Self {
+            cmd_tx: None,
+            open: None,
+            last_used: Instant::now(),
+        }
     }
 
     /// True when a live browser session exists.
@@ -162,8 +187,10 @@ impl BrowserSlot {
 
     /// Start the driver thread + actor for this session.
     fn spawn_driver(&mut self) -> Result<(), (StatusCode, Json<Value>)> {
-        let (cmd_tx, cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(BrowserCmd, tokio::sync::mpsc::UnboundedSender<Reply>)>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            BrowserCmd,
+            tokio::sync::mpsc::UnboundedSender<Reply>,
+        )>();
         let open = Arc::new(AtomicBool::new(true));
         let open_flag = open.clone();
         std::thread::Builder::new()
@@ -173,7 +200,9 @@ impl BrowserSlot {
                 // the control plane's runtime, and everything `!Send` (the
                 // V8 page) stays on this thread for the session's lifetime.
                 let open_inner = open_flag.clone();
-                let res = tokio::runtime::Builder::new_current_thread().enable_all().build();
+                let res = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
                 match res {
                     Ok(rt) => {
                         rt.block_on(async {
@@ -191,7 +220,12 @@ impl BrowserSlot {
                 }
                 open_flag.store(false, Ordering::Relaxed);
             })
-            .map_err(|e| http_err(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to start browser session: {e}")))?;
+            .map_err(|e| {
+                http_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to start browser session: {e}"),
+                )
+            })?;
         self.cmd_tx = Some(cmd_tx);
         self.open = Some(open);
         self.last_used = Instant::now();
@@ -229,11 +263,17 @@ async fn await_reply(
     match timeout(CMD_TIMEOUT, async { rx.recv().await }).await {
         Ok(val) => match val {
             Some(val) => Ok(val),
-            None => Err(http_err(StatusCode::INTERNAL_SERVER_ERROR, "browser session ended")),
-        }
+            None => Err(http_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "browser session ended",
+            )),
+        },
         Err(_) => {
             slot.stop();
-            Err(http_err(StatusCode::GATEWAY_TIMEOUT, "browser command timed out; session closed"))
+            Err(http_err(
+                StatusCode::GATEWAY_TIMEOUT,
+                "browser command timed out; session closed",
+            ))
         }
     }
 }
@@ -260,14 +300,19 @@ fn eval_js(page: &mut Page, expr: &str) -> String {
     if val.is_null() {
         "page script threw".to_string()
     } else {
-        val.as_str().map(|s| s.to_string()).unwrap_or_else(|| val.to_string())
+        val.as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| val.to_string())
     }
 }
 
 /// The session task (runs on the driver thread): owns the `Page` and serves
 /// commands one at a time.
 async fn actor_main(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<(BrowserCmd, tokio::sync::mpsc::UnboundedSender<Reply>)>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+        BrowserCmd,
+        tokio::sync::mpsc::UnboundedSender<Reply>,
+    )>,
     _open: Arc<AtomicBool>,
 ) {
     // Obscura refuses loopback/RFC1918/link-local at its HTTP layer, so even
@@ -275,10 +320,10 @@ async fn actor_main(
     // services.
     let ctx = Arc::new(BrowserContext::with_storage_and_network(
         "ninfier-coder".to_string(),
-        None, // no proxy
+        None,  // no proxy
         false, // no stealth: a transparent UA is friendlier to docs sites
         Some("NInfer Studio Coder Browser/1.0".to_string()),
-        None, // no persistent cookie storage
+        None,  // no persistent cookie storage
         false, // refuse private/loopback/link-local network access
     ));
     let mut page = Page::new("ninfier-coder-page".to_string(), ctx);
@@ -299,7 +344,11 @@ async fn actor_main(
                 }
             }
             BrowserCmd::Snapshot => {
-                let title = page.evaluate("document.title").as_str().unwrap_or("").to_string();
+                let title = page
+                    .evaluate("document.title")
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let md = match page.evaluate(HTML_TO_MARKDOWN_JS) {
                     Value::String(s) => s,
                     other => other.to_string(),
@@ -365,7 +414,10 @@ async fn actor_main(
                     json!({ "result": val })
                 }
             }
-            BrowserCmd::WaitFor { selector, timeout_secs } => {
+            BrowserCmd::WaitFor {
+                selector,
+                timeout_secs,
+            } => {
                 let expr = format!("document.querySelector({}) !== null", js(&selector));
                 let deadline = Instant::now() + Duration::from_secs(timeout_secs);
                 loop {
@@ -390,9 +442,22 @@ async fn actor_main(
     }
 }
 
-pub async fn browser(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_perm(&state, &perm_scope(&req), "browser", None, req.get("approvalToken").and_then(|v| v.as_str())).await?;
-    let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+pub async fn browser(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "browser",
+        None,
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
+    let action = req
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("status");
     let sel = req.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let mut slot = state.browser.lock().await;
 
@@ -415,10 +480,14 @@ pub async fn browser(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
                 .filter(|u| !u.trim().is_empty())
                 .map(|u| u.trim().to_string())
                 .ok_or_else(|| http_err(StatusCode::BAD_REQUEST, "navigate requires a url"))?;
-            let parsed =
-                reqwest::Url::parse(&url).map_err(|e| http_err(StatusCode::BAD_REQUEST, format!("bad url: {e}")))?;
+            let parsed = reqwest::Url::parse(&url)
+                .map_err(|e| http_err(StatusCode::BAD_REQUEST, format!("bad url: {e}")))?;
             ensure_public_http_url(&parsed).await?;
-            let wait = match req.get("wait_until").and_then(|v| v.as_str()).unwrap_or("domcontentloaded") {
+            let wait = match req
+                .get("wait_until")
+                .and_then(|v| v.as_str())
+                .unwrap_or("domcontentloaded")
+            {
                 "load" => WaitUntil::Load,
                 _ => WaitUntil::DomContentLoaded,
             };
@@ -431,34 +500,77 @@ pub async fn browser(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
         }
         "click" => {
             if sel.is_empty() {
-                return Err(http_err(StatusCode::BAD_REQUEST, "click requires a selector"));
+                return Err(http_err(
+                    StatusCode::BAD_REQUEST,
+                    "click requires a selector",
+                ));
             }
-            let rx = send_cmd(&mut slot, BrowserCmd::Click { selector: sel.to_string() }).await?;
+            let rx = send_cmd(
+                &mut slot,
+                BrowserCmd::Click {
+                    selector: sel.to_string(),
+                },
+            )
+            .await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "fill" => {
             if sel.is_empty() {
-                return Err(http_err(StatusCode::BAD_REQUEST, "fill requires a selector"));
+                return Err(http_err(
+                    StatusCode::BAD_REQUEST,
+                    "fill requires a selector",
+                ));
             }
             let value = req.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            let rx = send_cmd(&mut slot, BrowserCmd::Fill { selector: sel.to_string(), value: value.to_string() }).await?;
+            let rx = send_cmd(
+                &mut slot,
+                BrowserCmd::Fill {
+                    selector: sel.to_string(),
+                    value: value.to_string(),
+                },
+            )
+            .await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "press_key" => {
             let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
             if key.is_empty() {
-                return Err(http_err(StatusCode::BAD_REQUEST, "press_key requires a key (e.g. \"Enter\")"));
+                return Err(http_err(
+                    StatusCode::BAD_REQUEST,
+                    "press_key requires a key (e.g. \"Enter\")",
+                ));
             }
-            let selector = if sel.is_empty() { None } else { Some(sel.to_string()) };
-            let rx = send_cmd(&mut slot, BrowserCmd::PressKey { selector, key: key.to_string() }).await?;
+            let selector = if sel.is_empty() {
+                None
+            } else {
+                Some(sel.to_string())
+            };
+            let rx = send_cmd(
+                &mut slot,
+                BrowserCmd::PressKey {
+                    selector,
+                    key: key.to_string(),
+                },
+            )
+            .await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "select_option" => {
             if sel.is_empty() {
-                return Err(http_err(StatusCode::BAD_REQUEST, "select_option requires a selector"));
+                return Err(http_err(
+                    StatusCode::BAD_REQUEST,
+                    "select_option requires a selector",
+                ));
             }
             let value = req.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            let rx = send_cmd(&mut slot, BrowserCmd::SelectOption { selector: sel.to_string(), value: value.to_string() }).await?;
+            let rx = send_cmd(
+                &mut slot,
+                BrowserCmd::SelectOption {
+                    selector: sel.to_string(),
+                    value: value.to_string(),
+                },
+            )
+            .await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "evaluate" => {
@@ -466,28 +578,45 @@ pub async fn browser(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> 
                 .get("expression")
                 .and_then(|v| v.as_str())
                 .filter(|e| !e.trim().is_empty())
-                .ok_or_else(|| http_err(StatusCode::BAD_REQUEST, "evaluate requires an expression"))?
+                .ok_or_else(|| {
+                    http_err(StatusCode::BAD_REQUEST, "evaluate requires an expression")
+                })?
                 .to_string();
             let rx = send_cmd(&mut slot, BrowserCmd::Evaluate { expression }).await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "wait_for" => {
             if sel.is_empty() {
-                return Err(http_err(StatusCode::BAD_REQUEST, "wait_for requires a selector"));
+                return Err(http_err(
+                    StatusCode::BAD_REQUEST,
+                    "wait_for requires a selector",
+                ));
             }
             let timeout_secs = req
                 .get("timeout")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
                 .clamp(1, WAIT_FOR_MAX.as_secs());
-            let rx = send_cmd(&mut slot, BrowserCmd::WaitFor { selector: sel.to_string(), timeout_secs }).await?;
+            let rx = send_cmd(
+                &mut slot,
+                BrowserCmd::WaitFor {
+                    selector: sel.to_string(),
+                    timeout_secs,
+                },
+            )
+            .await?;
             await_reply(&mut slot, rx).await.map(Json)
         }
         "close" => {
             slot.stop();
             Ok(Json(json!({ "ok": true })))
         }
-        other => return Err(http_err(StatusCode::BAD_REQUEST, format!("unknown browser action: {other}"))),
+        other => {
+            return Err(http_err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown browser action: {other}"),
+            ));
+        }
     };
 
     slot.last_used = Instant::now();
@@ -539,9 +668,12 @@ mod tests {
             std::env::temp_dir(),
             None,
         ));
-        let (_code, body) = browser(AxumState(state.clone()), Json(json!({ "action": "frobnicate" })))
-            .await
-            .unwrap_err();
+        let (_code, body) = browser(
+            AxumState(state.clone()),
+            Json(json!({ "action": "frobnicate" })),
+        )
+        .await
+        .unwrap_err();
         assert!(body.0.get("error").is_some());
         assert!(!state.browser.lock().await.is_open());
     }

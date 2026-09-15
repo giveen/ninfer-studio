@@ -15,8 +15,8 @@
 
 // Rust guideline compliant 2026-07-28
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mimalloc::MiMalloc;
 use tauri::{Manager, WindowEvent};
@@ -244,7 +244,12 @@ fn handle_event(app: &tauri::AppHandle, ev: &AppEvent) {
                 .unwrap_or_else(|| "Engine exited unexpectedly.".to_string()),
         ),
         AppEvent::DownloadFinished { file, ok } => (
-            if *ok { "Download finished" } else { "Download failed" }.to_string(),
+            if *ok {
+                "Download finished"
+            } else {
+                "Download failed"
+            }
+            .to_string(),
             file.clone(),
         ),
         AppEvent::BuildFinished { action, ok } => (
@@ -257,16 +262,13 @@ fn handle_event(app: &tauri::AppHandle, ev: &AppEvent) {
         ),
     };
 
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title(title).body(body).show();
 
     // Reflect engine state in the tray ("engine still running" indicator).
     let running = matches!(ev, AppEvent::EngineReady { .. });
-    app.state::<EngineRunning>().0.store(running, Ordering::SeqCst);
+    app.state::<EngineRunning>()
+        .0
+        .store(running, Ordering::SeqCst);
     #[cfg(feature = "tray")]
     if let Some(tray) = app.state::<TrayState>().0.lock().unwrap().as_ref() {
         let tip = if running {

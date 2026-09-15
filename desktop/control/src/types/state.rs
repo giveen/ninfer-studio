@@ -1,11 +1,11 @@
 //! Control-plane runtime state + desktop-shell events.
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use super::domain::{EngineState, JobRec};
 use super::settings::{AppSettings, EngineProfile};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Event emitted by the control plane for desktop-shell concerns (tray state,
 /// OS notifications). The control crate stays framework-agnostic: the Tauri app
@@ -183,7 +183,13 @@ pub struct State {
     /// Cached repo symbol index for `coder::search` (TTL'd, keyed by the root
     /// it was built from so a workspace switch can't serve another
     /// workspace's stale index). See `bg_jobs` for why this lives on `State`.
-    pub symbol_index: std::sync::Mutex<Option<(std::time::Instant, std::path::PathBuf, Vec<crate::coder::SymHit>)>>,
+    pub symbol_index: std::sync::Mutex<
+        Option<(
+            std::time::Instant,
+            std::path::PathBuf,
+            Vec<crate::coder::SymHit>,
+        )>,
+    >,
     /// Optional bridge to the desktop shell. `None` when running headless.
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,
@@ -242,4 +248,3 @@ impl State {
         }
     }
 }
-

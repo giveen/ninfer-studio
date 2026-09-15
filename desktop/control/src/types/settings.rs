@@ -288,7 +288,10 @@ impl fmt::Debug for AppSettings {
             .field("models_dir", &self.models_dir)
             .field("engine_port", &self.engine_port)
             .field("api_key", &redacted(&self.api_key))
-            .field("cloud_provider_api_key", &redacted(&self.cloud_provider_api_key))
+            .field(
+                "cloud_provider_api_key",
+                &redacted(&self.cloud_provider_api_key),
+            )
             .field("hf_cli", &self.hf_cli)
             .field("hf_token", &redacted(&self.hf_token))
             .field("build_command", &self.build_command)
@@ -404,7 +407,10 @@ impl fmt::Debug for EngineProfile {
             .field("host_kv_mib", &self.host_kv_mib)
             .field("max_private_continuations", &self.max_private_continuations)
             .field("max_shared_prefixes", &self.max_shared_prefixes)
-            .field("max_long_anchors_per_continuation", &self.max_long_anchors_per_continuation)
+            .field(
+                "max_long_anchors_per_continuation",
+                &self.max_long_anchors_per_continuation,
+            )
             .field("spec", &self.spec)
             .field("draft_tokens", &self.draft_tokens)
             .field("lm_head_draft", &self.lm_head_draft)
@@ -425,7 +431,10 @@ impl fmt::Debug for EngineProfile {
             .field("seed", &self.seed)
             .field("log_level", &self.log_level)
             .field("request_log_jsonl", &self.request_log_jsonl)
-            .field("response_store_max_records", &self.response_store_max_records)
+            .field(
+                "response_store_max_records",
+                &self.response_store_max_records,
+            )
             .field("response_store_max_mib", &self.response_store_max_mib)
             .field("context_cost_presets", &self.context_cost_presets)
             .field("cors", &self.cors)
@@ -460,7 +469,9 @@ mod opt_number_or_auto {
                 .map(Some)
                 .map_err(|_| serde::de::Error::custom("kv-capacity: expected number or 'auto'")),
             Some(serde_json::Value::Number(n)) => Ok(n.as_u64().map(NumberOrAuto::Number)),
-            Some(_) => Err(serde::de::Error::custom("kv-capacity: expected number or 'auto'")),
+            Some(_) => Err(serde::de::Error::custom(
+                "kv-capacity: expected number or 'auto'",
+            )),
         }
     }
     pub fn serialize<S>(v: &Option<NumberOrAuto>, s: S) -> Result<S::Ok, S::Error>
@@ -489,32 +500,55 @@ mod debug_redaction {
             ..AppSettings::default()
         };
         let rendered = format!("{settings:?}");
-        assert!(!rendered.contains(SECRET), "AppSettings Debug leaked the secret: {rendered}");
+        assert!(
+            !rendered.contains(SECRET),
+            "AppSettings Debug leaked the secret: {rendered}"
+        );
         // The field should still be visible as present, just masked.
-        assert!(rendered.contains("api_key: \"***\""), "expected a masked api_key field: {rendered}");
-        assert!(rendered.contains("hf_token: \"***\""), "expected a masked hf_token field: {rendered}");
+        assert!(
+            rendered.contains("api_key: \"***\""),
+            "expected a masked api_key field: {rendered}"
+        );
+        assert!(
+            rendered.contains("hf_token: \"***\""),
+            "expected a masked hf_token field: {rendered}"
+        );
     }
 
     #[test]
     fn app_settings_debug_shows_empty_when_unset() {
         let settings = AppSettings::default();
         let rendered = format!("{settings:?}");
-        assert!(rendered.contains("api_key: \"\""), "expected an empty api_key field: {rendered}");
+        assert!(
+            rendered.contains("api_key: \"\""),
+            "expected an empty api_key field: {rendered}"
+        );
     }
 
     #[test]
     fn engine_profile_debug_omits_api_key() {
-        let profile = EngineProfile { api_key: Some(SECRET.to_string()), ..EngineProfile::default() };
+        let profile = EngineProfile {
+            api_key: Some(SECRET.to_string()),
+            ..EngineProfile::default()
+        };
         let rendered = format!("{profile:?}");
-        assert!(!rendered.contains(SECRET), "EngineProfile Debug leaked the secret: {rendered}");
-        assert!(rendered.contains("api_key: Some(\"***\")"), "expected a masked api_key field: {rendered}");
+        assert!(
+            !rendered.contains(SECRET),
+            "EngineProfile Debug leaked the secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("api_key: Some(\"***\")"),
+            "expected a masked api_key field: {rendered}"
+        );
     }
 
     #[test]
     fn engine_profile_debug_shows_none_when_unset() {
         let profile = EngineProfile::default();
         let rendered = format!("{profile:?}");
-        assert!(rendered.contains("api_key: None"), "expected api_key: None: {rendered}");
+        assert!(
+            rendered.contains("api_key: None"),
+            "expected api_key: None: {rendered}"
+        );
     }
 }
-

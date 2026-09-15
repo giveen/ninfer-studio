@@ -49,10 +49,11 @@ pub async fn rotate_log_if_large(path: &str) {
 
 #[cfg(test)]
 mod log_rotation_tests {
-    use super::{rotate_log_if_large, LOG_KEEP_TAIL_BYTES, MAX_LOG_BYTES};
+    use super::{LOG_KEEP_TAIL_BYTES, MAX_LOG_BYTES, rotate_log_if_large};
 
     fn tmp_log(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ninfier-logrotate-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ninfier-logrotate-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(name)
     }
@@ -84,26 +85,44 @@ mod log_rotation_tests {
         let last_line_no = i - 1;
         std::fs::write(&path, &body).unwrap();
         let original_len = std::fs::metadata(&path).unwrap().len();
-        assert!(original_len > MAX_LOG_BYTES, "test setup should exceed the cap");
+        assert!(
+            original_len > MAX_LOG_BYTES,
+            "test setup should exceed the cap"
+        );
 
         rotate_log_if_large(path.to_str().unwrap()).await;
 
         let new_len = std::fs::metadata(&path).unwrap().len();
         assert!(new_len < original_len, "rotation should shrink the file");
-        assert!(new_len <= LOG_KEEP_TAIL_BYTES + 200, "kept tail should be close to LOG_KEEP_TAIL_BYTES, got {new_len}");
+        assert!(
+            new_len <= LOG_KEEP_TAIL_BYTES + 200,
+            "kept tail should be close to LOG_KEEP_TAIL_BYTES, got {new_len}"
+        );
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with("--- log truncated"), "should carry the truncation marker");
+        assert!(
+            content.starts_with("--- log truncated"),
+            "should carry the truncation marker"
+        );
         // The very last line written must survive (nothing lost off the end).
-        assert!(content.trim_end().ends_with(&format!("{last_line_no} {line}")));
+        assert!(
+            content
+                .trim_end()
+                .ends_with(&format!("{last_line_no} {line}"))
+        );
         // An early line must NOT survive (the head was actually dropped).
         assert!(!content.contains(&format!("\n0 {line}\n")));
         // No partial line at the top of the kept tail (other than the marker).
         let mut lines = content.lines();
         assert!(lines.next().unwrap().starts_with("--- log truncated"));
         for l in lines {
-            if l.is_empty() { continue; }
-            assert!(l.ends_with(&line), "kept line should be a complete, unbroken original line: {l:?}");
+            if l.is_empty() {
+                continue;
+            }
+            assert!(
+                l.ends_with(&line),
+                "kept line should be a complete, unbroken original line: {l:?}"
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -116,4 +135,3 @@ mod log_rotation_tests {
         assert!(!path.exists());
     }
 }
-

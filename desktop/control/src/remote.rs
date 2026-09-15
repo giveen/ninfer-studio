@@ -14,10 +14,10 @@
 
 use crate::engine::S;
 use crate::routes_config::persist_config;
+use axum::Json;
 use axum::extract::{Request, State as AxumState};
 use axum::http::StatusCode;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Best-effort LAN-facing IPv4 address of this machine, for display only
 /// ("open this on your laptop: http://<ip>:<port>"). Uses the classic
@@ -112,9 +112,12 @@ pub(crate) async fn post_start(
         .and_then(|v| v.as_u64())
         .map(|v| v as u16)
         .unwrap_or(state.config.read().await.remote_access_port);
-    start(state.clone(), port)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not bind 0.0.0.0:{port}: {e}")))?;
+    start(state.clone(), port).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not bind 0.0.0.0:{port}: {e}"),
+        )
+    })?;
     let mut cfg = state.config.read().await.clone();
     cfg.remote_access_enabled = true;
     cfg.remote_access_port = port;
@@ -122,7 +125,9 @@ pub(crate) async fn post_start(
     Ok(Json(status_json(&state).await))
 }
 
-pub(crate) async fn post_stop(AxumState(state): AxumState<S>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn post_stop(
+    AxumState(state): AxumState<S>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     stop(&state).await;
     let mut cfg = state.config.read().await.clone();
     cfg.remote_access_enabled = false;

@@ -9,11 +9,11 @@
 
 use crate::engine::S;
 use crate::memstore::{apply_memory_update, read_bank_and_learnings};
+use axum::Json;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// `<DATA_DIR>/coder-memory/<slug>`, where `slug` is the workspace path with
@@ -181,8 +181,14 @@ mod tests {
         // UNC: canonicalize yields `\\?\UNC\server\share` — a bare
         // `UNC\server\share` would be relative, so the leading UNC
         // separators must be restored to the picker's `\\server\share`.
-        assert_eq!(strip_extended_prefix("\\\\?\\UNC\\server\\share"), "\\\\server\\share");
-        assert_eq!(strip_extended_prefix("\\\\?/UNC/server/share"), "\\\\server\\share");
+        assert_eq!(
+            strip_extended_prefix("\\\\?\\UNC\\server\\share"),
+            "\\\\server\\share"
+        );
+        assert_eq!(
+            strip_extended_prefix("\\\\?/UNC/server/share"),
+            "\\\\server\\share"
+        );
         // Plain paths pass through untouched.
         assert_eq!(strip_extended_prefix("C:\\tmp"), "C:\\tmp");
         assert_eq!(strip_extended_prefix("/home/dev/x"), "/home/dev/x");
@@ -195,9 +201,16 @@ mod tests {
         // on Windows path.resolve keeps `E:` + `\` separators, so both map
         // to `_` (two underscores after the drive letter).
         let slug = |ws: &str| -> String {
-            mem_dir(Path::new("D:/data"), ws).file_name().unwrap().to_string_lossy().into_owned()
+            mem_dir(Path::new("D:/data"), ws)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         };
-        assert_eq!(slug("E:/GitHub/PublicRepos/ninfer-studio"), "E__GitHub_PublicRepos_ninfer-studio");
+        assert_eq!(
+            slug("E:/GitHub/PublicRepos/ninfer-studio"),
+            "E__GitHub_PublicRepos_ninfer-studio"
+        );
         // Backslash vs slash paths must slug identically (Windows interop).
         assert_eq!(slug("E:\\GitHub\\proj"), slug("E:/GitHub/proj"));
         // Long paths keep their tail (slice(-160)).
@@ -210,7 +223,11 @@ mod tests {
         // JS replaces per UTF-16 code unit: an emoji is a surrogate pair →
         // TWO underscores, BMP non-ASCII → one.
         let slug = |ws: &str| -> String {
-            mem_dir(Path::new("D:/data"), ws).file_name().unwrap().to_string_lossy().into_owned()
+            mem_dir(Path::new("D:/data"), ws)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         };
         assert_eq!(slug("C:/w💡ork"), "C__w__ork"); // 💡 = two units → "__"
         assert_eq!(slug("C:/wéork"), "C__w_ork"); // é = one unit → "_"
@@ -219,7 +236,11 @@ mod tests {
             .encode_utf16()
             .map(|u| {
                 let c = char::from_u32(u as u32).unwrap_or('_');
-                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' }
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                    c
+                } else {
+                    '_'
+                }
             })
             .collect();
         assert_eq!(slug("C:/w💡ork"), js_style);
@@ -241,7 +262,10 @@ mod tests {
         let got = memory_dir(&root, ws);
         assert_eq!(got, clean);
         assert!(clean.exists(), "old dir must be migrated into place");
-        assert_eq!(std::fs::read_to_string(clean.join("bank.md")).unwrap(), "# kept");
+        assert_eq!(
+            std::fs::read_to_string(clean.join("bank.md")).unwrap(),
+            "# kept"
+        );
         // Idempotent: second call is a no-op.
         assert_eq!(memory_dir(&root, ws), clean);
         let _ = std::fs::remove_dir_all(&root);
@@ -272,20 +296,27 @@ mod tests {
         // Handler-level persistence regression: bank replace, JSONL append
         // fields, drop rewrite, per-workspace isolation, and the no-workspace
         // 400 — against a temp DATA_DIR, like coder_round_trip.
-        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-handler-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ninfier-memtest-handler-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let ws_a = tmp.join("ws-a");
         let ws_b = tmp.join("ws-b");
         std::fs::create_dir_all(&ws_a).unwrap();
         std::fs::create_dir_all(&ws_b).unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         let ws = || AxumState(state.clone());
 
         // No workspace configured → 400.
         state.config.write().await.coder_workspace = String::new();
-        let e = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap_err();
+        let e = memory_get(ws(), Query(MemQuery { workspace: None }))
+            .await
+            .unwrap_err();
         assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(e.1.0.get("error").and_then(|v| v.as_str()), Some("no workspace configured"));
+        assert_eq!(
+            e.1.0.get("error").and_then(|v| v.as_str()),
+            Some("no workspace configured")
+        );
 
         // Workspace A: append → exact entry shape (id prefix, kind,
         // provenance default, task, ISO ts), then bank replace, both returned.
@@ -295,35 +326,86 @@ mod tests {
             .unwrap()
             .0;
         let l0 = r.get("learnings").and_then(|v| v.as_array()).unwrap()[0].clone();
-        assert!(l0.get("id").and_then(|v| v.as_str()).unwrap().starts_with("l_"));
-        assert_eq!(l0.get("text").and_then(|v| v.as_str()), Some("run pnpm test"));
+        assert!(
+            l0.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("l_")
+        );
+        assert_eq!(
+            l0.get("text").and_then(|v| v.as_str()),
+            Some("run pnpm test")
+        );
         assert_eq!(l0.get("kind").and_then(|v| v.as_str()), Some("tip"));
         assert_eq!(l0.get("provenance").and_then(|v| v.as_str()), Some("tool"));
         assert_eq!(l0.get("task").and_then(|v| v.as_str()), Some("t1"));
-        assert!(l0.get("ts").and_then(|v| v.as_str()).unwrap().ends_with('Z'));
+        assert!(
+            l0.get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .ends_with('Z')
+        );
 
         // The append landed on disk as JSONL under the clean slug.
-        let on_disk = read_learnings(&memory_dir(&state.data_dir, &memory_ws(&ws_a.to_string_lossy()))).await;
+        let on_disk = read_learnings(&memory_dir(
+            &state.data_dir,
+            &memory_ws(&ws_a.to_string_lossy()),
+        ))
+        .await;
         assert_eq!(on_disk.len(), 1);
 
         // Second append, then drop the first — rewrite keeps the rest.
-        let r3 = memory_set(ws(), Json(json!({"learning": {"text": "second", "kind": "avoid"}}))).await.unwrap().0;
+        let r3 = memory_set(
+            ws(),
+            Json(json!({"learning": {"text": "second", "kind": "avoid"}})),
+        )
+        .await
+        .unwrap()
+        .0;
         let learnings = r3.get("learnings").and_then(|v| v.as_array()).unwrap();
         assert_eq!(learnings.len(), 2);
-        let first_id = learnings[0].get("id").and_then(|v| v.as_str()).unwrap().to_string();
-        let r4 = memory_set(ws(), Json(json!({"dropLearningId": first_id}))).await.unwrap().0;
+        let first_id = learnings[0]
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let r4 = memory_set(ws(), Json(json!({"dropLearningId": first_id})))
+            .await
+            .unwrap()
+            .0;
         let learnings = r4.get("learnings").and_then(|v| v.as_array()).unwrap();
         assert_eq!(learnings.len(), 1);
-        assert_eq!(learnings[0].get("text").and_then(|v| v.as_str()), Some("second"));
+        assert_eq!(
+            learnings[0].get("text").and_then(|v| v.as_str()),
+            Some("second")
+        );
 
         // Workspace B: fully isolated
         state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
-        let r5 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
-        assert_eq!(r5.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
+        let r5 = memory_get(ws(), Query(MemQuery { workspace: None }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            r5.get("learnings")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            0
+        );
         // …and A still has its learning.
         state.config.write().await.coder_workspace = ws_a.to_string_lossy().into_owned();
-        let r6 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
-        assert_eq!(r6.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+        let r6 = memory_get(ws(), Query(MemQuery { workspace: None }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            r6.get("learnings")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -334,30 +416,54 @@ mod tests {
         // the named store even when the global pointer is elsewhere — the
         // UI mid-switch safety case. Omitted falls back to the pointer
         // (legacy behavior); pointer unset without an override → 400.
-        let tmp = std::env::temp_dir().join(format!("ninfier-memtest-explicit-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ninfier-memtest-explicit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let ws_a = tmp.join("ws-a");
         let ws_b = tmp.join("ws-b");
         std::fs::create_dir_all(&ws_a).unwrap();
         std::fs::create_dir_all(&ws_b).unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         let ws = || AxumState(state.clone());
         let a = ws_a.to_string_lossy().into_owned();
-        let q_a = || Query(MemQuery { workspace: Some(a.clone()) });
+        let q_a = || {
+            Query(MemQuery {
+                workspace: Some(a.clone()),
+            })
+        };
         let q_none = || Query(MemQuery { workspace: None });
 
         // Pointer → B. An explicit-A POST lands in A's store…
         state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
-        let r = memory_set(ws(), Json(json!({"workspace": a, "learning": {"text": "for A only", "kind": "tip"}}))).await.unwrap().0;
-        assert_eq!(r.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+        let r = memory_set(
+            ws(),
+            Json(json!({"workspace": a, "learning": {"text": "for A only", "kind": "tip"}})),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            r.get("learnings").and_then(|v| v.as_array()).unwrap().len(),
+            1
+        );
         // …and the pointer's store (B) stayed empty.
         let rb = memory_get(ws(), q_none()).await.unwrap().0;
-        assert_eq!(rb.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
+        assert_eq!(
+            rb.get("learnings")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            0
+        );
         // Explicit GET reads A.
         let ra = memory_get(ws(), q_a()).await.unwrap().0;
         let la = ra.get("learnings").and_then(|v| v.as_array()).unwrap();
         assert_eq!(la.len(), 1);
-        assert_eq!(la[0].get("text").and_then(|v| v.as_str()), Some("for A only"));
+        assert_eq!(
+            la[0].get("text").and_then(|v| v.as_str()),
+            Some("for A only")
+        );
 
         // No pointer, no override → 400…
         state.config.write().await.coder_workspace = String::new();
@@ -365,7 +471,13 @@ mod tests {
         assert_eq!(e.0, axum::http::StatusCode::BAD_REQUEST);
         // …but an explicit override works with no pointer at all.
         let ok = memory_get(ws(), q_a()).await.unwrap().0;
-        assert_eq!(ok.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            ok.get("learnings")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -378,14 +490,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let ws = tmp.join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let state: S = std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
         state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
         let ws = || AxumState(state.clone());
 
         // Seed one entry.
-        let r = memory_set(ws(), Json(json!({"learning": {"text": "seed", "kind": "tip"}}))).await.unwrap().0;
+        let r = memory_set(
+            ws(),
+            Json(json!({"learning": {"text": "seed", "kind": "tip"}})),
+        )
+        .await
+        .unwrap()
+        .0;
         let seed_id = r.get("learnings").and_then(|v| v.as_array()).unwrap()[0]
-            .get("id").and_then(|v| v.as_str()).unwrap().to_string();
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
 
         // Fire many appends and drops concurrently; the final state must equal
         // seed + (appends that weren't dropped) — nothing but the dropped id
@@ -402,32 +524,59 @@ mod tests {
                 .unwrap()
                 .0;
                 // Every response is a consistent full snapshot.
-                assert!(!r.get("learnings").and_then(|v| v.as_array()).unwrap().is_empty());
+                assert!(
+                    !r.get("learnings")
+                        .and_then(|v| v.as_array())
+                        .unwrap()
+                        .is_empty()
+                );
             }));
             if i % 2 == 0 {
                 let s = state.clone();
                 let id = seed_id.clone();
                 handles.push(tokio::spawn(async move {
-                    let r = memory_set(AxumState(s), Json(json!({"dropLearningId": id}))).await.unwrap().0;
-                    assert!(!r.get("learnings").and_then(|v| v.as_array()).unwrap().is_empty());
+                    let r = memory_set(AxumState(s), Json(json!({"dropLearningId": id})))
+                        .await
+                        .unwrap()
+                        .0;
+                    assert!(
+                        !r.get("learnings")
+                            .and_then(|v| v.as_array())
+                            .unwrap()
+                            .is_empty()
+                    );
                 }));
             }
         }
         for h in handles {
             h.await.unwrap();
         }
-        let final_state = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
-        let learnings = final_state.get("learnings").and_then(|v| v.as_array()).unwrap();
+        let final_state = memory_get(ws(), Query(MemQuery { workspace: None }))
+            .await
+            .unwrap()
+            .0;
+        let learnings = final_state
+            .get("learnings")
+            .and_then(|v| v.as_array())
+            .unwrap();
         // All 8 appends must survive (only the seed was a drop target).
         let texts: Vec<String> = learnings
             .iter()
-            .map(|l| l.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .map(|l| {
+                l.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         for i in 0..8 {
             assert!(texts.contains(&format!("append-{i}")), "append-{i} lost");
         }
         // No duplicate ids from concurrent appends.
-        let ids: Vec<&str> = learnings.iter().filter_map(|l| l.get("id").and_then(|v| v.as_str())).collect();
+        let ids: Vec<&str> = learnings
+            .iter()
+            .filter_map(|l| l.get("id").and_then(|v| v.as_str()))
+            .collect();
         let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len(), "duplicate ids under concurrency");
 

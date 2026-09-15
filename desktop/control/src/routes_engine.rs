@@ -2,22 +2,22 @@
 
 // Rust guideline compliant 2026-07-28
 
-use axum::body::Body;
-use axum::extract::{Request, State as AxumState};
-use axum::http::StatusCode;
-use axum::Json;
-use serde::Deserialize;
-use serde_json::{json, Value};
 use crate::engine::{
-    discover_engines, engine_model_info, public_engine, refresh_engine_status,
-    start_engine, stop_engine, S, VRAM_FLOOR_GIB,
+    S, VRAM_FLOOR_GIB, discover_engines, engine_model_info, public_engine, refresh_engine_status,
+    start_engine, stop_engine,
 };
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models};
 use crate::read_json;
 use crate::repo::{start_update, update_public};
 use crate::routes_config::redact_config;
-use crate::types::{args_equal, base_name, build_serve_args, EngineProfile, ARTIFACTS};
+use crate::types::{ARTIFACTS, EngineProfile, args_equal, base_name, build_serve_args};
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Request, State as AxumState};
+use axum::http::StatusCode;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 pub(crate) async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
@@ -28,16 +28,19 @@ pub(crate) async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
     let vram = {
         let eng = state.engine.read().await;
         match (eng.port, eng.state) {
-            (Some(port), crate::types::EngineState::Running | crate::types::EngineState::Starting) => crate::engine::vram_status(&state.data_dir, port)
-                .await
-                .map(|(runtime_gib, free_gib)| {
+            (
+                Some(port),
+                crate::types::EngineState::Running | crate::types::EngineState::Starting,
+            ) => crate::engine::vram_status(&state.data_dir, port).await.map(
+                |(runtime_gib, free_gib)| {
                     json!({
                         "runtimeGib": runtime_gib,
                         "freeGib": free_gib,
                         "floorGib": VRAM_FLOOR_GIB,
                         "under": free_gib < VRAM_FLOOR_GIB,
                     })
-                }),
+                },
+            ),
             _ => None,
         }
     };
@@ -99,11 +102,12 @@ pub(crate) struct UpdateBody {
     action: Option<String>,
 }
 
-pub(crate) async fn engine_update(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn engine_update(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let parsed: UpdateBody = serde_json::from_value(body).unwrap_or(UpdateBody {
-        action: None,
-    });
+    let parsed: UpdateBody = serde_json::from_value(body).unwrap_or(UpdateBody { action: None });
     let action = parsed.action.unwrap_or_default();
     Ok(Json(start_update(&state, &action).await))
 }
@@ -131,7 +135,10 @@ pub(crate) fn sanitize_empty_strings(v: &mut Value) {
     }
 }
 
-pub(crate) async fn engine_start(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn engine_start(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
     // Parse `profile` and `artifact` independently. A whole-body deserialization
     // previously fell back to defaults on any profile field error (e.g.
@@ -158,7 +165,10 @@ pub(crate) async fn engine_start(AxumState(state): AxumState<S>, req: Request<Bo
             // (whose Debug impl already redacts it) never gets constructed.
             let mut redacted_profile = profile_val.clone();
             if let Value::Object(map) = &mut redacted_profile
-                && map.get("apiKey").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                && map
+                    .get("apiKey")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
             {
                 map.insert("apiKey".to_string(), Value::String("***".to_string()));
             }
@@ -172,7 +182,10 @@ pub(crate) async fn engine_start(AxumState(state): AxumState<S>, req: Request<Bo
             (EngineProfile::default(), Some(msg))
         }
     };
-    let artifact = body.get("artifact").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let artifact = body
+        .get("artifact")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let mut result = start_engine(&state, profile, artifact).await;
     if let Some(err) = profile_parse_error
         && let Value::Object(map) = &mut result
@@ -209,9 +222,16 @@ pub(crate) async fn engine_args(
         serde_json::from_value(sanitized).unwrap_or_else(|_| EngineProfile::default());
     let artifact = body.artifact.clone().unwrap_or_default();
 
-    let (eng, last, cfg) = (state.engine.read().await, state.last_start.read().await, state.config.read().await);
+    let (eng, last, cfg) = (
+        state.engine.read().await,
+        state.last_start.read().await,
+        state.config.read().await,
+    );
     let port = profile.port.unwrap_or(cfg.engine_port);
-    let running = matches!(eng.state, crate::types::EngineState::Running | crate::types::EngineState::External);
+    let running = matches!(
+        eng.state,
+        crate::types::EngineState::Running | crate::types::EngineState::External
+    );
     let port_match = eng.port.map(|p| p == port).unwrap_or(true);
     let running_args = eng.argv.as_deref().filter(|a| !a.is_empty());
     let form = build_serve_args(&profile, port);
@@ -230,9 +250,14 @@ pub(crate) async fn engine_args(
                 // The UI normalizes "" to null for the artifact, so an empty
                 // artifact here means "none" as well.
                 Some(ls) => {
-                    let art_opt = if artifact.is_empty() { None } else { Some(artifact.as_str()) };
+                    let art_opt = if artifact.is_empty() {
+                        None
+                    } else {
+                        Some(artifact.as_str())
+                    };
                     ls.artifact.as_deref() != art_opt
-                        || serde_json::to_string(&ls.profile).ok() != serde_json::to_string(&profile).ok()
+                        || serde_json::to_string(&ls.profile).ok()
+                            != serde_json::to_string(&profile).ok()
                 }
                 None => false,
             },
@@ -264,11 +289,11 @@ pub(crate) struct StopBody {
     external_pid: Option<u32>,
 }
 
-pub(crate) async fn engine_stop(AxumState(state): AxumState<S>, req: Request<Body>) -> Result<Json<Value>, (StatusCode, String)> {
+pub(crate) async fn engine_stop(
+    AxumState(state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let parsed: StopBody = serde_json::from_value(body).unwrap_or(StopBody {
-        external_pid: None,
-    });
+    let parsed: StopBody = serde_json::from_value(body).unwrap_or(StopBody { external_pid: None });
     Ok(Json(stop_engine(&state, parsed.external_pid).await))
 }
-

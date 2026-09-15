@@ -9,7 +9,7 @@
 //! fetch. This is a containment boundary for *file writes*, not a network
 //! sandbox.
 
-use super::{is_secret_env_var, shell_quote, ExecChild, SpawnReq};
+use super::{ExecChild, SpawnReq, is_secret_env_var, shell_quote};
 use std::io;
 use std::process::Stdio;
 use std::sync::LazyLock;
@@ -38,19 +38,22 @@ pub fn available() -> bool {
         // trivial payload: if *this* can't start, neither can a real exec.
         let mut probe = std::process::Command::new("bwrap");
         probe
-            .arg("--ro-bind").arg("/").arg("/")
-            .arg("--tmpfs").arg("/tmp")
-            .arg("--proc").arg("/proc")
-            .arg("--dev").arg("/dev")
+            .arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("--tmpfs")
+            .arg("/tmp")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--dev")
+            .arg("/dev")
             .arg("--unshare-pid")
-            .arg("--cap-drop").arg("ALL")
+            .arg("--cap-drop")
+            .arg("ALL")
             .arg("--")
             .arg("/usr/bin/true");
         probe.stdout(Stdio::null()).stderr(Stdio::null());
-        probe
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        probe.output().map(|o| o.status.success()).unwrap_or(false)
     });
     *AVAILABLE
 }
@@ -67,7 +70,10 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         let cd = if req.cwd == req.workspace {
             String::new()
         } else {
-            format!("cd {} 2>/dev/null || true\n", shell_quote(&req.cwd.to_string_lossy()))
+            format!(
+                "cd {} 2>/dev/null || true\n",
+                shell_quote(&req.cwd.to_string_lossy())
+            )
         };
         (req.workspace.clone(), format!("{cd}{}", req.command))
     } else {

@@ -65,12 +65,18 @@ mod argv_tests {
 
     #[test]
     fn parses_both_max_context_forms() {
-        let space = vec!["ninfer-serve".to_string(), "--max-context".to_string(), "240000".to_string()];
+        let space = vec![
+            "ninfer-serve".to_string(),
+            "--max-context".to_string(),
+            "240000".to_string(),
+        ];
         assert_eq!(argv_max_context(Some(&space)), Some(240_000));
         let eq = vec!["--max-context=128000".to_string()];
         assert_eq!(argv_max_context(Some(&eq)), Some(128_000));
         assert_eq!(argv_max_context(None), None);
-        assert_eq!(argv_max_context(Some(&vec!["--port".to_string(), "8080".to_string()])), None);
+        assert_eq!(
+            argv_max_context(Some(&vec!["--port".to_string(), "8080".to_string()])),
+            None
+        );
     }
 }
-
