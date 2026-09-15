@@ -317,9 +317,9 @@ impl RunShared {
             last_meta: live.last_meta.clone(),
             pending_approvals: live.pending_approvals.clone(),
             user_question: live.user_question.clone(),
-            hook_mode: match *shared_hook_mode(self) {
-                HookMode::Auto => "auto",
-                HookMode::Client => "client",
+            hook_mode: match shared_hook_mode(self) {
+                HookMode::Auto => "auto".to_string(),
+                HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
         }
