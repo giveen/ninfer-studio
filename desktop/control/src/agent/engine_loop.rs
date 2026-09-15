@@ -401,11 +401,7 @@ fn count_lines(text: &str) -> u64 {
 
 /// Up to `budget` bytes of complete lines, from the start or the end.
 fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
-    let lines: Vec<&str> = if from_end {
-        text.split_inclusive('\n').collect::<Vec<_>>()[..].to_vec().into_iter().rev().collect()
-    } else {
-        text.split_inclusive('\n').collect()
-    };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut selected: Vec<&str> = Vec::new();
     let mut selected_bytes = 0usize;
     let mut index = if from_end { lines.len().saturating_sub(1) } else { 0 };
@@ -418,8 +414,7 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
             break;
         }
         let line = lines[index];
-        let line_bytes = line.len();
-        if selected_bytes + line_bytes > budget {
+        if selected_bytes + line.len() > budget {
             break;
         }
         if from_end {
@@ -427,7 +422,7 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
         } else {
             selected.push(line);
         }
-        selected_bytes += line_bytes;
+        selected_bytes += line.len();
         index = if from_end { index.saturating_sub(1) } else { index + 1 };
     }
     selected.concat()
