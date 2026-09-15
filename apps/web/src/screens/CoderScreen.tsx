@@ -24,7 +24,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemorySetBank, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { localDateTimeBlock } from '../lib/chatHelpers';
@@ -88,20 +88,7 @@ After the verdict, you MAY append reusable learnings, one per line, to make futu
 LEARNING: <a working approach, command, or convention worth repeating — something to DO>
 AVOID: <a mistake or anti-pattern to steer future runs away from — something NOT to do>`;
 
-// Reflect: distill the FULL learning history (not just the recent window
-// injected into the system prompt) into the durable, user-curated Memory
-// Bank — so a recurring or important fact survives even after its raw
-// learning entry ages out of the injected context. Manually triggered from
-// the Memory modal; the result lands in the bank *draft* for the user to
-// review and save, never written to disk directly.
-const REFLECT_SYSTEM = `You distill a coding agent's accumulated learnings into its durable Memory Bank. You are given the current Memory Bank (markdown, user-curated) and the full list of structured learnings (kind: success/tip/avoid) recorded across prior runs.
-Output the COMPLETE updated Memory Bank as markdown, and nothing else — no preamble, no code fence, no commentary.
-Rules:
-- Preserve every existing bullet in the current bank verbatim unless a learning clearly supersedes or corrects it (e.g. a command changed) — then update it in place.
-- Fold in NEW stable facts, conventions, or recurring gotchas from the learnings that are not already captured in the bank. Prioritize 'avoid' learnings that recur or look durable, not one-off task-specific notes.
-- Do not just restate every learning — distill. Skip one-off or task-specific notes that won't help future runs.
-- Keep it concise: prefer merging related bullets over piling on new ones.
-- If nothing in the learnings is worth adding, return the bank exactly as given.`;
+
 
 
 
@@ -921,49 +908,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
     } catch { /* never break system-prompt assembly over follow-bindings */ }
 
-    // Self-improving memory (Hybrid A+B): inject the per-repo bank + the most
-    // recent learnings so the agent starts each run informed by past sessions.
-    // The bank is authored/edited by the user (Memory modal) and the learnings
-    // are extracted by the critic and the memory_update tool — the model never
-    // sees these as ordinary files, only as injected context here.
-    try {
-      const mem = memoryRef.current;
-      const blocks: string[] = [];
-      const bank = mem.bank?.trim();
-      if (bank) {
-        // User-authored and free-growing (Memory modal) — cap it like every
-        // other injected block so a long-lived bank can't dominate the prompt.
-        const MEMORY_BANK_CAP = 6000;
-        const bankText = bank.length > MEMORY_BANK_CAP
-          ? bank.slice(0, MEMORY_BANK_CAP) + '\n…(truncated — trim the Memory Bank in the Memory modal)'
-          : bank;
-        blocks.push(`# Repository Memory Bank\n${bankText}`);
-      }
-      // Value-aware selection instead of pure recency: dedupe exact-repeat
-      // text (keep the newest occurrence — a learning re-recorded verbatim
-      // shouldn't cost budget twice), then reserve room for 'avoid' entries
-      // (mistakes worth not repeating) before filling the rest with the most
-      // recent other learnings — so one flood of 'tip'/'success' entries
-      // can't push a still-relevant 'avoid' out of the injected window.
-      const LEARNINGS_BUDGET = 15;
-      const byText = new Map<string, CoderLearning>();
-      for (const l of mem.learnings ?? []) byText.set(l.text.trim().toLowerCase(), l);
-      const deduped = Array.from(byText.values()).sort((a, b) => a.ts.localeCompare(b.ts));
-      const avoids = deduped.filter((l) => l.kind === 'avoid').slice(-LEARNINGS_BUDGET);
-      const rest = deduped.filter((l) => l.kind !== 'avoid').slice(-Math.max(0, LEARNINGS_BUDGET - avoids.length));
-      const selected = [...avoids, ...rest].sort((a, b) => a.ts.localeCompare(b.ts));
-      if (selected.length) {
-        const tagged = selected
-          .slice()
-          .reverse()
-          .map((l) => `- [${l.kind}${l.task ? ` · ${l.task}` : ''}] ${l.text}`)
-          .join('\n');
-        blocks.push(`# Learnings from prior runs (most recent first)\n${tagged}`);
-      }
-      if (blocks.length) {
-        sys += `\n\n${blocks.join('\n\n')}\n`;
-      }
-    } catch { /* memory injection must never break system-prompt assembly */ }
+
 
     // Not-Ai humanize: when enabled, append the editorial contract (plus the
     // chosen voice profile) so the agent's user-facing prose avoids em dashes,
@@ -2571,26 +2516,16 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     const approved = /VERDICT:\s*APPROVED/i.test(content);
     // Pull learnings out of the raw text first so they don't bleed into `issues`.
-    const learnings: Array<{ text: string; kind: CoderLearningKind }> = [];
-    const kept: string[] = [];
-    for (const raw of content.split('\n')) {
-      const line = raw.trim();
-      const learn = line.match(/^LEARNING:\s*(.+)$/i) || line.match(/^\*?\s*LEARNING:\s*(.+)$/i);
-      const avoid = line.match(/^AVOID:\s*(.+)$/i) || line.match(/^\*?\s*AVOID:\s*(.+)$/i);
-      if (learn) {
-        const t = learn[1].trim();
-        if (t) learnings.push({ text: t, kind: 'success' });
-      } else if (avoid) {
-        const t = avoid[1].trim();
-        if (t) learnings.push({ text: t, kind: 'avoid' });
-      } else {
-        kept.push(raw);
-      }
+    let learnings: any[] = [];
+    let issues = content.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '').trim();
+    
+    const jsonMatch = content.match(/\`\`\`json\s*(\[[\s\S]*?\])\s*\`\`\`/);
+    if (jsonMatch) {
+      try {
+        learnings = JSON.parse(jsonMatch[1]);
+        issues = issues.replace(jsonMatch[0], '').trim();
+      } catch { /* ignore parse error */ }
     }
-    const issues = kept
-      .join('\n')
-      .replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '')
-      .trim();
     return { approved, issues, learnings };
   };
 
@@ -2617,40 +2552,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     adoptMemory(m);
   };
 
-  /** Manually triggered from the Memory modal's "Reflect" button. Runs the
-   *  full learning history (not just the injected recent window) through
-   *  REFLECT_SYSTEM and returns a proposed Memory Bank draft for the user to
-   *  review and save — never written to disk on its own, so a bad or
-   *  hallucinated distillation can't silently clobber the curated bank. */
-  const [reflectBusy, setReflectBusy] = useState(false);
-  const runReflectNow = async (): Promise<string> => {
-    const mem = memoryRef.current;
-    if (reflectBusy) return mem.bank;
-    setReflectBusy(true);
-    addLog({ type: 'read', label: 'reflect', detail: `distilling ${mem.learnings.length} learning(s) into the memory bank…` });
-    try {
-      const reflectModel = coderParams.criticModel?.trim() || modelRef.current;
-      const learningsText = mem.learnings.length
-        ? mem.learnings.map((l) => `- [${l.kind}${l.task ? ` · ${l.task}` : ''}] ${l.text}`).join('\n')
-        : '(none)';
-      const prompt = `CURRENT MEMORY BANK:\n${mem.bank?.trim() || '(empty)'}\n\nFULL LEARNING HISTORY (${mem.learnings.length} entries):\n${learningsText}`;
-      let content = '';
-      await trackedStream(
-        buildChatRequest(reflectModel, REFLECT_SYSTEM, [{ role: 'user', content: prompt }], { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 4096 } as ChatParams, {}),
-        abortRef.current?.signal ?? new AbortController().signal,
-        'reflect',
-        { onContentDelta: (t) => { content += t; } },
-      );
-      const draft = content.trim();
-      addLog({ type: 'todo', label: 'reflect', detail: draft && draft !== mem.bank.trim() ? 'draft ready — review before saving' : 'nothing new to fold in' });
-      return draft || mem.bank;
-    } catch (e) {
-      addLog({ type: 'error', label: 'reflect', detail: e instanceof Error ? e.message : String(e) });
-      return mem.bank;
-    } finally {
-      setReflectBusy(false);
-    }
-  };
+
 
   // ---------------------------------------------------------------------------
   // Standalone Verify/Critic actions — Verify and Critic also work as one-click
@@ -2758,6 +2660,47 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // Build the initial system prompt (CODER_SYSTEM + repo map); it is refreshed
     // after file mutations during the run (P1 #6).
     await refreshRepoMap();
+
+    // --- DYNAMIC RETRIEVAL TAGGER ---
+    let intentRulesBlock = '';
+    try {
+      const mem = memoryRef.current;
+      const comps = Array.from(new Set((mem?.learnings || []).map(l => l.component).filter(c => c && c !== 'general')));
+      let activeComponents = new Set<string>(['general']);
+      
+      const lastUserMsg = [...currentMessages].reverse().find(m => m.role === 'user' && !isCompactedMsg(m))?.content || '';
+      if (comps.length > 0 && lastUserMsg) {
+        const taggerPrompt = `TASK: \`\`\`\n${lastUserMsg.slice(0, 500)}\n\`\`\`\n\nWhich of the following components does this task involve? ${comps.join(', ')}\nReply with a JSON array of strings.`;
+        const taggerModel = coderParams.criticModel?.trim() || modelRef.current || 'qwen-coder';
+        const req = buildChatRequest(taggerModel, 'You are a task categorizer. Reply only with a JSON array of matching component strings.', [{ role: 'user', content: taggerPrompt }], { thinking: false, maxTokens: 100 } as ChatParams, {});
+        let textContent = '';
+        await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } });
+        const jsonMatch = textContent.match(/\[[\s\S]*?\]/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          for (const c of parsed) activeComponents.add(c);
+        }
+      }
+
+      if (mem && mem.learnings.length > 0) {
+        const byComponent: Record<string, CoderLearning[]> = {};
+        for (const l of mem.learnings) {
+          const comp = l.component || 'general';
+          if (!activeComponents.has(comp) && activeComponents.size > 1) continue; 
+          if (!byComponent[comp]) byComponent[comp] = [];
+          byComponent[comp].push(l);
+        }
+        const parts = [];
+        for (const [comp, rules] of Object.entries(byComponent)) {
+          parts.push(`### Component: ${comp}`);
+          for (const r of rules) parts.push(`- [${r.kind}] ${r.text}`);
+        }
+        if (parts.length > 0) {
+            intentRulesBlock = `\n\n# Intent Continuity Rules\n${parts.join('\n')}\n`;
+        }
+      }
+    } catch { /* ignore */ }
+    // --- END DYNAMIC RETRIEVAL TAGGER ---
 
     abortRef.current = new AbortController();
 
@@ -2968,7 +2911,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
         const system = (planMode
           ? `${dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
-          : dynamicSystemRef.current) + todoSystemBlock(todosRef.current);
+          : dynamicSystemRef.current) + intentRulesBlock + todoSystemBlock(todosRef.current);
         // Baseline for the stale todo_write guard: this request's system
         // prompt carried the list as of this moment.
         todosRevAtReqStartRef.current = todosRevRef.current;
@@ -3255,6 +3198,34 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   const onSubmit = () => {
     if ((!input.trim() && attachments.length === 0) || !activeWs) return;
+
+    const currentInput = input.trim();
+    if (/(?:must|never|always|prefer|use)\b/i.test(currentInput)) {
+      const extractorSystem = `Extract strict rules and intent constraints from the user's prompt as a JSON array. Only include genuinely reusable constraints, not one-off tasks.
+\`\`\`json
+[
+  { "kind": "success", "text": "use pnpm", "component": "general", "scope": "repo", "target_key": "packageManager", "value": "pnpm" }
+]
+\`\`\``;
+      const extractorModel = coderParams.criticModel?.trim() || modelRef.current;
+      const req = buildChatRequest(extractorModel, extractorSystem, [{ role: 'user', content: currentInput }], { thinking: false, maxTokens: 1024 } as ChatParams, {});
+      
+      (async () => {
+        let textContent = '';
+        try {
+          await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } });
+          const jsonMatch = textContent.match(/\`\`\`json\s*(\[[\s\S]*?\])\s*\`\`\`/);
+          if (jsonMatch) {
+            const rules = JSON.parse(jsonMatch[1]);
+            for (const r of rules) {
+              if (r.text && r.kind) {
+                coderMemoryAddLearning(r).then((m) => adoptMemory(m)).catch(() => {});
+              }
+            }
+          }
+        } catch { /* ignore */ }
+      })();
+    }
     if (running) {
       // Don't block on a run in flight — queue for whichever conversation is
       // on screen right now, and it auto-sends once that conversation's run
@@ -4071,7 +4042,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             type="button"
             onClick={() => setMemOpen(true)}
             disabled={!activeWs}
-            title={`Repository memory bank + learnings (${memory.learnings.length} learning${memory.learnings.length === 1 ? '' : 's'})`}
+            title={`Repository intent rules (${memory.learnings.length} rule${memory.learnings.length === 1 ? '' : 's'})`}
             className={cn('flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium disabled:opacity-40', memOpen ? 'border-accent/50 bg-accent/15 text-accent' : 'border-line text-mute hover:bg-panel2 hover:text-ink')}
           >
             <BookmarkPlus size={13} /> Memory{memory.learnings.length ? ` (${memory.learnings.length})` : ''}
@@ -4596,15 +4567,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         onClose={() => setFileDiffPath(null)}
         fetchDiff={() => (fileDiffPath ? fetchFileDiff(fileDiffPath) : Promise.resolve({ files: [], diff: '' }))}
       />
-      {/* Self-improving memory: per-repo bank (markdown) + extracted learnings. */}
+      {/* Self-improving memory: intent continuity rules */}
       <MemoryModal
         open={memOpen}
         onClose={() => setMemOpen(false)}
         memory={memory}
-        onSaveBank={(bank) => coderMemorySetBank(bank).then((m) => adoptMemory(m))}
         onDropLearning={(id) => coderMemoryDropLearning(id).then((m) => adoptMemory(m))}
         onChanged={() => loadMemory()}
-        onReflect={runReflectNow}
       />
       {showDir && (
         <DirBrowser

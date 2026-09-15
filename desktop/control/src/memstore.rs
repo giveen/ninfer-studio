@@ -1,4 +1,4 @@
-//! Shared file-level primitives for a `bank.md` + `learnings.jsonl` memory
+//! Shared file-level primitives for a `learnings.jsonl` memory
 //! store. Both Coder's per-workspace stores (`coder::memory`, one directory
 //! per slugged workspace) and Chat's single global store (`chat::memory`,
 //! one fixed directory) are just directories in this exact shape — this
@@ -21,14 +21,63 @@ pub async fn read_mem_file(dir: &Path, name: &str, def: &str) -> String {
     }
 }
 
-/// Parse `learnings.jsonl`: one JSON object per line, blank/invalid lines skipped.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_len = b.chars().count();
+    if b_len == 0 { return a.chars().count(); }
+    let mut cache: Vec<usize> = (1..=b_len).collect();
+    let mut result = b_len;
+    for (i, a_char) in a.chars().enumerate() {
+        result = i + 1;
+        let mut distance_b = i;
+        for (j, b_char) in b.chars().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            let distance_a = distance_b + cost;
+            distance_b = cache[j];
+            result = std::cmp::min(result + 1, std::cmp::min(distance_a, distance_b + 1));
+            cache[j] = result;
+        }
+    }
+    result
+}
+
 pub async fn read_learnings(dir: &Path) -> Vec<Value> {
     let raw = read_mem_file(dir, "learnings.jsonl", "").await;
-    raw.split('\n')
+    let entries: Vec<Value> = raw.split('\n')
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+        .collect();
+
+    // Stores (component, scope, target_key, verified_index)
+    let mut shadowed: Vec<(String, String, String, usize)> = Vec::new();
+    let mut verified = Vec::new();
+
+    for entry in entries {
+        let comp = entry.get("component").and_then(|v| v.as_str()).unwrap_or("");
+        let scope = entry.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+        let key = entry.get("target_key").and_then(|v| v.as_str()).unwrap_or("");
+
+        if comp.is_empty() && scope.is_empty() && key.is_empty() {
+            verified.push(entry);
+        } else {
+            let mut found_idx = None;
+            for s in &shadowed {
+                if s.0 == comp && s.1 == scope && levenshtein(&s.2, key) <= 2 {
+                    found_idx = Some(s.3);
+                    break;
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                verified[idx] = entry;
+            } else {
+                shadowed.push((comp.to_string(), scope.to_string(), key.to_string(), verified.len()));
+                verified.push(entry);
+            }
+        }
+    }
+
+    verified
 }
 
 /// Create the memory dir and write a file.
@@ -111,34 +160,32 @@ pub fn mem_lock(state: &S, store: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// `{bank, learnings}` — the shape every memory GET (and the tail of every
+/// `{learnings}` — the shape every memory GET (and the tail of every
 /// memory POST) returns.
 pub async fn read_bank_and_learnings(dir: &Path) -> Value {
-    let bank = read_mem_file(dir, "bank.md", "").await;
     let learnings = read_learnings(dir).await;
-    json!({"bank": bank, "learnings": learnings})
+    json!({"learnings": learnings})
 }
 
 /// Apply the standard POST body shape to `dir` under its store lock, then
-/// return the refreshed `{bank, learnings}`. At most one of the three
+/// return the refreshed `{learnings}`. At most one of the two
 /// fields is expected per call, matching every existing caller:
-///   `{ bank }`            replace the markdown bank wholesale
 ///   `{ learning: {...} }` append one structured learning
 ///   `{ dropLearningId }`  drop a single learning (file rewritten, rest kept)
 pub async fn apply_memory_update(state: &S, dir: &Path, req: &Value) -> Result<Value, (StatusCode, Json<Value>)> {
     let store_key = dir.to_string_lossy().into_owned();
     let store_lock = mem_lock(state, &store_key);
     let _guard = store_lock.lock().await;
-
-    if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
-        write_mem_file(dir, "bank.md", bank).await?;
-    }
     if let Some(learning) = req.get("learning").and_then(|v| v.as_object())
         && let Some(text) = learning.get("text").and_then(|v| v.as_str())
     {
         let (ts, now_ms) = iso_now();
         let entry = json!({
             "id": format!("l_{now_ms}_{}", mem_rand_suffix()),
+            "component": learning.get("component").and_then(|v| v.as_str()).unwrap_or(""),
+            "scope": learning.get("scope").and_then(|v| v.as_str()).unwrap_or(""),
+            "target_key": learning.get("target_key").and_then(|v| v.as_str()).unwrap_or(""),
+            "value": learning.get("value").and_then(|v| v.as_str()).unwrap_or(""),
             "text": text,
             "kind": learning.get("kind").and_then(|v| v.as_str()).unwrap_or("tip"),
             "provenance": learning.get("provenance").and_then(|v| v.as_str()).unwrap_or(""),
@@ -208,14 +255,29 @@ mod tests {
         assert!(l0.get("id").and_then(|v| v.as_str()).unwrap().starts_with("l_"));
         assert_eq!(l0.get("text").and_then(|v| v.as_str()), Some("a"));
 
-        let r2 = apply_memory_update(&state, &tmp, &json!({"bank": "# hi"})).await.unwrap();
-        assert_eq!(r2.get("bank").and_then(|v| v.as_str()), Some("# hi"));
-
         let id = l0.get("id").and_then(|v| v.as_str()).unwrap().to_string();
         let r3 = apply_memory_update(&state, &tmp, &json!({"dropLearningId": id})).await.unwrap();
         assert_eq!(r3.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
-        // Bank survives a drop that touches only the learnings file.
-        assert_eq!(r3.get("bank").and_then(|v| v.as_str()), Some("# hi"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_shadowing() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-memstore-fuzzy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        // 1. Add first learning
+        apply_memory_update(&state, &tmp, &json!({"learning": {"text": "npm", "kind": "tip", "component": "general", "scope": "repo", "target_key": "packageManager"}})).await.unwrap();
+        
+        // 2. Add second learning with fuzzy matched key
+        let r = apply_memory_update(&state, &tmp, &json!({"learning": {"text": "pnpm", "kind": "tip", "component": "general", "scope": "repo", "target_key": "package_manager"}})).await.unwrap();
+        
+        let learnings = r.get("learnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(learnings.len(), 1, "The second learning should have shadowed the first");
+        assert_eq!(learnings[0].get("text").and_then(|v| v.as_str()), Some("pnpm"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

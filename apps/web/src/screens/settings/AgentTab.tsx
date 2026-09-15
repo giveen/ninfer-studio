@@ -250,7 +250,6 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
         onClose={() => setMemoryModalOpen(false)}
         title="Chat Memory"
         memory={memory}
-        onSaveBank={(bank) => chatMemorySetBank(bank).then(adoptMemory)}
         onDropLearning={(id) => chatMemoryDropLearning(id).then(adoptMemory)}
         onChanged={loadMemory}
       />

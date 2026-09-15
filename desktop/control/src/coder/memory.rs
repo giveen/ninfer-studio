@@ -301,10 +301,7 @@ mod tests {
         assert_eq!(l0.get("provenance").and_then(|v| v.as_str()), Some("tool"));
         assert_eq!(l0.get("task").and_then(|v| v.as_str()), Some("t1"));
         assert!(l0.get("ts").and_then(|v| v.as_str()).unwrap().ends_with('Z'));
-        assert_eq!(r.get("bank").and_then(|v| v.as_str()), Some(""));
-        let bank = "# Bank\n- a";
-        let r2 = memory_set(ws(), Json(json!({"bank": bank}))).await.unwrap().0;
-        assert_eq!(r2.get("bank").and_then(|v| v.as_str()), Some(bank));
+
         // The append landed on disk as JSONL under the clean slug.
         let on_disk = read_learnings(&memory_dir(&state.data_dir, &memory_ws(&ws_a.to_string_lossy()))).await;
         assert_eq!(on_disk.len(), 1);
@@ -319,15 +316,13 @@ mod tests {
         assert_eq!(learnings.len(), 1);
         assert_eq!(learnings[0].get("text").and_then(|v| v.as_str()), Some("second"));
 
-        // Workspace B: fully isolated (no bank, no learnings leak across).
+        // Workspace B: fully isolated
         state.config.write().await.coder_workspace = ws_b.to_string_lossy().into_owned();
         let r5 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
-        assert_eq!(r5.get("bank").and_then(|v| v.as_str()), Some(""));
         assert_eq!(r5.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
-        // …and A still has its bank + learning.
+        // …and A still has its learning.
         state.config.write().await.coder_workspace = ws_a.to_string_lossy().into_owned();
         let r6 = memory_get(ws(), Query(MemQuery { workspace: None })).await.unwrap().0;
-        assert_eq!(r6.get("bank").and_then(|v| v.as_str()), Some(bank));
         assert_eq!(r6.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&tmp);

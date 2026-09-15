@@ -195,9 +195,13 @@ export function coderSandboxSet(enabled: boolean): Promise<SandboxStatus> {
 export type CoderLearningKind = 'success' | 'tip' | 'avoid';
 
 export interface CoderLearning {
-  /** Stable id (sha1 of text+ts) so the UI can drop individual entries. */
   id: string;
+  component: string;
+  scope: string;
+  target_key: string;
+  value: string;
   text: string;
+  /** 'success' (a fix that worked), 'tip' (a convention to follow), or 'avoid' (an anti-pattern to steer away from) */
   kind: CoderLearningKind;
   /** Where the learning came from (e.g. "critic:approve", "critic:reject", "tool"). */
   provenance?: string;
@@ -208,25 +212,24 @@ export interface CoderLearning {
 }
 
 export interface CoderMemory {
-  /** Full markdown bank text. */
-  bank: string;
+  /** Unstructured list of learnings; the active ones are filtered at runtime based on the domain schema. */
   learnings: CoderLearning[];
 }
 
-/** Read the current bank + learnings for the active workspace. */
+/** Read the current learnings for the active workspace. */
 export function coderMemoryGet(): Promise<CoderMemory> {
   return getJSON<CoderMemory>('/api/coder/memory', 8000);
 }
 
-/** Replace the markdown bank wholesale (used by the Memory modal's save). */
-export function coderMemorySetBank(bank: string): Promise<CoderMemory> {
-  return postJSON<CoderMemory>('/api/coder/memory', { bank }, 8000);
-}
 
 /** Append one structured learning (text + kind) and return the updated memory. */
 export function coderMemoryAddLearning(learning: {
   text: string;
   kind: CoderLearningKind;
+  component?: string;
+  scope?: string;
+  target_key?: string;
+  value?: string;
   provenance?: string;
   task?: string;
 }, signal?: AbortSignal): Promise<CoderMemory> {

@@ -22,8 +22,8 @@ interface UseCoderMemoryOpts {
  * pre-switch response would leak the OTHER workspace's bank into this one.
  */
 export function useCoderMemory({ activeWsDir, wsFlushed, appliedDirRef }: UseCoderMemoryOpts) {
-  const [memory, setMemory] = useState<CoderMemory>({ bank: '', learnings: [] });
-  const memoryRef = useRef<CoderMemory>({ bank: '', learnings: [] });
+  const [memory, setMemory] = useState<CoderMemory>({ learnings: [] });
+  const memoryRef = useRef<CoderMemory>({ learnings: [] });
   const [memOpen, setMemOpen] = useState(false);
   const seqRef = useRef(0);
 

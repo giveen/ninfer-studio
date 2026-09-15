@@ -128,7 +128,6 @@ mod tests {
         let w = || AxumState(state.clone());
 
         let empty = memory_get(w()).await.0;
-        assert_eq!(empty.get("bank").and_then(|v| v.as_str()), Some(""));
         assert_eq!(empty.get("learnings").and_then(|v| v.as_array()).unwrap().len(), 0);
 
         let r = memory_set(w(), Json(json!({"learning": {"text": "user prefers terse replies", "kind": "tip"}})))
@@ -139,11 +138,7 @@ mod tests {
         assert!(l0.get("id").and_then(|v| v.as_str()).unwrap().starts_with("l_"));
         assert_eq!(l0.get("text").and_then(|v| v.as_str()), Some("user prefers terse replies"));
 
-        let r2 = memory_set(w(), Json(json!({"bank": "# Chat memory\n- likes concise answers"}))).await.unwrap().0;
-        assert_eq!(r2.get("bank").and_then(|v| v.as_str()), Some("# Chat memory\n- likes concise answers"));
-
         // Landed under the single fixed <DATA_DIR>/chat-memory store, not a slug.
-        assert!(tmp.join("chat-memory").join("bank.md").exists());
         assert!(tmp.join("chat-memory").join("learnings.jsonl").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);

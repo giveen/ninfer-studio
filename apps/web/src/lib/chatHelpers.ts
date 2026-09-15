@@ -88,9 +88,7 @@ export function localDateTimeBlock(): string {
 function memoryBlock(memory: CoderMemory | undefined): string {
   if (!memory) return '';
   const blocks: string[] = [];
-  if (memory.bank && memory.bank.trim()) {
-    blocks.push(`# What you know about this user\n${memory.bank.trim()}`);
-  }
+
   const recent = (memory.learnings ?? []).slice(-15);
   if (recent.length) {
     const tagged = recent.map((l) => `- [${l.kind}] ${l.text}`).join('\n');
