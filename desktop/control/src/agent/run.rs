@@ -659,10 +659,15 @@ pub async fn events(AxumState(state): AxumState<S>, Path(id): Path<String>) -> R
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response").into_response())
 }
 
+/// A pinned `recv()` future for the run's broadcast channel. We cannot use
+/// `try_recv` in a `Stream::poll_next`: it never registers a waker, so a
+/// stream that returns `Pending` from it would never be woken again.
 struct SseStream {
-    rx: broadcast::Receiver<AgentEvent>,
-    started: bool,
     run: Arc<RunShared>,
+    /// Live while no `recv()` future is in flight.
+    rx: Option<broadcast::Receiver<AgentEvent>>,
+    recv: Option<Pin<Box<dyn Future<Output = Result<AgentEvent, broadcast::error::RecvError>> + Send>>>,
+    started: bool,
 }
 
 impl SseStream {
@@ -679,6 +684,12 @@ impl SseStream {
     }
 }
 
+impl std::fmt::Debug for SseStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseStream").field("started", &self.started).finish()
+    }
+}
+
 impl futures_util::Stream for SseStream {
     type Item = bytes::Bytes;
 
@@ -690,23 +701,36 @@ impl futures_util::Stream for SseStream {
                 let data = serde_json::to_string(&ev).unwrap_or_default();
                 return Poll::Ready(Some(Self::frame("state", &data)));
             }
-            match self.rx.try_recv() {
-                Ok(ev) => {
+            // Ensure a recv future is in flight (it registers the waker with
+            // the channel and wakes us on the next send).
+            if self.recv.is_none() {
+                let Some(rx) = self.rx.take() else {
+                    // No receiver left (channel closed and consumed).
+                    return Poll::Ready(None);
+                };
+                self.recv = Some(Box::pin(rx.recv()));
+            }
+            let fut = self.recv.as_mut().unwrap();
+            match Future::poll(fut.as_mut(), cx) {
+                Poll::Ready(Ok(ev)) => {
+                    self.recv = None;
                     let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
                     let name = v.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string();
                     return Poll::Ready(Some(Self::frame(&name, &v.to_string())));
                 }
-                Err(broadcast::error::TryRecvError::Empty) => {
-                    // No frame right now: wake on the next send. The broadcast
-                    // channel registers the waker for us while empty (the
-                    // poll loop re-runs on each sender).
-                    return Poll::Pending;
-                }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                // Lagged: frames were dropped for this slow subscriber.
+                // Wake immediately and keep draining — the client resyncs
+                // via the snapshot endpoint if it fell too far behind.
+                Poll::Ready(Err(broadcast::error::RecvError::Lagged(_))) => {
                     cx.waker().wake_by_ref();
                     continue;
                 }
-                Err(broadcast::error::TryRecvError::Closed) => return Poll::Ready(None),
+                Poll::Ready(Err(broadcast::error::RecvError::Closed)) => {
+                    self.rx = None;
+                    self.recv = None;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
