@@ -27,7 +27,7 @@ import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
-import { localDateTimeBlock } from '../lib/chatHelpers';
+import { localDateTimeBlock, resolveProviderConfig } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
@@ -47,6 +47,16 @@ const isGitCommitCommand = (cmd: string): boolean => {
 };
 const CODER_SYSTEM = `You are an elite, autonomous software engineer with complete access to the user's workspace, file system, and the internet.
 Your goal is to relentlessly drive the user's request to completion. Do not stop at planning—execute the plan, write the code, and prove it works.
+
+# CRITICAL INSTRUCTION 1: TOOL SELECTION
+You have specialized native tools (\`read\`, \`grep\`, \`glob\`, \`edit\`, \`apply_patch\`, \`udiff_edit\`). You MUST ALWAYS prioritize these specific tools over the generic \`bash\` tool.
+- DO NOT use \`bash\` with \`cat\`, \`head\`, \`tail\`, or \`less\` to view files. Use the \`read\` tool.
+- DO NOT use \`bash\` with \`grep\`, \`find\`, or \`ls\` to search for content or list files. Use the \`grep\` and \`glob\` tools.
+- DO NOT use \`bash\` with \`sed\`, \`awk\`, or \`echo >\` to modify files. Use the \`edit\` / \`udiff_edit\` / \`apply_patch\` tools.
+- ONLY use \`bash\` for executing builds, test suites, starting servers, running git commands (other than commit/diff which have tools), or running complex scripts that native tools cannot handle.
+
+# CRITICAL INSTRUCTION 2: THOUGHT PROCESS
+Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
 
 # Core Directives
 1. **Research First**: ALWAYS investigate before writing code. 
@@ -68,6 +78,8 @@ Your goal is to relentlessly drive the user's request to completion. Do not stop
 // writes real code but leaves version control + human interaction to the supervisor.
 const WORKER_SYSTEM = `You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
+- CRITICAL INSTRUCTION 1: DO NOT use \`bash\` for \`cat\`, \`head\`, \`tail\`, \`less\`, \`grep\`, \`find\`, \`ls\`, \`sed\`, or \`awk\`. ALWAYS use the native \`read\`, \`grep\`, \`glob\`, \`edit\`, and \`apply_patch\` tools instead.
+- CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
 - If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
@@ -231,7 +243,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   // Commit history of the active workspace (state + fetch live in useCoderGit).
   // Sampling params for the coder runs (persisted globally, not per workspace).
-  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; compactAt?: number; }
+  interface CoderParams { thinking: boolean; thinkLevel?: 'low' | 'medium' | 'high' | 'xhigh'; temperature?: number; topP?: number; topK?: number; seed?: number; criticModel?: string; promptCache?: boolean; humanize?: boolean; voiceProfile?: string; reviewLens?: string; maxAgentSteps?: number; compactAt?: number; primaryProvider?: 'ninfer' | 'cloud'; primaryCloudModel?: string; subagentProvider?: 'ninfer' | 'cloud'; subagentCloudModel?: string; }
   const CODER_PARAMS_KEY = 'ninfier.coder.params';
   const DEFAULT_CODER_PARAMS: CoderParams = { thinking: true };
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
@@ -264,6 +276,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     signal: AbortSignal,
     label: string,
     cb: ChatStreamCallbacks,
+    opts?: { baseUrl?: string; apiKey?: string }
   ) => {
     setLlmPhase({ stage: 'prefill', label, since: Date.now(), chars: 0 });
     try {
@@ -2216,11 +2229,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     let id: string | null = null;
     const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
     try {
+      const subConfig = resolveProviderConfig('subagent', appConfig, {
+        provider: coderParams.subagentProvider,
+        cloudModel: coderParams.subagentCloudModel,
+      });
       const started = await agentRunsApi.start({
         messages: [{ role: 'user', content: prompt }],
         kind: 'scout',
         label: `scout: ${label}`,
-        model,
+        model: subConfig.model,
+        baseUrl: subConfig.baseUrl,
+        apiKey: subConfig.apiKey,
         system: dynamicSystemRef.current,
         maxSteps,
         toolSet: 'coder',
@@ -2349,11 +2368,17 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // the risky/commit gates passed below). Ask-tier approvals and gate
       // pauses resolve through the same [subagent]-tagged dialogs the old
       // worker dispatcher showed; the cutoff summarizer rides the turn hook.
+      const subConfig = resolveProviderConfig('subagent', appConfig, {
+        provider: coderParams.subagentProvider,
+        cloudModel: coderParams.subagentCloudModel,
+      });
       const started = await agentRunsApi.start({
         messages: [{ role: 'user', content: prompt }],
         kind: 'worker',
         label: `worker: ${label}`,
-        model,
+        model: subConfig.model,
+        baseUrl: subConfig.baseUrl,
+        apiKey: subConfig.apiKey,
         system: WORKER_SYSTEM,
         maxSteps,
         toolSet: 'coder',
@@ -2947,7 +2972,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
               tools: activeTools,
               cacheSystem: coderParams.promptCache,
               signal: abortRef.current.signal,
-              stream: (r, sig, cb) => trackedStream(r, sig, 'agent', cb),
+              stream: (r, sig, cb) => {
+                const primaryConfig = resolveProviderConfig('primary', appConfig, {
+                  primaryProvider: coderParams.primaryProvider,
+                  primaryCloudModel: coderParams.primaryCloudModel,
+                });
+                return trackedStream(r, sig, 'agent', cb, { baseUrl: primaryConfig.baseUrl, apiKey: primaryConfig.apiKey });
+              },
               onStreamError: (msg) => { streamErrorMsg = msg; },
             });
           } catch (e) {
@@ -4250,6 +4281,62 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           {showCoderParams && (
             <div className="rounded-md border border-line bg-panel2 px-3 py-2 mb-2">
               <div className="flex items-center gap-4 flex-wrap">
+                {appConfig?.cloudProviderEnabled && (
+                  <>
+                    <div className="flex w-full items-center gap-4 flex-wrap pb-1 border-b border-line/50">
+                      <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Primary Agent</span>
+                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                        provider
+                        <SelectField
+                          value={coderParams.primaryProvider || 'ninfer'}
+                          onChange={(v) => setCoderParams({ ...coderParams, primaryProvider: v as 'ninfer' | 'cloud' })}
+                          options={[
+                            { value: 'ninfer', label: 'Local (ninfer)' },
+                            { value: 'cloud', label: 'Cloud API' },
+                          ]}
+                        />
+                      </label>
+                      {coderParams.primaryProvider === 'cloud' && (
+                        <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                          cloud model
+                          <input
+                            type="text"
+                            value={coderParams.primaryCloudModel || ''}
+                            onChange={(e) => setCoderParams({ ...coderParams, primaryCloudModel: e.target.value })}
+                            placeholder="e.g. gpt-4o"
+                            className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                          />
+                        </label>
+                      )}
+                    </div>
+                    <div className="flex w-full items-center gap-4 flex-wrap pb-2 border-b border-line/50">
+                      <span className="text-[11.5px] font-medium uppercase tracking-wider text-faint">Subagent (Worker)</span>
+                      <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                        provider
+                        <SelectField
+                          value={coderParams.subagentProvider || 'ninfer'}
+                          onChange={(v) => setCoderParams({ ...coderParams, subagentProvider: v as 'ninfer' | 'cloud' })}
+                          options={[
+                            { value: 'ninfer', label: 'Local (ninfer)' },
+                            { value: 'cloud', label: 'Cloud API' },
+                          ]}
+                        />
+                      </label>
+                      {coderParams.subagentProvider === 'cloud' && (
+                        <label className="flex items-center gap-1.5 text-[12px] text-mute">
+                          cloud model
+                          <input
+                            type="text"
+                            value={coderParams.subagentCloudModel || ''}
+                            onChange={(e) => setCoderParams({ ...coderParams, subagentCloudModel: e.target.value })}
+                            placeholder="e.g. gpt-4o-mini"
+                            className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                          />
+                        </label>
+                      )}
+                    </div>
+                  </>
+                )}
                 <label className="flex items-center gap-1.5 text-[12px] text-mute">
                   <Toggle checked={coderParams.thinking} onChange={(v) => setCoderParams({ ...coderParams, thinking: v })} /> thinking
                 </label>

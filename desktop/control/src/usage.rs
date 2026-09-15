@@ -179,14 +179,16 @@ pub(crate) async fn usage_stats(AxumState(state): AxumState<S>, Query(q): Query<
         ) {
             let prefill_s = prefill_ms as f64 / 1000.0;
             let decode_ms = total_ms.saturating_sub(prefill_ms);
-            if prefill_s > 0.0 && prompt > 0 {
+            // A minimum prefill window keeps degenerate events (near-zero timing jitter
+            // or immediate first-chunk responses) from producing absurd tok/s.
+            if prefill_ms >= 50 && prompt > 0 {
                 speed_prompt_tokens += prompt;
                 speed_prefill_secs += prefill_s;
             }
             // A minimum decode window keeps degenerate events (single-chunk
             // "streams", near-zero timing jitter) from producing absurd tok/s.
-            if decode_ms >= 50 && completion > 0 {
-                speed_completion_tokens += completion;
+            if decode_ms >= 50 && completion > 1 {
+                speed_completion_tokens += completion.saturating_sub(1);
                 speed_decode_secs += decode_ms as f64 / 1000.0;
             }
         }
@@ -370,6 +372,7 @@ async fn log_from_response_bytes(
 ) {
     let text = String::from_utf8_lossy(buf);
     let mut usage_obj: Option<Value> = None;
+    let mut timings_obj: Option<Value> = None;
     let mut resp_model: Option<String> = None;
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -384,21 +387,50 @@ async fn log_from_response_bytes(
         if let Some(u) = v.get("usage") {
             usage_obj = Some(u.clone());
         }
+        if let Some(t) = v.get("timings") {
+            timings_obj = Some(t.clone());
+        }
     }
-    let Some(usage) = usage_obj else { return };
     // `ctx.model` (set by `proxy::proxy`) is the actual artifact filename when
     // known — preferred over `resp_model`, which is just the engine's own
     // response echoing back the OpenAI-facing public alias, not the file
     // that was loaded. Falls back to the response's alias when the artifact
     // wasn't resolvable (e.g. a discovered/external engine — see proxy.rs).
     let model = ctx.model.or(resp_model).unwrap_or_else(|| "unknown".to_string());
-    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let cached_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let mut prompt_tokens = 0;
+    let mut completion_tokens = 0;
+    let mut cached_tokens = 0;
+    let mut found = false;
+
+    if let Some(usage) = usage_obj {
+        prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+        completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+        cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        found = true;
+    }
+
+    if let Some(timings) = timings_obj {
+        let cache_n = timings.get("cache_n").and_then(Value::as_u64).unwrap_or(0);
+        let prompt_n = timings.get("prompt_n").and_then(Value::as_u64).unwrap_or(0);
+        let predicted_n = timings.get("predicted_n").and_then(Value::as_u64).unwrap_or(0);
+        
+        if !found {
+            prompt_tokens = cache_n + prompt_n;
+            completion_tokens = predicted_n;
+            cached_tokens = cache_n;
+            found = true;
+        } else if cached_tokens == 0 && cache_n > 0 {
+            cached_tokens = cache_n;
+        }
+    }
+
+    if !found {
+        return;
+    }
     let _ = log_usage_event(
         &ctx.state,
         UsageEvent { ts_ms: now_ms(), model, source: ctx.source, prompt_tokens, completion_tokens, cached_tokens, prefill_ms, total_ms },
@@ -550,7 +582,9 @@ mod tests {
         let state = temp_state();
         // 100 prompt / 200 completion over 500ms prefill + 2000ms decode, and
         // 50 prompt / 100 completion over 500ms prefill + 1000ms decode:
-        // avgPrefillTps = 150 / 1.0 = 150, avgGenerationTps = 300 / 3.0 = 100.
+        // avgPrefillTps = 150 / 1.0 = 150.
+        // For generation, we subtract 1 token per request:
+        // avgGenerationTps = (199 + 99) / 3.0 = 298 / 3.0 = 99.333333...
         log_usage_event(
             &state,
             UsageEvent { ts_ms: now_ms(), model: "qwen3_8_27b_nvfp4.ninfer".into(), source: RequestSource::Local, prompt_tokens: 100, completion_tokens: 200, cached_tokens: 0, prefill_ms: Some(500), total_ms: Some(2500) },
@@ -574,7 +608,7 @@ mod tests {
         let Json(all) = usage_stats(AxumState(state), Query(UsageQuery { days: Some(1), source: None })).await;
         assert_eq!(all["totals"]["mostUsedModel"], "qwen3_8_27b_nvfp4");
         assert!((all["totals"]["avgPrefillTps"].as_f64().unwrap() - 150.0).abs() < 1e-9);
-        assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+        assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 99.33333333333333).abs() < 1e-9);
         let models: Vec<&str> = all["modelBreakdown"]
             .as_array()
             .unwrap()

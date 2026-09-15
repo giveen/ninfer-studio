@@ -158,6 +158,15 @@ pub struct AppSettings {
     /// Serializes as `mcpServers`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Whether the external cloud AI provider is enabled in the UI.
+    #[serde(default)]
+    pub cloud_provider_enabled: bool,
+    /// Base URL for the cloud provider.
+    #[serde(default)]
+    pub cloud_provider_base_url: String,
+    /// API Key for the cloud provider.
+    #[serde(default)]
+    pub cloud_provider_api_key: String,
 }
 
 /// One configured MCP server. Exactly one of `command` (stdio transport —
@@ -261,6 +270,9 @@ impl Default for AppSettings {
             currency_symbol: "$".into(),
             cost_per_kwh: 0.0,
             mcp_servers: Vec::new(),
+            cloud_provider_enabled: false,
+            cloud_provider_base_url: String::new(),
+            cloud_provider_api_key: String::new(),
         }
     }
 }
@@ -276,6 +288,7 @@ impl fmt::Debug for AppSettings {
             .field("models_dir", &self.models_dir)
             .field("engine_port", &self.engine_port)
             .field("api_key", &redacted(&self.api_key))
+            .field("cloud_provider_api_key", &redacted(&self.cloud_provider_api_key))
             .field("hf_cli", &self.hf_cli)
             .field("hf_token", &redacted(&self.hf_token))
             .field("build_command", &self.build_command)
@@ -303,6 +316,7 @@ pub struct EngineProfile {
     pub port: Option<u16>,
     pub api_key: Option<String>,
     pub model_id: Option<String>,
+    pub chat_template: Option<String>,
 
     // context & memory
     pub max_context: Option<u64>,
@@ -370,8 +384,9 @@ impl fmt::Debug for EngineProfile {
         f.debug_struct("EngineProfile")
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("api_key", &self.api_key.as_deref().map(redacted))
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .field("model_id", &self.model_id)
+            .field("chat_template", &self.chat_template)
             .field("max_context", &self.max_context)
             .field("kv_capacity", &self.kv_capacity)
             .field("prefill_chunk", &self.prefill_chunk)

@@ -154,9 +154,16 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         None
     };
 
-    let port = match route_port(&state, &body_bytes).await {
-        Ok(p) => p,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    let base_url = headers.get("x-ninfer-base-url").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let api_key_override = headers.get("x-ninfer-api-key").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+    let port_opt = if base_url.is_none() {
+        match route_port(&state, &body_bytes).await {
+            Ok(p) => Some(p),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        }
+    } else {
+        None
     };
     // Usage logging should attribute a request to the actual model artifact
     // (e.g. "qwen3_8_27b_nvfp4.ninfer") rather than the OpenAI-facing public
@@ -168,8 +175,12 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     // artifact info available, so it keeps the alias (see `route_port`).
     let request_model = {
         let eng = state.engine.read().await;
-        if eng.port == Some(port) {
-            eng.artifact.as_deref().map(crate::types::base_name).map(str::to_string).or(request_model)
+        if let Some(port) = port_opt {
+            if eng.port == Some(port) {
+                eng.artifact.as_deref().map(crate::types::base_name).map(str::to_string).or(request_model)
+            } else {
+                request_model
+            }
         } else {
             request_model
         }
@@ -189,9 +200,18 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     } else {
         (None, false)
     };
-    let api_key = { state.config.read().await.api_key.clone() };
-    let target = format!("http://127.0.0.1:{port}{}", uri.path());
-
+    let api_key = match api_key_override {
+        Some(k) => k,
+        None => state.config.read().await.api_key.clone(),
+    };
+    
+    let target = if let Some(base) = base_url {
+        let path = uri.path();
+        let path = if path.starts_with("/v1/") { &path[3..] } else { path }; // Trim /v1/ for raw base urls
+        format!("{}{}", base.trim_end_matches('/'), path)
+    } else {
+        format!("http://127.0.0.1:{}{}", port_opt.unwrap(), uri.path())
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(ENGINE_PROXY_TIMEOUT_SECS))
         .build()

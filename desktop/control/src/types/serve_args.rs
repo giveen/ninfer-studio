@@ -21,6 +21,7 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     kv(&mut a, "--port", &p.port.unwrap_or(port).to_string());
     kv(&mut a, "--api-key", &p.api_key.clone().unwrap_or_default());
     kv(&mut a, "--model-id", &p.model_id.clone().unwrap_or_default());
+    kv(&mut a, "--chat-template", &p.chat_template.clone().unwrap_or_default());
     kv(&mut a, "--max-context", &p.max_context.map(|v| v.to_string()).unwrap_or_default());
     match &p.kv_capacity {
         None => {}

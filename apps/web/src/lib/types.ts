@@ -107,6 +107,10 @@ export interface AppSettings {
   /** Electricity price per kWh, in currencySymbol units. 0 = not configured
    *  (the Usage tab hides cost figures rather than showing a false $0). */
   costPerKwh: number;
+  /** Enable Cloud AI provider integration */
+  cloudProviderEnabled?: boolean;
+  cloudProviderBaseUrl?: string;
+  cloudProviderApiKey?: string;
 }
 
 interface UpdateJob {
@@ -171,6 +175,7 @@ export interface EngineProfile {
   port: number;
   apiKey?: string;
   modelId?: string;
+  chatTemplate?: string;
 
   // context & memory
   maxContext?: number;
@@ -338,6 +343,10 @@ export interface ChatParams {
   frequencyPenalty?: number;
   seed?: number;
   greedy?: boolean;
+  primaryProvider?: 'ninfer' | 'cloud';
+  primaryCloudModel?: string;
+  subagentProvider?: 'ninfer' | 'cloud';
+  subagentCloudModel?: string;
 }
 
 // A named, reusable bundle of chat params (sampling + system prompt + thinking),

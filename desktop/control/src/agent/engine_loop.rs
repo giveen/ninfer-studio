@@ -626,8 +626,10 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
 /// are the engine's fault (bad status, transport, …).
 pub(crate) async fn stream_turn(state: &S, shared: &Arc<RunShared>, raw: &[u8]) -> Result<Turn, String> {
     let port = crate::proxy::route_port(state, raw).await?;
-    let api_key = state.config.read().await.api_key.clone();
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let api_key = shared.meta.api_key.clone().unwrap_or_else(|| {
+        if let Ok(c) = state.config.try_read() { c.api_key.clone() } else { String::new() }
+    });
+    let url = shared.meta.base_url.clone().map(|u| format!("{}/chat/completions", u.trim_end_matches('/'))).unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1/chat/completions"));
 
     let mut req = shared.client.post(&url).header("content-type", "application/json").body(raw.to_vec());
     if !api_key.is_empty() {
@@ -836,6 +838,31 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
     let max_steps = meta.max_steps;
     let mut turns = 0usize;
 
+    if meta.plan {
+        let task = {
+            let live = lock_live(&shared);
+            live.messages.last().and_then(|m| m.get("content").and_then(|v| v.as_str())).unwrap_or_default().to_string()
+        };
+        let c = chat_once(
+            &shared.client,
+            &state,
+            &meta.model,
+            meta.base_url.as_deref(),
+            meta.api_key.as_deref(),
+            "You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.",
+            &task,
+            Some(0.4),
+            Some(1024),
+            Duration::from_secs(30)
+        ).await;
+        if let Ok(plan_text) = c {
+            shared.append(json!({
+                "role": "assistant",
+                "content": format!("[Ideation / Plan]\n{plan_text}")
+            }));
+        }
+    }
+
     loop {
         if turns >= max_steps || shared.status().is_terminal() {
             finish(&shared, "steps");
@@ -922,6 +949,23 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 && !turn.content.trim().is_empty()
                 && matches!(meta.kind.as_str(), "worker" | "coder")
             {
+                let snippet = turn.content.clone();
+                let sum = chat_once(
+                    &shared.client,
+                    &state,
+                    &shared.meta.model,
+                    shared.meta.base_url.as_deref(),
+                    shared.meta.api_key.as_deref(),
+                    "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
+                    &snippet,
+                    None,
+                    Some(512),
+                    Duration::from_secs(30)
+                ).await.unwrap_or_else(|e| format!("(summarization failed: {e})"));
+                shared.append(json!({
+                    "role": "user",
+                    "content": format!("[Worker partial summary: {sum}]")
+                }));
                 // Token limit mid-turn: hand the next step a continuation
                 // note (the partial reply above stays in the transcript).
                 shared.append(json!({ "role": "user", "content": CUTOFF_NOTE }));
@@ -999,6 +1043,31 @@ Use only the tools listed above."
                 ),
             }));
         }
+
+        if let Some(ref critic_model) = meta.critic {
+            let turn_input = format!("Turn {} completed. Content: {}", turns, turn.content);
+            let critic_sys = "You are a CRITIC reviewing the agent's progress. Evaluate whether the agent is making progress toward the goal or going in circles.";
+            let c = chat_once(
+                &shared.client,
+                &state,
+                critic_model.as_str().unwrap_or_default(),
+                shared.meta.base_url.as_deref(),
+                shared.meta.api_key.as_deref(),
+                &critic_sys,
+                &turn_input,
+                Some(0.4),
+                Some(2048),
+                Duration::from_secs(45),
+            )
+            .await;
+            if let Ok(critique) = c {
+                shared.append(json!({
+                    "role": "system",
+                    "content": format!("[Critic Review]\n{critique}")
+                }));
+            }
+        }
+
         // Tool-call turn end: a client-hook screen may still want its gate
         // (e.g. the compaction pass before the next engine call).
         match await_turn_hook(&shared, &turn, turns, est_tokens).await {
@@ -1163,6 +1232,8 @@ pub(crate) async fn chat_once(
     client: &reqwest::Client,
     state: &S,
     model: &str,
+    base_url: Option<&str>,
+    api_key_override: Option<&str>,
     system: &str,
     user: &str,
     temperature: Option<f64>,
@@ -1185,8 +1256,10 @@ pub(crate) async fn chat_once(
     }
     let raw = serde_json::to_vec(&body).unwrap_or_default();
     let port = crate::proxy::route_port(state, &raw).await?;
-    let api_key = state.config.read().await.api_key.clone();
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let api_key = api_key_override.map(|s| s.to_string()).unwrap_or_else(|| {
+        if let Ok(c) = state.config.try_read() { c.api_key.clone() } else { String::new() }
+    });
+    let url = base_url.map(|u| format!("{}/chat/completions", u.trim_end_matches('/'))).unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1/chat/completions"));
 
     let mut req = client.post(&url).header("content-type", "application/json").body(raw);
     if !api_key.is_empty() {
@@ -1394,7 +1467,7 @@ mod tests {
                 tools_spec: Value::Array(vec![]),
                 params: Value::Null,
                 parent: None,
-                plan: false,
+                plan: false, api_key: None, base_url: None,
                 critic: None,
             },
             live: std::sync::Mutex::new(crate::agent::run::RunLive {
@@ -1548,7 +1621,7 @@ mod tests {
             tools_spec: Value::Array(vec![]),
             params: Value::Null,
             parent: None,
-            plan: false,
+            plan: false, api_key: None, base_url: None,
             critic: None,
         };
         let live = crate::agent::run::RunLive {
@@ -1654,7 +1727,7 @@ mod tests {
             tools_spec: Value::Array(vec![]),
             params: Value::Null,
             parent: None,
-            plan: false,
+            plan: false, api_key: None, base_url: None,
             critic: None,
         };
         let shared = Arc::new(crate::agent::run::RunShared {

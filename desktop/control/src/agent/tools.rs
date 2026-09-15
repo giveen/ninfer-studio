@@ -46,6 +46,9 @@ grep/glob/search the repo, fetch web docs, and run read-only inspection
 commands. You must NOT modify anything — no writes, edits, patches, git
 writes, or destructive commands.
 
+CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, or `ls`. ALWAYS use the native `read`, `grep`, and `glob` tools instead.
+CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
+
 Work autonomously: if the task is ambiguous, pick the most reasonable
 interpretation and note it in one line.
 
@@ -81,6 +84,8 @@ const SUBAGENT_TOOLS: &[&str] = &[
 /// the loop, not the webview.
 pub(crate) const WORKER_SYSTEM: &str = r#"You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
+- CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, or `awk`. ALWAYS use the native `read`, `grep`, `glob`, `edit`, and `apply_patch` tools instead.
+- CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
 - If your task says to try a different approach or fix a reviewer's rejection by rethinking the design, write a FRESH implementation for that approach instead of incrementally patching the stuck one — a patched-over wrong approach is usually worse than a clean rewrite.
@@ -820,6 +825,8 @@ async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -> Value {
         &parent.client,
         state,
         &wmodel,
+        parent.meta.base_url.as_deref(),
+        parent.meta.api_key.as_deref(),
         IDEATION_SYSTEM,
         &format!("TASK:\n{task}"),
         Some(0.4),
@@ -986,6 +993,8 @@ async fn spawn_child(
         kind: kind.into(),
         label: format!("{tool}: {}", prompt.chars().take(60).collect::<String>()),
         model,
+        base_url: parent.meta.base_url.clone(),
+        api_key: parent.meta.api_key.clone(),
         system: {
             if kind == "worker" && parent.meta.tool_set != "chat" {
                 Some(WORKER_SYSTEM.to_string())
@@ -1167,6 +1176,8 @@ async fn run_critic(
         &parent.client,
         state,
         &model,
+        parent.meta.base_url.as_deref(),
+        parent.meta.api_key.as_deref(),
         &system,
         &prompt,
         None,

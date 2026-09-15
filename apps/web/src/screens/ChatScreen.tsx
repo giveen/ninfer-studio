@@ -31,7 +31,7 @@ import type { AgentToolCall, ChatAttachment, ChatMessage, ChatParams, Conversati
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
 import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, type McpToolInfo } from '../lib/api';
@@ -265,7 +265,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
       return;
     }
-    const useModel = model || runningModel;
+    const { model: useModel, baseUrl, apiKey } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
     if (!useModel) return;
 
     setCompacting(true);
@@ -312,7 +312,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const useModel = model || runningModel;
+      const { model: useModel, baseUrl, apiKey } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
       if (!useModel) return;
       setStreaming(true);
       setStreamingConvId(convId);
@@ -509,6 +509,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           kind: 'chat',
           label: 'chat turn',
           model: useModel,
+          baseUrl,
+          apiKey,
           system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
           maxSteps: 12,
           toolSet: 'chat',
@@ -740,7 +742,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       onNavigate('engine');
       return;
     }
-    const useModel = model || runningModel;
+    const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
     if (!useModel) return;
 
     let conv = convs.find((c) => c.id === activeId);
@@ -784,7 +786,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const useModel = model || runningModel;
+      const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
       if (!useModel) return;
       const conv = convs.find((c) => c.id === activeId);
       if (!conv) return;

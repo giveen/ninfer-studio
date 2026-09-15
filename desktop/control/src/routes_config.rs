@@ -42,9 +42,11 @@ pub(crate) fn redact_config(mut v: Value) -> Value {
     };
     let hf_set = is_set("hfToken");
     let api_set = is_set("apiKey");
+    let cloud_api_set = is_set("cloudProviderApiKey");
     if let Some(obj) = v.as_object_mut() {
         obj.insert("hfToken".into(), json!(if hf_set { SECRET_MASK } else { "" }));
         obj.insert("apiKey".into(), json!(if api_set { SECRET_MASK } else { "" }));
+        obj.insert("cloudProviderApiKey".into(), json!(if cloud_api_set { SECRET_MASK } else { "" }));
     }
     v
 }
@@ -134,6 +136,17 @@ pub(crate) async fn set_config(AxumState(state): AxumState<S>, req: Request<Body
         && v >= 0.0
     {
         merged.cost_per_kwh = v;
+    }
+    if let Some(v) = body.get("cloudProviderEnabled").and_then(|v| v.as_bool()) {
+        merged.cloud_provider_enabled = v;
+    }
+    if let Some(v) = body.get("cloudProviderBaseUrl").and_then(|v| v.as_str()) {
+        merged.cloud_provider_base_url = v.into();
+    }
+    if let Some(v) = body.get("cloudProviderApiKey").and_then(|v| v.as_str()) {
+        if v != SECRET_MASK {
+            merged.cloud_provider_api_key = v.into();
+        }
     }
     persist_config(&state, &merged).await?;
     Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
