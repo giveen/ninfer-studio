@@ -36,17 +36,13 @@ import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type To
 import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
 import { TOOLS, DEFAULT_PERMS, MUTATING_TOOLS, DEFAULT_MAX_AGENT_STEPS, READONLY_TOOL_NAMES, WORKER_TOOL_NAMES, filterToolAllowList, filterToolsByConfig, isReadOnlyCommand, mcpToolTier, mcpToolSchema, mcpServerKey, splitMcpName, MCP_NAME_PREFIX, type PermTier, type PermConfig } from '../lib/coderTools';
-import { CONV_KEY, newConvId, emptyConv, baseName, relTime, todoSystemBlock, normalizeStore, loadStore, loadDefaultPerms, detectCommands, type LogEntry, type TodoItem, type ConvMeta, type Checkpoint, type WsData, type CoderStore } from '../lib/coderStore';import { CODER_SYSTEM, WORKER_SYSTEM, CRITIC_SYSTEM } from '../lib/coderPrompts';
+import { CODER_SYSTEM, WORKER_SYSTEM, CRITIC_SYSTEM } from '../lib/coderPrompts';
 import { SidebarSection } from '../components/coder/CoderSidebar';
 import { useCoderCheckpoints } from '../hooks/useCoderCheckpoints';
+import { useCoderToolHandlers, isGitCommitCommand } from '../hooks/useCoderToolHandlers';
 
 const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
 const LazyEditorPane = lazy(() => import('../components/editor/EditorPane'));
-/** Cheap guard used by the commit-approval gate: does this shell command commit? */
-const isGitCommitCommand = (cmd: string): boolean => {
-  const c = cmd.replace(/^\s*(sudo|env|time|setsid|nice)\s+/, '').trim();
-  return /^git\b/.test(c) && /\bcommit\b/.test(c);
-};
 
 export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [store, setStore] = useState<CoderStore>(loadStore);
@@ -1319,35 +1315,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     });
   };
 
-  /** Return a bounded unified-diff preview of uncommitted changes in one file against HEAD. */
-  const getFilePreview = async (path: string, signal?: AbortSignal): Promise<{ ok: boolean; preview: string }> => {
-    const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-    const d = await coderExec(`git diff HEAD -- ${q(path)}`, undefined, 10000, undefined, false, signal, activeWsDir);
-    return { ok: d.exitCode === 0, preview: (d.stdout || '').slice(0, 4000) };
-  };
-  /** Post-edit verification: lint (falls back to build) then test, each bounded.
-   * Returns extra result fields; the first failure stops the chain so the
-   * model sees one error to fix at a time. */
-  const runPostEditChecks = async (res: unknown, preview: string, signal?: AbortSignal): Promise<Record<string, unknown>> => {
-    const out: Record<string, unknown> = { ...(res as Record<string, unknown>), ...(preview ? { preview_diff: preview } : {}) };
-    const cmds = (activeWsDir ? detectedCmdsByWsRef.current.get(activeWsDir) : undefined) ?? {};
-    const lintCmd = cmds.lint || cmds.build;
-    if (lintCmd) {
-      const check = await coderExec(lintCmd, undefined, 120000, undefined, false, signal, activeWsDir);
-      if (check.exitCode !== 0) {
-        const diags = parseDiagnostics(lintCmd, check.stderr || check.stdout || '');
-        return { ...out, linter_error: (check.stderr || check.stdout || '').slice(0, 8000), diagnostics: diags };
-      }
-    }
-    if (cmds.test) {
-      const t = await coderExec(cmds.test, undefined, 180000, undefined, false, signal, activeWsDir);
-      if (t.exitCode !== 0) {
-        const diags = parseDiagnostics(cmds.test, t.stderr || t.stdout || '');
-        return { ...out, test_error: (t.stderr || t.stdout || '').slice(0, 8000), diagnostics: diags };
-      }
-    }
-    return out;
-  };
+  const { getFilePreview, runPostEditChecks } = useCoderToolHandlers({
+    activeWsDir,
+    detectedCmdsByWsRef,
+  });
   const handleToolCalls = async (calls: AgentToolCall[], currentMessages: ChatMessage[], onMutated?: () => void | Promise<void>) => {
     const nextMessages = [...currentMessages];
     let mutated = false;
