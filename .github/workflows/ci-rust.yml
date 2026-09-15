@@ -24,6 +24,9 @@ on:
       - '.github/workflows/ci-rust.yml'
   workflow_dispatch:
 
+env:
+  CARGO_INCREMENTAL: 0
+
 permissions:
   contents: read
 
@@ -38,6 +41,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold clang
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> $GITHUB_ENV
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
