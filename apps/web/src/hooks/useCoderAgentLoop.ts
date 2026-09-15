@@ -184,13 +184,18 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
     opts.abortRef.current = new AbortController();
 
-    let model = 'qwen-coder';
+    let fallbackModel = 'qwen-coder';
     try {
       const s = await getStatus();
-      if (s?.engine?.modelId) model = s.engine.modelId;
+      if (s?.engine?.modelId) fallbackModel = s.engine.modelId;
     } catch {
       /* ignore */
     }
+    const primaryConfig = resolveProviderConfig('primary', opts.appConfig, {
+      primaryProvider: opts.coderParams.primaryProvider,
+      primaryCloudModel: opts.coderParams.primaryCloudModel,
+    }, fallbackModel);
+    const model = primaryConfig.model;
     opts.modelRef.current = model;
 
     if (options?.scout && opts.scoutOn) {

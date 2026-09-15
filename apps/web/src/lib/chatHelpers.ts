@@ -302,7 +302,7 @@ export function resolveProviderConfig(
     return { model: fallbackModel || 'ninfer' };
   }
 
-  const explicitProvider = params[`${role}Provider` as keyof typeof params];
+  const explicitProvider = params[`${role}Provider`] || params.provider;
   const globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
 
   const effectiveProvider = explicitProvider || (globalUseCloud ? 'cloud' : 'ninfer');
@@ -311,7 +311,7 @@ export function resolveProviderConfig(
     return {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
-      model: params[`${role}CloudModel`] || appConfig.cloudProviderDefaultModel || 'gpt-4o',
+      model: params[`${role}CloudModel`] || params.cloudModel || appConfig.cloudProviderDefaultModel || 'gpt-4o',
     };
   }
 

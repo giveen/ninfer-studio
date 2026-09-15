@@ -170,12 +170,16 @@ export function useCoderSubagents({
   );
 
   const runIdeation = useCallback(
-    async (task: string, model: string, signal: AbortSignal): Promise<string> => {
+    async (task: string, fallbackModel: string, signal: AbortSignal): Promise<string> => {
+      const subConfig = resolveProviderConfig('subagent', appConfig, {
+        subagentProvider: coderParams.subagentProvider,
+        subagentCloudModel: coderParams.subagentCloudModel,
+      }, fallbackModel);
       let out = '';
       try {
         await streamChat(
           buildChatRequest(
-            model,
+            subConfig.model,
             'You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.',
             [{ role: 'user', content: `TASK:\n${task}` }],
             { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: 0.4, maxTokens: 1024 } as ChatParams,
@@ -187,24 +191,29 @@ export function useCoderSubagents({
             onContentDelta: (t: string) => {
               out += t;
             },
-          }
+          },
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
         );
       } catch {
         /* best-effort */
       }
       return out.trim();
     },
-    [coderParams]
+    [appConfig, coderParams]
   );
 
   const summarizeCutoff = useCallback(
-    async (partial: string, model: string, signal: AbortSignal): Promise<string> => {
+    async (partial: string, fallbackModel: string, signal: AbortSignal): Promise<string> => {
       const snippet = partial.length <= 9000 ? partial : `${partial.slice(0, 3500)}\n...[middle omitted]...\n${partial.slice(-5500)}`;
+      const subConfig = resolveProviderConfig('subagent', appConfig, {
+        subagentProvider: coderParams.subagentProvider,
+        subagentCloudModel: coderParams.subagentCloudModel,
+      }, fallbackModel);
       let out = '';
       try {
         await streamChat(
           buildChatRequest(
-            model,
+            subConfig.model,
             "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
             [{ role: 'user', content: `CUT-OFF ATTEMPT:\n${snippet}` }],
             { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, maxTokens: 512 } as ChatParams,
@@ -216,7 +225,8 @@ export function useCoderSubagents({
             onContentDelta: (t: string) => {
               out += t;
             },
-          }
+          },
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
         );
       } catch {
         /* best-effort */
@@ -330,14 +340,18 @@ export function useCoderSubagents({
       diff: string,
       taskText: string
     ): Promise<{ approved: boolean; issues: string; learnings: any[] }> => {
-      const model = coderParams.criticModel || 'qwen-coder';
+      const fallbackModel = coderParams.criticModel || 'qwen-coder';
+      const subConfig = resolveProviderConfig('subagent', appConfig, {
+        subagentProvider: coderParams.subagentProvider,
+        subagentCloudModel: coderParams.subagentCloudModel,
+      }, fallbackModel);
       const prompt = `CRITIC REVIEW:\nTask: ${taskText.slice(0, 1500)}\n\nDiff to review:\n${diff.slice(0, 12000)}`;
       let out = '';
       try {
         const ctrl = new AbortController();
         await streamChat(
           buildChatRequest(
-            model,
+            subConfig.model,
             'You are a rigorous code critic. Review the given diff against the task description. If acceptable, reply ONLY with "APPROVED". If there are issues, list them concisely.',
             [{ role: 'user', content: prompt }],
             { thinking: coderParams.thinking, reasoningEffort: coderParams.thinkLevel, temperature: 0.2, maxTokens: 1024 } as ChatParams,
@@ -349,7 +363,8 @@ export function useCoderSubagents({
             onContentDelta: (t: string) => {
               out += t;
             },
-          }
+          },
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
         );
       } catch {
         return { approved: true, issues: '', learnings: [] };
@@ -360,7 +375,7 @@ export function useCoderSubagents({
       }
       return { approved: false, issues: text, learnings: [] };
     },
-    [coderParams]
+    [appConfig, coderParams]
   );
 
   const persistLearnings = useCallback(
