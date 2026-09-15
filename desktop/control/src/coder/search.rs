@@ -231,7 +231,7 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
 
     let result = tokio::task::spawn_blocking(move || {
         use std::collections::{HashMap, HashSet};
-        use tree_sitter::{Parser, Query, QueryCursor};
+        use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
         let mut parser = Parser::new();
         let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
@@ -280,13 +280,13 @@ pub async fn repo_map(AxumState(state): AxumState<S>, Query(params): Query<WsQue
             
             let Ok(query) = Query::new(&lang, query_str) else { continue };
             let mut cursor = QueryCursor::new();
-            let matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+            let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
             
             let rel_path = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().to_string();
             let mut local_defs = Vec::new();
             
-            for m in matches {
-                for capture in m.captures {
+            while let Some(m) = matches.next() {
+                for capture in m.captures() {
                     let node = capture.node;
                     let tag_name = query.capture_names()[capture.index as usize];
                     if let Ok(text) = node.utf8_text(content.as_bytes()) {
