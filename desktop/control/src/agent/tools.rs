@@ -946,11 +946,7 @@ async fn run_critic(
             _ => kept.push(raw.to_string()),
         }
     }
-    let issues = kept
-        .join("\n")
-        .replace(&re_verdict().find(&kept.join("\n")).map(|m| m.as_str()).unwrap_or_default().to_string(), "")
-        .trim()
-        .to_string();
+    let issues = re_verdict_line().replace(&kept.join("\n"), "").trim().to_string();
     Ok((approved, issues, learnings))
 }
 
