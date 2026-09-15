@@ -1010,20 +1010,34 @@ async fn run_critic(
     .await?;
     let approved = re_verdict().is_match(&content);
     // Pull learnings out of the raw text first so they don't bleed into
-    // `issues` (the rest of the reply, verdict line stripped).
+    // `issues` (the client's runCritic parse).
     let mut learnings: Vec<(String, String)> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
+    let re_l = re_learning();
+    let re_a = re_avoid();
     for raw in content.lines() {
         let line = raw.trim();
-        let learn = line.strip_prefix("LEARNING:").map(str::trim);
-        let avoid = line.strip_prefix("AVOID:").map(str::trim);
-        match (learn, avoid) {
-            (Some(t), _) if !t.is_empty() => learnings.push(("success".into(), t.to_string())),
-            (None, Some(t)) if !t.is_empty() => learnings.push(("avoid".into(), t.to_string())),
-            _ => kept.push(raw.to_string()),
+        if let Some(c) = re_l
+            .captures(line)
+            .and_then(|m| m.get(1))
+            .filter(|s| !s.as_str().trim().is_empty())
+        {
+            learnings.push(("success".into(), c.as_str().trim().to_string()));
+        } else if let Some(c) = re_a
+            .captures(line)
+            .and_then(|m| m.get(1))
+            .filter(|s| !s.as_str().trim().is_empty())
+        {
+            learnings.push(("avoid".into(), c.as_str().trim().to_string()));
         }
+        // The client keeps the line in the issue text either way.
+        kept.push(raw.to_string());
     }
-    let issues = re_verdict_line().replace(&kept.join("\n"), "").trim().to_string();
+    let joined = kept.join("\n");
+    let issues = match re_verdict_token().find(&joined) {
+        Some(m) => joined.replacen(m.as_str(), "", 1).trim().to_string(),
+        None => joined.trim().to_string(),
+    };
     Ok((approved, issues, learnings))
 }
 
@@ -1034,12 +1048,25 @@ fn re_verdict() -> &'static Regex {
     RE_VERDICT.get_or_init(|| Regex::new("(?i)VERDICT:\\s*APPROVED").expect("static regex"))
 }
 
-static RE_VERDICT_LINE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static RE_VERDICT_TOKEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static RE_LEARNING: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+static RE_AVOID: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
-/// The whole `VERDICT: …` line, for stripping it out of the critic's issue
-/// text (the client stripped it with /VERDICT:.*$/i per line).
-fn re_verdict_line() -> &'static Regex {
-    RE_VERDICT_LINE.get_or_init(|| Regex::new("(?im)^.*VERDICT:.*$").expect("static regex"))
+/// The `VERDICT: APPROVED|CHANGES_REQUESTED` token — the client stripped the
+/// FIRST occurrence out of the issue text with a single
+/// `.replace(/VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*/i, '')`.
+fn re_verdict_token() -> &'static Regex {
+    RE_VERDICT_TOKEN
+        .get_or_init(|| Regex::new(r"(?i)VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*").expect("static regex"))
+}
+
+/// `LEARNING:` / `AVOID:` line extraction (case-insensitive, optional leading
+/// bullet — the client's `/*?\s*LEARNING:/` and `/*?\s*AVOID:/`).
+fn re_learning() -> &'static Regex {
+    RE_LEARNING.get_or_init(|| Regex::new(r"(?im)^\*?\s*LEARNING:\s*(.+)$").expect("static regex"))
+}
+fn re_avoid() -> &'static Regex {
+    RE_AVOID.get_or_init(|| Regex::new(r"(?im)^\*?\s*AVOID:\s*(.+)$").expect("static regex"))
 }
 
 /// Persist critic/agent learnings to the per-repo memory store (in-process
