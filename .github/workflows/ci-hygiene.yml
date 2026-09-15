@@ -1,0 +1,33 @@
+name: CI / Hygiene
+
+# Commit-message gate: blocks the `Agent auto-commit: patched|edited <path>`
+# noise that filled ~half of recent history. Runs on pull requests (each
+# commit in origin/main..HEAD) and direct pushes to main (HEAD only).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: commit messages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Commit-message hygiene (no Agent auto-commit noise)
+        run: node scripts/check-commit-hygiene.mjs

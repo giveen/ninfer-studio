@@ -56,13 +56,14 @@ function uiEndpoints() {
 // --- Collect routes each backend registers ---------------------------------
 function rustRoutes() {
   const routes = new Set();
-  const lib = read('desktop/control/src/lib.rs');
+  // Collapse all whitespace so cargo fmt reformats can't break the regex.
+  const lib = read('desktop/control/src/lib.rs').replace(/\s+/g, ' ');
   for (const m of lib.matchAll(/\.route\(\s*"([^"]+)"/g)) {
     routes.add(m[1].replace(/\{[^}]*\}/g, '*'));
   }
   // /api/agent is a nested router (agent/run.rs); its routes register there,
   // prefixed by the nest point in lib.rs.
-  const runs = read('desktop/control/src/agent/run.rs');
+  const runs = read('desktop/control/src/agent/run.rs').replace(/\s+/g, ' ');
   for (const m of runs.matchAll(/\.route\(\s*"([^"]+)"/g)) {
     routes.add(('/api/agent' + m[1]).replace(/\{[^}]*\}/g, '*'));
   }

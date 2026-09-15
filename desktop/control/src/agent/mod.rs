@@ -30,6 +30,9 @@
 //!                   bounded recursion (the server port of agentLoop.ts)
 //!   tools.rs      — in-process tool dispatch + permission/approval preflight
 
+pub mod bash_guard;
+pub mod child_run;
 pub mod engine_loop;
+pub mod gates;
 pub mod run;
 pub mod tools;
