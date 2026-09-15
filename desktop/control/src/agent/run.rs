@@ -915,7 +915,6 @@ pub(crate) async fn hook_decision(
     Json(json!({ "ok": true })).into_response()
 }
 
-/// Router for the whole `/api/agent` surface.
 /// Validate + normalize a `todo_write` items array (mirrors the client's
 /// guard: `content` must be a non-empty string, `status` one of the three
 /// known values — malformed items are dropped, never stringified).
