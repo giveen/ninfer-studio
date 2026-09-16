@@ -200,13 +200,38 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
     if (options?.scout && opts.scoutOn) {
       const mc = await opts.engineMaxConcurrency();
-      if (mc > 1 && !opts.abortRef.current?.signal.aborted) {
+      const subConfig = resolveProviderConfig('subagent', opts.appConfig, {
+        provider: opts.coderParams.subagentProvider,
+        cloudModel: opts.coderParams.subagentCloudModel,
+      }, model);
+      const isCloudSub = !!subConfig.baseUrl;
+
+      if (!opts.abortRef.current?.signal.aborted) {
         const task =
           [...currentMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content ?? '';
-        opts.addLog({ type: 'read', label: 'scout', detail: `3 parallel probes (engine concurrency ${mc})` });
         const signal = opts.abortRef.current!.signal;
-        const summaries = await Promise.all(
-          SCOUT_PROBES.map(async (p) => {
+
+        let summaries: string[] = [];
+        if (mc > 1 || isCloudSub) {
+          opts.addLog({ type: 'read', label: 'scout', detail: `3 parallel probes (${isCloudSub ? 'cloud' : `engine concurrency ${mc}`})` });
+          summaries = await Promise.all(
+            SCOUT_PROBES.map(async (p) => {
+              const s = await opts.runSubagent(
+                p.label,
+                `Task: ${task.slice(0, 2000)}\n\nScout goal (${p.label}): ${
+                  p.goal
+                }\n\nYou are read-only: investigate with tools and reply with a concise findings report (paths + facts). Do not write code.`,
+                model,
+                signal
+              );
+              opts.addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
+              return `## ${p.label}\n${s}`;
+            })
+          );
+        } else {
+          opts.addLog({ type: 'read', label: 'scout', detail: '3 sequential probes (local single concurrency)' });
+          for (const p of SCOUT_PROBES) {
+            if (signal.aborted) break;
             const s = await opts.runSubagent(
               p.label,
               `Task: ${task.slice(0, 2000)}\n\nScout goal (${p.label}): ${
@@ -216,27 +241,22 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               signal
             );
             opts.addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
-            return `## ${p.label}\n${s}`;
-          })
-        );
-        if (!signal.aborted) {
+            summaries.push(`## ${p.label}\n${s}`);
+          }
+        }
+
+        if (!signal.aborted && summaries.length > 0) {
           const scoutMsg: ChatMessage = {
             role: 'user',
             displayName: 'Scout',
             collapsed: true,
             content: `# Scout Report (read-only pre-pass, ${
-              SCOUT_PROBES.length
-            } parallel probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
+              summaries.length
+            } probes)\n${summaries.join('\n\n')}\n\nUse these findings; verify paths before editing.`,
           };
           currentMessages = [...currentMessages, scoutMsg];
           opts.updateRunMessages((prev) => [...prev, scoutMsg]);
         }
-      } else if (!opts.abortRef.current.signal.aborted) {
-        opts.addLog({
-          type: 'read',
-          label: 'scout',
-          detail: `skipped: engine max-concurrency is ${mc} (needs > 1 for parallel probes)`,
-        });
       }
     }
     if (opts.abortRef.current.signal.aborted) {
