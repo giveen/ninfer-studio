@@ -728,7 +728,7 @@ pub(crate) async fn stream_turn(
     let mut first_chunk: Option<u64> = None;
 
     let mut stream = stream;
-    loop {
+    'stream_loop: loop {
         let next = tokio::select! {
             r = stream.next() => r,
             _ = shared.wait_stop() => return Err(STOP_ERR.to_string()),
@@ -745,8 +745,11 @@ pub(crate) async fn stream_turn(
             let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
                 continue;
             };
-            if payload.is_empty() || payload == "[DONE]" {
+            if payload.is_empty() {
                 continue;
+            }
+            if payload == "[DONE]" {
+                break 'stream_loop;
             }
             let Ok(chunk_v) = serde_json::from_str::<Value>(payload) else {
                 continue;
@@ -879,6 +882,25 @@ pub(crate) async fn stream_turn(
         }
     }
 
+    if prompt_tokens == 0 {
+        prompt_tokens = (raw.len() as f64 / CHARS_PER_TOKEN).round() as u64;
+    }
+    if completion_tokens == 0 && !content.is_empty() {
+        completion_tokens = (content.len() as f64 / CHARS_PER_TOKEN).round() as u64;
+    }
+    if meta.get("promptTokens").is_none() && prompt_tokens > 0 {
+        meta.insert("promptTokens".into(), json!(prompt_tokens));
+    }
+    if meta.get("completionTokens").is_none() && completion_tokens > 0 {
+        meta.insert("completionTokens".into(), json!(completion_tokens));
+    }
+    if meta.get("decodeTokPerSec").is_none() && completion_tokens > 0 {
+        let elapsed_sec = started.elapsed().as_secs_f64();
+        if elapsed_sec > 0.0 {
+            let tps = completion_tokens as f64 / elapsed_sec;
+            meta.insert("decodeTokPerSec".into(), json!(tps));
+        }
+    }
     if let Some(first) = first_chunk {
         meta.insert("ttftMs".into(), json!(first));
     }
@@ -1022,6 +1044,9 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         }
         if !turn.tool_calls.is_empty() {
             am["tool_calls"] = Value::Array(turn.tool_calls.iter().map(Tc::to_value).collect());
+        }
+        if !turn.meta.is_null() && turn.meta.as_object().is_some_and(|o| !o.is_empty()) {
+            am["meta"] = turn.meta.clone();
         }
         shared.append(am);
         {

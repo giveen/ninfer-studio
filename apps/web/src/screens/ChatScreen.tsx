@@ -545,7 +545,9 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         const runId = started.id;
         const stream = new RunStream(
           runId,
-          () => {},
+          (snap) => {
+            if (snap.lastMeta) setLatestRequestMetrics(snap.lastMeta as unknown as MessageMeta, useModel);
+          },
           (ev) => {
             if (ac.signal.aborted) return;
             switch (ev.type) {
@@ -568,13 +570,18 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   const content = typeof msg.content === 'string' ? msg.content : '';
                   const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : undefined;
                   const calls = toAgentCalls(msg.tool_calls);
+                  const meta = (msg.meta ?? {}) as MessageMeta;
                   patchTarget((m) => ({
                     ...m,
                     content,
                     reasoning: reasoning ?? m.reasoning,
                     tool_calls: calls.length ? calls : undefined,
                     model: useModel,
+                    meta: Object.keys(meta).length ? meta : m.meta,
                   }));
+                  if (Object.keys(meta).length) {
+                    setLatestRequestMetrics(meta, useModel);
+                  }
                 } else {
                   const tm: ChatMessage = {
                     role: msg.role as ChatMessage['role'],
