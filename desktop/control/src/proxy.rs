@@ -307,15 +307,15 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     {
         rb = rb.header(header::CONTENT_TYPE, v);
     }
-    if let Some(ref eh) = extra_headers_override {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh) {
-            for (k, v) in parsed {
-                if let Some(s) = v.as_str() {
-                    let name: Result<axum::http::HeaderName, _> = k.parse();
-                    let value: Result<axum::http::HeaderValue, _> = s.parse();
-                    if let (Ok(name), Ok(value)) = (name, value) {
-                        rb = rb.header(name, value);
-                    }
+    if let Some(ref eh) = extra_headers_override
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh)
+    {
+        for (k, v) in parsed {
+            if let Some(s) = v.as_str() {
+                let name: Result<axum::http::HeaderName, _> = k.parse();
+                let value: Result<axum::http::HeaderValue, _> = s.parse();
+                if let (Ok(name), Ok(value)) = (name, value) {
+                    rb = rb.header(name, value);
                 }
             }
         }

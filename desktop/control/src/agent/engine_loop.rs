@@ -678,15 +678,15 @@ pub(crate) async fn stream_turn(
         .post(&url)
         .header("content-type", "application/json")
         .body(raw.to_vec());
-    if let Some(ref eh) = shared.meta.extra_headers {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh) {
-            for (k, v) in parsed {
-                if let Some(s) = v.as_str() {
-                    let name: Result<reqwest::header::HeaderName, _> = k.parse();
-                    let value: Result<reqwest::header::HeaderValue, _> = s.parse();
-                    if let (Ok(name), Ok(value)) = (name, value) {
-                        req = req.header(name, value);
-                    }
+    if let Some(ref eh) = shared.meta.extra_headers
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh)
+    {
+        for (k, v) in parsed {
+            if let Some(s) = v.as_str() {
+                let name: Result<reqwest::header::HeaderName, _> = k.parse();
+                let value: Result<reqwest::header::HeaderValue, _> = s.parse();
+                if let (Ok(name), Ok(value)) = (name, value) {
+                    req = req.header(name, value);
                 }
             }
         }
