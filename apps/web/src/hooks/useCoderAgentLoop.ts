@@ -58,6 +58,7 @@ export interface UseCoderAgentLoopOptions {
   mcpToolsRef: React.MutableRefObject<McpToolInfo[]>;
   planMode: boolean;
   dynamicSystemRef: React.MutableRefObject<string>;
+  codebaseContextRef: React.MutableRefObject<string>;
   todosRef: React.MutableRefObject<TodoItem[]>;
   todosRevRef: React.MutableRefObject<number>;
   todosRevAtReqStartRef: React.MutableRefObject<number>;
@@ -310,7 +311,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
     const respMax =
       maxContext > 0 ? Math.min(Math.max(Math.floor(maxContext / 2), respFloor), 16384) : 8192;
 
-    const sysTokenEstimate = Math.ceil(opts.dynamicSystemRef.current.length / CHARS_PER_TOKEN);
+    const sysTokenEstimate = Math.ceil((opts.dynamicSystemRef.current.length + opts.codebaseContextRef.current.length) / CHARS_PER_TOKEN);
     const estimateTokens = (msgs: ChatMessage[]): number => {
       let n = sysTokenEstimate;
       for (const m of msgs) {
@@ -342,7 +343,10 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               baseUrl: primaryConfig.baseUrl,
               apiKey: primaryConfig.apiKey,
               extraHeaders: primaryConfig.extraHeaders,
-              systemPrompt: opts.dynamicSystemRef.current,
+              // A one-off call over the whole history, not a growing prefix,
+              // so there's no cache locality to protect — give it the full
+              // codebase context for a better-grounded summary.
+              systemPrompt: [opts.dynamicSystemRef.current, opts.codebaseContextRef.current].filter(Boolean).join('\n\n'),
               history: currentMessages,
               maxTokens: 2048,
               signal: opts.abortRef.current?.signal,
@@ -409,16 +413,19 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
         const system = opts.planMode
           ? `${opts.dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
           : opts.dynamicSystemRef.current;
-        // Live task-list + intent rules move OUT of the system message and
+        // Live task-list + intent rules + codebase context (repo map,
+        // conventions, followed files) move OUT of the system message and
         // into streamTurn's per-turn trailing note (with the date/time),
-        // appended after the conversation history instead: both change on
-        // most steps (a completed todo, a newly tagged component), and
-        // baking either into the system prefix would invalidate the
-        // engine's KV-cache reuse (and cacheSystem's cache_control
-        // breakpoint) for the entire growing history on every such step —
-        // exactly the mechanism that used to make this run's system prompt
-        // change on nearly every mutating tool call.
-        const turnContext = [intentRulesBlock, todoSystemBlock(opts.todosRef.current)].filter(Boolean).join('\n\n');
+        // appended after the conversation history instead: all of these
+        // change on most steps (a completed todo, a newly tagged component,
+        // a file the agent just edited), and baking any of them into the
+        // system prefix would invalidate the engine's KV-cache reuse (and
+        // cacheSystem's cache_control breakpoint) for the entire growing
+        // history on every such step — exactly the mechanism that used to
+        // make this run's system prompt change on nearly every mutating
+        // tool call (codebaseContextRef used to be inlined into
+        // dynamicSystemRef and re-set by refreshRepoMap() after every one).
+        const turnContext = [intentRulesBlock, todoSystemBlock(opts.todosRef.current), opts.codebaseContextRef.current].filter(Boolean).join('\n\n');
         opts.todosRevAtReqStartRef.current = opts.todosRevRef.current;
         const wireMessages = await packForRequest(currentMessages);
         const turnParams = {

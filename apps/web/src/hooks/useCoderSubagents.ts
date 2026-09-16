@@ -27,6 +27,7 @@ export interface UseCoderSubagentsOptions {
   appConfig: any;
   coderParams: CoderParams;
   dynamicSystemRef: React.RefObject<string>;
+  codebaseContextRef: React.RefObject<string>;
   requestApproval: (tool: string, detail: string) => Promise<boolean>;
   addLog: (entry: Omit<LogEntry, 'id' | 'time'>) => void;
   memoryRef: React.RefObject<CoderMemory>;
@@ -39,6 +40,7 @@ export function useCoderSubagents({
   appConfig,
   coderParams,
   dynamicSystemRef,
+  codebaseContextRef,
   requestApproval,
   addLog,
   memoryRef,
@@ -262,7 +264,11 @@ export function useCoderSubagents({
           apiKey: subConfig.apiKey,
           extraHeaders: subConfig.extraHeaders,
           allowFallback: appConfig?.cloudFallbackToLocal !== false,
-          system: dynamicSystemRef.current ?? undefined,
+          // Worker runs a single self-contained task as its own fresh
+          // conversation (no shared history to protect from cache
+          // invalidation), so — unlike the supervisor's own turns — it's
+          // safe and correct to give it the full codebase context inline.
+          system: [dynamicSystemRef.current, codebaseContextRef.current].filter(Boolean).join('\n\n') || undefined,
           maxSteps,
           toolSet: 'coder',
           toolNames: names,
@@ -328,7 +334,7 @@ export function useCoderSubagents({
         jobs.unregisterSub(subId);
       }
     },
-    [activeWsDir, appConfig, coderParams, dynamicSystemRef, jobs, addLog, requestApproval, summarizeCutoff]
+    [activeWsDir, appConfig, coderParams, dynamicSystemRef, codebaseContextRef, jobs, addLog, requestApproval, summarizeCutoff]
   );
 
   const runCritic = useCallback(
