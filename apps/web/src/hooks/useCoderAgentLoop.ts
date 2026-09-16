@@ -11,8 +11,6 @@ import {
   frameCompactedSummary,
   coderExec,
   coderDiff,
-  suggestFollowUps,
-  buildChatRequest,
   streamChat,
 } from '../lib/api';
 import {
@@ -25,7 +23,7 @@ import {
 } from '../lib/coderTools';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { resolveProviderConfig } from '../lib/chatHelpers';
-import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type TurnResult } from '../lib/agentLoop';
+import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, contextNoteMessage, type TurnResult } from '../lib/agentLoop';
 import { packForRequest } from '../lib/observationPack';
 import { effectiveVoice, humanizeRewriteText } from '../lib/notai';
 import { detectCommands, todoSystemBlock } from '../lib/coderStore';
@@ -123,59 +121,22 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
     }
     await opts.refreshRepoMap();
 
+    // No task-categorizer call here (unlike a design that once tagged each
+    // task's component via a separate model call): that call went to the
+    // same local engine, with its own system prompt, right before the main
+    // run's first request — a throwaway continuation that competes with
+    // this run's for the same small device-state/catalog slots, same
+    // failure mode as scout probes and suggestFollowUps below. Skipping the
+    // classification just means every component's intent rules are shown
+    // instead of only the relevant ones — a precision loss, not a
+    // correctness one.
     let intentRulesBlock = '';
     try {
       const mem = opts.memoryRef.current;
-      const comps = Array.from(
-        new Set((mem?.learnings || []).map((l) => l.component).filter((c) => c && c !== 'general'))
-      );
-      let activeComponents = new Set<string>(['general']);
-
-      const lastUserMsg =
-        [...currentMessages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content || '';
-      if (comps.length > 0 && lastUserMsg) {
-        const taggerPrompt = `TASK: \`\`\`\n${lastUserMsg.slice(
-          0,
-          500
-        )}\n\`\`\`\n\nWhich of the following components does this task involve? ${comps.join(
-          ', '
-        )}\nReply with a JSON array of strings.`;
-        const taggerModel = opts.coderParams.criticModel?.trim() || opts.modelRef.current || 'qwen-coder';
-        const taggerCfg = resolveProviderConfig('subagent', opts.appConfig, {
-          provider: opts.coderParams.subagentProvider,
-          cloudModel: opts.coderParams.subagentCloudModel,
-          taskWeight: 'light',
-        }, taggerModel);
-        const req = buildChatRequest(
-          taggerCfg.model,
-          'You are a task categorizer. Reply only with a JSON array of matching component strings.',
-          [{ role: 'user', content: taggerPrompt }],
-          { thinking: false, maxTokens: 100 } as ChatParams,
-          {}
-        );
-        let textContent = '';
-        await streamChat(req, new AbortController().signal, {
-          onContentDelta: (t: string) => {
-            textContent += t;
-          },
-        }, {
-          baseUrl: taggerCfg.baseUrl,
-          apiKey: taggerCfg.apiKey,
-          extraHeaders: taggerCfg.extraHeaders,
-          allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
-        });
-        const jsonMatch = textContent.match(/\[[\s\S]*?\]/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          for (const c of parsed) activeComponents.add(c);
-        }
-      }
-
       if (mem && mem.learnings.length > 0) {
         const byComponent: Record<string, any[]> = {};
         for (const l of mem.learnings) {
           const comp = l.component || 'general';
-          if (!activeComponents.has(comp) && activeComponents.size > 1) continue;
           if (!byComponent[comp]) byComponent[comp] = [];
           byComponent[comp].push(l);
         }
@@ -415,19 +376,54 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           : opts.dynamicSystemRef.current;
         // Live task-list + intent rules + codebase context (repo map,
         // conventions, followed files) move OUT of the system message and
-        // into streamTurn's per-turn trailing note (with the date/time),
-        // appended after the conversation history instead: all of these
-        // change on most steps (a completed todo, a newly tagged component,
-        // a file the agent just edited), and baking any of them into the
-        // system prefix would invalidate the engine's KV-cache reuse (and
-        // cacheSystem's cache_control breakpoint) for the entire growing
-        // history on every such step — exactly the mechanism that used to
-        // make this run's system prompt change on nearly every mutating
-        // tool call (codebaseContextRef used to be inlined into
-        // dynamicSystemRef and re-set by refreshRepoMap() after every one).
+        // into a persisted contextNoteMessage() appended to real history
+        // instead: all of these change on most steps (a completed todo, a
+        // newly tagged component, a file the agent just edited), and baking
+        // any of them into the system prefix would invalidate the engine's
+        // KV-cache reuse (and cacheSystem's cache_control breakpoint) for
+        // the entire growing history on every such step — exactly the
+        // mechanism that used to make this run's system prompt change on
+        // nearly every mutating tool call (codebaseContextRef used to be
+        // inlined into dynamicSystemRef and re-set by refreshRepoMap()
+        // after every one). The note is appended as real history (not
+        // recomputed and dropped) because a discarded trailing note has the
+        // same effect: the next request is never a byte extension of what
+        // the engine actually generated against, so its own continuation
+        // cache never matches either — see contextNoteMessage.
         const turnContext = [intentRulesBlock, todoSystemBlock(opts.todosRef.current), opts.codebaseContextRef.current].filter(Boolean).join('\n\n');
         opts.todosRevAtReqStartRef.current = opts.todosRevRef.current;
-        const wireMessages = await packForRequest(currentMessages);
+        const contextNote = contextNoteMessage(turnContext);
+        if (contextNote) {
+          currentMessages = [...currentMessages, contextNote];
+          opts.updateRunMessages((prev) => [...prev, contextNote]);
+        }
+        // Adopt packForRequest's result as real history instead of a
+        // wire-only view: packForRequest is pure (never mutates its input)
+        // specifically so a caller can choose either — but a wire-only view
+        // means the FIRST turn a given tool result crosses the packing
+        // threshold, that turn's prompt has a message shrink out from under
+        // it relative to what the engine actually cached from the previous
+        // turn, which breaks continuation matching for that entire request
+        // (confirmed empirically: an otherwise-60% cache hit turn drops to
+        // 0% the moment one earlier tool result gets packed on the wire but
+        // not in history). Since a new tool result crosses that threshold on
+        // nearly every turn of a real tool-heavy run, that 0% was chronic,
+        // not a one-off. Persisting it — via the same "replace this message
+        // object in place" mirroring already used for assistant-turn edits
+        // above — makes each pack transition a one-time, permanent part of
+        // history, so every later request is a true extension again. The
+        // placeholder text itself remains human-readable and points at
+        // obs_recall, so nothing is actually lost from the transcript.
+        const packedMessages = await packForRequest(currentMessages);
+        if (packedMessages !== currentMessages) {
+          const replaced = new Map<ChatMessage, ChatMessage>();
+          packedMessages.forEach((m, i) => {
+            if (m !== currentMessages[i]) replaced.set(currentMessages[i], m);
+          });
+          currentMessages = packedMessages;
+          opts.updateRunMessages((prev) => prev.map((m) => replaced.get(m) ?? m));
+        }
+        const wireMessages = currentMessages;
         const turnParams = {
           thinking: opts.coderParams.thinking,
           reasoningEffort: opts.coderParams.thinkLevel,
@@ -451,8 +447,6 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               params: turnParams,
               tools: activeTools,
               cacheSystem: opts.coderParams.promptCache,
-              extraContext: turnContext,
-              appendDateTime: true,
               signal: opts.abortRef.current.signal,
               stream: (r, sig, cb) => {
                 const primaryConfig = resolveProviderConfig('primary', opts.appConfig, {
@@ -678,28 +672,12 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
             }
           }
           if (bounced) continue;
-          if (!opts.abortRef.current?.signal.aborted && finishReason !== 'length') {
-            const lastAssistant = currentMessages[currentMessages.length - 1];
-            if (lastAssistant?.role === 'assistant' && lastAssistant.content.trim()) {
-              try {
-                const followUps = await suggestFollowUps({
-                  model,
-                  baseUrl: primaryConfig.baseUrl,
-                  apiKey: primaryConfig.apiKey,
-                  extraHeaders: primaryConfig.extraHeaders,
-                  history: [...wireMessages, lastAssistant],
-                  signal: opts.abortRef.current?.signal,
-                });
-                if (!opts.abortRef.current?.signal.aborted && followUps.length) {
-                  const withFollowUps: ChatMessage = { ...lastAssistant, followUps };
-                  currentMessages = currentMessages.map((m) => (m === lastAssistant ? withFollowUps : m));
-                  opts.updateRunMessages((prev) => prev.map((m) => (m === lastAssistant ? withFollowUps : m)));
-                }
-              } catch (followUpError) {
-                console.warn('[coder] follow-up suggestions skipped', followUpError);
-              }
-            }
-          }
+          // No suggestFollowUps call here (unlike ChatScreen's plain chat
+          // loop): it's a separate request to the same local engine, with
+          // its own system prompt, that doesn't extend this run's
+          // continuation — it only competes with it for the same small
+          // device-state/catalog slots right as the run ends, same failure
+          // mode as the scout probes and task-tagger call above.
           break;
         }
       }

@@ -122,9 +122,10 @@ function toolsAvailableBlock(toolNames: string[]): string {
 // reuse, and the Anthropic-style cache_control breakpoint chatHelpers'
 // callers can request) only reuses tokens up to the first point of
 // divergence, a value that changes almost every turn there silently zeroes
-// out caching for the entire history on every single turn. Callers pass the
-// date instead as buildChatRequest's `trailingNote` (see chat.ts), appended
-// AFTER history so only that small tail reprices each turn.
+// out caching for the entire history on every single turn. Callers append
+// the date instead as a persisted contextNoteMessage() (see agentLoop.ts),
+// added to real history after the conversation so far rather than baked
+// into this system prompt.
 export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory, computerUseDir?: string, toolNames?: string[]): string => {
   const base = effectiveSystemPrompt(params);
   return [base, CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? '')].filter(Boolean).join('\n\n');

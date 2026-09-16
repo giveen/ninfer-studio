@@ -27,17 +27,40 @@ const DB_VERSION = 1;
 const PACK_THRESHOLD_BYTES = 4 * 1024;
 /** Sent in full for this many prior turns before being packed. */
 const PACK_FULL_SENDS = 2;
+/** Minimum number of newly-eligible tool results to pack in one pass. Once a
+ *  message is packed, the caller is expected to persist that shrink into
+ *  real history (see useCoderAgentLoop.ts's runAgent), so it never needs
+ *  reprocessing — but the FIRST turn any given message gets packed still
+ *  changes a byte the engine already cached a continuation against, and
+ *  that turn's whole request misses the KV/prefix cache no matter what
+ *  (confirmed empirically: the engine only ever matches an exact extension
+ *  of the last request it processed, not a merely-overlapping prefix). In a
+ *  tool-call-heavy run a new result crosses PACK_FULL_SENDS on nearly every
+ *  turn, so packing one at a time means nearly every turn pays that miss.
+ *  Batching multiple eligible results into a single pack event cuts how
+ *  often that happens by roughly this factor, at the cost of carrying a
+ *  slightly larger backlog of not-yet-packed (but already-old) results in
+ *  context in the meantime. */
+const PACK_BATCH_SIZE = 8;
 /** Placeholder excerpt budget, split evenly between head and tail. */
 const PACK_EXCERPT_BYTES = 1024;
 
 const RECALL_MAX_BYTES = 4000;
 const RECALL_MAX_LINES = 200;
 const OBSERVATION_ID_PATTERN = /^obs_[a-f0-9]{24}$/;
-/** Tools whose results are already bounded/paged, or that ARE the recall
- *  path itself — never pack (this module) or AI-summarize (maybeSummarizeTool
- *  in CoderScreen.tsx) these. Shared so the two "large tool output" pipelines
- *  can't drift on what counts as already-bounded. */
-export const LARGE_OUTPUT_EXCLUDED_TOOLS = new Set(['grep', 'glob', 'repo_search', 'obs_recall']);
+/** Tools that ARE the recall path itself — packing or AI-summarizing
+ *  (maybeSummarizeTool in CoderScreen.tsx) obs_recall's own output would be
+ *  circular. Shared so the two "large tool output" pipelines can't drift on
+ *  what's excluded.
+ *
+ *  grep/glob/repo_search used to be excluded too, on the assumption their
+ *  own result caps made them "already bounded" — but grep's default
+ *  maxMatches is 2000 (each line truncated to only 400 chars, so a single
+ *  broad grep can still return ~800KB) and glob truncates to 4000 paths, both
+ *  far past PACK_THRESHOLD_BYTES. Since neither pipeline ever touched them,
+ *  repeated searches over a long session accumulated in context forever
+ *  instead of aging out like every other tool result. */
+export const LARGE_OUTPUT_EXCLUDED_TOOLS = new Set(['obs_recall']);
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 function getDb(): Promise<IDBDatabase> {
@@ -169,16 +192,58 @@ export interface ToolResultText {
   hasStd: boolean;
 }
 
+/** Replace a tool result's large field with `placeholder`, whichever shape
+ *  it came from. For the matches/files array shapes the bulky original
+ *  array is deleted, not left dangling alongside the new `content` field —
+ *  otherwise the result would grow instead of shrink. */
+export function applyResultPlaceholder(res: Record<string, unknown>, placeholder: string): void {
+  if (typeof res.stdout === 'string' || typeof res.stderr === 'string') {
+    res.stdout = placeholder;
+    res.stderr = '';
+    return;
+  }
+  delete res.matches;
+  delete res.files;
+  res.content = placeholder;
+}
+
+/** Render a JSON array field (grep's `matches`, glob's `files`) as
+ *  readable lines so the placeholder's head/tail excerpt stays meaningful
+ *  instead of showing a JSON fragment. */
+function renderListField(list: unknown[]): string {
+  return list
+    .map((item) => {
+      if (item && typeof item === 'object' && 'file' in item) {
+        const m = item as { file: unknown; line?: unknown; text?: unknown };
+        return m.line !== undefined ? `${m.file}:${m.line}: ${m.text ?? ''}` : String(m.file);
+      }
+      return typeof item === 'string' ? item : JSON.stringify(item);
+    })
+    .join('\n');
+}
+
 /** Extract the large-text field (and which shape it came from) out of an
  *  already-JSON-parsed tool result — shared by ObservationPack and
  *  maybeSummarizeTool in CoderScreen.tsx so the two "large tool output"
- *  pipelines can't disagree on what counts as a result's text. Returns null
- *  for a result with neither shape. */
+ *  pipelines can't disagree on what counts as a result's text. Handles the
+ *  stdout/stderr shape (bash/exec-style tools), a plain `content` string,
+ *  and grep's `matches`/glob's `files` array shapes — those two used to be
+ *  excluded entirely (see LARGE_OUTPUT_EXCLUDED_TOOLS) on the assumption
+ *  their own result caps made them small enough not to need this, but
+ *  grep's default 2000-match cap and glob's 4000-path cap both run well
+ *  past PACK_THRESHOLD_BYTES in practice. Returns null for a result with
+ *  none of these shapes. */
 export function extractToolResultText(res: Record<string, unknown>): ToolResultText | null {
   const hasStd = typeof res.stdout === 'string' || typeof res.stderr === 'string';
   const hasContent = typeof res.content === 'string';
-  if (!hasStd && !hasContent) return null;
-  const text = hasStd ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}` : (res.content as string);
+  const hasMatches = Array.isArray(res.matches);
+  const hasFiles = Array.isArray(res.files);
+  if (!hasStd && !hasContent && !hasMatches && !hasFiles) return null;
+  const text = hasStd
+    ? `${(res.stdout as string) || ''}\n${(res.stderr as string) || ''}`
+    : hasContent
+      ? (res.content as string)
+      : renderListField((hasMatches ? res.matches : res.files) as unknown[]);
   return { text, hasStd };
 }
 
@@ -212,8 +277,13 @@ const packedCache = new Map<string, string>();
 /** Build the request-only view of `messages`: any tool-result message old
  *  enough (PACK_FULL_SENDS turns behind the newest tool result) and large
  *  enough (PACK_THRESHOLD_BYTES) gets its content field replaced with a
- *  placeholder. The canonical, displayed message array is never touched —
- *  this returns a new array, or the same reference when nothing changed.
+ *  placeholder — but only once at least PACK_BATCH_SIZE such messages are
+ *  eligible at once, packed together in one pass (see PACK_BATCH_SIZE). This
+ *  function itself never mutates `messages` — it returns a new array, or
+ *  the same reference when nothing changed — but a caller that wants the
+ *  batching to actually reduce cache misses (rather than just deferring
+ *  them) needs to adopt the result as real history, not just a wire-only
+ *  view of it: see useCoderAgentLoop.ts's runAgent.
  *
  *  History here is append-only within a run (aside from compaction, which
  *  replaces the whole array), so "N tool-result messages appear later in
@@ -226,6 +296,11 @@ export async function packForRequest(messages: ChatMessage[]): Promise<ChatMessa
 
   let changed = false;
   const out = messages.slice();
+
+  // Pass 1: reapply placeholders already decided on a prior call (cheap,
+  // and never a NEW divergence — just reproducing an existing decision) and
+  // collect candidates that would be newly eligible this call.
+  const newlyEligible: Array<{ idx: number; text: string; res: Record<string, unknown> }> = [];
   for (let rank = 0; rank < toolIndices.length; rank += 1) {
     const laterCount = toolIndices.length - 1 - rank;
     if (laterCount < PACK_FULL_SENDS) continue; // still within its full-send window
@@ -242,20 +317,23 @@ export async function packForRequest(messages: ChatMessage[]): Promise<ChatMessa
 
     const packable = extractPackable(m.name, originalContent);
     if (!packable) continue;
-    const { text, res } = packable;
-    if (new TextEncoder().encode(text).length <= PACK_THRESHOLD_BYTES) continue;
+    if (new TextEncoder().encode(packable.text).length <= PACK_THRESHOLD_BYTES) continue;
+    newlyEligible.push({ idx, ...packable });
+  }
 
+  // Pass 2: only actually pack once PACK_BATCH_SIZE have piled up, and pack
+  // all of them together — see PACK_BATCH_SIZE for why one-at-a-time is
+  // costly. Below the batch size, leave these full for now; they'll be
+  // reconsidered (still eligible, plus whatever else piles up) next call.
+  if (newlyEligible.length < PACK_BATCH_SIZE) return changed ? out : messages;
+  for (const { idx, text, res } of newlyEligible) {
+    const m = out[idx];
     const id = `obs_${(await hashText(text)).slice(0, 24)}`;
     await ensureStored(id, text);
     const placeholder = placeholderFor(id, m.name || 'tool', text);
-    if (typeof res.stdout === 'string' || typeof res.stderr === 'string') {
-      res.stdout = placeholder;
-      res.stderr = '';
-    } else {
-      res.content = placeholder;
-    }
+    applyResultPlaceholder(res, placeholder);
     const packedContent = JSON.stringify(res);
-    packedCache.set(originalContent, packedContent);
+    packedCache.set(m.content, packedContent);
     out[idx] = { ...m, content: packedContent };
     changed = true;
   }
@@ -296,12 +374,7 @@ export async function maybeSummarizeTool(
     if (!receipt) return resultStr;
     const tail = text.slice(-SUMMARY_TAIL);
     const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
-    if (hasStd) {
-      res.stdout = wrapped;
-      res.stderr = '';
-    } else {
-      res.content = wrapped;
-    }
+    applyResultPlaceholder(res, wrapped);
     res._summarized = true;
     return JSON.stringify(res);
   } catch {

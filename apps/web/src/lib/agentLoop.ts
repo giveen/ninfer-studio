@@ -219,8 +219,41 @@ function toolNameOf(t: unknown): string | null {
   return typeof fn.name === 'string' && fn.name ? fn.name : null;
 }
 
+/** Build a small persisted "context for this turn" message (date/time plus
+ *  any extra per-turn text) — a real `ChatMessage` the caller appends to
+ *  actual history before the turn, not a value threaded through
+ *  `streamTurn`/`buildChatRequest` and discarded afterward. That older
+ *  design recomputed this block fresh every turn and dropped it right
+ *  after, so it never sat in front of the growing history — but the engine
+ *  still generated its reply *with those exact tokens in context*. The next
+ *  turn's real prompt (history + new content) was therefore never a byte
+ *  extension of what the previous turn actually sent: the tail the model
+ *  saw got silently swapped out from under it. Prefix/continuation caching
+ *  (the engine's own KV-cache reuse, and the Anthropic-style `cache_control`
+ *  breakpoint `cacheSystem` requests) only ever match a request that
+ *  extends the previous one byte-for-byte, so that swap zeroed out caching
+ *  for the entire history on every single turn — confirmed against the
+ *  ninfer engine directly (see the fix-scout-cache-eviction branch notes).
+ *  Persisting the note instead — even though its date/time stamp goes stale
+ *  the moment history moves on — keeps every request a true extension of
+ *  the last. Returns null when there's nothing to add. */
+export function contextNoteMessage(extra?: string): ChatMessage | null {
+  const text = [extra, localDateTimeBlock()].filter(Boolean).join('\n\n').trim();
+  if (!text) return null;
+  return {
+    role: 'user',
+    displayName: 'Context',
+    collapsed: true,
+    content: `[System context for this turn — not something the user said]\n\n${text}`,
+  };
+}
+
 /** Stream one assistant turn: accumulate deltas/usage/tool calls, then fall
- *  back to markup recovery when the model emitted calls as text. */
+ *  back to markup recovery when the model emitted calls as text. Per-turn
+ *  context (date/time, live todos, ...) is the caller's concern now — fold
+ *  it into `messages` via `contextNoteMessage` before calling this, so it's
+ *  persisted rather than reinvented and dropped each turn (see
+ *  `contextNoteMessage` for why that distinction matters for caching). */
 export async function streamTurn(opts: {
   model: string;
   system: string | undefined;
@@ -228,36 +261,22 @@ export async function streamTurn(opts: {
   params: ChatParams;
   tools?: unknown[];
   cacheSystem?: boolean;
-  /** Append the current date/time as a trailing message, after the whole
-   *  conversation history, instead of baking it into the system prompt.
-   *  Recomputed fresh on every call (this function's own concern, not the
-   *  caller's) so a multi-turn tool loop's system prompt — and hence its
-   *  cacheable prefix — never has to change just because the clock ticked;
-   *  see buildChatRequest's `trailingNote` for why position matters here. */
-  appendDateTime?: boolean;
-  /** Extra per-turn context (live todo list, intent-continuity rules, ...)
-   *  that must reach the model fresh every turn but shouldn't sit inside
-   *  the cacheable system prefix (see appendDateTime) — combined with the
-   *  date/time block, if requested, into one trailing message. */
-  extraContext?: string;
   signal: AbortSignal;
   stream?: StreamFn;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string) => void;
   onStreamError?: (message: string) => void;
 }): Promise<TurnResult> {
-  const { model, system, messages, params, tools, cacheSystem, appendDateTime, extraContext, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
+  const { model, system, messages, params, tools, cacheSystem, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
   let content = '';
   let reasoning = '';
   let toolCalls: AgentToolCall[] = [];
   let finishReason: string | undefined;
   let meta: MessageMeta = {};
-  const trailingNote = [extraContext, appendDateTime ? localDateTimeBlock() : ''].filter(Boolean).join('\n\n');
   const req = buildChatRequest(
     model, system, messages, params,
     tools && tools.length ? { tools } : undefined,
     cacheSystem,
-    trailingNote || undefined,
   );
   await stream(req, signal, {
     onContentDelta: (t) => { content += t; onDelta?.('content', t); },
@@ -357,8 +376,9 @@ export interface ToolLoopOptions {
   signal: AbortSignal;
   stream?: StreamFn;
   cacheSystem?: boolean;
-  /** See streamTurn's `appendDateTime` — applied fresh on every internal
-   *  turn of this loop, not just once for the whole call. */
+  /** Append a fresh `contextNoteMessage()` (date/time) to real history
+   *  before every internal turn of this loop — persisted, not discarded;
+   *  see `contextNoteMessage`. */
   appendDateTime?: boolean;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string, turn: number) => void;
@@ -394,8 +414,15 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
   while (turns < maxSteps) {
     if (signal.aborted) return { messages, turns, stop: 'aborted', finishReason, meta };
     opts.onTurnStart?.(turns);
+    if (appendDateTime) {
+      const note = contextNoteMessage();
+      if (note) {
+        messages = [...messages, note];
+        opts.onAppended?.([note], turns);
+      }
+    }
     const t = await streamTurn({
-      model, system, messages, params, tools, cacheSystem, appendDateTime, signal, stream, recoverMarkup,
+      model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
       onStreamError: (msg) => opts.onStreamError?.(msg, turns),
     });
