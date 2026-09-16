@@ -19,35 +19,11 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
-  # 1. Create one draft release up-front so every matrix job can append to it.
-  create-release:
-    runs-on: ubuntu-24.04
-    outputs:
-      release_id: ${{ steps.create.outputs.id }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create draft release
-        id: create
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const tag = context.ref.replace('refs/tags/', '');
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: tag,
-              name: `NInfer Studio ${tag}`,
-              draft: true,
-              prerelease: false,
-            });
-            core.setOutput('id', data.id);
-
-  # 2. Build + bundle on each platform, uploading into the draft release.
+  # Build + bundle on each platform, uploading into the draft release.
   build:
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -104,5 +80,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop/app
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: v__VERSION__
+          releaseName: 'NInfer Studio v__VERSION__'
+          releaseDraft: true
+          prerelease: false
           args: ${{ matrix.args }}
