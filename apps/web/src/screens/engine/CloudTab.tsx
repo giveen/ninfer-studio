@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles } from 'lucide-react';
 import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
-import { testCloudConnection, fetchCloudModels, type CloudTestResult } from '../../lib/api';
+import { testCloudConnection, type CloudTestResult, type CloudModelInfo } from '../../lib/api';
 
 interface CloudTabProps {
   settings: AppSettings | null;
@@ -76,6 +76,9 @@ const PRESETS: ProviderPreset[] = [
 export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [apiDraft, setApiDraft] = useState('');
   const [models, setModels] = useState<string[]>([]);
+  /** Context length / $ pricing for whichever models the provider reported
+   *  it for (OpenRouter does, most others don't) — keyed by model id. */
+  const [modelInfo, setModelInfo] = useState<Record<string, CloudModelInfo>>({});
   const [testing, setTesting] = useState(false);
   const [retrieving, setRetrieving] = useState(false);
   const [retrieveNotice, setRetrieveNotice] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -106,6 +109,15 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     if (preset.extraHeaders) setShowHeaders(true);
   };
 
+  const applyModelInfo = (info: CloudModelInfo[] | undefined) => {
+    if (!info?.length) return;
+    setModelInfo((prev) => {
+      const next = { ...prev };
+      for (const m of info) next[m.id] = m;
+      return next;
+    });
+  };
+
   const handleRetrieveModels = async () => {
     setRetrieving(true);
     setRetrieveNotice(null);
@@ -115,9 +127,11 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
       // stored secret (the UI only ever holds the redaction mask).
       const key = apiDraft.trim();
       const headers = settings.cloudProviderExtraHeaders;
-      const list = await fetchCloudModels(baseUrl, key, headers);
-      setModels(list);
-      setRetrieveNotice({ ok: true, msg: `Retrieved ${list.length} model${list.length === 1 ? '' : 's'} from endpoint` });
+      const res = await testCloudConnection(baseUrl, key, headers);
+      if (!res.ok) throw new Error(res.error || 'Failed to retrieve models');
+      setModels(res.models);
+      applyModelInfo(res.modelInfo);
+      setRetrieveNotice({ ok: true, msg: `Retrieved ${res.models.length} model${res.models.length === 1 ? '' : 's'} from endpoint` });
     } catch (e) {
       setRetrieveNotice({ ok: false, msg: e instanceof Error ? e.message : 'Failed to retrieve models' });
     } finally {
@@ -136,10 +150,29 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
       setTestResult(res);
       if (res.ok && res.models.length > 0) {
         setModels(res.models);
+        applyModelInfo(res.modelInfo);
       }
     } finally {
       setTesting(false);
     }
+  };
+
+  /** Compact "128K ctx · $3.00/$15.00 per M" caption for a model the
+   *  provider reported pricing/context for — omitted entirely (not "—")
+   *  when nothing is known, matching how the rest of this tab treats
+   *  provider-reported optional metadata. */
+  const modelInfoCaption = (modelId: string): string | null => {
+    const info = modelInfo[modelId];
+    if (!info) return null;
+    const parts: string[] = [];
+    if (info.contextLength) {
+      parts.push(`${info.contextLength >= 1000 ? `${Math.round(info.contextLength / 1000)}K` : info.contextLength} ctx`);
+    }
+    if (info.pricePromptPerM != null || info.priceCompletionPerM != null) {
+      const fmt = (n: number | undefined) => (n != null ? `$${n.toFixed(2)}` : '?');
+      parts.push(`${fmt(info.pricePromptPerM)}/${fmt(info.priceCompletionPerM)} per M`);
+    }
+    return parts.length ? parts.join(' · ') : null;
   };
 
 
@@ -310,6 +343,9 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                         placeholder="Custom model name..."
                         className="text-[12px]"
                       />
+                      {modelInfoCaption(primaryModel) && (
+                        <p className="text-[11px] text-faint">{modelInfoCaption(primaryModel)}</p>
+                      )}
                     </div>
                   </Field>
 
@@ -326,6 +362,9 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                         placeholder="Custom model name..."
                         className="text-[12px]"
                       />
+                      {modelInfoCaption(subagentModel) && (
+                        <p className="text-[11px] text-faint">{modelInfoCaption(subagentModel)}</p>
+                      )}
                     </div>
                   </Field>
                 </div>

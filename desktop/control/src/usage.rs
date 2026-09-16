@@ -98,6 +98,22 @@ async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
     f.write_all(b"\n").await
 }
 
+/// `POST /api/usage/reset` — delete the usage log outright so the Usage tab
+/// starts from a clean slate (e.g. after a change expected to shift the
+/// numbers, like a cache-hit-rate fix, where old and new behavior mixed
+/// together in one average would hide whether it actually helped).
+/// Irreversible; takes the same per-store lock `log_usage_event` does so a
+/// write in flight can't interleave with the delete.
+pub(crate) async fn usage_reset(AxumState(state): AxumState<S>) -> Json<Value> {
+    let lock = mem_lock(&state, "usage");
+    let _guard = lock.lock().await;
+    match tokio::fs::remove_file(usage_log_path(&state)).await {
+        Ok(()) => Json(json!({ "ok": true })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
 async fn read_usage_events(state: &S) -> Vec<Value> {
     let Ok(raw) = tokio::fs::read_to_string(usage_log_path(state)).await else {
         return Vec::new();
@@ -118,6 +134,10 @@ struct DayAgg {
     prompt_tokens: u64,
     cached_tokens: u64,
     tokens_by_model: HashMap<String, u64>,
+    /// USD cost for events this day whose model has known pricing (see
+    /// `AppSettings::cloud_model_pricing`) — 0.0 when none of the day's
+    /// events matched a priced model, same as `cost_known` below.
+    cost_usd: f64,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +166,16 @@ pub(crate) async fn usage_stats(
     let energy_by_day = crate::power::energy_kwh_by_day(&state, &day_string(cutoff_ms)).await;
     let energy_total_kwh: f64 = energy_by_day.values().sum();
 
+    // Cloud $ pricing, keyed by model id exactly as logged (see
+    // AppSettings::cloud_model_pricing / cloud_test). Computed at read time
+    // (not log time) so a later price refresh re-prices old log lines too —
+    // same reasoning as `display_model_name` above.
+    let pricing = state.config.read().await.cloud_model_pricing.clone();
+    let price_event = |model: &str, prompt: u64, completion: u64| -> Option<f64> {
+        let p = pricing.get(model)?;
+        Some(prompt as f64 * p.prompt_per_token + completion as f64 * p.completion_per_token)
+    };
+
     let events: Vec<Value> = read_usage_events(&state)
         .await
         .into_iter()
@@ -173,6 +203,12 @@ pub(crate) async fn usage_stats(
     let mut days_seen: BTreeSet<String> = BTreeSet::new();
     let mut by_day: BTreeMap<String, DayAgg> = BTreeMap::new();
     let mut by_model: HashMap<String, u64> = HashMap::new(); // model -> tokens
+    let mut cost_by_model: HashMap<String, f64> = HashMap::new();
+    let mut cost_total = 0.0f64;
+    // Whether ANY event this window matched a priced model — lets the
+    // response send `null` (no pricing data at all) instead of a
+    // misleading "$0.00" when nothing here is actually free.
+    let mut cost_known = false;
 
     for e in &events {
         let prompt = e.get("promptTokens").and_then(Value::as_u64).unwrap_or(0);
@@ -186,8 +222,15 @@ pub(crate) async fn usage_stats(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let model = display_model_name(e.get("model").and_then(Value::as_str).unwrap_or("unknown"));
+        let raw_model = e.get("model").and_then(Value::as_str).unwrap_or("unknown");
+        let model = display_model_name(raw_model);
         let tokens = prompt + completion;
+        let event_cost = price_event(raw_model, prompt, completion);
+        if let Some(c) = event_cost {
+            cost_known = true;
+            cost_total += c;
+            *cost_by_model.entry(model.clone()).or_insert(0.0) += c;
+        }
 
         if let (Some(prefill_ms), Some(total_ms)) = (
             e.get("prefillMs").and_then(Value::as_u64),
@@ -221,6 +264,9 @@ pub(crate) async fn usage_stats(
             agg.prompt_tokens += prompt;
             agg.cached_tokens += cached;
             *agg.tokens_by_model.entry(model.clone()).or_insert(0) += tokens;
+            if let Some(c) = event_cost {
+                agg.cost_usd += c;
+            }
         }
         *by_model.entry(model).or_insert(0) += tokens;
     }
@@ -262,12 +308,15 @@ pub(crate) async fn usage_stats(
                 // model, colored the same way as the model-usage donut.
                 "models": agg.tokens_by_model,
                 "kwh": energy_by_day.get(day).copied().unwrap_or(0.0),
+                "cloudCostUsd": agg.cost_usd,
             })
         })
         .collect();
     let mut model_breakdown: Vec<Value> = by_model
         .into_iter()
-        .map(|(model, tokens)| json!({ "model": model, "tokens": tokens }))
+        .map(|(model, tokens)| {
+            json!({ "model": &model, "tokens": tokens, "cloudCostUsd": cost_by_model.get(&model).copied() })
+        })
         .collect();
     model_breakdown.sort_by(|a, b| b["tokens"].as_u64().cmp(&a["tokens"].as_u64()));
 
@@ -275,6 +324,7 @@ pub(crate) async fn usage_stats(
         "totals": {
             "tokenUsage": prompt_total + completion_total,
             "requests": requests,
+            "cloudCostUsd": if cost_known { Some(cost_total) } else { None },
             "activeDays": days_seen.len(),
             "avgCacheHitRate": cache_hit_rate,
             "mostUsedModel": most_used_model,

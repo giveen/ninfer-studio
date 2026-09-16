@@ -91,16 +91,33 @@ pub(crate) struct Turn {
 /// and `reasoning_effort` are derived from one intent (a contradictory pair
 /// is rejected by the engine), `max_completion_tokens` for the cap,
 /// snake_case sampling keys, greedy wins over a lingering temperature.
+///
+/// `cache_system` marks the system message with an Anthropic-style
+/// `cache_control: {"type": "ephemeral"}` breakpoint (as a content-parts
+/// array instead of a plain string) — pass `true` only when the request is
+/// cloud-routed. OpenRouter passes this through for Claude/Gemini models
+/// (a large win, since the coder/chat system prompt — often several KB —
+/// would otherwise be repriced in full on every turn); providers that don't
+/// recognize the field ignore the extra key, and the local engine never
+/// receives it since it's only set for cloud requests. `false` for the
+/// local engine, which doesn't benefit and shouldn't get a payload shape
+/// change it has no reason to see.
 pub fn build_request(
     model: &str,
     system: Option<&str>,
     messages: &[Value],
     params: &Value,
     tools: &Value,
+    cache_system: bool,
 ) -> Value {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     if let Some(sys) = system.map(str::trim).filter(|s| !s.is_empty()) {
-        msgs.push(json!({ "role": "system", "content": sys }));
+        let content = if cache_system {
+            json!([{ "type": "text", "text": sys, "cache_control": { "type": "ephemeral" } }])
+        } else {
+            json!(sys)
+        };
+        msgs.push(json!({ "role": "system", "content": content }));
     }
     for m in messages {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -653,22 +670,55 @@ pub fn pack_transcript(shared: &RunShared, context: &[Value]) -> Vec<Value> {
 /// calls over SSE, then fall back to markup recovery when the model emitted
 /// calls as text. `Err(STOP_ERR)` when a stop won the race; other errors
 /// are the engine's fault (bad status, transport, …).
+/// A [`stream_turn`] failure. `status` is the provider's HTTP status when
+/// the failure was an HTTP-level rejection (never set for a network/
+/// transport error or a stop) — the retry loop uses it to decide whether a
+/// cloud failure is worth falling back to the local engine for.
+#[derive(Debug)]
+pub(crate) struct StreamErr {
+    pub message: String,
+    pub status: Option<u16>,
+}
+
+impl From<String> for StreamErr {
+    fn from(message: String) -> Self {
+        StreamErr {
+            message,
+            status: None,
+        }
+    }
+}
+
+/// Stream one engine turn. When `force_local` is true, the request goes to
+/// the local engine regardless of the run's own cloud `base_url`/`api_key`/
+/// `extra_headers` — used by the retry loop's cloud→local fallback (see
+/// `run`), where `raw` has already had its `model` field patched to a local
+/// model by the caller.
 pub(crate) async fn stream_turn(
     state: &S,
     shared: &Arc<RunShared>,
     raw: &[u8],
-) -> Result<Turn, String> {
+    force_local: bool,
+) -> Result<Turn, StreamErr> {
     let port = crate::proxy::route_port(state, raw).await?;
-    let api_key = shared.meta.api_key.clone().unwrap_or_else(|| {
-        if let Ok(c) = state.config.try_read() {
-            c.api_key.clone()
+    let (base_url, api_key, extra_headers): (Option<String>, String, Option<String>) =
+        if force_local {
+            (None, state.config.read().await.api_key.clone(), None)
         } else {
-            String::new()
-        }
-    });
-    let url = shared
-        .meta
-        .base_url
+            let api_key = shared.meta.api_key.clone().unwrap_or_else(|| {
+                if let Ok(c) = state.config.try_read() {
+                    c.api_key.clone()
+                } else {
+                    String::new()
+                }
+            });
+            (
+                shared.meta.base_url.clone(),
+                api_key,
+                shared.meta.extra_headers.clone(),
+            )
+        };
+    let url = base_url
         .clone()
         .map(|u| format!("{}/chat/completions", u.trim_end_matches('/')))
         .unwrap_or_else(|| format!("http://127.0.0.1:{port}/v1/chat/completions"));
@@ -678,7 +728,7 @@ pub(crate) async fn stream_turn(
         .post(&url)
         .header("content-type", "application/json")
         .body(raw.to_vec());
-    if let Some(ref eh) = shared.meta.extra_headers
+    if let Some(ref eh) = extra_headers
         && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh)
     {
         for (k, v) in parsed {
@@ -702,15 +752,23 @@ pub(crate) async fn stream_turn(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "engine error {status}: {}",
-            text.chars().take(500).collect::<String>()
-        ));
+        return Err(StreamErr {
+            message: format!(
+                "engine error {status}: {}",
+                text.chars().take(500).collect::<String>()
+            ),
+            status: Some(status.as_u16()),
+        });
     }
     let stream = resp.bytes_stream();
+    let usage_model = if force_local {
+        "ninfer".to_string()
+    } else {
+        shared.meta.model.clone()
+    };
     let stream = crate::usage::wrap_for_usage_logging(
         state.clone(),
-        Some(shared.meta.model.clone()),
+        Some(usage_model),
         crate::usage::RequestSource::Local,
         true,
         Some(started),
@@ -731,7 +789,7 @@ pub(crate) async fn stream_turn(
     'stream_loop: loop {
         let next = tokio::select! {
             r = stream.next() => r,
-            _ = shared.wait_stop() => return Err(STOP_ERR.to_string()),
+            _ = shared.wait_stop() => return Err(StreamErr::from(STOP_ERR.to_string())),
         };
         let Some(chunk) = next else { break };
         let bytes = chunk.map_err(|e| e.to_string())?;
@@ -1005,6 +1063,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             &context,
             &meta.params,
             &meta.tools_spec,
+            meta.base_url.is_some(),
         );
         let raw = serde_json::to_vec(&req).unwrap_or_default();
         // Token estimate of this request for the client's compaction gate.
@@ -1012,19 +1071,61 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
 
         let _ = shared.tx.send(AgentEvent::TurnStarted { turns });
         // Stream the turn, retrying transient engine failures with growing
-        // backoff (the webview loop did the same: 3 attempts, 800ms·n).
+        // backoff (the webview loop did the same: 3 attempts, 800ms·n). A
+        // cloud run whose failure looks like a rate limit or server error
+        // (429/5xx) switches to the local engine instead of retrying the
+        // same cloud endpoint again, mirroring the client's own streamChat
+        // fallback (api/chat.ts) — `meta.allow_fallback` (default true for
+        // cloud runs) opts out of this.
         let mut turn = None;
+        let mut use_local = false;
         for attempt in 1..=3u32 {
-            match stream_turn(&state, &shared, &raw).await {
+            let this_raw = if use_local {
+                let mut v: Value = serde_json::from_slice(&raw).unwrap_or_else(|_| json!({}));
+                v["model"] = json!("ninfer");
+                // The cloud body's system message may carry a cache_control
+                // content-parts array (see build_request) — meaningless (and
+                // an unfamiliar shape) for the local engine, so flatten it
+                // back to a plain string on the fallback attempt.
+                if let Some(first) = v
+                    .get_mut("messages")
+                    .and_then(|m| m.as_array_mut())
+                    .and_then(|a| a.first_mut())
+                    && first.get("role").and_then(|r| r.as_str()) == Some("system")
+                    && let Some(parts) = first.get("content").and_then(|c| c.as_array())
+                    && let Some(text) = parts.first().and_then(|p| p.get("text")).cloned()
+                {
+                    first["content"] = text;
+                }
+                serde_json::to_vec(&v).unwrap_or_else(|_| raw.clone())
+            } else {
+                raw.clone()
+            };
+            match stream_turn(&state, &shared, &this_raw, use_local).await {
                 Ok(t) => {
                     turn = Some(t);
                     break;
                 }
-                Err(e) if e == STOP_ERR => {
+                Err(e) if e.message == STOP_ERR => {
                     // stop_run already marked the run terminal — just unwind.
                     return;
                 }
                 Err(e) => {
+                    if !use_local
+                        && meta.base_url.is_some()
+                        && meta.allow_fallback
+                        && matches!(e.status, Some(s) if s == 429 || s >= 500)
+                    {
+                        use_local = true;
+                        let _ = shared.tx.send(AgentEvent::Delta {
+                            kind: "reasoning",
+                            text: format!(
+                                "\n⚠️ Cloud API error ({}). Falling back to local engine...\n\n",
+                                e.message
+                            ),
+                        });
+                        continue;
+                    }
                     if attempt < 3 {
                         let mut stop_rx = shared.stop_rx.clone();
                         tokio::select! {
@@ -1034,7 +1135,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                         continue;
                     }
                     if !shared.status().is_terminal() {
-                        shared.mark_terminal(RunStatus::Error, None, Some(e));
+                        shared.mark_terminal(RunStatus::Error, None, Some(e.message));
                     }
                     return;
                 }
@@ -1501,7 +1602,7 @@ mod tests {
             json!({ "role": "user", "content": "hi" }),
             json!({ "role": "assistant", "content": "ok", "reasoning": "hmm" }),
         ];
-        let req = build_request("m", Some("SYS"), &msgs, &params, &tools);
+        let req = build_request("m", Some("SYS"), &msgs, &params, &tools, false);
         assert_eq!(req["model"], "m");
         assert_eq!(req["stream"], true);
         // effort wins the thinking switch (one intent, no contradictory pair)
@@ -1522,7 +1623,7 @@ mod tests {
             json!({ "role": "system", "content": "OLD" }),
             json!({ "role": "user", "content": "x" }),
         ];
-        let req2 = build_request("m", None, &msgs2, &json!({}), &json!([]));
+        let req2 = build_request("m", None, &msgs2, &json!({}), &json!([]), false);
         assert_eq!(req2["messages"].as_array().unwrap().len(), 1);
         assert!(req2.get("tools").is_none());
     }
@@ -1533,7 +1634,14 @@ mod tests {
             "content": "look",
             "attachments": [{ "path": "/tmp/a.txt", "body": "abc" }],
         });
-        let req = build_request("m", None, std::slice::from_ref(&m), &json!({}), &json!([]));
+        let req = build_request(
+            "m",
+            None,
+            std::slice::from_ref(&m),
+            &json!({}),
+            &json!([]),
+            false,
+        );
         let content = req["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["text"], "look");
         assert!(
@@ -1552,7 +1660,14 @@ mod tests {
                 { "kind": "image", "name": "p.png", "dataUrl": "data:image/png;base64,AAA" },
             ],
         });
-        let req2 = build_request("m", None, std::slice::from_ref(&m2), &json!({}), &json!([]));
+        let req2 = build_request(
+            "m",
+            None,
+            std::slice::from_ref(&m2),
+            &json!({}),
+            &json!([]),
+            false,
+        );
         let c2 = req2["messages"][0]["content"].as_array().unwrap();
         assert_eq!(c2.len(), 2);
         assert!(c2[0]["text"].as_str().unwrap().contains("````\n"));

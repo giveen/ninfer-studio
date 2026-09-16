@@ -31,6 +31,21 @@ pub(crate) async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
 /// it unchanged.
 pub(crate) const SECRET_MASK: &str = "********";
 
+/// Resolve a client-supplied secret against its stored value: an empty
+/// string or the redaction mask both mean "unchanged, use what's saved" —
+/// the client only ever holds [`SECRET_MASK`] for a field it didn't type
+/// into, never the real value (see `redact_config`). Any other string is
+/// the user's own typed override. Shared by every call site that accepts a
+/// client-supplied cloud API key (`cloud_test`, the agent-run starter, the
+/// `/v1/*` proxy) so a saved key can't silently be replaced by the literal
+/// mask text on the wire to the real provider.
+pub(crate) fn resolve_secret(raw: Option<&str>, stored: &str) -> String {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() && v != SECRET_MASK => v.to_string(),
+        _ => stored.to_string(),
+    }
+}
+
 /// Redact every secret field (`hfToken`, `apiKey`) before a config value
 /// reaches a client — see [`SECRET_MASK`].
 pub(crate) fn redact_config(mut v: Value) -> Value {
@@ -224,14 +239,11 @@ pub(crate) async fn cloud_test(
         .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1");
-    let api_key_raw = body.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
-    // An empty key or the redaction mask means "use the saved key" — the UI
-    // only ever holds the mask, never the real secret (see `redact_config`).
-    let api_key = if api_key_raw.trim().is_empty() || api_key_raw == SECRET_MASK {
-        state.config.read().await.cloud_provider_api_key.clone()
-    } else {
-        api_key_raw.to_string()
-    };
+    let api_key_raw = body.get("apiKey").and_then(|v| v.as_str());
+    let api_key = resolve_secret(
+        api_key_raw,
+        &state.config.read().await.cloud_provider_api_key,
+    );
     let extra_headers = body
         .get("extraHeaders")
         .and_then(|v| v.as_str())
@@ -289,22 +301,72 @@ pub(crate) async fn cloud_test(
             }
             let data: Value = res.json().await.unwrap_or_default();
             let mut models = Vec::new();
+            let mut model_info = Vec::new();
+            // Pricing/context-length keyed by model id, merged into the
+            // stored config below so usage_stats can price cloud requests
+            // later — most providers (OpenAI, Groq, DeepSeek, Together)
+            // don't report this on /models, OpenRouter does
+            // (`pricing.prompt`/`pricing.completion` in $/token,
+            // `context_length` in tokens); parsed defensively so a provider
+            // that omits or reshapes these fields just yields no entry.
+            let mut pricing: std::collections::HashMap<String, crate::types::ModelPricing> =
+                std::collections::HashMap::new();
             if let Some(arr) = data.get("data").and_then(|v| v.as_array()) {
                 for item in arr {
-                    if let Some(id) = item
+                    let Some(id) = item
                         .as_str()
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                        && !id.is_empty()
+                        .filter(|id| !id.is_empty())
+                    else {
+                        continue;
+                    };
+                    models.push(id.to_string());
+                    let context_length = item.get("context_length").and_then(Value::as_u64);
+                    let parse_price = |v: Option<&Value>| -> Option<f64> {
+                        v.and_then(|v| {
+                            v.as_str()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .or_else(|| v.as_f64())
+                        })
+                    };
+                    let prompt_price =
+                        parse_price(item.get("pricing").and_then(|p| p.get("prompt")));
+                    let completion_price =
+                        parse_price(item.get("pricing").and_then(|p| p.get("completion")));
+                    if prompt_price.is_some()
+                        || completion_price.is_some()
+                        || context_length.is_some()
                     {
-                        models.push(id.to_string());
+                        model_info.push(json!({
+                            "id": id,
+                            "contextLength": context_length,
+                            "pricePromptPerM": prompt_price.map(|p| p * 1_000_000.0),
+                            "priceCompletionPerM": completion_price.map(|p| p * 1_000_000.0),
+                        }));
+                    }
+                    if prompt_price.is_some() || completion_price.is_some() {
+                        pricing.insert(
+                            id.to_string(),
+                            crate::types::ModelPricing {
+                                prompt_per_token: prompt_price.unwrap_or(0.0),
+                                completion_per_token: completion_price.unwrap_or(0.0),
+                                context_length,
+                            },
+                        );
                     }
                 }
             }
             models.sort();
+            if !pricing.is_empty() {
+                let mut merged = state.config.read().await.clone();
+                merged.cloud_model_pricing.extend(pricing);
+                let _ = persist_config(&state, &merged).await;
+            }
             Ok(Json(json!({
                 "ok": true,
                 "latencyMs": latency_ms,
-                "models": models
+                "models": models,
+                "modelInfo": model_info,
             })))
         }
         Err(e) => {

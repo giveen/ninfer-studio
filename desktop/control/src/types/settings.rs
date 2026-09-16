@@ -197,6 +197,31 @@ pub struct AppSettings {
     /// Automatically use cloud provider for subagent worker turns.
     #[serde(default)]
     pub cloud_use_for_subagent: bool,
+    /// Per-model USD pricing + context length, discovered from a cloud
+    /// provider's `/models` response (OpenRouter reports `pricing.prompt`/
+    /// `pricing.completion` in $/token and `context_length` per model) and
+    /// refreshed whenever "Retrieve Models"/"Test Connection" succeeds.
+    /// Keyed by the exact model id string, matching what's sent as the
+    /// request's `model` field and logged in usage events — so
+    /// `usage::usage_stats` can price a cloud request without guessing.
+    /// Providers that don't report pricing (Groq, DeepSeek, Together, plain
+    /// OpenAI) simply never get an entry; their usage stays priced as
+    /// unknown rather than 0.
+    #[serde(default)]
+    pub cloud_model_pricing: std::collections::HashMap<String, ModelPricing>,
+}
+
+/// One model's discovered cost + context window (see `AppSettings::cloud_model_pricing`).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelPricing {
+    /// USD per prompt (input) token.
+    pub prompt_per_token: f64,
+    /// USD per completion (output) token.
+    pub completion_per_token: f64,
+    /// Context window in tokens, when the provider reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
 }
 
 /// One configured MCP server. Exactly one of `command` (stdio transport —
@@ -313,6 +338,7 @@ impl Default for AppSettings {
             cloud_use_local_compactor: true,
             cloud_use_for_primary: false,
             cloud_use_for_subagent: false,
+            cloud_model_pricing: std::collections::HashMap::new(),
         }
     }
 }

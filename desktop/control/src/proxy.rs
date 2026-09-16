@@ -272,9 +272,21 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     } else {
         (None, false)
     };
-    let api_key = match api_key_override {
-        Some(k) => k,
-        None => state.config.read().await.api_key.clone(),
+    // A cloud-routed request (base_url present) authenticates against the
+    // stored *cloud* key, substituting the redaction mask/blank the client
+    // sends for an untouched field — see `resolve_secret`. A local-engine
+    // request keeps falling back to the local engine's own api_key.
+    let api_key = if base_url.is_some() {
+        let cfg = state.config.read().await;
+        crate::routes_config::resolve_secret(
+            api_key_override.as_deref(),
+            &cfg.cloud_provider_api_key,
+        )
+    } else {
+        match api_key_override {
+            Some(k) => k,
+            None => state.config.read().await.api_key.clone(),
+        }
     };
 
     let target = if let Some(base) = base_url {

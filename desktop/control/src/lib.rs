@@ -122,6 +122,7 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
     };
     let router = Router::new()
         .route("/api/usage", get(usage::usage_stats))
+        .route("/api/usage/reset", post(usage::usage_reset))
         .route("/api/health", get(routes_engine::health))
         .route("/api/status", get(routes_engine::status))
         .route(

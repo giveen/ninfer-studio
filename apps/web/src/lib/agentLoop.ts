@@ -24,6 +24,7 @@
 // through the onDelta / onTurnStart / onAppended events.
 
 import { buildChatRequest, streamChat, type ChatStreamCallbacks } from './api';
+import { localDateTimeBlock } from './chatHelpers';
 import { evaluate, needsHumanize, HUMANIZE_MAX_DEPTH, type VoiceProfile } from './notai';
 import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './types';
 
@@ -227,22 +228,36 @@ export async function streamTurn(opts: {
   params: ChatParams;
   tools?: unknown[];
   cacheSystem?: boolean;
+  /** Append the current date/time as a trailing message, after the whole
+   *  conversation history, instead of baking it into the system prompt.
+   *  Recomputed fresh on every call (this function's own concern, not the
+   *  caller's) so a multi-turn tool loop's system prompt — and hence its
+   *  cacheable prefix — never has to change just because the clock ticked;
+   *  see buildChatRequest's `trailingNote` for why position matters here. */
+  appendDateTime?: boolean;
+  /** Extra per-turn context (live todo list, intent-continuity rules, ...)
+   *  that must reach the model fresh every turn but shouldn't sit inside
+   *  the cacheable system prefix (see appendDateTime) — combined with the
+   *  date/time block, if requested, into one trailing message. */
+  extraContext?: string;
   signal: AbortSignal;
   stream?: StreamFn;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string) => void;
   onStreamError?: (message: string) => void;
 }): Promise<TurnResult> {
-  const { model, system, messages, params, tools, cacheSystem, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
+  const { model, system, messages, params, tools, cacheSystem, appendDateTime, extraContext, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
   let content = '';
   let reasoning = '';
   let toolCalls: AgentToolCall[] = [];
   let finishReason: string | undefined;
   let meta: MessageMeta = {};
+  const trailingNote = [extraContext, appendDateTime ? localDateTimeBlock() : ''].filter(Boolean).join('\n\n');
   const req = buildChatRequest(
     model, system, messages, params,
     tools && tools.length ? { tools } : undefined,
     cacheSystem,
+    trailingNote || undefined,
   );
   await stream(req, signal, {
     onContentDelta: (t) => { content += t; onDelta?.('content', t); },
@@ -342,6 +357,9 @@ export interface ToolLoopOptions {
   signal: AbortSignal;
   stream?: StreamFn;
   cacheSystem?: boolean;
+  /** See streamTurn's `appendDateTime` — applied fresh on every internal
+   *  turn of this loop, not just once for the whole call. */
+  appendDateTime?: boolean;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string, turn: number) => void;
   onTurnStart?: (turn: number) => void;
@@ -368,7 +386,7 @@ export interface ToolLoopResult {
  *  appends the assistant message, then either stops (no calls, halt, empty,
  *  abort, budget) or dispatches through the registry and continues. */
 export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult> {
-  const { model, system, params, tools, registry, maxSteps, signal, stream, cacheSystem, recoverMarkup } = opts;
+  const { model, system, params, tools, registry, maxSteps, signal, stream, cacheSystem, appendDateTime, recoverMarkup } = opts;
   let messages = [...opts.messages];
   let turns = 0;
   let finishReason: string | undefined;
@@ -377,7 +395,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
     if (signal.aborted) return { messages, turns, stop: 'aborted', finishReason, meta };
     opts.onTurnStart?.(turns);
     const t = await streamTurn({
-      model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
+      model, system, messages, params, tools, cacheSystem, appendDateTime, signal, stream, recoverMarkup,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
       onStreamError: (msg) => opts.onStreamError?.(msg, turns),
     });

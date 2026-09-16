@@ -483,6 +483,19 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           tools,
           registry,
           maxSteps: 12,
+          // The system prompt (capabilities block + memory + tool list) is
+          // resent verbatim every turn — cheap to try caching it whenever
+          // the turn is cloud-routed (baseUrl set); a provider that doesn't
+          // support cache_control just ignores the field (see
+          // buildChatRequest). No user toggle needed, unlike Coder's
+          // explicit Prompt Cache setting.
+          cacheSystem: !!baseUrl,
+          // The system prompt above deliberately excludes the current
+          // date/time (see chatSystemWithCapabilities) — appended here
+          // instead, fresh per turn, after the conversation history so it
+          // never invalidates the system+history prefix cacheSystem/the
+          // engine's own KV-cache reuse depend on.
+          appendDateTime: true,
           signal: ac.signal,
           onTurnStart: (turnIdx) => {
             if (turnIdx === 0) return;

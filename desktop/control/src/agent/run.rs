@@ -791,13 +791,34 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
             }
             Value::Object(o)
         });
+    // A cloud-routed run (base_url present) authenticates against the
+    // stored *cloud* key, substituting the redaction mask/blank the client
+    // sends for an untouched field (the client's appConfig only ever holds
+    // the mask — see routes_config::redact_config) with the real stored
+    // secret. Without this, every cloud run's Authorization header would
+    // literally be "Bearer ********". A local run keeps `body.api_key` as
+    // given (None normally; the local engine key is injected later by the
+    // proxy/engine_loop fallback).
+    let api_key = if is_remote_cloud {
+        let resolved = crate::routes_config::resolve_secret(
+            body.api_key.as_deref(),
+            &state.config.read().await.cloud_provider_api_key,
+        );
+        if resolved.is_empty() {
+            None
+        } else {
+            Some(resolved)
+        }
+    } else {
+        body.api_key
+    };
     let meta = RunMeta {
         id: id.clone(),
         kind: body.kind,
         label: body.label,
         model,
         base_url: body.base_url,
-        api_key: body.api_key,
+        api_key,
         extra_headers: body.extra_headers,
         allow_fallback: body.allow_fallback,
         system: body.system,

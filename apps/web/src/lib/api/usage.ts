@@ -4,7 +4,7 @@
 // unlike `useStatus` this fetches on demand rather than polling.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { getJSON } from './core';
+import { getJSON, postJSON } from './core';
 
 export type UsageSource = 'all' | 'local' | 'remote';
 
@@ -18,11 +18,18 @@ export interface UsageDailyPoint {
   models: Record<string, number>;
   /** GPU energy drawn that day while an engine was running, in kWh. */
   kwh: number;
+  /** USD spent that day on cloud-model requests whose model has known
+   *  pricing (see `AppSettings.cloudModelPricing`) — 0 when none of the
+   *  day's requests matched a priced model (which may just mean no
+   *  pricing data exists yet, not that they were free). */
+  cloudCostUsd: number;
 }
 
 export interface UsageModelBreakdown {
   model: string;
   tokens: number;
+  /** USD spent on this model, or null when it has no known pricing. */
+  cloudCostUsd: number | null;
 }
 
 export interface UsageTotals {
@@ -42,6 +49,10 @@ export interface UsageTotals {
    *  filtered by the source param (board power isn't attributable to
    *  local/remote traffic). */
   energyKwh: number;
+  /** Total USD spent on cloud-model requests with known pricing this
+   *  window, or null when no request in the window matched a priced model
+   *  (distinct from 0 — "no pricing data" vs. "spent nothing"). */
+  cloudCostUsd: number | null;
 }
 
 export interface UsageStats {
@@ -52,6 +63,13 @@ export interface UsageStats {
 
 export function getUsageStats(days: number, source: UsageSource): Promise<UsageStats> {
   return getJSON<UsageStats>(`/api/usage?days=${days}&source=${source}`, 8000);
+}
+
+/** Delete the usage log outright — irreversible, for starting a clean stats
+ *  baseline (e.g. after a change expected to shift the numbers, so old and
+ *  new behavior don't average together into a misleading figure). */
+export function resetUsageStats(): Promise<{ ok: boolean; error?: string }> {
+  return postJSON<{ ok: boolean; error?: string }>('/api/usage/reset', {}, 8000);
 }
 
 /** Fetch usage stats for `days`/`source`, refetching when either changes, plus

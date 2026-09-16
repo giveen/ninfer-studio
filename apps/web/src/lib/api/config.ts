@@ -104,10 +104,23 @@ export async function fetchCloudModels(baseUrl?: string, apiKey?: string, extraH
   return test.models;
 }
 
+/** Context window + USD pricing for one model, when the provider's /models
+ *  response reports it (OpenRouter does; most others don't — the field is
+ *  simply absent for those models). Prices are per million tokens. */
+export interface CloudModelInfo {
+  id: string;
+  contextLength?: number;
+  pricePromptPerM?: number;
+  priceCompletionPerM?: number;
+}
+
 export interface CloudTestResult {
   ok: boolean;
   latencyMs: number;
   models: string[];
+  /** Metadata for models the provider reported pricing/context for — a
+   *  subset of `models`, not parallel to it. */
+  modelInfo?: CloudModelInfo[];
   error?: string;
 }
 
