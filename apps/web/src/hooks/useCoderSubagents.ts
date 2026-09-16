@@ -1,6 +1,5 @@
 import { useCallback } from 'react';
 import {
-  getStatus,
   coderDiff,
   coderMemoryAddLearning,
   buildChatRequest,
@@ -44,17 +43,6 @@ export function useCoderSubagents({
   addLog,
   memoryRef,
 }: UseCoderSubagentsOptions) {
-  const engineMaxConcurrency = useCallback(async (): Promise<number> => {
-    try {
-      const s = await getStatus();
-      const mc = s?.lastStart?.profile?.maxConcurrency;
-      if (typeof mc === 'number' && mc > 0) return mc;
-    } catch {
-      /* unknown — fail closed below */
-    }
-    return 1;
-  }, []);
-
   const runSubagentInner = useCallback(
     async (
       label: string,
@@ -411,7 +399,6 @@ export function useCoderSubagents({
   );
 
   return {
-    engineMaxConcurrency,
     runSubagent,
     runWorker,
     runIdeation,

@@ -1228,7 +1228,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   });
 
   const {
-    engineMaxConcurrency,
     runSubagent,
     runWorker,
     runIdeation,
@@ -1414,7 +1413,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setQueued,
     storeRef,
     setStore,
-    engineMaxConcurrency,
     runSubagent,
   });
 

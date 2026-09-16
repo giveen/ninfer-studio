@@ -86,7 +86,6 @@ export interface UseCoderAgentLoopOptions {
   setQueued: React.Dispatch<React.SetStateAction<Record<string, QueuedItem[]>>>;
   storeRef: React.MutableRefObject<CoderStore>;
   setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
-  engineMaxConcurrency: () => Promise<number>;
   runSubagent: (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps?: number, allowedTools?: string[], depth?: number) => Promise<string>;
 }
 
@@ -211,7 +210,6 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
     opts.addLog({ type: 'read', label: 'run', provider: mainProvider, detail: `main agent on ${mainProvider}: ${model}` });
 
     if (options?.scout && opts.scoutOn) {
-      const mc = await opts.engineMaxConcurrency();
       const subConfig = resolveProviderConfig('subagent', opts.appConfig, {
         provider: opts.coderParams.subagentProvider,
         cloudModel: opts.coderParams.subagentCloudModel,
@@ -225,8 +223,12 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
         const signal = opts.abortRef.current!.signal;
 
         let summaries: string[] = [];
-        if (mc > 1 || isCloudSub) {
-          opts.addLog({ type: 'read', label: 'scout', provider: isCloudSub ? 'cloud' : 'local', detail: `3 parallel probes (${isCloudSub ? 'cloud' : `engine concurrency ${mc}`})` });
+        if (isCloudSub) {
+          // Parallel probes only when the subagent hits a separate cloud endpoint.
+          // On the local engine, probes share the main conversation's KV-cache
+          // budget/slots — running them concurrently evicts the primary loop's
+          // cached prefix and can drop its hit rate to 0%.
+          opts.addLog({ type: 'read', label: 'scout', provider: 'cloud', detail: '3 parallel probes (cloud)' });
           summaries = await Promise.all(
             SCOUT_PROBES.map(async (p) => {
               const s = await opts.runSubagent(
@@ -237,12 +239,12 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                 model,
                 signal
               );
-              opts.addLog({ type: 'read', label: `scout:${p.label}`, provider: isCloudSub ? 'cloud' : 'local', detail: `${s.length} chars` });
+              opts.addLog({ type: 'read', label: `scout:${p.label}`, provider: 'cloud', detail: `${s.length} chars` });
               return `## ${p.label}\n${s}`;
             })
           );
         } else {
-          opts.addLog({ type: 'read', label: 'scout', provider: 'local', detail: '3 sequential probes (local single concurrency)' });
+          opts.addLog({ type: 'read', label: 'scout', provider: 'local', detail: '3 sequential probes (preserves local KV cache)' });
           for (const p of SCOUT_PROBES) {
             if (signal.aborted) break;
             const s = await opts.runSubagent(
