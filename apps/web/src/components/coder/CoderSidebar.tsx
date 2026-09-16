@@ -328,6 +328,14 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
                 <div key={l.id} className="flex flex-col gap-0.5 border-l-2 border-line pl-2 ml-1 text-[10.5px]">
                   <div className="flex items-center gap-1.5">
                     <span className="font-mono text-faint">{new Date(l.time).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                    {l.provider && (
+                      <span className={cn(
+                        "rounded px-1 py-0.2 text-[9px] font-bold uppercase tracking-wider",
+                        l.provider === 'cloud' ? 'bg-accent/20 text-accent border border-accent/30' : 'bg-panel2 text-mute border border-line'
+                      )}>
+                        {l.provider}
+                      </span>
+                    )}
                     <span className={cn(
                       "font-semibold",
                       l.type === 'error' ? 'text-danger' : 

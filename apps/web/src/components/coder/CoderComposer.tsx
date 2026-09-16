@@ -161,26 +161,23 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
                       <label className="flex items-center gap-1.5 text-[12px] text-mute">
                         cloud model
                         <SelectField
-                          value={coderParams.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
+                          value={coderParams.primaryCloudModel || appConfig?.cloudProviderPrimaryModel || appConfig?.cloudProviderDefaultModel || ''}
                           onChange={(v: string) => setCoderParams({ ...coderParams, primaryCloudModel: v })}
                           options={Array.from(
                             new Set([
-                              'gpt-4o',
-                              'gpt-4o-mini',
-                              'gpt-4-turbo',
-                              'o1',
-                              'o3-mini',
+                              ...(appConfig?.cloudProviderPrimaryModel ? [appConfig.cloudProviderPrimaryModel] : []),
+                              ...(appConfig?.cloudProviderSubagentModel ? [appConfig.cloudProviderSubagentModel] : []),
                               ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
                               ...(coderParams.primaryCloudModel ? [coderParams.primaryCloudModel] : []),
-                            ])
+                            ].filter(Boolean))
                           ).map((m) => ({ value: m, label: m }))}
                         />
                         <input
                           type="text"
                           value={coderParams.primaryCloudModel || ''}
                           onChange={(e) => setCoderParams({ ...coderParams, primaryCloudModel: e.target.value })}
-                          placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                          className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                          placeholder={appConfig?.cloudProviderPrimaryModel || appConfig?.cloudProviderDefaultModel || 'Cloud model...'}
+                          className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
                         />
                       </label>
                     )}
@@ -202,26 +199,23 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
                       <label className="flex items-center gap-1.5 text-[12px] text-mute">
                         cloud model
                         <SelectField
-                          value={coderParams.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
+                          value={coderParams.subagentCloudModel || appConfig?.cloudProviderSubagentModel || appConfig?.cloudProviderDefaultModel || ''}
                           onChange={(v: string) => setCoderParams({ ...coderParams, subagentCloudModel: v })}
                           options={Array.from(
                             new Set([
-                              'gpt-4o-mini',
-                              'gpt-4o',
-                              'gpt-4-turbo',
-                              'o1-mini',
-                              'o3-mini',
+                              ...(appConfig?.cloudProviderSubagentModel ? [appConfig.cloudProviderSubagentModel] : []),
+                              ...(appConfig?.cloudProviderPrimaryModel ? [appConfig.cloudProviderPrimaryModel] : []),
                               ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
                               ...(coderParams.subagentCloudModel ? [coderParams.subagentCloudModel] : []),
-                            ])
+                            ].filter(Boolean))
                           ).map((m) => ({ value: m, label: m }))}
                         />
                         <input
                           type="text"
                           value={coderParams.subagentCloudModel || ''}
                           onChange={(e) => setCoderParams({ ...coderParams, subagentCloudModel: e.target.value })}
-                          placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                          className="w-28 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                          placeholder={appConfig?.cloudProviderSubagentModel || appConfig?.cloudProviderDefaultModel || 'Cloud model...'}
+                          className="w-32 rounded border border-line bg-inset px-2 py-1 text-[11px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
                         />
                       </label>
                     )}

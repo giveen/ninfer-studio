@@ -341,15 +341,17 @@ export function resolveProviderConfig(
 
   if (effectiveProvider === 'cloud') {
     const roleModel = role === 'primary' ? appConfig.cloudProviderPrimaryModel : appConfig.cloudProviderSubagentModel;
-    const fallbackDefault = role === 'primary' ? 'gpt-4o' : 'gpt-4o-mini';
+    const fallbackDefault = role === 'primary'
+      ? (appConfig.cloudProviderPrimaryModel || appConfig.cloudProviderDefaultModel || 'gpt-4o')
+      : (appConfig.cloudProviderSubagentModel || appConfig.cloudProviderDefaultModel || 'gpt-4o-mini');
     return {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
-      model: params[`${role}CloudModel`] || params.cloudModel || roleModel || appConfig.cloudProviderDefaultModel || fallbackDefault,
+      model: params[`${role}CloudModel`] || params.cloudModel || roleModel || fallbackDefault,
     };
   }
 
   return {
-    model: fallbackModel || 'ninfer',
+    model: fallbackModel && fallbackModel !== 'ninfer' ? fallbackModel : 'ninfer',
   };
 }

@@ -9,7 +9,7 @@ import { ChatMessage } from './types';
 import { PermConfig, DEFAULT_PERMS } from './coderTools';
 import { getConfig, coderRead } from './api';
 
-export type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number };
+export type LogEntry = { id: string; time: number; type: 'bash' | 'read' | 'write' | 'edit' | 'grep' | 'glob' | 'web' | 'todo' | 'error' | 'compact' | 'ask'; label: string; detail?: string; durationMs?: number; provider?: 'cloud' | 'local' };
 export type TodoItem = { content: string; status: 'pending' | 'in_progress' | 'completed' };
 
 export interface ConvMeta {

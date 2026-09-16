@@ -82,7 +82,8 @@ export function useCoderSubagents({
         const subConfig = resolveProviderConfig('subagent', appConfig, {
           provider: coderParams.subagentProvider,
           cloudModel: coderParams.subagentCloudModel,
-        });
+        }, model);
+        const subProvider = subConfig.baseUrl ? 'cloud' : 'local';
         const started = await agentRunsApi.start({
           messages: [{ role: 'user', content: prompt }],
           kind: 'scout',
@@ -258,7 +259,7 @@ export function useCoderSubagents({
         const subConfig = resolveProviderConfig('subagent', appConfig, {
           provider: coderParams.subagentProvider,
           cloudModel: coderParams.subagentCloudModel,
-        });
+        }, model);
         const started = await agentRunsApi.start({
           messages: [{ role: 'user', content: prompt }],
           kind: 'worker',
