@@ -804,6 +804,9 @@ pub(crate) async fn stream_turn(
                 finish_reason = Some(fr.to_string());
             }
             let Some(delta) = choice.get("delta") else {
+                if finish_reason.is_some() {
+                    break 'stream_loop;
+                }
                 continue;
             };
             if let Some(d) = delta.get("content").and_then(|v| v.as_str())
@@ -847,6 +850,9 @@ pub(crate) async fn stream_turn(
                         }
                     }
                 }
+            }
+            if finish_reason.is_some() {
+                break 'stream_loop;
             }
         }
     }
