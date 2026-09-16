@@ -33,7 +33,7 @@ import { resolveProviderConfig } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
-import { packForRequest, readRecallChunk, extractToolResultText, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
+import { packForRequest, readRecallChunk, extractToolResultText, applyResultPlaceholder, LARGE_OUTPUT_EXCLUDED_TOOLS } from '../lib/observationPack';
 import { compactedContext, isCompactedMsg, humanizePassText, streamTurn, type ToolHandler, type ToolRegistry, type TurnResult } from '../lib/agentLoop';
 import { agentRunsApi, RunStream } from '../lib/agentRuns';
 import { redactSecrets, ReportBlock, TrajectoryBlock } from '../components/toolResults';
@@ -892,12 +892,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // every request — a value that changed on essentially every call would
     // invalidate the engine's KV-cache reuse (and any cache_control
     // breakpoint) for the entire history on every single turn. The date is
-    // appended instead as a per-turn trailing note, after history, in
-    // useCoderAgentLoop's streamTurn call — see chat.ts's `trailingNote`.
-    // The same reasoning is why `ctx` (repo map, conventions, followed
-    // files — all live filesystem state, refreshed on every mutating tool
-    // call) is kept out of dynamicSystemRef entirely and fed to the trailing
-    // note by the caller instead; see codebaseContextRef's declaration.
+    // appended instead as a persisted contextNoteMessage(), added to real
+    // history in useCoderAgentLoop's runAgent — see agentLoop.ts. The same
+    // reasoning is why `ctx` (repo map, conventions, followed files — all
+    // live filesystem state, refreshed on every mutating tool call) is kept
+    // out of dynamicSystemRef entirely and folded into that same note by the
+    // caller instead; see codebaseContextRef's declaration.
     dynamicSystemRef.current = staticSys;
     codebaseContextRef.current = ctx;
   }, []);
@@ -1105,7 +1105,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     model: string,
     signal?: AbortSignal,
   ): Promise<string> => {
-    // Structured results (grep/glob/repo_search/obs_recall) are already bounded — skip them.
+    // obs_recall is the recall path itself — summarizing its own output would
+    // be circular (see LARGE_OUTPUT_EXCLUDED_TOOLS).
     if (LARGE_OUTPUT_EXCLUDED_TOOLS.has(name)) return resultStr;
     let res: Record<string, unknown> | null = null;
     try {
@@ -1130,12 +1131,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       if (!receipt) return resultStr;
       const tail = text.slice(-SUMMARY_TAIL);
       const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
-      if (hasStd) {
-        res.stdout = wrapped;
-        res.stderr = '';
-      } else {
-        res.content = wrapped;
-      }
+      applyResultPlaceholder(res, wrapped);
       res._summarized = true;
       return JSON.stringify(res);
     } catch {

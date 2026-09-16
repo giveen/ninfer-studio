@@ -492,10 +492,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           // explicit Prompt Cache setting.
           cacheSystem: !!baseUrl,
           // The system prompt above deliberately excludes the current
-          // date/time (see chatSystemWithCapabilities) — appended here
-          // instead, fresh per turn, after the conversation history so it
-          // never invalidates the system+history prefix cacheSystem/the
-          // engine's own KV-cache reuse depend on.
+          // date/time (see chatSystemWithCapabilities) — runToolLoop appends
+          // it fresh each turn instead, as a persisted contextNoteMessage()
+          // added to real history, so it never invalidates the
+          // system+history prefix cacheSystem/the engine's own KV-cache
+          // reuse depend on (a discarded-and-rebuilt note would defeat that
+          // reuse just as badly as baking it into the system prompt would —
+          // see contextNoteMessage in agentLoop.ts).
           appendDateTime: true,
           signal: ac.signal,
           onTurnStart: (turnIdx) => {

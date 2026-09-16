@@ -109,10 +109,11 @@ unset → executable defaults), copy button, "long-context preset" shortcut.
 | Preset | Purpose |
 |---|---|
 | Default | executable defaults (bf16 KV, no spec, C=1, 8k ctx) |
-| **Long context MTP3** | the published RTX 5090 profile: 240k ctx, FP8 KV, C=2, 2 dev + 8 host state slots, 8 GiB host KV, MTP3 + optimized head, vision, preserve-thinking |
-| Chat MTP3 | 32k ctx, auto KV, MTP3, C=2 |
+| **Coding agent (cache-optimized)** | 200k ctx, k8v4 KV, C=2, 8 device + 8 host state slots, 4 long anchors/continuation — extra checkpoint headroom (beyond the engine default of device-state-slots = max-concurrency) so a scout probe or subagent doesn't evict the main run's cached continuation; tuned for the Coder harness's long tool-call-heavy sessions |
+| **Long context MTP3** | the published RTX 5090 profile: 240k ctx, FP8 KV, C=2, 4 dev + 8 host state slots, 8 GiB host KV, 4 long anchors/continuation, MTP3 + optimized head, vision, preserve-thinking |
+| Chat MTP3 | 32k ctx, auto KV, MTP3, C=2, 6 device state slots for cache headroom |
 | Vision multimodal | 81,920 ctx, vision + media budgets, MTP3 |
-| Max concurrency (C=8) | 8 lanes + matching state slots for aggregate decode |
+| Max concurrency (C=8) | 8 lanes + 10 device state slots (2 beyond concurrency) for aggregate decode plus a little cache headroom |
 | 35B-A3B DFlash / 3.8-27B DFlash2 | the per-architecture speculative backends (7 drafts) |
 
 **Option sections** (every control carries a tooltip quoting the engine docs; every omitted
