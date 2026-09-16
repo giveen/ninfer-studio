@@ -229,6 +229,7 @@ fn release_acl(path: &Path) {
 }
 
 /// Revokes the low-integrity write grant on `path` when dropped.
+#[derive(Debug)]
 struct AclGuard {
     path: PathBuf,
 }
@@ -279,7 +280,7 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     let r = unsafe {
         GetNamedSecurityInfoW(
             name,
-            SE_FILE_OBJECT as SE_OBJECT_TYPE,
+            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -318,7 +319,7 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     let r = unsafe {
         SetNamedSecurityInfoW(
             name,
-            SE_FILE_OBJECT as SE_OBJECT_TYPE,
+            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -353,6 +354,7 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
 /// The handles live in `std::os::windows::io::OwnedHandle` (`Send + Sync`,
 /// closes on drop) so the child can cross threads; the exit reaper works on
 /// the raw handle *value* and never closes one.
+#[derive(Debug)]
 pub struct WinChild {
     process: Option<std::os::windows::io::OwnedHandle>,
     job: std::os::windows::io::OwnedHandle,
@@ -474,7 +476,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     }
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     limits.BasicLimitInformation.LimitFlags =
-        (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK) as _;
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     if unsafe {
         SetInformationJobObject(
             job,
@@ -710,7 +712,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
             // CREATE_UNICODE_ENVIRONMENT: `env` is a UTF-16 block
             // (see `env_block`) — without it CreateProcessW parses the
             // block as ANSI and the child inherits a garbage environment.
-            (EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT) as _,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             env.as_ptr() as *const _,
             wide_ptr(&cwd_wide),
             &si_ex.StartupInfo as *const STARTUPINFOW,
