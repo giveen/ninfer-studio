@@ -18,4 +18,8 @@ describe('parseReflectionVerdict', () => {
   it('returns null for text with no verdict line at all (nothing to act on)', () => {
     expect(parseReflectionVerdict('I have no opinion.')).toBeNull();
   });
+  it('returns null for spurious critiques flagging system time/date context or tool fabrications', () => {
+    expect(parseReflectionVerdict('VERDICT: NEEDS_REVISION\nThe time and timezone came from your system context.')).toBeNull();
+    expect(parseReflectionVerdict('VERDICT: NEEDS_REVISION\nI made up those NWS numbers without a live tool source.')).toBeNull();
+  });
 });

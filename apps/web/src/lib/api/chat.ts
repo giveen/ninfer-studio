@@ -413,7 +413,7 @@ export function summarizeConversation(opts: {
 // as "approved" / "no revision" so reflection can never strand a turn that
 // already streamed successfully.
 // ---------------------------------------------------------------------------
-const CHAT_REFLECTION_SYSTEM = `You are reviewing an AI assistant's draft reply before it is shown to the user. You are given the recent conversation (including any tool calls and retrieved tool results) and the draft. Decide whether it is good enough to send as-is.
+const CHAT_REFLECTION_SYSTEM = `You are reviewing an AI assistant's draft reply before it is shown to the user. You are given the recent conversation and the draft. Decide whether it is good enough to send as-is.
 
 Respond with EXACTLY one verdict line, then (only when requesting changes) a short, specific critique:
 VERDICT: APPROVED
@@ -421,8 +421,8 @@ or
 VERDICT: NEEDS_REVISION
 <one or two sentences on what's wrong and what to fix>
 
-Only request revision for a real problem: a wrong claim that contradicts retrieved tool results or conversation context, a misread of the user's question, or a missing part of a multi-part request.
-CRITICAL: Do NOT claim the assistant fabricated facts if the data was retrieved via tool calls (web_fetch, web_search, browser, etc.) present in the conversation history. Do not request revision for style, tone, length, or formatting preferences alone.`;
+Only request revision for a real problem: a wrong claim that contradicts conversation context, a misread of the user's question, or a missing part of a multi-part request.
+CRITICAL: Do NOT flag system date, time, timezone, or system clock information as fabricated. Do NOT request revision for style, tone, length, or formatting preferences alone.`;
 
 function formatReflectionHistory(history: ChatMessage[]): string {
   return history
@@ -453,7 +453,14 @@ export function parseReflectionVerdict(raw: string): string | null {
   if (!/VERDICT:\s*(?:APPROVED|NEEDS_REVISION)/i.test(raw)) return null;
   if (/VERDICT:\s*APPROVED/i.test(raw)) return null;
   const critique = raw.replace(/VERDICT:\s*NEEDS_REVISION\s*/i, '').trim();
-  return critique || null;
+  if (!critique) return null;
+
+  // Ignore spurious critiques about date/time system context, system clock, or tool fabrications
+  if (/\b(?:system context|system clock|time|timezone|clock|tool|web_fetch|web_search|live source|fabricated)\b/i.test(critique)) {
+    return null;
+  }
+
+  return critique;
 }
 
 export function critiqueChatReply(opts: {

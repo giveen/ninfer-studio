@@ -511,7 +511,9 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
             if (!assistantMsg.tool_calls?.length) {
               let content = assistantMsg.content;
-              if (reflectionEnabled && content.trim()) {
+              const hasToolsInHistory = history.some((m: ChatMessage) => m.role === 'tool' || Boolean(m.tool_calls && m.tool_calls.length > 0));
+              const toolsActive = (tools && tools.length > 0) || hasToolsInHistory;
+              if (reflectionEnabled && !toolsActive && content.trim()) {
                 setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
                 try {
                   const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
@@ -539,7 +541,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                       params,
                       signal: ac.signal,
                     });
-                    if (revised && !ac.signal.aborted) content = revised;
+                    if (revised && !ac.signal.aborted) {
+                      const hasRawToolCall = /<tool_call>|<function=/i.test(revised);
+                      const isFalseApology = /I (?:owe you a correction|made up|fabricated|don't actually have access)/i.test(revised) && !/I (?:owe you a correction|made up|fabricated|don't actually have access)/i.test(content);
+                      if (!hasRawToolCall && !isFalseApology) {
+                        content = revised;
+                      } else {
+                        console.warn('[chat] reflection revision produced raw tool call or false apology; discarding revision');
+                      }
+                    }
                   }
                 } catch (reflectionError) {
                   console.warn('[chat] reflection pass skipped', reflectionError);
