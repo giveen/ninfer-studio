@@ -116,9 +116,18 @@ function toolsAvailableBlock(toolNames: string[]): string {
   return `# Tools available\nYou have access to exactly these tools and no others this turn: ${toolNames.join(', ')}.\nDo not claim to have a tool that isn't in this list. Do not claim to lack a tool that is in this list — call it instead of guessing or refusing.`;
 }
 
+// Deliberately excludes localDateTimeBlock(): a live clock baked into the
+// system prompt sits ahead of the growing conversation history in every
+// request, and because prefix-based caching (the engine's own KV-cache
+// reuse, and the Anthropic-style cache_control breakpoint chatHelpers'
+// callers can request) only reuses tokens up to the first point of
+// divergence, a value that changes almost every turn there silently zeroes
+// out caching for the entire history on every single turn. Callers pass the
+// date instead as buildChatRequest's `trailingNote` (see chat.ts), appended
+// AFTER history so only that small tail reprices each turn.
 export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSystemPrompt>[0], memory?: CoderMemory, computerUseDir?: string, toolNames?: string[]): string => {
   const base = effectiveSystemPrompt(params);
-  return [base, CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? ''), localDateTimeBlock()].filter(Boolean).join('\n\n');
+  return [base, CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? '')].filter(Boolean).join('\n\n');
 };
 
 export const CHAT_TOOLS = [
@@ -331,9 +340,14 @@ export function resolveProviderConfig(
   const explicitProvider = params[`${role}Provider`] || params.provider;
   let globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
 
-  // Smart Task-Based Tiering: If smart tiering is enabled and this is a light/read subagent task,
-  // route to local engine if subagent cloud isn't explicitly requested
-  if (appConfig.cloudSmartTiering && role === 'subagent' && !explicitProvider && !params.forceCloud) {
+  // Smart Task-Based Tiering: only downgrade a subagent call the caller has
+  // itself marked lightweight (`taskWeight: 'light'` — Scout probes,
+  // tagger/extractor classification, ideation, cut-off summaries, Critic
+  // review). A call that leaves taskWeight unset defaults to heavy, which
+  // covers the Worker (the subagent that actually writes code): tiering
+  // must never silently downgrade the one subagent role the user is most
+  // likely to have explicitly picked a strong cloud model for.
+  if (appConfig.cloudSmartTiering && role === 'subagent' && params.taskWeight === 'light' && !explicitProvider && !params.forceCloud) {
     globalUseCloud = false;
   }
 

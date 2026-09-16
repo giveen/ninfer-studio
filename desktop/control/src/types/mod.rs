@@ -23,6 +23,6 @@ pub use domain::{
     ARTIFACTS, CatalogEntry, EngineState, EngineStatus, GpuApp, GpuStats, JobRec, ModelArtifact,
 };
 pub use serve_args::{args_equal, build_serve_args};
-pub use settings::{AppSettings, EngineProfile, McpServerSpec, NumberOrAuto};
+pub use settings::{AppSettings, EngineProfile, McpServerSpec, ModelPricing, NumberOrAuto};
 pub use state::{AppEvent, EngineInner, LastStart, ProfileState, SavedProfile, State};
 pub use util::{base_name, now_ms, strip_extended_prefix};

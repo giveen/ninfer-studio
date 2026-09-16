@@ -29,7 +29,7 @@ import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
 import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
-import { localDateTimeBlock, resolveProviderConfig } from '../lib/chatHelpers';
+import { resolveProviderConfig } from '../lib/chatHelpers';
 import { coderLensBlock, CODING_LENSES, LINUS_LENS } from '../lib/coderLens';
 import { formatTokens, CHARS_PER_TOKEN } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
@@ -872,7 +872,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     const lensBlock = coderLensBlock(coderParamsRef.current.reviewLens);
     if (lensBlock) sys += `\n\n# Review lens\n${lensBlock}\n`;
 
-    sys += `\n\n${localDateTimeBlock()}`;
+    // Deliberately no live date/time appended here: this string is reused
+    // as-is across every step of a run (and re-set after every mutating
+    // tool call), and it sits ahead of the growing conversation history in
+    // every request — a value that changed on essentially every call would
+    // invalidate the engine's KV-cache reuse (and any cache_control
+    // breakpoint) for the entire history on every single turn. The date is
+    // appended instead as a per-turn trailing note, after history, in
+    // useCoderAgentLoop's streamTurn call — see chat.ts's `trailingNote`.
     dynamicSystemRef.current = sys;
   }, []);
 
@@ -1425,6 +1432,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       const extractorCfg = resolveProviderConfig('subagent', appConfig, {
         subagentProvider: coderParams.subagentProvider,
         subagentCloudModel: coderParams.subagentCloudModel,
+        taskWeight: 'light',
       }, coderParams.criticModel?.trim() || modelRef.current);
       const req = buildChatRequest(extractorCfg.model, extractorSystem, [{ role: 'user', content: currentInput }], { thinking: false, maxTokens: 1024 } as ChatParams, {});
 

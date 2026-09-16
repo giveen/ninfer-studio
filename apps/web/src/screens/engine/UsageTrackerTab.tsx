@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { RefreshCw, Trash2 } from 'lucide-react';
 import { Bar, CartesianGrid, Cell, ComposedChart, Legend, Line, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Button, SectionCard, Segmented, Stat } from '../../components/ui';
 import { formatTokens } from '../../lib/format';
 import { getConfig } from '../../lib/api';
-import { useUsageStats, type UsageDailyPoint, type UsageSource } from '../../lib/api/usage';
+import { useUsageStats, resetUsageStats, type UsageDailyPoint, type UsageSource } from '../../lib/api/usage';
 
 // `Segmented`'s value type is constrained to `string`, so the range lives as
 // strings here and is parsed back to a number for the API call.
@@ -56,7 +56,7 @@ function fillDailySeries(series: UsageDailyPoint[], days: number): UsageDailyPoi
     const d = new Date(today);
     d.setUTCDate(d.getUTCDate() - i);
     const key = d.toISOString().slice(0, 10);
-    out.push(byDay.get(key) ?? { day: key, tokens: 0, requests: 0, cacheHitRate: 0, models: {}, kwh: 0 });
+    out.push(byDay.get(key) ?? { day: key, tokens: 0, requests: 0, cacheHitRate: 0, models: {}, kwh: 0, cloudCostUsd: 0 });
   }
   return out;
 }
@@ -128,6 +128,34 @@ export function UsageTrackerTab() {
   const estCost = totals ? totals.energyKwh * costPerKwh : 0;
   const costPerMillionTokens = totals && costPerKwh > 0 && totals.tokenUsage > 0 ? (estCost / totals.tokenUsage) * 1_000_000 : null;
 
+  // Reset is a two-click confirm (no modal needed for a single irreversible
+  // action): the first click arms it and auto-disarms after a few seconds
+  // if the user doesn't follow through, so a stray click can't wipe the log.
+  const [resetArmed, setResetArmed] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+  const armTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (armTimerRef.current) clearTimeout(armTimerRef.current); }, []);
+  const handleResetClick = () => {
+    if (!resetArmed) {
+      setResetArmed(true);
+      setResetError(null);
+      armTimerRef.current = setTimeout(() => setResetArmed(false), 4000);
+      return;
+    }
+    if (armTimerRef.current) clearTimeout(armTimerRef.current);
+    setResetArmed(false);
+    setResetting(true);
+    setResetError(null);
+    resetUsageStats()
+      .then((r) => {
+        if (!r.ok) throw new Error(r.error || 'Reset failed');
+        refreshAll();
+      })
+      .catch((e) => setResetError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setResetting(false));
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -135,11 +163,29 @@ export function UsageTrackerTab() {
           <Segmented value={rangeDays} onChange={setRangeDays} options={RANGE_OPTIONS} />
           <Segmented value={source} onChange={setSource} options={SOURCE_OPTIONS} />
         </div>
-        <Button onClick={refreshAll} disabled={loading}>
-          <RefreshCw size={13} className={loading ? 'animate-spin' : undefined} />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant={resetArmed ? 'danger' : 'ghost'}
+            onClick={handleResetClick}
+            disabled={resetting}
+            className="border border-line/60"
+            title="Delete all logged usage history and start fresh"
+          >
+            <Trash2 size={13} />
+            {resetting ? 'Resetting…' : resetArmed ? 'Confirm reset?' : 'Reset stats'}
+          </Button>
+          <Button onClick={refreshAll} disabled={loading}>
+            <RefreshCw size={13} className={loading ? 'animate-spin' : undefined} />
+            Refresh
+          </Button>
+        </div>
       </div>
+
+      {resetError && (
+        <div className="rounded-lg border border-danger/40 bg-danger/10 px-4 py-3 text-[13px] text-danger">
+          Failed to reset usage stats: {resetError}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-lg border border-danger/40 bg-danger/10 px-4 py-3 text-[13px] text-danger">
@@ -162,10 +208,16 @@ export function UsageTrackerTab() {
           sub={source === 'remote' ? 'Not applicable for remote' : (costPerKwh === 0 ? 'set cost/kWh in Settings' : undefined)}
         />
         <Stat label="Cost / 1M tokens" value={source === 'remote' ? '—' : (costPerMillionTokens !== null ? `${currencySymbol}${formatSmallCost(costPerMillionTokens)}` : '—')} />
+        <Stat
+          label="Cloud API cost"
+          value={totals?.cloudCostUsd != null ? `$${formatSmallCost(totals.cloudCostUsd)}` : '—'}
+          sub={totals?.cloudCostUsd == null ? 'no priced cloud requests yet' : 'USD, priced models only'}
+        />
       </div>
       <p className="text-[11.5px] text-faint">
         Energy reflects total GPU power draw while an engine is running — not power isolated to a single request, or a specific
-        model if you switched models mid-session.
+        model if you switched models mid-session. Cloud API cost only covers models whose provider reported pricing on
+        "Retrieve Models" (e.g. OpenRouter) — it is not a full accounting of every cloud dollar spent.
       </p>
 
       <SectionCard title="Activity heatmap" description={`Requests per day over the last ${days} days`}>
@@ -265,6 +317,7 @@ export function UsageTrackerTab() {
                   </span>
                   <span className="shrink-0 font-mono text-mute">
                     {formatTokens(m.tokens)} · {totalModelTokens > 0 ? Math.round((m.tokens / totalModelTokens) * 100) : 0}%
+                    {m.cloudCostUsd != null && ` · $${formatSmallCost(m.cloudCostUsd)}`}
                   </span>
                 </div>
               ))}

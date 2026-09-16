@@ -82,6 +82,7 @@ export function useCoderSubagents({
         const subConfig = resolveProviderConfig('subagent', appConfig, {
           provider: coderParams.subagentProvider,
           cloudModel: coderParams.subagentCloudModel,
+          taskWeight: 'light',
         }, model);
         const subProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
         const started = await agentRunsApi.start({
@@ -176,6 +177,7 @@ export function useCoderSubagents({
       const subConfig = resolveProviderConfig('subagent', appConfig, {
         subagentProvider: coderParams.subagentProvider,
         subagentCloudModel: coderParams.subagentCloudModel,
+        taskWeight: 'light',
       }, fallbackModel);
       let out = '';
       try {
@@ -210,6 +212,7 @@ export function useCoderSubagents({
       const subConfig = resolveProviderConfig('subagent', appConfig, {
         subagentProvider: coderParams.subagentProvider,
         subagentCloudModel: coderParams.subagentCloudModel,
+        taskWeight: 'light',
       }, fallbackModel);
       let out = '';
       try {
@@ -349,6 +352,7 @@ export function useCoderSubagents({
       const subConfig = resolveProviderConfig('subagent', appConfig, {
         subagentProvider: coderParams.subagentProvider,
         subagentCloudModel: coderParams.subagentCloudModel,
+        taskWeight: 'light',
       }, fallbackModel);
       const prompt = `CRITIC REVIEW:\nTask: ${taskText.slice(0, 1500)}\n\nDiff to review:\n${diff.slice(0, 12000)}`;
       let out = '';

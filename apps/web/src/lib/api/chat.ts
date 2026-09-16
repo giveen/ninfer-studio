@@ -29,12 +29,34 @@ export function buildChatRequest(
    *  cache it across turns (Anthropic-style prefix caching). Opt-in: only enable
    *  if your engine supports it; some OpenAI-compatible servers reject the field. */
   cacheSystem = false,
+  /** Per-turn context (current date/time, live todo state, ...) that must
+   *  reach the model but changes on essentially every request. Appended as
+   *  a final message AFTER the whole conversation history instead of baked
+   *  into the system prompt, so it never sits in front of the
+   *  system+history prefix that both the engine's own KV-cache reuse and
+   *  `cacheSystem` above depend on staying byte-identical turn to turn — a
+   *  live clock inside the system message, ahead of the (large, valuable
+   *  to reuse) growing history, silently zeroes out caching for the entire
+   *  history on every single turn (see chatHelpers.ts's
+   *  chatSystemWithCapabilities / CoderScreen.tsx's refreshRepoMap, which
+   *  used to do exactly that). Never persisted into `history` — recomputed
+   *  fresh by the caller each call. */
+  trailingNote?: string,
 ): Record<string, unknown> {
   const messages: Array<Record<string, unknown>> = [];
   if (systemPrompt?.trim()) {
-    const sys: Record<string, unknown> = { role: 'system', content: systemPrompt.trim() };
-    if (cacheSystem) sys.cache_control = { type: 'ephemeral' };
-    messages.push(sys);
+    const text = systemPrompt.trim();
+    // The cache breakpoint belongs on a content BLOCK, not as a sibling
+    // field of the message — Anthropic (and OpenRouter's pass-through of
+    // it for Claude/Gemini models) only recognizes cache_control inside a
+    // `{type: "text", text, cache_control}` part. A plain string `content`
+    // with a stray `cache_control` key next to it is just an unrecognized
+    // field every provider silently ignores, so caching never actually
+    // triggered before this content-parts wrapping.
+    const content = cacheSystem
+      ? [{ type: 'text', text, cache_control: { type: 'ephemeral' } }]
+      : text;
+    messages.push({ role: 'system', content });
   }
   for (const m of history) {
     if (m.role === 'system') continue;
@@ -68,6 +90,9 @@ export function buildChatRequest(
       if (m.name) msg.name = m.name;
       messages.push(msg);
     }
+  }
+  if (trailingNote?.trim()) {
+    messages.push({ role: 'user', content: `[System context for this turn — not something the user said]\n\n${trailingNote.trim()}` });
   }
   // Thinking switch + effort: a contradictory enable_thinking/reasoning_effort
   // pair is rejected by the engine, so derive both from one intent.

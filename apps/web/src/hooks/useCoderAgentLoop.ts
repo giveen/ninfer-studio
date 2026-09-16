@@ -144,6 +144,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
         const taggerCfg = resolveProviderConfig('subagent', opts.appConfig, {
           provider: opts.coderParams.subagentProvider,
           cloudModel: opts.coderParams.subagentCloudModel,
+          taskWeight: 'light',
         }, taggerModel);
         const req = buildChatRequest(
           taggerCfg.model,
@@ -214,6 +215,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
       const subConfig = resolveProviderConfig('subagent', opts.appConfig, {
         provider: opts.coderParams.subagentProvider,
         cloudModel: opts.coderParams.subagentCloudModel,
+        taskWeight: 'light',
       }, model);
       const isCloudSub = !!subConfig.baseUrl;
 
@@ -402,12 +404,19 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           ? undeniedTools.filter((t) => READONLY_TOOL_NAMES.has(t.function.name) || t.function.name === 'bash')
           : [...undeniedTools, ...undeniedMcp];
         const planToolNames = [...new Set([...READONLY_TOOL_NAMES, 'bash'])].join(', ');
-        const system =
-          (opts.planMode
-            ? `${opts.dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
-            : opts.dynamicSystemRef.current) +
-          intentRulesBlock +
-          todoSystemBlock(opts.todosRef.current);
+        const system = opts.planMode
+          ? `${opts.dynamicSystemRef.current}\n\n# PLAN MODE (read-only): investigate, analyze, and propose a concrete, step-by-step plan, then stop and wait for the user.\nAvailable tools: ${planToolNames}. bash is READ-ONLY here: inspection commands only (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show) — redirection, pipes, chaining, and anything that mutates state are rejected.\nDo NOT call write, edit, apply_patch, git_commit, or git_branch — they are disabled and calls to them are denied.\nCall tools through the native tool-call mechanism only — never write <tool_call> markup inside your reply text.`
+          : opts.dynamicSystemRef.current;
+        // Live task-list + intent rules move OUT of the system message and
+        // into streamTurn's per-turn trailing note (with the date/time),
+        // appended after the conversation history instead: both change on
+        // most steps (a completed todo, a newly tagged component), and
+        // baking either into the system prefix would invalidate the
+        // engine's KV-cache reuse (and cacheSystem's cache_control
+        // breakpoint) for the entire growing history on every such step —
+        // exactly the mechanism that used to make this run's system prompt
+        // change on nearly every mutating tool call.
+        const turnContext = [intentRulesBlock, todoSystemBlock(opts.todosRef.current)].filter(Boolean).join('\n\n');
         opts.todosRevAtReqStartRef.current = opts.todosRevRef.current;
         const wireMessages = await packForRequest(currentMessages);
         const turnParams = {
@@ -433,6 +442,8 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               params: turnParams,
               tools: activeTools,
               cacheSystem: opts.coderParams.promptCache,
+              extraContext: turnContext,
+              appendDateTime: true,
               signal: opts.abortRef.current.signal,
               stream: (r, sig, cb) => {
                 const primaryConfig = resolveProviderConfig('primary', opts.appConfig, {
