@@ -254,7 +254,8 @@ pub(crate) async fn cloud_test(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key.trim()));
     }
     if !extra_headers.trim().is_empty()
-        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers) {
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers)
+    {
         for (k, v) in parsed {
             if let Some(s) = v.as_str() {
                 // Skip invalid header names/values instead of panicking
@@ -293,7 +294,8 @@ pub(crate) async fn cloud_test(
                     if let Some(id) = item
                         .as_str()
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                        && !id.is_empty() {
+                        && !id.is_empty()
+                    {
                         models.push(id.to_string());
                     }
                 }
