@@ -22,7 +22,7 @@ import { HitlDialog } from '../components/HitlDialog';
 import { frameCompactedSummary, getConversations, saveConversations, suggestFollowUps, summarizeConversation } from '../lib/api';
 import { GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { effectiveSystemPrompt, effectiveVoice, humanizeRewriteText, type VoiceProfile } from '../lib/notai';
-import { isCompactedMsg, humanizePassText } from '../lib/agentLoop';
+import { isCompactedMsg, humanizePassText, runToolLoop, type ToolRegistry } from '../lib/agentLoop';
 import { agentRunsApi, RunStream, type RunEvent, type RunMessageWire, type RunSnapshot } from '../lib/agentRuns';
 import { formatRate, formatTime, formatTokens, uid } from '../lib/format';
 import type { MessageMeta } from '../lib/types';
@@ -34,7 +34,7 @@ import { ParamsPopover, ContextMeter } from '../components/chatParams';
 import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, type McpToolInfo } from '../lib/api';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, type McpToolInfo } from '../lib/api';
 import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 import { engineMaxConcurrency } from '../lib/engineInfo';
@@ -428,200 +428,165 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       };
       const cloudRun = !!baseUrl;
       const prunedHistory = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
-      const seedMessages: RunMessageWire[] = prunedHistory.map((m) => {
-        const w: RunMessageWire = { role: m.role, content: m.content };
-        if (m.reasoning) w.reasoning = m.reasoning;
-        if (m.tool_calls?.length) w.tool_calls = m.tool_calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }));
-        if (m.tool_call_id) w.tool_call_id = m.tool_call_id;
-        if (m.name) w.name = m.name;
-        if (m.attachments?.length) w.attachments = m.attachments;
-        return w;
-      });
-      // Turn-hook pause (hookMode client): intermediate tool turns continue
-      // untouched; the final content turn runs the reflection + humanize
-      // passes below, then its verdict replaces the turn's reply.
-      const handleRunHook = async (runId: string, hookId: string, hadToolCalls: boolean) => {
-        const decide = (body: { action: 'done' | 'replace' | 'continue' | 'abort'; content?: string }) =>
-          agentRunsApi.decideHook(runId, hookId, body).catch(() => {});
-        if (ac.signal.aborted) { await decide({ action: 'abort' }); return; }
-        // Intermediate tool-call turns pass through untouched (mirrors the
-        // old onAssistantTurn early return); only content turns get passes.
-        if (hadToolCalls) { await decide({ action: 'continue' }); return; }
-        let content = '';
-        try {
-          const cur = await agentRunsApi.get(runId);
-          const last = [...cur.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
-          content = (last?.content ?? '') as string;
-        } catch { /* fall through with empty content → continue */ }
-        if (!content.trim()) { await decide({ action: 'done' }); return; }
-        const original = content;
-        if (reflectionEnabled) {
-          setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
-          try {
-            const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
-            const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, baseUrl, apiKey, extraHeaders, history: critiqueHistory, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
-            if (critique && !ac.signal.aborted) {
-              setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
-              const revised = await regenerateChatReply({
-                model: useModel,
-                baseUrl,
-                apiKey,
-                extraHeaders,
-                system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
-                history,
-                originalReply: content,
-                critique,
-                params,
-                signal: ac.signal,
-              });
-              if (revised && !ac.signal.aborted) content = revised;
-            }
-          } catch (reflectionError) {
-            console.warn('[chat] reflection pass skipped (critique/regenerate failed)', reflectionError);
-          } finally {
-            if (!ac.signal.aborted) setNotice(null);
+      const seedMessages: ChatMessage[] = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
+
+      const registry: ToolRegistry = {
+        web_search: async (args, sig) => {
+          const res = await coderWebSearch(String(args.query || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          return JSON.stringify(res);
+        },
+        web_fetch: async (args, sig) => {
+          const res = await coderWebFetch(String(args.url || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          return JSON.stringify(res);
+        },
+        browser: async (args, sig) => {
+          const action = String(args.action || 'open');
+          const res = await coderBrowser(action, args as Record<string, string | number>, sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          return JSON.stringify(res);
+        },
+        memory_update: async (args) => {
+          const res = await coderMemoryAddLearning({ text: String(args.text || ''), kind: (String(args.kind || 'tip')) as any });
+          if (memoryEnabled) await loadMemory();
+          return JSON.stringify({ ok: true, learnings: res?.learnings?.length ?? 1 });
+        },
+        memory_recall: async (args) => {
+          const mem = memoryRef.current;
+          const q = String(args.query || '').trim().toLowerCase();
+          const matches = (mem?.learnings || []).filter((l: any) => String(l.text || '').toLowerCase().includes(q) || String(l.task || '').toLowerCase().includes(q));
+          return JSON.stringify({ matches });
+        },
+        set_directory: async (args) => {
+          const p = String(args.path || '').trim();
+          if (p) setComputerUseDir(p);
+          return JSON.stringify({ ok: true, scope: p });
+        },
+      };
+
+      if (computerUseOn && mcpToolsRef.current.length > 0) {
+        for (const t of mcpToolsRef.current) {
+          if (mcpToolTier(computerUsePerms, t.name) !== 'deny') {
+            registry[`mcp__${t.name}`] = async (args, sig) => {
+              const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope: computerUseDirRef.current ?? undefined }, sig);
+              return JSON.stringify(res);
+            };
           }
         }
-        if (!params.humanize) {
-          if (content !== original) patchTarget((m) => ({ ...m, content }));
-          await decide(content !== original ? { action: 'replace', content } : { action: 'done' });
-          return;
-        }
-        try {
-          const humanized = await humanizePassText(content, {
-            voice: effectiveVoice(params),
-            signal: ac.signal,
-            rewrite: (current) => humanizeRewriteText({
-              model: useModel,
-              baseUrl,
-              apiKey,
-              extraHeaders,
-              baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
-              priorMessages: history,
-              originalText: current,
-              params,
-              signal: ac.signal,
-            }),
-          });
-          if (!ac.signal.aborted && humanized.trim() !== content.trim()) content = humanized;
-        } catch (humanizeError) {
-          console.warn('[chat] humanize pass skipped (gate/rewrite failed)', humanizeError);
-        }
-        if (content !== original) patchTarget((m) => ({ ...m, content }));
-        await decide(content !== original ? { action: 'replace', content } : { action: 'done' });
-      };
-      // Ask-tier pause: the existing dialog mints the one-shot token, exactly
-      // like the old MCP-tool handler did.
-      const handleRunApproval = async (runId: string, a: { id: string; tool: string; rel: string | null; args: string }) => {
-        const ok = await requestApproval(a.tool, a.rel ?? a.args.slice(0, 160));
-        let token: string | undefined;
-        if (ok) {
-          try {
-            token = (await coderPermsApprove(a.tool, undefined, computerUseDirRef.current)).token;
-          } catch { /* no token — the endpoint's ask re-check will reject; surfaced to the model */ }
-        }
-        await agentRunsApi.approve(runId, a.id, ok ? 'approve' : 'deny', token).catch(() => {});
-      };
-      let snap: RunSnapshot | null = null;
+      }
+
+      let loopStop: string | undefined;
       try {
-        const started = await agentRunsApi.start({
-          messages: seedMessages,
-          kind: 'chat',
-          label: 'chat turn',
+        const loopResult = await runToolLoop({
           model: useModel,
-          baseUrl,
-          apiKey,
-          extraHeaders,
-          allowFallback: runAllowFallback,
           system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
-          maxSteps: 12,
-          toolSet: 'chat',
-          toolNames: tools.map((t) => t.function.name),
+          messages: seedMessages,
+          params,
           tools,
-          params: params as unknown as Record<string, unknown>,
-          scope: computerUseOn ? computerUseDirRef.current : null,
-          hookMode: (reflectionEnabled || params.humanize) ? 'client' : 'auto',
-        });
-        const runId = started.id;
-        const stream = new RunStream(
-          runId,
-          (snap) => {
-            if (snap.lastMeta) setLatestRequestMetrics(snap.lastMeta as unknown as MessageMeta, useModel);
+          registry,
+          maxSteps: 12,
+          signal: ac.signal,
+          onTurnStart: (turnIdx) => {
+            if (turnIdx === 0) return;
+            const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
+            liveTargetId = next.id;
+            setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, next] })));
           },
-          (ev) => {
+          onDelta: (kind, text) => {
             if (ac.signal.aborted) return;
-            switch (ev.type) {
-              case 'turn_started': {
-                if ((ev.turns as number) === 0) return;
-                const next: ChatMessage = { role: 'assistant', content: '', id: uid(), model: useModel, meta: {} };
-                liveTargetId = next.id;
-                setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, next] })));
-                break;
-              }
-              case 'delta': {
-                const text = ev.text as string;
-                if ((ev.kind as string) === 'content') patchTarget((m) => ({ ...m, content: m.content + text }));
-                else patchTarget((m) => ({ ...m, reasoning: (m.reasoning || '') + text }));
-                break;
-              }
-              case 'appended': {
-                const msg = ev.message as Record<string, unknown>;
-                if (msg.role === 'assistant') {
-                  const content = typeof msg.content === 'string' ? msg.content : '';
-                  const reasoning = typeof msg.reasoning_content === 'string' ? msg.reasoning_content : undefined;
-                  const calls = toAgentCalls(msg.tool_calls);
-                  const meta = (msg.meta ?? {}) as MessageMeta;
-                  patchTarget((m) => ({
-                    ...m,
-                    content,
-                    reasoning: reasoning ?? m.reasoning,
-                    tool_calls: calls.length ? calls : undefined,
-                    model: useModel,
-                    meta: Object.keys(meta).length ? meta : m.meta,
-                  }));
-                  if (Object.keys(meta).length) {
-                    setLatestRequestMetrics(meta, useModel);
+            if (kind === 'content') patchTarget((m) => ({ ...m, content: m.content + text }));
+            else patchTarget((m) => ({ ...m, reasoning: (m.reasoning || '') + text }));
+          },
+          onAssistantTurn: async (assistantMsg, info) => {
+            if (ac.signal.aborted) return;
+            patchTarget((m) => ({
+              ...m,
+              content: assistantMsg.content,
+              reasoning: assistantMsg.reasoning,
+              tool_calls: assistantMsg.tool_calls,
+              model: useModel,
+              meta: Object.keys(info.meta).length ? info.meta : m.meta,
+            }));
+            if (info.meta && Object.keys(info.meta).length) {
+              setLatestRequestMetrics(info.meta, useModel);
+            }
+
+            if (!assistantMsg.tool_calls?.length) {
+              let content = assistantMsg.content;
+              if (reflectionEnabled && content.trim()) {
+                setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
+                try {
+                  const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
+                  const critique = await critiqueChatReply({
+                    model: reflectionModel.trim() || useModel,
+                    baseUrl,
+                    apiKey,
+                    extraHeaders,
+                    history: critiqueHistory,
+                    reply: content,
+                    maxTokens: reflectionCritiqueMaxTokens,
+                    signal: ac.signal,
+                  });
+                  if (critique && !ac.signal.aborted) {
+                    setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
+                    const revised = await regenerateChatReply({
+                      model: useModel,
+                      baseUrl,
+                      apiKey,
+                      extraHeaders,
+                      system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+                      history,
+                      originalReply: content,
+                      critique,
+                      params,
+                      signal: ac.signal,
+                    });
+                    if (revised && !ac.signal.aborted) content = revised;
                   }
-                } else {
-                  const tm: ChatMessage = {
-                    role: msg.role as ChatMessage['role'],
-                    content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
-                    ...(typeof msg.tool_call_id === 'string' ? { tool_call_id: msg.tool_call_id } : {}),
-                    ...(typeof msg.name === 'string' ? { name: msg.name } : {}),
-                  };
-                  setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, tm] })));
+                } catch (reflectionError) {
+                  console.warn('[chat] reflection pass skipped', reflectionError);
+                } finally {
+                  if (!ac.signal.aborted) setNotice(null);
                 }
-                break;
               }
-              case 'approval_requested':
-                void handleRunApproval(runId, ev as unknown as { id: string; tool: string; rel: string | null; args: string });
-                break;
-              case 'user_question_requested':
-                // Chat never offered ask_user and the nested prompt forbids
-                // questions — answer empty so the run keeps moving.
-                void agentRunsApi.answer(runId, ev.id as string, '').catch(() => {});
-                break;
-              case 'hook_requested':
-                void handleRunHook(runId, ev.id as string, (ev.had_tool_calls as boolean) ?? false);
-                break;
-              case 'error':
-                patchTarget((m) => ({ ...m, error: true, content: m.content || (ev.message as string) || 'Run failed', meta: { finishReason: 'error' } }));
-                break;
-              default:
-                break;
+
+              if (params.humanize && content.trim()) {
+                try {
+                  const humanized = await humanizePassText(content, {
+                    voice: effectiveVoice(params),
+                    signal: ac.signal,
+                    rewrite: (current) => humanizeRewriteText({
+                      model: useModel,
+                      baseUrl,
+                      apiKey,
+                      extraHeaders,
+                      baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
+                      priorMessages: history,
+                      originalText: current,
+                      params,
+                      signal: ac.signal,
+                    }),
+                  });
+                  if (!ac.signal.aborted && humanized.trim() !== content.trim()) content = humanized;
+                } catch (humanizeError) {
+                  console.warn('[chat] humanize pass skipped', humanizeError);
+                }
+              }
+
+              if (content !== assistantMsg.content) {
+                patchTarget((m) => ({ ...m, content }));
+                return { content };
+              }
             }
           },
-          () => {},
-        );
-        ac.signal.addEventListener('abort', () => {
-          stream.close();
-          agentRunsApi.stop(runId).catch(() => {});
-        }, { once: true });
-        await stream.attach();
-        snap = await agentRunsApi.get(runId);
-        if (snap.lastMeta) setLatestRequestMetrics(snap.lastMeta as unknown as MessageMeta, useModel);
-        // Memory tools dispatch server-side against the same global bank —
-        // resync the UI snapshot the old registry updated inline.
+          onAppended: (appendedMsgs) => {
+            if (ac.signal.aborted) return;
+            const nonAssistant = appendedMsgs.filter((m) => m.role !== 'assistant');
+            if (nonAssistant.length > 0) {
+              setConvs((cs) => cs.map((c) => (c.id !== convId ? c : { ...c, messages: [...c.messages, ...nonAssistant] })));
+            }
+          },
+        });
+        loopStop = loopResult.stop;
+        if (loopResult.meta) setLatestRequestMetrics(loopResult.meta, useModel);
         if (memoryEnabled && !ac.signal.aborted) await loadMemory();
       } catch (loopError) {
         if (!ac.signal.aborted) {
@@ -638,9 +603,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         abortRef.current = null;
       }
 
-      // Tool-step budget: the runner stops after 12 tool cycles without a
-      // final reply, same guard the old depth>=12 recursion carried.
-      if (snap?.stop === 'steps' && !ac.signal.aborted) {
+      if (loopStop === 'steps' && !ac.signal.aborted) {
         patchTarget((m) => ({
           ...m,
           content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
