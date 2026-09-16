@@ -450,7 +450,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           const last = [...cur.messages].reverse().find((m) => m.role === 'assistant' && (m.content ?? '').trim());
           content = (last?.content ?? '') as string;
         } catch { /* fall through with empty content → continue */ }
-        if (!content.trim()) { await decide({ action: 'continue' }); return; }
+        if (!content.trim()) { await decide({ action: 'done' }); return; }
         const original = content;
         if (reflectionEnabled) {
           setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
@@ -528,7 +528,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           tools,
           params: params as unknown as Record<string, unknown>,
           scope: computerUseOn ? computerUseDirRef.current : null,
-          hookMode: 'client',
+          hookMode: (reflectionEnabled || params.humanize) ? 'client' : 'auto',
         });
         const runId = started.id;
         const stream = new RunStream(

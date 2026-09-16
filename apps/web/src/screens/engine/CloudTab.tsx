@@ -2,28 +2,12 @@ import { useEffect, useState } from 'react';
 import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles } from 'lucide-react';
 import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
-import { testCloudConnection, type CloudTestResult } from '../../lib/api';
+import { testCloudConnection, fetchCloudModels, type CloudTestResult } from '../../lib/api';
 
 interface CloudTabProps {
   settings: AppSettings | null;
   onUpdate: (patch: Partial<AppSettings>) => void;
 }
-
-const COMMON_OPENAI_MODELS = [
-  'gpt-4o',
-  'gpt-4o-mini',
-  'gpt-4-turbo',
-  'gpt-4',
-  'gpt-3.5-turbo',
-  'o1',
-  'o1-mini',
-  'o1-preview',
-  'o3-mini',
-  'anthropic/claude-3.5-sonnet',
-  'deepseek-chat',
-  'deepseek-reasoner',
-  'llama-3.3-70b-versatile',
-];
 
 interface ProviderPreset {
   id: string;
@@ -83,6 +67,8 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [apiDraft, setApiDraft] = useState('');
   const [models, setModels] = useState<string[]>([]);
   const [testing, setTesting] = useState(false);
+  const [retrieving, setRetrieving] = useState(false);
+  const [retrieveNotice, setRetrieveNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [testResult, setTestResult] = useState<CloudTestResult | null>(null);
   const [showHeaders, setShowHeaders] = useState(false);
 
@@ -110,6 +96,23 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     if (preset.extraHeaders) setShowHeaders(true);
   };
 
+  const handleRetrieveModels = async () => {
+    setRetrieving(true);
+    setRetrieveNotice(null);
+    try {
+      const baseUrl = settings.cloudProviderBaseUrl || 'https://api.openai.com/v1';
+      const key = apiDraft.trim() || settings.cloudProviderApiKey || '';
+      const headers = settings.cloudProviderExtraHeaders;
+      const list = await fetchCloudModels(baseUrl, key, headers);
+      setModels(list);
+      setRetrieveNotice({ ok: true, msg: `Retrieved ${list.length} model${list.length === 1 ? '' : 's'} from endpoint` });
+    } catch (e) {
+      setRetrieveNotice({ ok: false, msg: e instanceof Error ? e.message : 'Failed to retrieve models' });
+    } finally {
+      setRetrieving(false);
+    }
+  };
+
   const handleTestConnection = async () => {
     setTesting(true);
     setTestResult(null);
@@ -130,7 +133,7 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
   const subagentModel = settings.cloudProviderSubagentModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';
 
-  const combinedList = Array.from(new Set([...COMMON_OPENAI_MODELS, ...models, primaryModel, subagentModel]));
+  const combinedList = Array.from(new Set([...models, primaryModel, subagentModel].filter(Boolean)));
   const modelOptions = combinedList.map((m) => ({ value: m, label: m }));
 
   return (
@@ -249,12 +252,36 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
 
               {/* Role-Specific Default Models */}
               <div className="rounded-xl border border-line bg-panel p-4 space-y-4">
-                <div>
-                  <h4 className="text-[13px] font-semibold text-ink">Default Models per Role</h4>
-                  <p className="text-[11.5px] text-faint">
-                    Assign distinct models for your Main Agent (reasoning/coding) vs. Subagent Workers (speed/cost).
-                  </p>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h4 className="text-[13px] font-semibold text-ink flex items-center gap-1.5">
+                      Default Models per Role
+                    </h4>
+                    <p className="text-[11.5px] text-faint">
+                      Assign distinct models for your Main Agent (reasoning/coding) vs. Subagent Workers (speed/cost).
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleRetrieveModels}
+                    disabled={retrieving}
+                    className="border border-line/60 self-start sm:self-auto shrink-0"
+                  >
+                    <RefreshCw size={13} className={retrieving ? 'animate-spin' : ''} />
+                    {retrieving ? 'Retrieving…' : 'Retrieve Models'}
+                  </Button>
                 </div>
+
+                {retrieveNotice && (
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-[11.5px] ${
+                      retrieveNotice.ok ? 'border-ok/30 bg-ok/5 text-ok' : 'border-danger/30 bg-danger/5 text-danger'
+                    }`}
+                  >
+                    {retrieveNotice.msg}
+                  </div>
+                )}
 
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                   <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active.">
