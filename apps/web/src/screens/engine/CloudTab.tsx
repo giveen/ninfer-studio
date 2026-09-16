@@ -19,6 +19,16 @@ interface ProviderPreset {
   extraHeaders?: string;
 }
 
+// Shown when the endpoint hasn't returned a model list yet (fresh setup, or
+// Retrieve/Test not run). Kept in sync with the provider presets below so a
+// new user always has something sensible to pick.
+const COMMON_MODEL_FALLBACK = [
+  'gpt-4o',
+  'gpt-4o-mini',
+  'gpt-4-turbo',
+  'gpt-4',
+  'gpt-3.5-turbo',
+];
 const PRESETS: ProviderPreset[] = [
   {
     id: 'openai',
@@ -101,7 +111,9 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     setRetrieveNotice(null);
     try {
       const baseUrl = settings.cloudProviderBaseUrl || 'https://api.openai.com/v1';
-      const key = apiDraft.trim() || settings.cloudProviderApiKey || '';
+      // Empty string = "use the saved key": the backend substitutes the
+      // stored secret (the UI only ever holds the redaction mask).
+      const key = apiDraft.trim();
       const headers = settings.cloudProviderExtraHeaders;
       const list = await fetchCloudModels(baseUrl, key, headers);
       setModels(list);
@@ -118,7 +130,7 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     setTestResult(null);
     try {
       const baseUrl = settings.cloudProviderBaseUrl || 'https://api.openai.com/v1';
-      const key = apiDraft.trim() || settings.cloudProviderApiKey || '';
+      const key = apiDraft.trim();
       const headers = settings.cloudProviderExtraHeaders;
       const res = await testCloudConnection(baseUrl, key, headers);
       setTestResult(res);
@@ -130,10 +142,11 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     }
   };
 
+
   const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
   const subagentModel = settings.cloudProviderSubagentModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';
 
-  const combinedList = Array.from(new Set([...models, primaryModel, subagentModel].filter(Boolean)));
+  const combinedList = Array.from(new Set([...models, primaryModel, subagentModel, ...COMMON_MODEL_FALLBACK].filter(Boolean)));
   const modelOptions = combinedList.map((m) => ({ value: m, label: m }));
 
   return (

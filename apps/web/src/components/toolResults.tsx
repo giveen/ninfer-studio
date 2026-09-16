@@ -168,7 +168,7 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
  *  model-written markdown documents injected into the transcript — they get a
  *  proper source label and render as markdown when expanded, instead of
  *  showing up as a plain "user" wall of text. */
-export function ReportBlock({ message }: { message: ChatMessage }) {
+export function ReportBlock({ message, workspace }: { message: ChatMessage; workspace?: string }) {
   const [open, setOpen] = useState(!message.collapsed);
   const preview = (message.content.replace(/^#+\s*/, '').split('\n')[0] || '').slice(0, 90);
   return (
@@ -182,7 +182,7 @@ export function ReportBlock({ message }: { message: ChatMessage }) {
       {open && message.content && (
         <div className="markdown border-t border-line px-3 py-2 text-[13.5px] leading-relaxed">
           <Suspense fallback={null}>
-            <Markdown>{message.content}</Markdown>
+            <Markdown workspace={workspace}>{message.content}</Markdown>
           </Suspense>
         </div>
       )}
@@ -190,7 +190,7 @@ export function ReportBlock({ message }: { message: ChatMessage }) {
   );
 }
 
-export function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
+export function TrajectoryBlock({ items, workspace }: { items: ChatMessage[]; workspace?: string }) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -215,7 +215,7 @@ export function TrajectoryBlock({ items }: { items: ChatMessage[] }) {
               )}
               {m.content && m.role !== 'tool' && (
                 m.role === 'assistant'
-                  ? <div className="markdown text-[12px] leading-relaxed"><Suspense fallback={null}><Markdown>{m.content}</Markdown></Suspense></div>
+                  ? <div className="markdown text-[12px] leading-relaxed"><Suspense fallback={null}><Markdown workspace={workspace}>{m.content}</Markdown></Suspense></div>
                   : <div className="break-words text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (

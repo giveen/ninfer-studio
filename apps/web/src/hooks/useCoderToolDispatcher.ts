@@ -67,7 +67,7 @@ export interface UseCoderToolDispatcherOptions {
     registerSub: (sub: { id: string; label: string; task: string; ws: string }) => void;
     unregisterSub: (id: string) => void;
   };
-  addLog: (log: { type: LogEntry['type']; label: string; detail?: string; durationMs?: number }) => void;
+  addLog: (log: { type: LogEntry['type']; label: string; detail?: string; durationMs?: number; provider?: 'cloud' | 'local' }) => void;
   createCheckpoint: (opts?: { auto?: boolean }) => Promise<any>;
   requestApproval: (name: string, detail: string) => Promise<boolean>;
   requestRiskyApproval: (cmd: string, reason: string, fromSubagent?: boolean) => Promise<'deny' | 'once' | 'remember'>;

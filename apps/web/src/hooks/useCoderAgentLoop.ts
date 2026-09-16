@@ -196,7 +196,9 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
       primaryCloudModel: opts.coderParams.primaryCloudModel,
     }, fallbackModel);
     const model = primaryConfig.model;
+    const mainProvider: 'cloud' | 'local' = primaryConfig.baseUrl ? 'cloud' : 'local';
     opts.modelRef.current = model;
+    opts.addLog({ type: 'read', label: 'run', provider: mainProvider, detail: `main agent on ${mainProvider}: ${model}` });
 
     if (options?.scout && opts.scoutOn) {
       const mc = await opts.engineMaxConcurrency();
@@ -213,7 +215,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
         let summaries: string[] = [];
         if (mc > 1 || isCloudSub) {
-          opts.addLog({ type: 'read', label: 'scout', detail: `3 parallel probes (${isCloudSub ? 'cloud' : `engine concurrency ${mc}`})` });
+          opts.addLog({ type: 'read', label: 'scout', provider: isCloudSub ? 'cloud' : 'local', detail: `3 parallel probes (${isCloudSub ? 'cloud' : `engine concurrency ${mc}`})` });
           summaries = await Promise.all(
             SCOUT_PROBES.map(async (p) => {
               const s = await opts.runSubagent(
@@ -224,12 +226,12 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                 model,
                 signal
               );
-              opts.addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
+              opts.addLog({ type: 'read', label: `scout:${p.label}`, provider: isCloudSub ? 'cloud' : 'local', detail: `${s.length} chars` });
               return `## ${p.label}\n${s}`;
             })
           );
         } else {
-          opts.addLog({ type: 'read', label: 'scout', detail: '3 sequential probes (local single concurrency)' });
+          opts.addLog({ type: 'read', label: 'scout', provider: 'local', detail: '3 sequential probes (local single concurrency)' });
           for (const p of SCOUT_PROBES) {
             if (signal.aborted) break;
             const s = await opts.runSubagent(
@@ -240,7 +242,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               model,
               signal
             );
-            opts.addLog({ type: 'read', label: `scout:${p.label}`, detail: `${s.length} chars` });
+            opts.addLog({ type: 'read', label: `scout:${p.label}`, provider: 'local', detail: `${s.length} chars` });
             summaries.push(`## ${p.label}\n${s}`);
           }
         }

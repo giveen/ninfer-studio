@@ -6,12 +6,18 @@ import type { ReactNode } from 'react';
 import { openExternalLink } from '../lib/externalLink';
 import { postJSON } from '../lib/api/core';
 
-function ImageWithFallback({ src, alt }: { src?: string; alt?: string }) {
-  const [resolvedSrc, setResolvedSrc] = useState(src || '');
+// Per-workspace data-URL cache: the same image path can appear many times in
+// a long transcript, and each <img> mounts its own ImageWithFallback. Without
+// a cache that's one fs/b64 round trip per mount (plus a re-fetch on every
+// remount). Keyed on workspace + cleaned path.
+const imageCache = new Map<string, string>();
+
+function ImageWithFallback({ src, alt, workspace }: { src?: string; alt?: string; workspace?: string }) {
+  const isRemote = !src || /^(https?:|data:|blob:)/.test(src);
+  const [resolvedSrc, setResolvedSrc] = useState(isRemote ? (src || '') : '');
 
   useEffect(() => {
     if (!src) return;
-    const isRemote = /^(https?:|data:|blob:)/.test(src);
     if (isRemote) {
       setResolvedSrc(src);
       return;
@@ -20,22 +26,31 @@ function ImageWithFallback({ src, alt }: { src?: string; alt?: string }) {
     let clean = src.replace(/^file:\/\//, '');
     if (clean.startsWith('<repo-root>/')) clean = clean.replace('<repo-root>/', '');
     if (clean.startsWith('./')) clean = clean.slice(2);
-
-    postJSON<{ dataUrl?: string }>('/api/coder/fs/b64', { path: clean }, 5000)
+    const cacheKey = `${workspace ?? ''}\0${clean}`;
+    const cached = imageCache.get(cacheKey);
+    if (cached) {
+      setResolvedSrc(cached);
+      return;
+    }
+    // Leave the previous src in place while loading — no broken-image flash.
+    postJSON<{ dataUrl?: string }>('/api/coder/fs/b64', { path: clean, workspace }, 5000)
       .then((res) => {
         if (live && res?.dataUrl) {
+          imageCache.set(cacheKey, res.dataUrl);
           setResolvedSrc(res.dataUrl);
         }
       })
       .catch(() => {
-        if (live) setResolvedSrc(src);
+        // Keep the original src so the browser shows its own broken-image
+        // state rather than silently rendering nothing.
       });
 
     return () => {
       live = false;
     };
-  }, [src]);
+  }, [src, isRemote, workspace]);
 
+  if (!resolvedSrc) return null;
   return (
     <img
       src={resolvedSrc}
@@ -113,7 +128,7 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
  * Inline code keeps the default (styled) rendering; fenced blocks get the
  * header bar + highlight.js tokens.
  */
-export function Markdown({ children }: { children: string }) {
+export function Markdown({ children, workspace }: { children: string; workspace?: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -129,7 +144,7 @@ export function Markdown({ children }: { children: string }) {
           return <code className={cls}>{children}</code>;
         },
         img: ({ src, alt }) => {
-          return <ImageWithFallback src={src} alt={alt} />;
+          return <ImageWithFallback src={src} alt={alt} workspace={workspace} />;
         },
         a: ({ href, children }) => {
           return (

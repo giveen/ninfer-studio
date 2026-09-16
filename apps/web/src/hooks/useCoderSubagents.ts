@@ -83,7 +83,7 @@ export function useCoderSubagents({
           provider: coderParams.subagentProvider,
           cloudModel: coderParams.subagentCloudModel,
         }, model);
-        const subProvider = subConfig.baseUrl ? 'cloud' : 'local';
+        const subProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
         const started = await agentRunsApi.start({
           messages: [{ role: 'user', content: prompt }],
           kind: 'scout',
@@ -122,9 +122,9 @@ export function useCoderSubagents({
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
-                addLog({ type: 'ask', label: a.tool, detail: `[subagent] ${detail}` });
+                addLog({ type: 'ask', label: a.tool, provider: subProvider, detail: `[subagent] ${detail}` });
                 const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
-                addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+                addLog({ type: ok ? 'bash' : 'error', label: a.tool, provider: subProvider, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
                 await agentRunsApi.approve(id as string, a.id, ok ? 'approve' : 'deny').catch(() => {});
               })();
             },
@@ -260,6 +260,7 @@ export function useCoderSubagents({
           provider: coderParams.subagentProvider,
           cloudModel: coderParams.subagentCloudModel,
         }, model);
+        const workerProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
         const started = await agentRunsApi.start({
           messages: [{ role: 'user', content: prompt }],
           kind: 'worker',
@@ -301,9 +302,9 @@ export function useCoderSubagents({
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
-                addLog({ type: 'ask', label: a.tool, detail: `[worker] ${detail}` });
+                addLog({ type: 'ask', label: a.tool, provider: workerProvider, detail: `[worker] ${detail}` });
                 const ok = signal.aborted ? false : await requestApproval(a.tool, detail);
-                addLog({ type: ok ? 'bash' : 'error', label: a.tool, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
+                addLog({ type: ok ? 'bash' : 'error', label: a.tool, provider: workerProvider, detail: ok ? `approved: ${detail}` : `denied: ${detail}` });
                 await agentRunsApi.approve(id, a.id, ok ? 'approve' : 'deny').catch(() => {});
               })();
             },

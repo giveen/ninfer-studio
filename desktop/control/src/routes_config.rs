@@ -216,7 +216,7 @@ pub(crate) async fn set_config(
 }
 
 pub(crate) async fn cloud_test(
-    AxumState(_state): AxumState<S>,
+    AxumState(state): AxumState<S>,
     req: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
@@ -224,7 +224,14 @@ pub(crate) async fn cloud_test(
         .get("baseUrl")
         .and_then(|v| v.as_str())
         .unwrap_or("https://api.openai.com/v1");
-    let api_key = body.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+    let api_key_raw = body.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+    // An empty key or the redaction mask means "use the saved key" — the UI
+    // only ever holds the mask, never the real secret (see `redact_config`).
+    let api_key = if api_key_raw.trim().is_empty() || api_key_raw == SECRET_MASK {
+        state.config.read().await.cloud_provider_api_key.clone()
+    } else {
+        api_key_raw.to_string()
+    };
     let extra_headers = body
         .get("extraHeaders")
         .and_then(|v| v.as_str())
@@ -243,19 +250,24 @@ pub(crate) async fn cloud_test(
         .unwrap_or_default();
 
     let mut req_builder = client.get(&url);
-    if !api_key.trim().is_empty() && api_key != SECRET_MASK {
+    if !api_key.trim().is_empty() {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key.trim()));
     }
     if !extra_headers.trim().is_empty() {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers) {
             for (k, v) in parsed {
                 if let Some(s) = v.as_str() {
-                    req_builder = req_builder.header(k, s);
+                    // Skip invalid header names/values instead of panicking
+                    // inside reqwest's `TryFrom` conversion.
+                    let name: Result<axum::http::HeaderName, _> = k.parse();
+                    let value: Result<axum::http::HeaderValue, _> = s.parse();
+                    if let (Ok(name), Ok(value)) = (name, value) {
+                        req_builder = req_builder.header(name, value);
+                    }
                 }
             }
         }
     }
-
     let t0 = std::time::Instant::now();
     match req_builder.send().await {
         Ok(res) => {

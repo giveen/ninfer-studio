@@ -127,8 +127,9 @@ export async function testCloudConnection(baseUrl?: string, apiKey?: string, ext
     const base = (baseUrl?.trim() || 'https://api.openai.com/v1').replace(/\/+$/, '');
     const url = base.endsWith('/models') ? base : `${base}/models`;
     const headers: Record<string, string> = {};
-    if (apiKey?.trim() && apiKey !== '******** (saved)') {
-      headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+    const k = apiKey?.trim() ?? '';
+    if (k && k !== '********' && k !== '******** (saved)') {
+      headers['Authorization'] = `Bearer ${k}`;
     }
     if (extraHeaders?.trim()) {
       try {

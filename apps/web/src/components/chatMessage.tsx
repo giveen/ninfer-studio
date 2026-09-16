@@ -31,7 +31,7 @@ export function CompactDivider() {
 // ---------------------------------------------------------------------------
 // Message rendering
 // ---------------------------------------------------------------------------
-function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean }) {
+function ReasoningBlock({ text, streaming, workspace }: { text: string; streaming?: boolean; workspace?: string }) {
   // Collapsed by default — long chains-of-thought shouldn't dominate the view.
   // A live pulse shows while it's actively thinking; a short preview is shown so
   // the gist is visible without expanding.
@@ -63,7 +63,7 @@ function ReasoningBlock({ text, streaming }: { text: string; streaming?: boolean
           {streaming ? (
             <div className="whitespace-pre-wrap break-words">{text}</div>
           ) : (
-            <Markdown>{text}</Markdown>
+            <Markdown workspace={workspace}>{text}</Markdown>
           )}
         </div>
       )}
@@ -140,6 +140,7 @@ export const MessageRow = memo(function MessageRow({
   index,
   isLast,
   actions,
+  workspace,
 }: {
   m: ChatMessage;
   streaming?: boolean;
@@ -153,6 +154,7 @@ export const MessageRow = memo(function MessageRow({
    *  a truncated reply anywhere else would orphan the messages after it. */
   isLast?: boolean;
   actions: MsgActions;
+  workspace?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(m.content);
@@ -195,7 +197,7 @@ export const MessageRow = memo(function MessageRow({
   // of text — same treatment Coder gives its Scout/Verify/Critic messages
   // (no row toolbar either: Edit/Regenerate don't apply to a report).
   if (m.displayName && m.collapsed) {
-    return <ReportBlock message={m} />;
+    return <ReportBlock message={m} workspace={workspace} />;
   }
 
   if (m.role === 'user') {
@@ -289,7 +291,7 @@ export const MessageRow = memo(function MessageRow({
           {m.model && <span className="font-mono text-[10.5px] text-faint">{m.model}</span>}
           {streaming && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
         </div>
-        <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} />
+        <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
         <div className={cn('rounded-xl rounded-tl-sm border border-line bg-panel px-3.5 py-2.5', streaming && m.content && 'stream-caret')}>
           {m.error ? (
             <div>
@@ -306,7 +308,7 @@ export const MessageRow = memo(function MessageRow({
               <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
             ) : (
               <div className="markdown text-[13.5px] leading-relaxed">
-                <Markdown>{m.content}</Markdown>
+                <Markdown workspace={workspace}>{m.content}</Markdown>
               </div>
             )
           ) : !streaming && !m.reasoning && !m.tool_calls ? (

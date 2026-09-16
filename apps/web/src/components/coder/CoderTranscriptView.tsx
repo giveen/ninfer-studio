@@ -15,13 +15,14 @@ export interface CoderTranscriptViewProps {
   planMode: boolean;
   coderSafeMode: boolean;
   activeWs: string;
+  activeWsDir?: string;
   messageGroups: MessageGroup[];
   running: boolean;
   pendingQuestion: string | null;
   onFollowUp: (q: string) => void;
-  TrajectoryBlock: React.ComponentType<{ items: any[] }>;
-  ReportBlock: React.ComponentType<{ message: any }>;
-  Markdown: React.ComponentType<{ children: string }>;
+  TrajectoryBlock: React.ComponentType<{ items: ChatMessage[]; workspace?: string }>;
+  ReportBlock: React.ComponentType<{ message: ChatMessage; workspace?: string }>;
+  Markdown: React.ComponentType<{ children: string; workspace?: string }>;
 }
 
 export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
@@ -31,6 +32,7 @@ export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
   planMode,
   coderSafeMode,
   activeWs,
+  activeWsDir,
   messageGroups,
   running,
   pendingQuestion,
@@ -39,6 +41,7 @@ export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
   ReportBlock,
   Markdown,
 }) => {
+  const ws = activeWsDir ?? activeWs;
   return (
     <div
       ref={transcriptRef}
@@ -78,9 +81,9 @@ export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
                 <span className="h-px flex-1 bg-line" />
               </div>
             ) : g.type === 'trajectory' ? (
-              <TrajectoryBlock items={g.items} />
+              <TrajectoryBlock items={g.items} workspace={ws} />
             ) : g.items[0].displayName && g.items[0].collapsed ? (
-              <ReportBlock message={g.items[0]} />
+              <ReportBlock message={g.items[0]} workspace={ws} />
             ) : (
               <div className={cn("p-3 rounded-lg border mb-4", g.items[0].role === 'user' ? 'bg-panel border-line' : 'bg-panel border-accent/30')}>
                 <div className="font-semibold text-xs text-faint mb-1">{g.items[0].displayName ?? (g.items[0].role === 'assistant' ? 'Garrulous' : g.items[0].role)}</div>
@@ -93,7 +96,7 @@ export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
                 ) : null}
                 {g.items[0].content && (
                   g.items[0].role === 'assistant' || g.items[0].displayName
-                    ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown>{g.items[0].content}</Markdown></Suspense></div>
+                    ? <div className="markdown text-[13.5px] leading-relaxed"><Suspense fallback={null}><Markdown workspace={ws}>{g.items[0].content}</Markdown></Suspense></div>
                     : <div className="text-sm whitespace-pre-wrap">{g.items[0].content}</div>
                 )}
                 {i === messageGroups.length - 1 && !running && !pendingQuestion && g.items[0].followUps && g.items[0].followUps.length > 0 && (

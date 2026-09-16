@@ -1767,6 +1767,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           planMode={planMode}
           coderSafeMode={coderSafeMode}
           activeWs={activeWs}
+          activeWsDir={activeWsDir}
           messageGroups={messageGroups}
           running={running}
           pendingQuestion={pendingQuestion}
