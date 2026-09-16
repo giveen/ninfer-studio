@@ -1,11 +1,13 @@
-// Deep research: concurrency-gated parallel fan-out, the same
-// orchestrator-workers shape as Coder's Scout pre-pass (CoderScreen.tsx's
-// SCOUT_PROBES/runSubagent), simplified for Chat's workspace-independent
-// tool set. A quick planning call breaks the question into up to
-// `maxAngles` independent angles; each angle runs as its own small,
-// tool-restricted server-side run in parallel (the control plane owns the
-// loop now — runs survive window close); the findings are combined into
-// one report string the caller injects as context for the final answer.
+// Deep research: concurrency-gated fan-out, the same orchestrator-workers
+// shape as Coder's Scout pre-pass (CoderScreen.tsx's SCOUT_PROBES/
+// runSubagent), simplified for Chat's workspace-independent tool set. A
+// quick planning call breaks the question into up to `maxAngles`
+// independent angles; each angle runs as its own small, tool-restricted
+// server-side run (the control plane owns the loop now — runs survive
+// window close) — in parallel when hitting a cloud endpoint, sequentially
+// on the local engine to avoid evicting the main conversation's KV cache;
+// the findings are combined into one report string the caller injects as
+// context for the final answer.
 
 import { buildChatRequest, streamChat } from './api';
 import { CHAT_TOOLS, CHAT_BROWSER_TOOL } from './chatHelpers';
@@ -40,6 +42,9 @@ async function planResearchAngles(opts: {
   question: string;
   maxAngles: number;
   signal?: AbortSignal;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
 }): Promise<string[]> {
   const plannerParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 300 };
   const body = buildChatRequest(opts.model, RESEARCH_PLANNER_SYSTEM(opts.maxAngles), [{ role: 'user', content: opts.question.slice(0, 2000) }], plannerParams);
@@ -51,7 +56,7 @@ async function planResearchAngles(opts: {
         onContentDelta: (d) => { acc += d; },
         onDone: () => resolve(),
         onError: (m) => reject(new Error(m)),
-      });
+      }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
     });
   } catch {
     return [opts.question];
@@ -70,7 +75,7 @@ const RESEARCH_ANGLE_SYSTEM = 'You are researching one specific angle of a large
  *  (the old client registry never permission-checked these tools, so
  *  allow-with-denial-on-ask preserves its effective behavior without a UI).
  *  Abort stops the server run. */
-async function runResearchAngle(opts: { model: string; angle: string; maxSteps: number; signal: AbortSignal }): Promise<string> {
+async function runResearchAngle(opts: { model: string; angle: string; maxSteps: number; signal: AbortSignal; baseUrl?: string; apiKey?: string; extraHeaders?: string }): Promise<string> {
   let id: string | null = null;
   const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
   try {
@@ -79,6 +84,9 @@ async function runResearchAngle(opts: { model: string; angle: string; maxSteps: 
       kind: 'research',
       label: `research: ${opts.angle.slice(0, 60)}`,
       model: opts.model,
+      baseUrl: opts.baseUrl,
+      apiKey: opts.apiKey,
+      extraHeaders: opts.extraHeaders,
       system: RESEARCH_ANGLE_SYSTEM,
       maxSteps: opts.maxSteps,
       toolSet: 'chat',
@@ -119,23 +127,37 @@ export interface DeepResearchResult {
   report: string;
 }
 
-/** Full fan-out: plan angles, research each in parallel, combine into one
- *  report. `maxAngles` should already be `min(engineMaxConcurrency(), 3)` —
- *  this function doesn't re-check concurrency itself, since gating on
- *  whether to call it at all is the caller's job (mirrors Scout's own
- *  call-site gate). */
+/** Full fan-out: plan angles, research each, combine into one report.
+ *  Angles run in parallel only when `baseUrl` points at a real cloud
+ *  endpoint — a local engine's KV cache is a single shared budget, and
+ *  concurrent angles with unrelated prefixes evict the main conversation's
+ *  cached tokens (the same failure mode Scout had). Local angles run
+ *  sequentially instead, trading fan-out speed for cache locality. */
 export async function runDeepResearch(opts: {
   model: string;
   question: string;
   maxAngles: number;
   maxStepsPerAngle?: number;
   signal: AbortSignal;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
 }): Promise<DeepResearchResult> {
-  const angles = await planResearchAngles({ model: opts.model, question: opts.question, maxAngles: opts.maxAngles, signal: opts.signal });
+  const { baseUrl, apiKey, extraHeaders } = opts;
+  const angles = await planResearchAngles({ model: opts.model, question: opts.question, maxAngles: opts.maxAngles, signal: opts.signal, baseUrl, apiKey, extraHeaders });
   if (opts.signal.aborted) return { angles, report: '' };
-  const findings = await Promise.all(
-    angles.map((angle) => runResearchAngle({ model: opts.model, angle, maxSteps: opts.maxStepsPerAngle ?? 5, signal: opts.signal })),
-  );
+  const runAngle = (angle: string) =>
+    runResearchAngle({ model: opts.model, angle, maxSteps: opts.maxStepsPerAngle ?? 5, signal: opts.signal, baseUrl, apiKey, extraHeaders });
+  let findings: string[];
+  if (baseUrl) {
+    findings = await Promise.all(angles.map(runAngle));
+  } else {
+    findings = [];
+    for (const angle of angles) {
+      if (opts.signal.aborted) break;
+      findings.push(await runAngle(angle));
+    }
+  }
   if (opts.signal.aborted) return { angles, report: '' };
   const report = angles.map((angle, i) => `## ${angle}\n${findings[i]}`).join('\n\n');
   return { angles, report };

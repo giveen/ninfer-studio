@@ -11,7 +11,6 @@ import {
   Archive,
   Trash2,
   RotateCcw,
-  Shield,
   GitCommit,
   Activity,
   RefreshCw,
@@ -19,9 +18,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../ui';
 import type { CoderStore, LogEntry } from '../../lib/coderStore';
-import type { McpToolInfo } from '../../lib/api';
 import type { FileNode } from '../../lib/types';
-import { TOOLS, type PermTier, type PermConfig, mcpServerKey, mcpToolTier, splitMcpName, DEFAULT_PERMS } from '../../lib/coderTools';
 import { CommitsPanel } from './CommitsPanel';
 import { JobsPanel } from './JobsPanel';
 import { RunsPanel } from './RunsPanel';
@@ -76,14 +73,7 @@ export interface CoderSidebarProps {
   archivedOpen: Record<string, boolean>;
   setArchivedOpen: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
   ledger: LogEntry[];
-  perms: PermConfig;
-  permsOpen: boolean;
-  setPermsOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  setToolPerm: (name: string, tier: PermTier) => void;
-  mcpTools: McpToolInfo[];
   activeWsDir: string;
-  setPerms: (p: PermConfig) => void;
-  setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
   git: any;
   jobs: any;
   treeOpen: boolean;
@@ -118,14 +108,7 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
   archivedOpen,
   setArchivedOpen,
   ledger,
-  perms,
-  permsOpen,
-  setPermsOpen,
-  setToolPerm,
-  mcpTools,
   activeWsDir,
-  setPerms,
-  setStore,
   git,
   jobs,
   treeOpen,
@@ -350,156 +333,6 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
               ))}
               {ledger.length === 0 && <div className="text-faint italic text-[11px]">No activity yet.</div>}
             </div>
-          </div>
-        </SidebarSection>
-
-        {/* Permissions */}
-        <SidebarSection title="Permissions" icon={<Shield size={13} />} defaultOpen={false}>
-          <div className="shrink-0 border-t border-line p-2">
-            <div className="mb-1.5 flex items-center">
-              <button
-                type="button"
-                className="ml-auto rounded p-0.5 text-faint hover:text-ink"
-                title={permsOpen ? 'Collapse' : 'Expand'}
-                onClick={() => setPermsOpen((o) => !o)}
-              >
-                {permsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-              </button>
-            </div>
-            {permsOpen && (
-              <>
-                {!activeWs ? (
-                  <div className="text-[10.5px] italic text-faint">Select a workspace.</div>
-                ) : (
-                  <>
-                    <div className="max-h-36 space-y-1 overflow-auto">
-                      {TOOLS.map((t) => {
-                        const tier = perms.tools[t.function.name] ?? 'allow';
-                        return (
-                          <div key={t.function.name} className="flex items-center gap-1">
-                            <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.function.description}>{t.function.name}</span>
-                            {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                              <button
-                                key={v}
-                                type="button"
-                                onClick={() => setToolPerm(t.function.name, v)}
-                                title={`${v} ${t.function.name}`}
-                                className={cn(
-                                  'rounded px-1.5 py-px text-[10px] font-medium',
-                                  tier === v
-                                    ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                                    : 'text-faint hover:bg-panel2 hover:text-mute',
-                                )}
-                              >
-                                {v}
-                              </button>
-                            ))}
-                          </div>
-                        );
-                      })}
-                      {mcpTools.length > 0 && (
-                        <>
-                          {Array.from(new Set(mcpTools.map((t) => mcpServerKey(t.name) ?? t.name))).map((serverKey) => {
-                            const serverName = serverKey.replace(/^mcp__/, '');
-                            const tools = mcpTools.filter((t) => mcpServerKey(t.name) === serverKey);
-                            const serverTier = mcpToolTier(perms, serverKey);
-                            return (
-                              <div key={serverKey}>
-                                <div className="flex items-center gap-1">
-                                  <span
-                                    className="min-w-0 flex-1 truncate font-mono text-[10.5px] font-semibold text-mute"
-                                    title={`MCP server ${serverName} — this tier applies to every tool the server exposes unless a tool below overrides it`}
-                                  >
-                                    {serverName}
-                                  </span>
-                                  {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                                    <button
-                                      key={v}
-                                      type="button"
-                                      onClick={() => setToolPerm(serverKey, v)}
-                                      title={`${v} every tool from ${serverName}`}
-                                      className={cn(
-                                        'rounded px-1.5 py-px text-[10px] font-medium',
-                                        serverTier === v
-                                          ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                                          : 'text-faint hover:bg-panel2 hover:text-mute',
-                                      )}
-                                    >
-                                      {v}
-                                    </button>
-                                  ))}
-                                </div>
-                                {tools.map((t) => {
-                                  const tier = mcpToolTier(perms, t.name);
-                                  const short = splitMcpName(t.name)?.tool ?? t.name;
-                                  return (
-                                    <div key={t.name} className="flex items-center gap-1 pl-3">
-                                      <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-mute" title={t.description}>{short}</span>
-                                      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                                        <button
-                                          key={v}
-                                          type="button"
-                                          onClick={() => setToolPerm(t.name, v)}
-                                          title={`${v} ${t.name}`}
-                                          className={cn(
-                                            'rounded px-1.5 py-px text-[10px] font-medium',
-                                            tier === v
-                                              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                                              : 'text-faint hover:bg-panel2 hover:text-mute',
-                                          )}
-                                        >
-                                          {v}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            );
-                          })}
-                        </>
-                      )}
-                    </div>
-                    <input
-                      key={activeWs}
-                      defaultValue={perms.denyPaths.join(' ')}
-                      placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
-                      title="Tool calls touching these workspace-relative paths are denied"
-                      onBlur={(e) => setPerms({ ...perms, denyPaths: e.target.value.split(/\s+/).map((s) => s.trim()).filter(Boolean) })}
-                      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-                      className="mt-1.5 w-full rounded border border-line bg-inset px-1.5 py-1 font-mono text-[10.5px] outline-none placeholder:text-faint focus:border-accent/50"
-                    />
-                    <div className="mt-2">
-                      <div className="mb-1 text-[10.5px] font-semibold text-mute">Approved risky commands</div>
-                      {(perms.approvedCommands || []).length === 0 ? (
-                        <div className="text-[10px] italic text-faint">None yet. Risky commands (push, publish, ssh, sudo, docker, cloud/infra mutations…) prompt for approval; choose &quot;Approve &amp; remember&quot; to whitelist them here for this workspace.</div>
-                      ) : (
-                        <div className="max-h-28 space-y-1 overflow-auto">
-                          {(perms.approvedCommands || []).map((c: string) => (
-                            <div key={c} className="flex items-center gap-1 rounded border border-line bg-inset px-1.5 py-0.5">
-                              <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-mute" title={c}>{c}</span>
-                              <button
-                                type="button"
-                                onClick={() => setStore((prev) => {
-                                  const wsd = prev.workspaces[activeWs];
-                                  if (!wsd) return prev;
-                                  const cur = wsd.perms?.approvedCommands || [];
-                                  return { ...prev, workspaces: { ...prev.workspaces, [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: cur.filter((x) => x !== c) } } } };
-                                })}
-                                className="shrink-0 rounded p-0.5 text-faint hover:bg-danger/10 hover:text-danger"
-                                title="Remove from approved list"
-                              >
-                                <Trash2 size={12} />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </>
-            )}
           </div>
         </SidebarSection>
 

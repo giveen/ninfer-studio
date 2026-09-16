@@ -48,11 +48,24 @@ struct UsageEvent {
     cached_tokens: u64,
     /// Streaming-request timing, in ms, when the response was streamed:
     /// `prefill_ms` is request-forwarded → first chunk, `total_ms` is
-    /// request-forwarded → stream end. Both feed the average prefill /
-    /// generation speed stats. `None` for non-streaming responses (a single
-    /// blob gives no prefill/decode split) and older log lines.
+    /// request-forwarded → stream end. Kept for display/debugging, but NOT
+    /// used for the average prefill/generation speed stats — see
+    /// `prompt_tok_per_sec`/`decode_tok_per_sec` for why. `None` for
+    /// non-streaming responses and older log lines.
     prefill_ms: Option<u64>,
     total_ms: Option<u64>,
+    /// The engine's own self-reported per-request speeds, from the
+    /// SGLang-style `timings.prompt_per_second` / `predicted_per_second`
+    /// extension (see `log_from_response_bytes`). Far more accurate than
+    /// deriving speed from `prefill_ms`: most OpenAI-compatible engines
+    /// (this one included — see the mock SSE fixtures in engine_loop.rs)
+    /// send an empty leading delta chunk (role announcement, no content)
+    /// before prefill has actually finished, so "time to first chunk"
+    /// measures near-zero connection/framing latency, not prefill compute —
+    /// which is what made the Usage tab's old "avg prefill" read in the
+    /// millions of tok/s. `None` for cloud providers (no `timings` object).
+    prompt_tok_per_sec: Option<f64>,
+    decode_tok_per_sec: Option<f64>,
 }
 
 /// Artifact filenames carry a format extension ("qwen3_8_27b_nvfp4.ninfer")
@@ -84,6 +97,12 @@ async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
     if let (Some(prefill), Some(total)) = (evt.prefill_ms, evt.total_ms) {
         obj.insert("prefillMs".into(), json!(prefill));
         obj.insert("totalMs".into(), json!(total));
+    }
+    if let Some(v) = evt.prompt_tok_per_sec {
+        obj.insert("promptTokPerSec".into(), json!(v));
+    }
+    if let Some(v) = evt.decode_tok_per_sec {
+        obj.insert("decodeTokPerSec".into(), json!(v));
     }
     let line = Value::Object(obj).to_string();
     let lock = mem_lock(state, "usage");
@@ -232,24 +251,30 @@ pub(crate) async fn usage_stats(
             *cost_by_model.entry(model.clone()).or_insert(0.0) += c;
         }
 
-        if let (Some(prefill_ms), Some(total_ms)) = (
-            e.get("prefillMs").and_then(Value::as_u64),
-            e.get("totalMs").and_then(Value::as_u64),
-        ) {
-            let prefill_s = prefill_ms as f64 / 1000.0;
-            let decode_ms = total_ms.saturating_sub(prefill_ms);
-            // A minimum prefill window keeps degenerate events (near-zero timing jitter
-            // or immediate first-chunk responses) from producing absurd tok/s.
-            if prefill_ms >= 50 && prompt > 0 {
-                speed_prompt_tokens += prompt;
-                speed_prefill_secs += prefill_s;
-            }
-            // A minimum decode window keeps degenerate events (single-chunk
-            // "streams", near-zero timing jitter) from producing absurd tok/s.
-            if decode_ms >= 50 && completion > 1 {
-                speed_completion_tokens += completion.saturating_sub(1);
-                speed_decode_secs += decode_ms as f64 / 1000.0;
-            }
+        // Speed is derived from the engine's own self-reported
+        // `prompt_per_second` / `predicted_per_second` (SGLang-style
+        // `timings` extension — see log_from_response_bytes), not from
+        // wall-clock request timing: most OpenAI-compatible engines send an
+        // empty leading delta chunk (role announcement) before prefill
+        // finishes, so "time to first chunk" measures connection/framing
+        // latency rather than actual prefill compute — that used to produce
+        // tok/s figures in the millions. `prompt`/`completion` here are the
+        // FULL counts (prompt includes cached tokens); weight by the tokens
+        // actually processed this request (uncached prefill, full decode).
+        let uncached_prompt = prompt.saturating_sub(cached);
+        if let Some(pps) = e.get("promptTokPerSec").and_then(Value::as_f64)
+            && pps > 0.0
+            && uncached_prompt > 0
+        {
+            speed_prompt_tokens += uncached_prompt;
+            speed_prefill_secs += uncached_prompt as f64 / pps;
+        }
+        if let Some(dps) = e.get("decodeTokPerSec").and_then(Value::as_f64)
+            && dps > 0.0
+            && completion > 0
+        {
+            speed_completion_tokens += completion;
+            speed_decode_secs += completion as f64 / dps;
         }
 
         prompt_total += prompt;
@@ -494,6 +519,8 @@ async fn log_from_response_bytes(
     let mut completion_tokens = 0;
     let mut cached_tokens = 0;
     let mut found = false;
+    let mut prompt_tok_per_sec = None;
+    let mut decode_tok_per_sec = None;
 
     if let Some(usage) = usage_obj {
         prompt_tokens = usage
@@ -528,6 +555,8 @@ async fn log_from_response_bytes(
         } else if cached_tokens == 0 && cache_n > 0 {
             cached_tokens = cache_n;
         }
+        prompt_tok_per_sec = timings.get("prompt_per_second").and_then(Value::as_f64);
+        decode_tok_per_sec = timings.get("predicted_per_second").and_then(Value::as_f64);
     }
 
     if !found {
@@ -544,6 +573,8 @@ async fn log_from_response_bytes(
             cached_tokens,
             prefill_ms,
             total_ms,
+            prompt_tok_per_sec,
+            decode_tok_per_sec,
         },
     )
     .await;
@@ -594,6 +625,8 @@ mod tests {
                 cached_tokens: 20,
                 prefill_ms: None,
                 total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
             },
         )
         .await
@@ -609,6 +642,8 @@ mod tests {
                 cached_tokens: 0,
                 prefill_ms: None,
                 total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
             },
         )
         .await
@@ -624,6 +659,8 @@ mod tests {
                 cached_tokens: 300,
                 prefill_ms: None,
                 total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
             },
         )
         .await
@@ -742,6 +779,8 @@ mod tests {
                 cached_tokens: 0,
                 prefill_ms: None,
                 total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
             },
         )
         .await
@@ -783,18 +822,18 @@ mod tests {
         assert_eq!(display_model_name("unknown"), "unknown");
     }
 
-    /// Streamed events contribute to the average prefill / generation speeds
-    /// (weighted: total tokens / total time across events), non-streamed
-    /// events don't, and the artifact extension is stripped from the model
-    /// name everywhere it surfaces.
+    /// Events carrying the engine's own `promptTokPerSec`/`decodeTokPerSec`
+    /// (from the SGLang-style `timings` extension) contribute to the average
+    /// prefill / generation speeds (weighted: total tokens / total time
+    /// across events), events without them don't, and the artifact
+    /// extension is stripped from the model name everywhere it surfaces.
     #[tokio::test]
     async fn stream_timing_feeds_average_speeds_and_model_extension_is_stripped() {
         let state = temp_state();
-        // 100 prompt / 200 completion over 500ms prefill + 2000ms decode, and
-        // 50 prompt / 100 completion over 500ms prefill + 1000ms decode:
-        // avgPrefillTps = 150 / 1.0 = 150.
-        // For generation, we subtract 1 token per request:
-        // avgGenerationTps = (199 + 99) / 3.0 = 298 / 3.0 = 99.333333...
+        // 100 prompt tokens prefilled at 200 tok/s (0.5s) + 50 at 100 tok/s
+        // (0.5s): avgPrefillTps = (100 + 50) / (0.5 + 0.5) = 150.
+        // 200 completion tokens decoded at 100 tok/s (2.0s) + 100 at 100 tok/s
+        // (1.0s): avgGenerationTps = (200 + 100) / (2.0 + 1.0) = 100.
         log_usage_event(
             &state,
             UsageEvent {
@@ -804,8 +843,10 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 200,
                 cached_tokens: 0,
-                prefill_ms: Some(500),
-                total_ms: Some(2500),
+                prefill_ms: None,
+                total_ms: None,
+                prompt_tok_per_sec: Some(200.0),
+                decode_tok_per_sec: Some(100.0),
             },
         )
         .await
@@ -819,13 +860,16 @@ mod tests {
                 prompt_tokens: 50,
                 completion_tokens: 100,
                 cached_tokens: 0,
-                prefill_ms: Some(500),
-                total_ms: Some(1500),
+                prefill_ms: None,
+                total_ms: None,
+                prompt_tok_per_sec: Some(100.0),
+                decode_tok_per_sec: Some(100.0),
             },
         )
         .await
         .unwrap();
-        // No timing → counts toward tokens/requests but not the speeds.
+        // No engine-reported speed → counts toward tokens/requests but not
+        // the speed averages.
         log_usage_event(
             &state,
             UsageEvent {
@@ -837,6 +881,8 @@ mod tests {
                 cached_tokens: 0,
                 prefill_ms: None,
                 total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
             },
         )
         .await
@@ -852,9 +898,7 @@ mod tests {
         .await;
         assert_eq!(all["totals"]["mostUsedModel"], "qwen3_8_27b_nvfp4");
         assert!((all["totals"]["avgPrefillTps"].as_f64().unwrap() - 150.0).abs() < 1e-9);
-        assert!(
-            (all["totals"]["avgGenerationTps"].as_f64().unwrap() - 99.33333333333333).abs() < 1e-9
-        );
+        assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 100.0).abs() < 1e-9);
         let models: Vec<&str> = all["modelBreakdown"]
             .as_array()
             .unwrap()

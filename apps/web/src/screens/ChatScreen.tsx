@@ -37,7 +37,6 @@ import { useChatAgent } from '../lib/chatAgent';
 import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, type McpToolInfo } from '../lib/api';
 import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
-import { engineMaxConcurrency } from '../lib/engineInfo';
 
 // ---------------------------------------------------------------------------
 // Screen
@@ -323,18 +322,20 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const ac = new AbortController();
       abortRef.current = ac;
 
-      // Deep research: concurrency-gated fan-out over the user's latest
-      // question, run BEFORE the main turn so the findings are already in
-      // context for the synthesis reply — same shape as Scout's
-      // fan-out-then-inject-report pre-pass. The report is both appended to
-      // `effectiveHistory` (for this call's model context) AND spliced into
-      // the visible conv.messages as a collapsed "Deep Research" report
-      // (ReportBlock, via MessageRow's displayName+collapsed branch) — same
-      // treatment Coder gives Scout, so the findings are auditable instead
-      // of only ever reaching the model invisibly.
+      // Deep research: fan-out over the user's latest question, run BEFORE
+      // the main turn so the findings are already in context for the
+      // synthesis reply — same shape as Scout's fan-out-then-inject-report
+      // pre-pass. The report is both appended to `effectiveHistory` (for
+      // this call's model context) AND spliced into the visible
+      // conv.messages as a collapsed "Deep Research" report (ReportBlock,
+      // via MessageRow's displayName+collapsed branch) — same treatment
+      // Coder gives Scout, so the findings are auditable instead of only
+      // ever reaching the model invisibly. Angles run in parallel only when
+      // `baseUrl` is a real cloud endpoint (see deepResearch.ts) — on the
+      // local engine they run sequentially so they don't evict the main
+      // conversation's KV cache.
       let effectiveHistory = history;
-      const maxConcurrency = engineMaxConcurrency(status);
-      if (deepResearchEnabled && maxConcurrency > 1 && !ac.signal.aborted) {
+      if (deepResearchEnabled && !ac.signal.aborted) {
         const question = [...history].reverse().find((m) => m.role === 'user')?.content ?? '';
         const isTrivial = (q: string): boolean => {
           const t = q.trim().toLowerCase().replace(/[^\w\s]/g, '');
@@ -344,10 +345,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           return false;
         };
         if (question.trim() && !isTrivial(question)) {
-          const maxAngles = Math.min(maxConcurrency, deepResearchMaxAngles);
+          const maxAngles = deepResearchMaxAngles;
           setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
           try {
-            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal });
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal, baseUrl, apiKey, extraHeaders });
             if (report && !ac.signal.aborted) {
               const researchMsg: ChatMessage = {
                 role: 'user',

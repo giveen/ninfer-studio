@@ -198,7 +198,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return () => clearInterval(t);
   }, [llmPhase ? 1 : 0]);
   // Commit panel collapse state lives in useCoderGit.
-  const [permsOpen, setPermsOpen] = useState(true);
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
   const trackedStream = async (
@@ -354,9 +353,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // The ref updates inside stream callbacks (no re-render); mirror it into
   // state whenever the transcript changes so the meter stays live.
   useEffect(() => { setCtxTokens(lastPromptTokensRef.current); }, [messages]);
-  // The system prompt (CODER_SYSTEM + live repo map). Kept in a ref so it can be
-  // refreshed mid-run after the agent writes/edits files (P1 #6).
+  // The system prompt (CODER_SYSTEM + humanize/review-lens settings). Kept in
+  // a ref for the same reason codebaseContextRef is (see its comment below),
+  // but this half rarely changes mid-run, so it stays fit for the system
+  // message without threatening cache locality.
   const dynamicSystemRef = useRef<string>(CODER_SYSTEM);
+  // Live codebase context (repo map, conventions, detected commands, skills
+  // index, followed files) — refreshed mid-run after the agent writes/edits
+  // files (P1 #6), same as dynamicSystemRef used to include inline. Kept
+  // separate and fed in as a per-turn trailing note (after history) instead
+  // of the system prompt: this half changes on nearly every mutating tool
+  // call during real coding work, and baking a value that changes almost
+  // every turn into the system prefix invalidates the engine's KV-cache
+  // reuse for the entire growing history each time — see the trailing-note
+  // pattern already used for date/time and todos in useCoderAgentLoop.ts.
+  const codebaseContextRef = useRef<string>('');
 
   /** Load a conversation's live state from the store (always reads the latest). */
   const loadConv = (ws: string, convId: string) => {
@@ -728,10 +739,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     mutateTodos((prev) => prev.filter((_, j) => j !== i));
     addLog({ type: 'todo', label: 'manual', detail: 'removed a task' });
   };
-  // Rebuild the system prompt, refreshing the codebase map so the agent sees files
-  // it just created/edited (P1 #6). Stored in dynamicSystemRef for use each turn.
+  // Rebuild the system prompt's static half and refresh the live codebase
+  // context (repo map etc.) so the agent sees files it just created/edited
+  // (P1 #6). Stored in dynamicSystemRef / codebaseContextRef for use each turn.
   const refreshRepoMap = useCallback(async () => {
-    let sys = CODER_SYSTEM;
+    const sys = CODER_SYSTEM;
+    let ctx = '';
     try {
       const rMap = await coderRepoMap();
       if (rMap && rMap.map) {
@@ -742,7 +755,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         const map = rMap.map.length > REPO_MAP_CAP
           ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
           : rMap.map;
-        sys += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
+        ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
       }
     } catch { /* ignore */ }
     // Project conventions: AGENTS.md preferred, CLAUDE.md fallback — refreshed
@@ -763,7 +776,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       conventionsRef.current = '';
     }
     if (conventionsRef.current.trim()) {
-      sys += `\n\n# Project Conventions (from ${convName || 'workspace memory file'} — follow these)\n${conventionsRef.current}\n`;
+      ctx += `\n\n# Project Conventions (from ${convName || 'workspace memory file'} — follow these)\n${conventionsRef.current}\n`;
     }
     // Bootstrap: surface the already-detected lint/test/build commands up
     // front so the model doesn't spend early tool calls discovering them
@@ -783,7 +796,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           cmds.lint ? `- lint: \`${cmds.lint}\`` : '',
           cmds.test ? `- test: \`${cmds.test}\`` : '',
         ].filter(Boolean);
-        sys += `\n\n# Detected project commands\nUse these to build/lint/test — no need to search for them:\n${lines.join('\n')}\n`;
+        ctx += `\n\n# Detected project commands\nUse these to build/lint/test — no need to search for them:\n${lines.join('\n')}\n`;
       }
     } catch { /* bootstrap injection must never break system-prompt assembly */ }
     // Skills-lite: workspace `skills/*/SKILL.md` index. Only names + first-line
@@ -804,7 +817,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         } catch { /* skip unreadable skill */ }
       }
       if (lines.length > 0) {
-        sys += `\n\n# Skills (read the SKILL.md with the read tool when its trigger matches)\n${lines.join('\n').slice(0, 4000)}\n`;
+        ctx += `\n\n# Skills (read the SKILL.md with the read tool when its trigger matches)\n${lines.join('\n').slice(0, 4000)}\n`;
         addLog({ type: 'read', label: 'skills', detail: `${lines.length} skill(s)` });
       }
     } catch { /* no skills dir */ }
@@ -850,27 +863,28 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
             followed.push(`- ${p} (unreadable)`);
           }
         }
-        if (followed.length > 1) sys += followed.join('\n');
+        if (followed.length > 1) ctx += followed.join('\n');
       }
     } catch { /* never break system-prompt assembly over follow-bindings */ }
-
-
 
     // Not-Ai humanize: when enabled, append the editorial contract (plus the
     // chosen voice profile) so the agent's user-facing prose avoids em dashes,
     // buzzwords, and empty framing. The deterministic gate is applied separately
-    // to content-only assistant replies.
+    // to content-only assistant replies. Driven by a user toggle, not live
+    // filesystem state, so this stays part of the (cache-stable) system prompt.
+    let staticSys = sys;
     if (coderParamsRef.current.humanize) {
       const voice = voiceSnippet(coderParamsRef.current.voiceProfile || 'technical');
-      sys += `\n\n# Humanize replies (Not-Ai)\n${NOT_AI_CONTRACT}${voice ? `\n\n${voice}` : ''}\n`;
+      staticSys += `\n\n# Humanize replies (Not-Ai)\n${NOT_AI_CONTRACT}${voice ? `\n\n${voice}` : ''}\n`;
     }
 
     // Review lens: inject a distilled coding-review discipline (e.g. the Linus
     // Torvalds method) into the system prompt. The full method is too large to
     // inline every turn, so only the compact distillation is injected here; the
     // complete catalog can live in the workspace `skills/` dir (auto-indexed).
+    // Also a user toggle, not live filesystem state.
     const lensBlock = coderLensBlock(coderParamsRef.current.reviewLens);
-    if (lensBlock) sys += `\n\n# Review lens\n${lensBlock}\n`;
+    if (lensBlock) staticSys += `\n\n# Review lens\n${lensBlock}\n`;
 
     // Deliberately no live date/time appended here: this string is reused
     // as-is across every step of a run (and re-set after every mutating
@@ -880,7 +894,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     // breakpoint) for the entire history on every single turn. The date is
     // appended instead as a per-turn trailing note, after history, in
     // useCoderAgentLoop's streamTurn call — see chat.ts's `trailingNote`.
-    dynamicSystemRef.current = sys;
+    // The same reasoning is why `ctx` (repo map, conventions, followed
+    // files — all live filesystem state, refreshed on every mutating tool
+    // call) is kept out of dynamicSystemRef entirely and fed to the trailing
+    // note by the caller instead; see codebaseContextRef's declaration.
+    dynamicSystemRef.current = staticSys;
+    codebaseContextRef.current = ctx;
   }, []);
 
   const {
@@ -1228,7 +1247,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   });
 
   const {
-    engineMaxConcurrency,
     runSubagent,
     runWorker,
     runIdeation,
@@ -1241,6 +1259,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     appConfig,
     coderParams,
     dynamicSystemRef,
+    codebaseContextRef,
     requestApproval,
     addLog,
     memoryRef,
@@ -1390,6 +1409,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     mcpToolsRef,
     planMode,
     dynamicSystemRef,
+    codebaseContextRef,
     todosRef,
     todosRevRef,
     todosRevAtReqStartRef,
@@ -1414,7 +1434,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     setQueued,
     storeRef,
     setStore,
-    engineMaxConcurrency,
     runSubagent,
   });
 
@@ -1700,14 +1719,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         archivedOpen={archivedOpen}
         setArchivedOpen={setArchivedOpen}
         ledger={ledger}
-        perms={perms}
-        permsOpen={permsOpen}
-        setPermsOpen={setPermsOpen}
-        setToolPerm={setToolPerm}
-        mcpTools={mcpTools}
         activeWsDir={activeWsDir}
-        setPerms={setPerms}
-        setStore={setStore}
         git={git}
         jobs={jobs}
         treeOpen={treeOpen}
