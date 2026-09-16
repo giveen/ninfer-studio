@@ -1,10 +1,11 @@
 name: CI / Web
 
-# Type-check + production build of the React app, the vitest unit suite,
-# plus the API-surface registration gate (every /api/* path the UI calls
-# must be registered by the Rust control plane). Runs on pull requests that
-# touch the web app or the control-plane router (including forks) and on
-# direct pushes to main, so the lockfile and TS surfaces can't silently drift.
+# Type-check + production build of the React app, the vitest unit suite, the
+# Playwright e2e suite (against the dev server), plus the API-surface
+# registration gate (every /api/* path the UI calls must be registered by the
+# Rust control plane). Runs on pull requests that touch the web app or the
+# control-plane router (including forks) and on direct pushes to main, so the
+# lockfile and TS surfaces can't silently drift.
 
 on:
   pull_request:
@@ -39,7 +40,7 @@ jobs:
   web:
     name: tsc + vite build + tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4 # version comes from packageManager in package.json
@@ -53,6 +54,19 @@ jobs:
         run: pnpm --filter @ninfier/web build
       - name: Unit tests (apps/web)
         run: pnpm --filter @ninfier/web test
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      - name: Install Playwright browser binary (cache miss only)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: pnpm --filter @ninfier/web exec playwright install chromium
+      - name: Install Playwright OS dependencies
+        run: pnpm --filter @ninfier/web exec playwright install-deps chromium
+      - name: E2E tests (apps/web)
+        run: pnpm --filter @ninfier/web test:e2e
       - name: API surface registration (UI endpoints vs control plane)
         run: node scripts/api-parity.mjs
       - name: Version parity (apps/web vs root)

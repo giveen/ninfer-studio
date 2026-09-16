@@ -23,7 +23,16 @@ concurrency:
 
 jobs:
   # Build + bundle on each platform, uploading into the draft release.
+  #
+  # Gated behind the `release` environment: tags still fire this workflow the
+  # moment they're pushed, but each matrix job pauses at "Waiting" until a
+  # required reviewer approves it in the Actions tab. Without this, every tag
+  # push — including ones cut per-commit during active development — burns a
+  # full Linux + Windows installer build (~30 billed minutes) unconditionally.
+  # Configure the required reviewers once in Settings > Environments >
+  # release; this file alone doesn't enforce approval on its own.
   build:
+    environment: release
     strategy:
       fail-fast: false
       matrix:

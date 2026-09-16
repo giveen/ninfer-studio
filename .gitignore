@@ -6,6 +6,8 @@ data/
 *.tsbuildinfo
 desktop/target/
 *.deb
+apps/web/test-results/
+apps/web/playwright-report/
 
   # Runtime local storage (not source)
 storage/
