@@ -613,100 +613,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
             meta: { finishReason: 'error' },
           }));
         }
+      } finally {
+        setStreaming(false);
+        setStreamingConvId(null);
+        abortRef.current = null;
       }
 
-      // Tool-step budget: the runner stops after 12 tool cycles without a
-      // final reply, same guard the old depth>=12 recursion carried.
-      if (snap?.stop === 'steps' && !ac.signal.aborted) {
-        patchTarget((m) => ({
-          ...m,
-          content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
-          error: true,
-        }));
-      }
-      
-      // Auto-compact: once this turn's usage crosses the configured share of
-      // the model's context window, silently fold the conversation into a
-      // summary checkpoint so the next message doesn't risk truncation.
-      // Reactive (checked after each reply) rather than Coder's proactive
-      // per-step check, since Chat turns are user-initiated, not an
-      // autonomous loop — the natural checkpoint is right after a reply
-      // lands, before the user's next message.
-      if (!ac.signal.aborted) {
-        try {
-          // Look up the engine actually serving `useModel`, not just the
-          // first/primary one — matters when multiple engines with different
-          // context sizes are running (same fix as ctxLimit above).
-          const limit = allEngines.find((e) => e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
-          const convForCompact = convsRef.current.find((c) => c.id === convId);
-          const msgsForCompact = convForCompact?.messages ?? [];
-          // The final reply is the last assistant message (past the original
-          // placeholder once tool turns ran), not necessarily the placeholder.
-          const finalMsg = [...msgsForCompact].reverse().find((m) => m.role === 'assistant');
-          const usedTok = finalMsg?.meta ? (finalMsg.meta.promptTokens ?? 0) + (finalMsg.meta.completionTokens ?? 0) : 0;
-          const thresholdPct = params.compactAt ?? 80;
-          if (convForCompact && limit && usedTok > 0 && usedTok >= (thresholdPct / 100) * limit) {
-            const prior: ChatMessage[] = convForCompact.compactedSummary
-              ? [{ role: 'user', content: frameCompactedSummary(convForCompact.compactedSummary) }]
-              : [];
-            const summary = await summarizeConversation({
-              model: useModel,
-              systemPrompt: params.systemPrompt,
-              history: [...prior, ...convForCompact.messages],
-              signal: ac.signal,
-            });
-            if (summary) {
-              const compacted: Conversation = { ...convForCompact, compactedSummary: summary, compactedCount: convForCompact.messages.length };
-              setConvs((cs) => cs.map((c) => (c.id === compacted.id ? compacted : c)));
-              setNotice({ tone: 'ok', text: `Auto-compacted at ${thresholdPct}% of context — prior messages stay on screen, summary injected as context.` });
-            }
-          }
-        } catch (compactError) {
-          // Best-effort like the humanize pass above: never take the turn
-          // down over this — the reply is already complete and shown.
-          console.warn('[chat] auto-compact skipped', compactError);
-        }
-      }
-
-      // Suggested follow-ups: a fast, best-effort pass offering 3 one-click
-      // next questions so the user isn't stuck staring at a blank composer.
-      // Skipped on a truncated reply (Continue is the more useful action there).
-      if (!ac.signal.aborted) {
-        try {
-          const convForFollowUps = convsRef.current.find((c) => c.id === convId);
-          const msgsForFollowUps = convForFollowUps?.messages ?? [];
-          let idxForFollowUps = msgsForFollowUps.length - 1;
-          while (idxForFollowUps >= 0 && msgsForFollowUps[idxForFollowUps].role !== 'assistant') idxForFollowUps--;
-          const finalMsgForFollowUps = msgsForFollowUps[idxForFollowUps];
-          if (
-            convForFollowUps &&
-            finalMsgForFollowUps &&
-            !finalMsgForFollowUps.error &&
-            finalMsgForFollowUps.content.trim() &&
-            finalMsgForFollowUps.meta?.finishReason !== 'length'
-          ) {
-            const followUps = await suggestFollowUps({
-              model: useModel,
-              history: modelHistory({ ...convForFollowUps, messages: msgsForFollowUps.slice(0, idxForFollowUps + 1) }),
-              signal: ac.signal,
-            });
-            if (!ac.signal.aborted && followUps.length) {
-              setConvs((cs) =>
-                cs.map((c) =>
-                  c.id !== convId ? c : { ...c, messages: c.messages.map((m, i) => (i === idxForFollowUps ? { ...m, followUps } : m)) },
-                ),
-              );
-            }
-          }
-        } catch (followUpError) {
-          // Best-effort like the passes above: never take the turn down over this.
-          console.warn('[chat] follow-up suggestions skipped', followUpError);
-        }
-      }
-
-      setStreaming(false);
-      setStreamingConvId(null);
-      abortRef.current = null;
       // Auto-drain: if this turn finished naturally (not a user Stop) and the
       // user queued a message for this conversation while it was streaming,
       // send it next — that's the whole point of queuing instead of blocking.

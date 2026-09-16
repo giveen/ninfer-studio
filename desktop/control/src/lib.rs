@@ -128,6 +128,7 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
             "/api/config",
             get(routes_config::get_config).post(routes_config::set_config),
         )
+        .route("/api/cloud/test", post(routes_config::cloud_test))
         .route(
             "/api/profile-state",
             get(routes_config::profile_state_get).post(routes_config::profile_state_set),

@@ -666,17 +666,24 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
     }
     // Fail fast when no engine can serve the model — a run that can't stream
     // its first turn is a client error, not a zombie.
-    let probe = match &body.model {
-        Some(m) if !m.is_empty() => json!({ "model": m, "stream": true }),
-        _ => json!({ "stream": true }),
-    };
-    let raw = serde_json::to_vec(&probe).unwrap_or_default();
-    if crate::proxy::route_port(&state, &raw).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "no engine available for the requested model"})),
-        )
-            .into_response();
+    let is_remote_cloud = body
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|u| !u.is_empty());
+    if !is_remote_cloud {
+        let probe = match &body.model {
+            Some(m) if !m.is_empty() => json!({ "model": m, "stream": true }),
+            _ => json!({ "stream": true }),
+        };
+        let raw = serde_json::to_vec(&probe).unwrap_or_default();
+        if crate::proxy::route_port(&state, &raw).await.is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "no engine available for the requested model"})),
+            )
+                .into_response();
+        }
     }
     {
         let runs = state.agent_runs.lock().unwrap_or_else(|p| p.into_inner());

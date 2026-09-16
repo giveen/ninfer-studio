@@ -1,9 +1,50 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import hljs from 'highlight.js/lib/common';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { ReactNode } from 'react';
 import { openExternalLink } from '../lib/externalLink';
+import { postJSON } from '../lib/api/core';
+
+function ImageWithFallback({ src, alt }: { src?: string; alt?: string }) {
+  const [resolvedSrc, setResolvedSrc] = useState(src || '');
+
+  useEffect(() => {
+    if (!src) return;
+    const isRemote = /^(https?:|data:|blob:)/.test(src);
+    if (isRemote) {
+      setResolvedSrc(src);
+      return;
+    }
+    let live = true;
+    let clean = src.replace(/^file:\/\//, '');
+    if (clean.startsWith('<repo-root>/')) clean = clean.replace('<repo-root>/', '');
+    if (clean.startsWith('./')) clean = clean.slice(2);
+
+    postJSON<{ dataUrl?: string }>('/api/coder/fs/b64', { path: clean }, 5000)
+      .then((res) => {
+        if (live && res?.dataUrl) {
+          setResolvedSrc(res.dataUrl);
+        }
+      })
+      .catch(() => {
+        if (live) setResolvedSrc(src);
+      });
+
+    return () => {
+      live = false;
+    };
+  }, [src]);
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt || ''}
+      className="my-2 max-h-[300px] object-contain rounded-md border border-line bg-panel2 shadow-sm"
+      loading="lazy"
+    />
+  );
+}
 
 function textOf(node: ReactNode): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -88,14 +129,7 @@ export function Markdown({ children }: { children: string }) {
           return <code className={cls}>{children}</code>;
         },
         img: ({ src, alt }) => {
-          return (
-            <img
-              src={src}
-              alt={alt || ''}
-              className="my-2 max-h-[300px] object-contain rounded-md border border-line bg-panel2 shadow-sm"
-              loading="lazy"
-            />
-          );
+          return <ImageWithFallback src={src} alt={alt} />;
         },
         a: ({ href, children }) => {
           return (

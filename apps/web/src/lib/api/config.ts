@@ -112,6 +112,16 @@ export interface CloudTestResult {
 }
 
 export async function testCloudConnection(baseUrl?: string, apiKey?: string, extraHeaders?: string): Promise<CloudTestResult> {
+  // Try control plane backend endpoint first (bypasses browser CORS completely)
+  try {
+    const res = await postJSON<CloudTestResult>('/api/cloud/test', { baseUrl, apiKey, extraHeaders }, 12_000);
+    if (res && typeof res.ok === 'boolean') {
+      return res;
+    }
+  } catch {
+    /* fallback to direct browser fetch if backend endpoint is unavailable */
+  }
+
   const t0 = performance.now();
   try {
     const base = (baseUrl?.trim() || 'https://api.openai.com/v1').replace(/\/+$/, '');

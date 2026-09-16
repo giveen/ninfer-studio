@@ -215,6 +215,99 @@ pub(crate) async fn set_config(
     Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
 }
 
+pub(crate) async fn cloud_test(
+    AxumState(_state): AxumState<S>,
+    req: Request<Body>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let body: Value = read_json(req).await?;
+    let base_url = body
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://api.openai.com/v1");
+    let api_key = body.get("apiKey").and_then(|v| v.as_str()).unwrap_or("");
+    let extra_headers = body
+        .get("extraHeaders")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let base = base_url.trim().trim_end_matches('/');
+    let url = if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .unwrap_or_default();
+
+    let mut req_builder = client.get(&url);
+    if !api_key.trim().is_empty() && api_key != SECRET_MASK {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    if !extra_headers.trim().is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers) {
+            for (k, v) in parsed {
+                if let Some(s) = v.as_str() {
+                    req_builder = req_builder.header(k, s);
+                }
+            }
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    match req_builder.send().await {
+        Ok(res) => {
+            let latency_ms = t0.elapsed().as_millis() as u64;
+            let status = res.status();
+            if !status.is_success() {
+                let text = res.text().await.unwrap_or_default();
+                let err_msg = if text.len() > 200 {
+                    &text[..200]
+                } else {
+                    &text
+                };
+                return Ok(Json(json!({
+                    "ok": false,
+                    "latencyMs": latency_ms,
+                    "models": [],
+                    "error": format!("HTTP {status}: {}", if err_msg.is_empty() { "request failed" } else { err_msg })
+                })));
+            }
+            let data: Value = res.json().await.unwrap_or_default();
+            let mut models = Vec::new();
+            if let Some(arr) = data.get("data").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(id) = item
+                        .as_str()
+                        .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                    {
+                        if !id.is_empty() {
+                            models.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            models.sort();
+            Ok(Json(json!({
+                "ok": true,
+                "latencyMs": latency_ms,
+                "models": models
+            })))
+        }
+        Err(e) => {
+            let latency_ms = t0.elapsed().as_millis() as u64;
+            Ok(Json(json!({
+                "ok": false,
+                "latencyMs": latency_ms,
+                "models": [],
+                "error": e.to_string()
+            })))
+        }
+    }
+}
+
 /// Write `cfg` to `<data>/config.json` and install it as the live config.
 /// Shared by [`set_config`] and any other handler that mutates settings with
 /// a side effect beyond a plain field edit (e.g. `remote::start`/`stop`).
