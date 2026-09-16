@@ -31,7 +31,7 @@ import type { AgentToolCall, ChatAttachment, ChatMessage, ChatParams, Conversati
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
 import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, type McpToolInfo } from '../lib/api';
@@ -315,8 +315,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const { model: useModel, baseUrl, apiKey } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
-      if (!useModel) return;
+      const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+      const runAllowFallback = appConfig?.cloudFallbackToLocal !== false;
       setStreaming(true);
       setStreamingConvId(convId);
       const ac = new AbortController();
@@ -425,7 +425,9 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           return { id: String(o.id ?? ''), name: String(fn.name ?? o.name ?? ''), arguments: typeof args === 'string' ? args : JSON.stringify(args) };
         });
       };
-      const seedMessages: RunMessageWire[] = effectiveHistory.map((m) => {
+      const cloudRun = !!baseUrl;
+      const prunedHistory = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
+      const seedMessages: RunMessageWire[] = prunedHistory.map((m) => {
         const w: RunMessageWire = { role: m.role, content: m.content };
         if (m.reasoning) w.reasoning = m.reasoning;
         if (m.tool_calls?.length) w.tool_calls = m.tool_calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }));
@@ -455,11 +457,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         if (reflectionEnabled) {
           setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
           try {
-            const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, history, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
+            const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
+            const critique = await critiqueChatReply({ model: reflectionModel.trim() || useModel, baseUrl, apiKey, extraHeaders, history: critiqueHistory, reply: content, maxTokens: reflectionCritiqueMaxTokens, signal: ac.signal });
             if (critique && !ac.signal.aborted) {
               setNotice({ tone: 'ok', text: 'Reflection: revising reply…' });
               const revised = await regenerateChatReply({
                 model: useModel,
+                baseUrl,
+                apiKey,
+                extraHeaders,
                 system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
                 history,
                 originalReply: content,
@@ -486,6 +492,9 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
             signal: ac.signal,
             rewrite: (current) => humanizeRewriteText({
               model: useModel,
+              baseUrl,
+              apiKey,
+              extraHeaders,
               baseSystem: effectiveSystemPrompt(params) || params.systemPrompt || '',
               priorMessages: history,
               originalText: current,
@@ -521,6 +530,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           model: useModel,
           baseUrl,
           apiKey,
+          extraHeaders,
+          allowFallback: runAllowFallback,
           system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
           maxSteps: 12,
           toolSet: 'chat',

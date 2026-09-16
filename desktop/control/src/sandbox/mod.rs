@@ -278,7 +278,7 @@ mod quoting_tests {
                 numslash += 1;
             }
             if i < b.len() && b[i] == b'"' {
-                if numslash % 2 == 0 {
+                if numslash.is_multiple_of(2) {
                     // `""` inside a quoted string is a literal `"` (the UCRT
                     // special case); `arg_quote` never relies on it — it
                     // always emits an odd backslash run before a literal

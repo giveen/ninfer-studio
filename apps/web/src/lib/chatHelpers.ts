@@ -315,7 +315,7 @@ export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * Resolves the effective provider configuration (baseUrl, apiKey, and model)
+ * Resolves the effective provider configuration (baseUrl, apiKey, extra headers, and model)
  * based on the requested role (primary or subagent).
  */
 export function resolveProviderConfig(
@@ -323,7 +323,7 @@ export function resolveProviderConfig(
   appConfig: AppSettings | null,
   params: Record<string, any>,
   fallbackModel?: string
-): { baseUrl?: string; apiKey?: string; model: string } {
+): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string } {
   if (!appConfig?.cloudProviderEnabled) {
     return { model: fallbackModel || 'ninfer' };
   }
@@ -347,6 +347,7 @@ export function resolveProviderConfig(
     return {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
+      extraHeaders: appConfig.cloudProviderExtraHeaders || undefined,
       model: params[`${role}CloudModel`] || params.cloudModel || roleModel || fallbackDefault,
     };
   }

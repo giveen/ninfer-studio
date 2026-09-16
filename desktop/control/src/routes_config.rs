@@ -253,17 +253,16 @@ pub(crate) async fn cloud_test(
     if !api_key.trim().is_empty() {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key.trim()));
     }
-    if !extra_headers.trim().is_empty() {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers) {
-            for (k, v) in parsed {
-                if let Some(s) = v.as_str() {
-                    // Skip invalid header names/values instead of panicking
-                    // inside reqwest's `TryFrom` conversion.
-                    let name: Result<axum::http::HeaderName, _> = k.parse();
-                    let value: Result<axum::http::HeaderValue, _> = s.parse();
-                    if let (Ok(name), Ok(value)) = (name, value) {
-                        req_builder = req_builder.header(name, value);
-                    }
+    if !extra_headers.trim().is_empty()
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(extra_headers) {
+        for (k, v) in parsed {
+            if let Some(s) = v.as_str() {
+                // Skip invalid header names/values instead of panicking
+                // inside reqwest's `TryFrom` conversion.
+                let name: Result<axum::http::HeaderName, _> = k.parse();
+                let value: Result<axum::http::HeaderValue, _> = s.parse();
+                if let (Ok(name), Ok(value)) = (name, value) {
+                    req_builder = req_builder.header(name, value);
                 }
             }
         }
@@ -294,10 +293,8 @@ pub(crate) async fn cloud_test(
                     if let Some(id) = item
                         .as_str()
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                    {
-                        if !id.is_empty() {
-                            models.push(id.to_string());
-                        }
+                        && !id.is_empty() {
+                        models.push(id.to_string());
                     }
                 }
             }

@@ -365,6 +365,9 @@ function humanizeInstruction(text: string, res: GateResult): string {
  */
 export async function humanizeRewriteText(opts: {
   model: string;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
   baseSystem: string;
   priorMessages: ChatMessage[];
   originalText: string;
@@ -390,7 +393,7 @@ export async function humanizeRewriteText(opts: {
   await streamChat(body, opts.signal ?? AbortSignal.timeout(120_000), {
     onContentDelta: (d) => { acc += d; },
     onError: (m) => { throw new Error(m); },
-  });
+  }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
   // streamChat resolves (rather than rejects) on abort, so a partial rewrite
   // would otherwise replace the finished reply. Bail out when aborted — the
   // caller keeps the original text.

@@ -356,6 +356,7 @@ export function summarizeConversation(opts: {
   model: string;
   baseUrl?: string;
   apiKey?: string;
+  extraHeaders?: string;
   systemPrompt?: string;
   history: ChatMessage[];
   onDelta?: (text: string) => void;
@@ -371,10 +372,10 @@ export function summarizeConversation(opts: {
     preserveThinking: false,
     maxTokens: opts.maxTokens ?? 2048,
   };
-
   let targetModel = opts.model;
   let targetBaseUrl = opts.baseUrl;
   let targetApiKey = opts.apiKey;
+  let targetExtraHeaders = opts.extraHeaders;
 
   // Local AI Context Summarizer: If useLocalCompactor is active, route the compaction pass
   // to the zero-cost local NInfer engine instead of sending thousands of compaction tokens to paid cloud APIs.
@@ -382,6 +383,7 @@ export function summarizeConversation(opts: {
     targetModel = 'ninfer';
     targetBaseUrl = undefined;
     targetApiKey = undefined;
+    targetExtraHeaders = undefined;
   }
 
   const body = buildChatRequest(targetModel, opts.systemPrompt, [...opts.history, instruction], summaryParams);
@@ -398,7 +400,7 @@ export function summarizeConversation(opts: {
         resolve(acc.trim());
       },
       onError: (m) => reject(new Error(m)),
-    }, { baseUrl: targetBaseUrl, apiKey: targetApiKey });
+    }, { baseUrl: targetBaseUrl, apiKey: targetApiKey, extraHeaders: targetExtraHeaders });
   });
 }
 
@@ -450,6 +452,7 @@ export function critiqueChatReply(opts: {
   model: string;
   baseUrl?: string;
   apiKey?: string;
+  extraHeaders?: string;
   history: ChatMessage[];
   reply: string;
   maxTokens?: number;
@@ -464,8 +467,7 @@ export function critiqueChatReply(opts: {
     streamChat(body, signal, {
       onContentDelta: (d) => { acc += d; },
       onDone: () => resolve(signal.aborted ? null : parseReflectionVerdict(acc)),
-      onError: () => resolve(null),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
   });
 }
 
@@ -477,6 +479,7 @@ export function regenerateChatReply(opts: {
   model: string;
   baseUrl?: string;
   apiKey?: string;
+  extraHeaders?: string;
   system: string | undefined;
   history: ChatMessage[];
   originalReply: string;
@@ -496,8 +499,7 @@ export function regenerateChatReply(opts: {
     streamChat(body, signal, {
       onContentDelta: (d) => { acc += d; },
       onDone: () => resolve(signal.aborted ? null : (acc.trim() || null)),
-      onError: () => resolve(null),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
   });
 }
 
@@ -684,7 +686,7 @@ function parseFollowUps(raw: string): string[] {
 
 /** Ask the engine for 3 suggested follow-up questions given `history` (which
  *  should already end in the assistant's just-completed reply). */
-export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey?: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
+export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey?: string; extraHeaders?: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
   const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
   const params: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 200 };
   const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
@@ -696,7 +698,7 @@ export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey
       },
       onDone: () => resolve(parseFollowUps(acc)),
       onError: (m) => reject(new Error(m)),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey });
+    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
   });
 }
 

@@ -956,8 +956,10 @@ mod tests {
         let gid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let snap = shared.snapshot();
-                if snap.status == RunStatus::AwaitingGate && snap.pending_gate.is_some() {
-                    return snap.pending_gate.as_ref().unwrap().id.clone();
+                if let Some(gate) = &snap.pending_gate
+                    && snap.status == RunStatus::AwaitingGate
+                {
+                    return gate.id.clone();
                 }
                 tokio::task::yield_now().await;
             }
@@ -1006,8 +1008,8 @@ mod tests {
         let gid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let snap = shared.snapshot();
-                if snap.pending_gate.is_some() {
-                    return snap.pending_gate.as_ref().unwrap().id.clone();
+                if let Some(gate) = &snap.pending_gate {
+                    return gate.id.clone();
                 }
                 tokio::task::yield_now().await;
             }
@@ -1031,6 +1033,8 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
+
+    #[tokio::test]
     async fn approval_pause_denies_to_none() {
         let (out, snap) = round_trip(ApprovalDecision::Denied).await;
         assert_eq!(out, None);

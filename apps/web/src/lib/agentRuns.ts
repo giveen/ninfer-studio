@@ -106,6 +106,10 @@ export interface StartRunBody {
   model?: string;
   baseUrl?: string;
   apiKey?: string;
+  /** JSON string of extra headers forwarded to the cloud provider. */
+  extraHeaders?: string;
+  /** Fall back to the local engine on cloud 429/5xx (default true for cloud runs). */
+  allowFallback?: boolean;
   system?: string | null;
   maxSteps?: number;
   /** 'chat' | 'coder' — selects the tool table the server enforces. */
@@ -120,8 +124,7 @@ export interface StartRunBody {
   scope?: string | null;
   /** Child runs set this (the parent run's id). */
   parent?: string | null;
-  /** 'client' pauses at each turn end for this screen's rewrite/gate
-   *  decision (reflection, humanize); omit for uninterrupted runs. */
+  /** 'client' pauses at each turn end for this screen's rewrite/gate decision (reflection, humanize); omit for uninterrupted runs. */
   hookMode?: 'client' | 'auto';
   /** Risky-command gate: pause bash on risky-but-allowed commands. */
   riskyGate?: boolean;

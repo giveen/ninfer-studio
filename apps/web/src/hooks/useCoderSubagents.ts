@@ -91,7 +91,8 @@ export function useCoderSubagents({
           model: subConfig.model,
           baseUrl: subConfig.baseUrl,
           apiKey: subConfig.apiKey,
-          system: dynamicSystemRef.current ?? undefined,
+          extraHeaders: subConfig.extraHeaders,
+          allowFallback: appConfig?.cloudFallbackToLocal !== false,
           maxSteps,
           toolSet: 'coder',
           toolNames: names,
@@ -193,7 +194,7 @@ export function useCoderSubagents({
               out += t;
             },
           },
-          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey, extraHeaders: subConfig.extraHeaders, allowFallback: appConfig?.cloudFallbackToLocal !== false }
         );
       } catch {
         /* best-effort */
@@ -227,7 +228,7 @@ export function useCoderSubagents({
               out += t;
             },
           },
-          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey, extraHeaders: subConfig.extraHeaders, allowFallback: appConfig?.cloudFallbackToLocal !== false }
         );
       } catch {
         /* best-effort */
@@ -268,6 +269,8 @@ export function useCoderSubagents({
           model: subConfig.model,
           baseUrl: subConfig.baseUrl,
           apiKey: subConfig.apiKey,
+          extraHeaders: subConfig.extraHeaders,
+          allowFallback: appConfig?.cloudFallbackToLocal !== false,
           system: dynamicSystemRef.current ?? undefined,
           maxSteps,
           toolSet: 'coder',
@@ -366,7 +369,7 @@ export function useCoderSubagents({
               out += t;
             },
           },
-          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey }
+          { baseUrl: subConfig.baseUrl, apiKey: subConfig.apiKey, extraHeaders: subConfig.extraHeaders, allowFallback: appConfig?.cloudFallbackToLocal !== false }
         );
       } catch {
         return { approved: true, issues: '', learnings: [] };

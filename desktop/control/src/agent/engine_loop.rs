@@ -1608,6 +1608,8 @@ mod tests {
                 plan: false,
                 api_key: None,
                 base_url: None,
+                extra_headers: None,
+                allow_fallback: true,
                 critic: None,
             },
             live: std::sync::Mutex::new(crate::agent::run::RunLive {
@@ -1779,6 +1781,8 @@ mod tests {
             plan: false,
             api_key: None,
             base_url: None,
+            extra_headers: None,
+            allow_fallback: true,
             critic: None,
         };
         let live = crate::agent::run::RunLive {
@@ -1893,6 +1897,8 @@ mod tests {
             plan: false,
             api_key: None,
             base_url: None,
+            extra_headers: None,
+            allow_fallback: true,
             critic: None,
         };
         let shared = Arc::new(crate::agent::run::RunShared {

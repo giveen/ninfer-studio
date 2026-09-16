@@ -361,6 +361,12 @@ pub struct RunMeta {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    /// JSON object string of extra headers forwarded to the cloud provider.
+    #[serde(default)]
+    pub extra_headers: Option<String>,
+    /// Fall back to the local engine on cloud 429/5xx (default true for cloud runs).
+    #[serde(default = "default_allow_fallback")]
+    pub allow_fallback: bool,
     pub system: Option<String>,
     pub max_steps: usize,
     pub created_at: u64,
@@ -566,6 +572,11 @@ pub(crate) struct StartBody {
     model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
+    /// JSON object string of extra headers forwarded to the cloud provider.
+    extra_headers: Option<String>,
+    /// Fall back to the local engine on cloud 429/5xx (default true for cloud runs).
+    #[serde(default = "default_allow_fallback")]
+    allow_fallback: bool,
     system: Option<String>,
     messages: Vec<Value>,
     /// Engine tool spec array (OpenAI shape), sent verbatim to the engine.
@@ -603,6 +614,9 @@ pub(crate) struct StartBody {
 
 fn default_kind() -> String {
     "chat".into()
+}
+fn default_allow_fallback() -> bool {
+    true
 }
 fn default_tool_set() -> String {
     "chat".into()
@@ -784,6 +798,8 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         model,
         base_url: body.base_url,
         api_key: body.api_key,
+        extra_headers: body.extra_headers,
+        allow_fallback: body.allow_fallback,
         system: body.system,
         max_steps: body.max_steps,
         created_at: live.updated_at,
@@ -1369,6 +1385,8 @@ pub(crate) fn test_run(
         model: "test-model".into(),
         base_url: None,
         api_key: None,
+        extra_headers: None,
+        allow_fallback: true,
         system: None,
         max_steps: 4,
         created_at: now_ms(),

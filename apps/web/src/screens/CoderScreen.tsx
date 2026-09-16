@@ -206,7 +206,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     signal: AbortSignal,
     label: string,
     cb: ChatStreamCallbacks,
-    opts?: { baseUrl?: string; apiKey?: string }
+    opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
   ) => {
     setLlmPhase({ stage: 'prefill', label, since: Date.now(), chars: 0 });
     try {
@@ -233,7 +233,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           setLlmPhase(null);
           cb.onError?.(msg);
         },
-      });
+      }, opts);
     } catch (e) {
       setLlmPhase(null);
       throw e;
@@ -1420,13 +1420,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   { "kind": "success", "text": "use pnpm", "component": "general", "scope": "repo", "target_key": "packageManager", "value": "pnpm" }
 ]
 \`\`\``;
-      const extractorModel = coderParams.criticModel?.trim() || modelRef.current;
-      const req = buildChatRequest(extractorModel, extractorSystem, [{ role: 'user', content: currentInput }], { thinking: false, maxTokens: 1024 } as ChatParams, {});
-      
+      const extractorCfg = resolveProviderConfig('subagent', appConfig, {
+        subagentProvider: coderParams.subagentProvider,
+        subagentCloudModel: coderParams.subagentCloudModel,
+      }, coderParams.criticModel?.trim() || modelRef.current);
+      const req = buildChatRequest(extractorCfg.model, extractorSystem, [{ role: 'user', content: currentInput }], { thinking: false, maxTokens: 1024 } as ChatParams, {});
+
       (async () => {
         let textContent = '';
         try {
-          await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } });
+          await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } }, {
+            baseUrl: extractorCfg.baseUrl,
+            apiKey: extractorCfg.apiKey,
+            extraHeaders: extractorCfg.extraHeaders,
+            allowFallback: appConfig?.cloudFallbackToLocal !== false,
+          });
           const jsonMatch = textContent.match(/\`\`\`json\s*(\[[\s\S]*?\])\s*\`\`\`/);
           if (jsonMatch) {
             const rules = JSON.parse(jsonMatch[1]);

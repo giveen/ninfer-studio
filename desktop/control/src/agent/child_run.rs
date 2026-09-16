@@ -303,6 +303,8 @@ pub(crate) async fn spawn_child(
         model,
         base_url: parent.meta.base_url.clone(),
         api_key: parent.meta.api_key.clone(),
+        extra_headers: parent.meta.extra_headers.clone(),
+        allow_fallback: parent.meta.allow_fallback,
         system: {
             if kind == "worker" && parent.meta.tool_set != "chat" {
                 Some(WORKER_SYSTEM.to_string())

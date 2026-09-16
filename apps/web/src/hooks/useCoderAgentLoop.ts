@@ -429,6 +429,8 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                 return streamChat(r, sig, cb, {
                   baseUrl: primaryConfig.baseUrl,
                   apiKey: primaryConfig.apiKey,
+                  extraHeaders: primaryConfig.extraHeaders,
+                  allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
                 });
               },
               onStreamError: (msg) => {

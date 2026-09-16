@@ -1408,47 +1408,61 @@ mod tests {
         // Lenient on purpose: hand-edited configs without a transport are
         // tolerated at load time (they show as disconnected); upsert is the
         // strict gate for that (see `mcp_stdio_end_to_end`).
-        let mut s = McpServerSpec::default();
-        s.name = "none".into();
+        let s = McpServerSpec {
+            name: "none".into(),
+            ..Default::default()
+        };
         assert!(validate_spec(&s).is_ok());
 
         // But the name must survive sanitization.
-        let mut s = McpServerSpec::default();
-        s.name = "!!!".into();
+        let s = McpServerSpec {
+            name: "!!!".into(),
+            ..Default::default()
+        };
         let (st, body) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(body.0.get("error").is_some());
 
         // And an over-long name is rejected.
-        let mut s = McpServerSpec::default();
-        s.name = "x".repeat(41);
-        s.command = Some("/bin/true".into());
+        let s = McpServerSpec {
+            name: "x".repeat(41),
+            command: Some("/bin/true".into()),
+            ..Default::default()
+        };
         let (st, _) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
 
-        let mut s = McpServerSpec::default();
-        s.name = "ok".into();
-        s.command = Some("/bin/true".into());
+        let s = McpServerSpec {
+            name: "ok".into(),
+            command: Some("/bin/true".into()),
+            ..Default::default()
+        };
         assert!(validate_spec(&s).is_ok());
 
-        let mut s = McpServerSpec::default();
-        s.name = "ok".into();
-        s.url = Some("https://mcp.example.com/mcp".into());
+        let s = McpServerSpec {
+            name: "ok".into(),
+            url: Some("https://mcp.example.com/mcp".into()),
+            ..Default::default()
+        };
         assert!(validate_spec(&s).is_ok());
 
         // Non-http(s) URLs are rejected up front.
-        let mut s = McpServerSpec::default();
-        s.name = "bad".into();
-        s.url = Some("ftp://mcp.example.com".into());
+        let s = McpServerSpec {
+            name: "bad".into(),
+            url: Some("ftp://mcp.example.com".into()),
+            ..Default::default()
+        };
         let (st, _) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
 
         // Both transports set is ambiguous (stdio would silently win) —
         // rejected so the misconfiguration surfaces immediately.
-        let mut s = McpServerSpec::default();
-        s.name = "both".into();
-        s.command = Some("/bin/true".into());
-        s.url = Some("https://mcp.example.com/mcp".into());
+        let s = McpServerSpec {
+            name: "both".into(),
+            command: Some("/bin/true".into()),
+            url: Some("https://mcp.example.com/mcp".into()),
+            ..Default::default()
+        };
         let (st, _) = validate_spec(&s).unwrap_err();
         assert_eq!(st, StatusCode::BAD_REQUEST);
     }
