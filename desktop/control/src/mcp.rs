@@ -36,7 +36,7 @@ use axum::extract::{Path as AxumPath, Query, State as AxumState};
 use axum::http::StatusCode;
 use axum::http::header::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig,
     ContentBlock, Implementation, InitializeRequestParams, ProtocolVersion, Tool,
 };
 use rmcp::service::RunningService;
@@ -57,7 +57,7 @@ use tokio::time::timeout;
 
 /// A live MCP session (rmcp's running client service). `!Send` — it lives
 /// on the actor thread only (see `actor_entry`/`dispatcher`).
-pub(crate) type McpService = RunningService<RoleClient, ClientInfo>;
+pub(crate) type McpService = RunningService<RoleClient, ClientConfig>;
 
 /// `mcp__<server>__<tool>` — the prefix every MCP-exposed tool name carries.
 pub(crate) const MCP_PREFIX: &str = "mcp__";
@@ -354,7 +354,7 @@ fn validate_spec(spec: &McpServerSpec) -> Result<(), (StatusCode, Json<Value>)> 
 // `!Send` and must never cross a `.await` into the axum world)
 // ---------------------------------------------------------------------------
 
-fn client_info() -> ClientInfo {
+fn client_info() -> ClientConfig {
     InitializeRequestParams::new(
         ClientCapabilities::default(),
         Implementation::new("ninfier-studio", env!("CARGO_PKG_VERSION")),
