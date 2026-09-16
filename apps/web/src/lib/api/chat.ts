@@ -616,6 +616,9 @@ export function renderOutputReceipt(receipt: OutputReceipt): string {
  *  so callers can fall back to the raw output unchanged. */
 export async function summarizeOutputVerified(opts: {
   model: string;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
   output: string;
   isError?: boolean;
   signal?: AbortSignal;
@@ -637,7 +640,7 @@ export async function summarizeOutputVerified(opts: {
         onContentDelta: (d) => { acc += d; },
         onDone: () => resolve(acc.trim()),
         onError: (m) => reject(new Error(m)),
-      });
+      }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
     });
   } catch {
     return null;

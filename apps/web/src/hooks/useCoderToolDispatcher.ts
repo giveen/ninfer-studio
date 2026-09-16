@@ -39,7 +39,12 @@ import {
   type PermConfig,
 } from '../lib/coderTools';
 
+import { resolveProviderConfig } from '../lib/chatHelpers';
+import type { CoderParams } from '../components/coder/CoderComposer';
+
 export interface UseCoderToolDispatcherOptions {
+  appConfig?: any;
+  coderParams?: CoderParams;
   abortRef: React.RefObject<AbortController | null>;
   activeWsDir: string;
   activeWs: string;
@@ -139,11 +144,16 @@ export function useCoderToolDispatcher(opts: UseCoderToolDispatcherOptions) {
           }
           const durationMs = Math.round(performance.now() - t0);
           opts.addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
+          const primaryConfig = resolveProviderConfig('primary', opts.appConfig ?? null, {
+            primaryProvider: opts.coderParams?.primaryProvider,
+            primaryCloudModel: opts.coderParams?.primaryCloudModel,
+          });
           const maybeSummarized = await maybeSummarizeTool(
             call.name,
             result,
             opts.modelRef.current,
-            opts.abortRef.current?.signal
+            opts.abortRef.current?.signal,
+            primaryConfig
           );
           if (maybeSummarized !== result) {
             opts.addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });
@@ -801,11 +811,16 @@ export function useCoderToolDispatcher(opts: UseCoderToolDispatcherOptions) {
       const durationMs = Math.round(performance.now() - t0);
       opts.addLog({ type: logType, label: call.name, detail: logDetail, durationMs });
 
+      const primaryConfig = resolveProviderConfig('primary', opts.appConfig ?? null, {
+        primaryProvider: opts.coderParams?.primaryProvider,
+        primaryCloudModel: opts.coderParams?.primaryCloudModel,
+      });
       const maybeSummarized = await maybeSummarizeTool(
         call.name,
         result,
         opts.modelRef.current,
-        opts.abortRef.current?.signal
+        opts.abortRef.current?.signal,
+        primaryConfig
       );
       if (maybeSummarized !== result) {
         opts.addLog({ type: 'compact', label: call.name, detail: 'output AI-summarized (too large to pass through)' });

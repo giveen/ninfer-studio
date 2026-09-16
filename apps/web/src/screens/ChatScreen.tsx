@@ -265,7 +265,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
       return;
     }
-    const { model: useModel, baseUrl, apiKey } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+    const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
     if (!useModel) return;
 
     setCompacting(true);
@@ -283,6 +283,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         model: useModel,
         baseUrl,
         apiKey,
+        extraHeaders,
         systemPrompt: params.systemPrompt,
         history: [...prior, ...conv.messages],
         signal: ac.signal,
@@ -668,9 +669,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               model: useModel,
               baseUrl,
               apiKey,
+              extraHeaders,
               systemPrompt: params.systemPrompt,
               history: [...prior, ...convForCompact.messages],
               signal: ac.signal,
+              useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
             });
             if (summary) {
               const compacted: Conversation = { ...convForCompact, compactedSummary: summary, compactedCount: convForCompact.messages.length };
@@ -706,6 +709,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               model: useModel,
               baseUrl,
               apiKey,
+              extraHeaders,
               history: modelHistory({ ...convForFollowUps, messages: msgsForFollowUps.slice(0, idxForFollowUps + 1) }),
               signal: ac.signal,
             });

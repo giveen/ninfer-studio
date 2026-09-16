@@ -296,11 +296,29 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         return (StatusCode::INTERNAL_SERVER_ERROR, "client build failed").into_response();
     };
 
+    let extra_headers_override = headers
+        .get("x-ninfer-extra-headers")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let mut rb = client.request(method, &target);
     if let Some(ct) = headers.get(header::CONTENT_TYPE)
         && let Ok(v) = ct.to_str()
     {
         rb = rb.header(header::CONTENT_TYPE, v);
+    }
+    if let Some(ref eh) = extra_headers_override {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh) {
+            for (k, v) in parsed {
+                if let Some(s) = v.as_str() {
+                    let name: Result<axum::http::HeaderName, _> = k.parse();
+                    let value: Result<axum::http::HeaderValue, _> = s.parse();
+                    if let (Ok(name), Ok(value)) = (name, value) {
+                        rb = rb.header(name, value);
+                    }
+                }
+            }
+        }
     }
     // inject the configured engine API key when the client sent no auth header
     if !api_key.is_empty()

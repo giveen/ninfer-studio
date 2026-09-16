@@ -141,8 +141,12 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           ', '
         )}\nReply with a JSON array of strings.`;
         const taggerModel = opts.coderParams.criticModel?.trim() || opts.modelRef.current || 'qwen-coder';
+        const taggerCfg = resolveProviderConfig('subagent', opts.appConfig, {
+          provider: opts.coderParams.subagentProvider,
+          cloudModel: opts.coderParams.subagentCloudModel,
+        }, taggerModel);
         const req = buildChatRequest(
-          taggerModel,
+          taggerCfg.model,
           'You are a task categorizer. Reply only with a JSON array of matching component strings.',
           [{ role: 'user', content: taggerPrompt }],
           { thinking: false, maxTokens: 100 } as ChatParams,
@@ -153,6 +157,11 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           onContentDelta: (t: string) => {
             textContent += t;
           },
+        }, {
+          baseUrl: taggerCfg.baseUrl,
+          apiKey: taggerCfg.apiKey,
+          extraHeaders: taggerCfg.extraHeaders,
+          allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
         });
         const jsonMatch = textContent.match(/\[[\s\S]*?\]/);
         if (jsonMatch) {
@@ -326,10 +335,14 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           try {
             const summary = await summarizeConversation({
               model,
+              baseUrl: primaryConfig.baseUrl,
+              apiKey: primaryConfig.apiKey,
+              extraHeaders: primaryConfig.extraHeaders,
               systemPrompt: opts.dynamicSystemRef.current,
               history: currentMessages,
               maxTokens: 2048,
               signal: opts.abortRef.current?.signal,
+              useLocalCompactor: opts.appConfig?.cloudUseLocalCompactor !== false,
             });
             if (!summary) throw new Error('compaction produced no summary');
             currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
@@ -511,6 +524,9 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               rewrite: (current) =>
                 humanizeRewriteText({
                   model,
+                  baseUrl: primaryConfig.baseUrl,
+                  apiKey: primaryConfig.apiKey,
+                  extraHeaders: primaryConfig.extraHeaders,
                   baseSystem: opts.dynamicSystemRef.current,
                   priorMessages: currentMessages.slice(0, currentMessages.length - 1),
                   originalText: current,
@@ -648,6 +664,9 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               try {
                 const followUps = await suggestFollowUps({
                   model,
+                  baseUrl: primaryConfig.baseUrl,
+                  apiKey: primaryConfig.apiKey,
+                  extraHeaders: primaryConfig.extraHeaders,
                   history: [...wireMessages, lastAssistant],
                   signal: opts.abortRef.current?.signal,
                 });

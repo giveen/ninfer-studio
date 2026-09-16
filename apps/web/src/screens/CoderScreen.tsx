@@ -1240,6 +1240,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   });
 
   const { handleToolCalls } = useCoderToolDispatcher({
+    appConfig,
+    coderParams,
     abortRef,
     activeWsDir,
     activeWs,

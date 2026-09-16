@@ -267,6 +267,7 @@ export async function maybeSummarizeTool(
   resultStr: string,
   model: string,
   signal?: AbortSignal,
+  cloudOpts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string },
 ): Promise<string> {
   if (LARGE_OUTPUT_EXCLUDED_TOOLS.has(name)) return resultStr;
   let res: Record<string, unknown> | null = null;
@@ -283,7 +284,15 @@ export async function maybeSummarizeTool(
   if (text.length <= SUMMARY_THRESHOLD) return resultStr;
   const isError = hasStd && typeof res.exitCode === 'number' ? res.exitCode !== 0 : undefined;
   try {
-    const receipt = await summarizeOutputVerified({ model, output: text, isError, signal });
+    const receipt = await summarizeOutputVerified({
+      model,
+      baseUrl: cloudOpts?.baseUrl,
+      apiKey: cloudOpts?.apiKey,
+      extraHeaders: cloudOpts?.extraHeaders,
+      output: text,
+      isError,
+      signal,
+    });
     if (!receipt) return resultStr;
     const tail = text.slice(-SUMMARY_TAIL);
     const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
