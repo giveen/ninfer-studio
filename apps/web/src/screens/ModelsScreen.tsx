@@ -87,6 +87,32 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   };
 
   const RECIPE_PRESETS: Record<string, any> = {
+    'qwen_moe': {
+      name: 'qwen-moe',
+      outName: 'qwen_moe.ninfer',
+      defaultComponents: ['text', 'vision', 'moe', 'mtp'],
+      warning: 'Requires Qwen MoE architecture with active router expert conversion.',
+      hasMtp: true,
+      hasMoe: true,
+    },
+    'qwen_moe_nvfp4': {
+      name: 'qwen-moe-nvfp4',
+      outName: 'qwen_moe_nvfp4.ninfer',
+      defaultComponents: ['text', 'vision', 'moe', 'mtp'],
+      warning: 'Requires Qwen MoE architecture. Requires a quantized NVFP4 source.',
+      hasMtp: true,
+      hasMoe: true,
+      needsQuantized: true,
+    },
+    'qwen3_6_35b_a3b': {
+      name: 'qwen3.6-35b-a3b',
+      outName: 'qwen3_6_35b_a3b.ninfer',
+      defaultComponents: ['text', 'vision', 'moe', 'mtp', 'dflash'],
+      warning: 'Requires Qwen3.6 MoE architecture (35B A3B active experts).',
+      hasMtp: true,
+      hasDflash: true,
+      hasMoe: true,
+    },
     'qwen3_6_27b': {
       name: 'qwen3.6-27b',
       outName: 'qwen3_6_27b.ninfer',
@@ -119,23 +145,16 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
       hasDflash2: true,
       needsQuantized: true,
     },
-    'qwen3_6_35b_a3b': {
-      name: 'qwen3.6-35b-a3b',
-      outName: 'qwen3_6_35b_a3b.ninfer',
-      defaultComponents: ['text', 'vision', 'mtp', 'dflash'],
-      warning: 'Requires Qwen3.5 MoE mathematics.',
-      hasMtp: true,
-      hasDflash: true,
-    }
   };
 
-  const [convRecipe, setConvRecipe] = useState('qwen3_6_27b');
+  const [convRecipe, setConvRecipe] = useState('qwen_moe');
   const [convModelPath, setConvModelPath] = useState('');
-  const [convName, setConvName] = useState('qwen3.6-27b');
-  const [convOutName, setConvOutName] = useState('qwen3_6_27b.ninfer');
+  const [convName, setConvName] = useState('qwen-moe');
+  const [convOutName, setConvOutName] = useState('qwen_moe.ninfer');
   const [convDflash, setConvDflash] = useState('');
   const [convDflash2, setConvDflash2] = useState('');
   const [convMtp, setConvMtp] = useState('');
+  const [convMoe, setConvMoe] = useState('');
   const [convQuantized, setConvQuantized] = useState('');
   const [convExtraArgs, setConvExtraArgs] = useState('--proposal');
   const [convError, setConvError] = useState<string | null>(null);
@@ -157,6 +176,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
       if (preset.hasDflash && convDflash) args += ` --source dflash=${convDflash}`;
       if (preset.hasDflash2 && convDflash2) args += ` --source dflash2=${convDflash2}`;
       if (preset.hasMtp && convMtp) args += ` --source mtp=${convMtp}`;
+      if (preset.hasMoe && convMoe) args += ` --source moe=${convMoe}`;
       if (preset.needsQuantized && convQuantized) args += ` --source quantized=${convQuantized}`;
       if (convExtraArgs) args += ` ${convExtraArgs}`;
 
@@ -282,11 +302,13 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                 value={convRecipe}
                 onChange={(e) => setConvRecipe(e.target.value)}
               >
-                <option value="qwen3_6_27b">qwen3_6_27b</option>
-                <option value="qwen3_6_27b_nvfp4">qwen3_6_27b_nvfp4</option>
-                <option value="qwen3_8_27b">qwen3_8_27b</option>
-                <option value="qwen3_8_27b_nvfp4">qwen3_8_27b_nvfp4</option>
-                <option value="qwen3_6_35b_a3b">qwen3_6_35b_a3b</option>
+                <option value="qwen_moe">qwen_moe (Qwen MoE Standard)</option>
+                <option value="qwen_moe_nvfp4">qwen_moe_nvfp4 (Qwen MoE Quantized NVFP4)</option>
+                <option value="qwen3_6_35b_a3b">qwen3_6_35b_a3b (Qwen3.6 35B A3B MoE)</option>
+                <option value="qwen3_6_27b">qwen3_6_27b (Qwen3.6 27B Dense)</option>
+                <option value="qwen3_6_27b_nvfp4">qwen3_6_27b_nvfp4 (Qwen3.6 27B NVFP4)</option>
+                <option value="qwen3_8_27b">qwen3_8_27b (Qwen3.8 27B Dense)</option>
+                <option value="qwen3_8_27b_nvfp4">qwen3_8_27b_nvfp4 (Qwen3.8 27B NVFP4)</option>
               </select>
             </Field>
             <Field label="Output .ninfer Filename" hint="Saved in your models dir">
@@ -294,10 +316,15 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
             </Field>
             <div className="md:col-span-2">
               <Field label="Base Model Path" hint="Absolute path to base model weights on disk">
-                <TextField value={convModelPath} onChange={setConvModelPath} placeholder="/path/to/Qwen-27B" />
+                <TextField value={convModelPath} onChange={setConvModelPath} placeholder="/path/to/Qwen-MoE" />
               </Field>
             </div>
             
+            {RECIPE_PRESETS[convRecipe]?.hasMoe && (
+              <Field label="MoE Experts Source (Optional)" hint="Path to expert weights if separate from base model">
+                <TextField value={convMoe} onChange={setConvMoe} placeholder="/path/to/experts" />
+              </Field>
+            )}
             {RECIPE_PRESETS[convRecipe]?.hasMtp && (
               <Field label="MTP Source (Optional)" hint="Path to MTP weights if not in base model">
                 <TextField value={convMtp} onChange={setConvMtp} placeholder="/path/to/mtp" />
