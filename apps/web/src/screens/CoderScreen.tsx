@@ -198,7 +198,6 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     return () => clearInterval(t);
   }, [llmPhase ? 1 : 0]);
   // Commit panel collapse state lives in useCoderGit.
-  const [permsOpen, setPermsOpen] = useState(true);
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
   const trackedStream = async (
@@ -1698,14 +1697,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         archivedOpen={archivedOpen}
         setArchivedOpen={setArchivedOpen}
         ledger={ledger}
-        perms={perms}
-        permsOpen={permsOpen}
-        setPermsOpen={setPermsOpen}
-        setToolPerm={setToolPerm}
-        mcpTools={mcpTools}
         activeWsDir={activeWsDir}
-        setPerms={setPerms}
-        setStore={setStore}
         git={git}
         jobs={jobs}
         treeOpen={treeOpen}
