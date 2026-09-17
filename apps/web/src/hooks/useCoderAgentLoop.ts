@@ -522,13 +522,21 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
         const isEmptyResponse = !content.trim() && toolCalls.length === 0;
         if (isEmptyResponse) {
+          const errorDetail = streamErrorMsg
+            ? streamErrorMsg
+            : 'Model returned an empty response (no content or tool calls).';
           opts.addLog({
             type: 'error',
             label: 'empty',
-            detail: streamErrorMsg
-              ? `${streamErrorMsg} — stopping the turn.`
-              : 'Model returned an empty response (no content or tool calls) — stopping the turn.',
+            detail: `${errorDetail} — stopping turn.`,
           });
+          const errAssistantMsg: ChatMessage = {
+            role: 'assistant',
+            content: `⚠️ *${errorDetail}*`,
+            error: true,
+          };
+          currentMessages = [...currentMessages, errAssistantMsg];
+          opts.updateRunMessages((prev) => [...prev, errAssistantMsg]);
           break;
         }
 
@@ -698,9 +706,9 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
       if (!isAbort) {
         const msg = err instanceof Error ? err.message : String(err);
         opts.addLog({ type: 'error', label: 'System Error', detail: msg });
-        opts.setMessages((prev) => [
+        opts.updateRunMessages((prev) => [
           ...prev,
-          { role: 'user', displayName: 'System', content: `[Run failed: ${msg}]`, error: true },
+          { role: 'assistant', displayName: 'System', content: `[Run failed: ${msg}]`, error: true },
         ]);
       }
     } finally {
