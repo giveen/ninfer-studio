@@ -6,6 +6,7 @@ import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../ty
 import { API_BASE, getJSON, postJSON, fetchStream, isAbortError } from './core';
 import type { CoderMemory, CoderLearningKind } from './coder';
 import { setLatestRequestMetrics } from '../liveMetrics';
+import { sanitizeMessagesForApi } from '../chatHelpers';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -31,6 +32,7 @@ export function buildChatRequest(
    *  if your engine supports it; some OpenAI-compatible servers reject the field. */
   cacheSystem = false,
 ): Record<string, unknown> {
+  const sanitizedHistory = sanitizeMessagesForApi(history);
   const messages: Array<Record<string, unknown>> = [];
   if (systemPrompt?.trim()) {
     const text = systemPrompt.trim();
@@ -46,9 +48,9 @@ export function buildChatRequest(
       : text;
     messages.push({ role: 'system', content });
   }
-  const lastUserIdx = history.findLastIndex((m) => m.role === 'user' && (m.content.trim() || (m.attachments && m.attachments.length)));
-  for (let i = 0; i < history.length; i++) {
-    const m = history[i];
+  const lastUserIdx = sanitizedHistory.findLastIndex((m) => m.role === 'user' && (m.content.trim() || (m.attachments && m.attachments.length)));
+  for (let i = 0; i < sanitizedHistory.length; i++) {
+    const m = sanitizedHistory[i];
     if (m.role === 'system') continue;
     const cacheThisMsg = cacheSystem && i === lastUserIdx;
     if (m.attachments && m.attachments.length) {

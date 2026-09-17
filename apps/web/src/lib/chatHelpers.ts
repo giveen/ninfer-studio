@@ -300,12 +300,90 @@ export function normalizeParams(raw: unknown): ChatParams {
 }
 
 /**
+ * Sanitizes a conversation message sequence so that:
+ * 1. Every `role: 'tool'` message has a matching `role: 'assistant'` message with `tool_calls` preceding it.
+ * 2. If a `role: 'tool'` message is orphaned (e.g. from context slicing or interrupted turns), it is converted to a user context note so OpenRouter/OpenAI API specs are satisfied.
+ * 3. Any unfulfilled `tool_calls` in an assistant message receive dummy tool responses.
+ */
+export function sanitizeMessagesForApi(history: ChatMessage[]): ChatMessage[] {
+  if (!history || history.length === 0) return [];
+  const out: ChatMessage[] = [];
+
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
+
+    if (m.role === 'tool') {
+      const tcid = m.tool_call_id;
+      let matched = false;
+      for (let j = out.length - 1; j >= 0; j--) {
+        const prev = out[j];
+        if (prev.role === 'assistant' && prev.tool_calls?.some((tc) => tc.id === tcid)) {
+          matched = true;
+          break;
+        }
+        if (prev.role === 'user' || prev.role === 'system') {
+          break;
+        }
+      }
+
+      if (matched) {
+        out.push(m);
+      } else {
+        out.push({
+          role: 'user',
+          displayName: 'Historical Tool Result',
+          collapsed: true,
+          content: `[Historical tool result for ${m.name || 'tool'}]:\n${m.content || ''}`,
+        });
+      }
+      continue;
+    }
+
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+      const expectedIds = new Set(m.tool_calls.map((tc) => tc.id));
+      const foundIds = new Set<string>();
+
+      let k = i + 1;
+      while (k < history.length && history[k].role === 'tool') {
+        if (history[k].tool_call_id) {
+          foundIds.add(history[k].tool_call_id!);
+        }
+        k++;
+      }
+
+      out.push(m);
+      for (let j = i + 1; j < k; j++) {
+        out.push(history[j]);
+      }
+
+      for (const tc of m.tool_calls) {
+        if (!foundIds.has(tc.id)) {
+          out.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            name: tc.name,
+            content: JSON.stringify({ error: 'tool execution was interrupted or omitted' }),
+          });
+        }
+      }
+
+      i = k - 1;
+      continue;
+    }
+
+    out.push(m);
+  }
+
+  return out;
+}
+
+/**
  * Prunes historical tool output dumps (> 1500 chars in older turns) before shipping
  * prompts to paid cloud providers. Preserves recent turns and current context intact
  * while trimming bloated legacy tool results, saving up to 70% in cloud API input tokens.
  */
 export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length <= 2) return messages;
+  if (messages.length <= 2) return sanitizeMessagesForApi(messages);
 
   const cutoffIndex = Math.max(0, messages.length - 4);
   let pruned = messages.map((m, idx) => {
@@ -355,7 +433,7 @@ export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
     }
   }
 
-  return pruned;
+  return sanitizeMessagesForApi(pruned);
 }
 
 /**

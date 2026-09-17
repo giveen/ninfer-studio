@@ -91,6 +91,29 @@ describe('buildChatRequest', () => {
     expect(msgs[0].content.length).toBe(2);
     expect(msgs[0].content[1].text).toContain('[Attached file: main.py]');
   });
+
+  it('sanitizes orphaned tool messages and unfulfilled tool_calls for API compliance', () => {
+    const req = buildChatRequest(
+      'mock-model',
+      undefined,
+      [
+        { role: 'user', content: 'Run test' },
+        { role: 'tool', tool_call_id: 'orphaned_1', name: 'bash', content: 'orphaned result' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', name: 'todo_write', arguments: '{}' }] },
+      ],
+      { thinking: false },
+    );
+    const msgs = req.messages as Array<{ role: string; content: unknown; tool_call_id?: string }>;
+    expect(msgs.length).toBe(4);
+    // Orphaned tool message converted to user context message
+    expect(msgs[1].role).toBe('user');
+    expect(msgs[1].content).toContain('[Historical tool result for bash]');
+    // Assistant message preserved
+    expect(msgs[2].role).toBe('assistant');
+    // Missing tool response fulfilled with dummy tool result
+    expect(msgs[3].role).toBe('tool');
+    expect(msgs[3].tool_call_id).toBe('call_1');
+  });
 });
 
 describe('validateOutputReceipt', () => {
