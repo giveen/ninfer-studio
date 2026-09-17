@@ -141,12 +141,19 @@ pub async fn safe_mode_get(AxumState(state): AxumState<S>) -> Json<Value> {
     Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
 }
 
-pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
-    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        tracing::info!(enabled = %enabled, "coder_safe_mode updated");
-        persist_bool_setting(&state, |c, v| c.coder_safe_mode = v, enabled).await;
-    }
-    Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
+pub async fn safe_mode_set(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "field 'enabled' must be a boolean" })),
+        ));
+    };
+    tracing::info!(enabled = %enabled, "coder_safe_mode updated");
+    persist_bool_setting(&state, |c, v| c.coder_safe_mode = v, enabled).await;
+    Ok(Json(json!({ "enabled": state.config.read().await.coder_safe_mode })))
 }
 
 pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> {
@@ -156,12 +163,16 @@ pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> 
 pub async fn commit_approval_set(
     AxumState(state): AxumState<S>,
     Json(req): Json<Value>,
-) -> Json<Value> {
-    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        tracing::info!(enabled = %enabled, "coder_commit_approval updated");
-        persist_bool_setting(&state, |c, v| c.coder_commit_approval = v, enabled).await;
-    }
-    Json(json!({"enabled": state.config.read().await.coder_commit_approval}))
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "field 'enabled' must be a boolean" })),
+        ));
+    };
+    tracing::info!(enabled = %enabled, "coder_commit_approval updated");
+    persist_bool_setting(&state, |c, v| c.coder_commit_approval = v, enabled).await;
+    Ok(Json(json!({ "enabled": state.config.read().await.coder_commit_approval })))
 }
 
 // ---------------------------------------------------------------------------
@@ -889,12 +900,12 @@ mod tests {
 
         assert_eq!(safe_mode_get(w()).await["enabled"], true);
         assert_eq!(
-            safe_mode_set(w(), Json(json!({"enabled": false}))).await["enabled"],
+            safe_mode_set(w(), Json(json!({"enabled": false}))).await.unwrap()["enabled"],
             false
         );
         assert_eq!(commit_approval_get(w()).await["enabled"], false);
         assert_eq!(
-            commit_approval_set(w(), Json(json!({"enabled": true}))).await["enabled"],
+            commit_approval_set(w(), Json(json!({"enabled": true}))).await.unwrap()["enabled"],
             true
         );
 
