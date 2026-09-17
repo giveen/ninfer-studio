@@ -417,18 +417,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // (tools dispatch in-process through the same endpoints the old client
       // registry called, with tiers enforced from the mirrored perms). This
       // client starts the run and attaches over SSE — closing the window no
-      // longer kills it; re-attaching resyncs from the snapshot.
-      const toAgentCalls = (tcs: unknown): AgentToolCall[] => {
-        if (!Array.isArray(tcs)) return [];
-        return tcs.map((tc) => {
-          const o = tc as Record<string, unknown>;
-          const fn = (o.function ?? o) as Record<string, unknown>;
-          const args = fn.arguments ?? o.arguments ?? {};
-          return { id: String(o.id ?? ''), name: String(fn.name ?? o.name ?? ''), arguments: typeof args === 'string' ? args : JSON.stringify(args) };
-        });
-      };
       const cloudRun = !!baseUrl;
-      const prunedHistory = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
       const seedMessages: ChatMessage[] = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
 
       const registry: ToolRegistry = {
