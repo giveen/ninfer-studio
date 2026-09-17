@@ -9,7 +9,7 @@ use crate::engine::{
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models};
 use crate::read_json;
-use crate::repo::{start_update, update_public};
+use crate::repo::{cancel_update, start_update, update_public};
 use crate::routes_config::redact_config;
 use crate::types::{ARTIFACTS, EngineProfile, args_equal, base_name, build_serve_args};
 use axum::Json;
@@ -18,6 +18,12 @@ use axum::extract::{Request, State as AxumState};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+pub(crate) async fn engine_update_cancel(
+    AxumState(state): AxumState<S>,
+) -> Json<Value> {
+    Json(cancel_update(&state).await)
+}
 
 pub(crate) async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
