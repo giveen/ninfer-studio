@@ -84,8 +84,11 @@ const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 /// through a fresh connection) instead of wedging the catalog forever.
 const LIST_TOOLS_LIMIT: Duration = Duration::from_secs(35);
 
-/// Same slack idea for `tools/call`, over the actor's `CALL_TIMEOUT` cap
-/// (computed at the call site — `Duration` addition is not const-stable).
+/// Connect timeout limit on handler side (60s init + 30s tools/list + 5s slack).
+const CONNECT_LIMIT: Duration = Duration::from_secs(95);
+
+/// `tools/call` timeout limit on handler side (600s call + 10s slack).
+const CALL_LIMIT: Duration = Duration::from_secs(610);
 /// One MCP server tool in its LLM-facing namespaced form.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -290,14 +293,16 @@ pub(crate) fn split_mcp_name(name: &str) -> Option<(&str, &str)> {
 fn mangle_tools(server: &str, tools: &[Tool]) -> Vec<ToolDef> {
     let prefix = format!("{MCP_PREFIX}{server}__");
     let mut defs = Vec::new();
-    let mut count: HashMap<String, i64> = HashMap::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in tools {
-        let mut mangled = format!("{prefix}{}", sanitize_tool_name(&t.name));
-        let n = count.entry(mangled.clone()).or_insert(0);
-        *n += 1;
-        if *n > 1 {
-            mangled = format!("{mangled}_{n}");
+        let base = format!("{prefix}{}", sanitize_tool_name(&t.name));
+        let mut mangled = base.clone();
+        let mut n = 2;
+        while used.contains(&mangled) {
+            mangled = format!("{base}_{n}");
+            n += 1;
         }
+        used.insert(mangled.clone());
         defs.push(ToolDef {
             mangled,
             original: t.name.as_ref().to_string(),
@@ -755,7 +760,11 @@ fn render_result(result: &CallToolResult) -> String {
         out = "(no content)".into();
     }
     if out.len() > MAX_TOOL_OUTPUT {
-        out.truncate(MAX_TOOL_OUTPUT);
+        let cut = (0..=MAX_TOOL_OUTPUT)
+            .rev()
+            .find(|&i| out.is_char_boundary(i))
+            .unwrap_or(0);
+        out.truncate(cut);
         out.push_str("\n… (truncated)");
     }
     out
@@ -845,7 +854,7 @@ pub(crate) async fn ensure_conn(state: &S, name: &str) -> Result<(), (StatusCode
             server: name.to_string(),
             spec,
         },
-        INIT_TIMEOUT + Duration::from_secs(10),
+        CONNECT_LIMIT,
     )
     .await
     {
@@ -1048,6 +1057,14 @@ pub async fn servers_upsert(
             .cloned()
     };
     if let Some(existing) = &existing {
+        if name != existing.name {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("server name '{name}' sanitizes to '{sanit}', which collides with existing server '{exist}'", sanit = spec.name, exist = existing.name)
+                })),
+            ));
+        }
         if spec.authorization.as_deref() == Some("***") {
             spec.authorization = existing.authorization.clone();
         }
@@ -1121,6 +1138,15 @@ pub async fn server_delete(
     )
     .await;
     state.mcp.read().await.meta_remove(&name);
+    let server_perm_prefix = format!("{MCP_PREFIX}{name}");
+    {
+        let mut all_perms = state.coder_perms.write().await;
+        for scope_perms in all_perms.values_mut() {
+            scope_perms.tools.retain(|k, _| {
+                !(k == &server_perm_prefix || k.starts_with(&format!("{server_perm_prefix}__")))
+            });
+        }
+    }
     let mut cfg = state.config.write().await;
     cfg.mcp_servers.retain(|s| s.name != name);
     persist_config(&state, &cfg).await;
@@ -1261,7 +1287,12 @@ async fn call_tool(
     name: &str,
     arguments: Map<String, Value>,
 ) -> Result<(bool, String), (StatusCode, Json<Value>)> {
-    let (server, _) = split_mcp_name(name).expect("caller checked the name shape");
+    let Some((server, _)) = split_mcp_name(name) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid MCP tool name '{name}'") })),
+        ));
+    };
     let server = server.to_string();
     for attempt in 0..2u32 {
         let meta = {
@@ -1282,7 +1313,7 @@ async fn call_tool(
                 tool: def.original,
                 arguments: arguments.clone(),
             },
-            CALL_TIMEOUT + Duration::from_secs(10),
+            CALL_LIMIT,
         )
         .await
         {
@@ -1383,24 +1414,32 @@ pub async fn mcp_call(
             ));
         }
     }
-    // Fail fast on a connection that just failed (a blind reconnect would
-    // burn up to the init timeout on every call).
-    {
+    // Connect when needed — reuse live session and fail fast if failed recently.
+    let need_conn = {
         let m = state.mcp.read().await;
-        if let Some(meta) = m.meta_get(&server)
-            && !meta.alive
-            && failed_recently(&meta)
-        {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": meta
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "MCP server not connected".to_string()) })),
-            ));
+        match m.meta_get(&server) {
+            None => true,
+            Some(meta) => {
+                if !meta.alive {
+                    if failed_recently(&meta) {
+                        return Err((
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({ "error": meta
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "MCP server not connected".to_string()) })),
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
         }
+    };
+    if need_conn {
+        ensure_conn(&state, &server).await?;
     }
-    ensure_conn(&state, &server).await?;
     let (ok, output) = call_tool(&state, &name, arguments).await?;
     Ok(Json(json!({ "ok": ok, "output": output })))
 }
@@ -1438,6 +1477,30 @@ mod tests {
         let b = sanitize_tool_name("a_b");
         assert_eq!(a, b);
         assert_eq!(format!("{a}_2"), format!("{b}_2"));
+    }
+
+    #[test]
+    fn mangle_tools_deduplication() {
+        let tools = vec![
+            Tool::new("a.b", "", Arc::new(rmcp::model::JsonObject::default())),
+            Tool::new("a_b", "", Arc::new(rmcp::model::JsonObject::default())),
+            Tool::new("a:b", "", Arc::new(rmcp::model::JsonObject::default())),
+        ];
+        let defs = mangle_tools("test", &tools);
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[0].mangled, "mcp__test__a_b");
+        assert_eq!(defs[1].mangled, "mcp__test__a_b_2");
+        assert_eq!(defs[2].mangled, "mcp__test__a_b_3");
+    }
+
+    #[test]
+    fn render_result_utf8_truncation() {
+        // Multi-byte CJK character replicated across MAX_TOOL_OUTPUT boundary
+        let multi_byte = "你好".repeat(MAX_TOOL_OUTPUT / 2);
+        let res = CallToolResult::success(vec![ContentBlock::text(multi_byte)]);
+        let out = render_result(&res);
+        assert!(out.contains("… (truncated)"));
+        assert!(out.len() <= MAX_TOOL_OUTPUT + "\n… (truncated)".len());
     }
 
     #[test]
@@ -1566,7 +1629,17 @@ done
             list[0].get("peer").unwrap().get("name").unwrap(),
             "fake-mcp"
         );
-        assert!(list[0].get("pid").unwrap().as_u64().unwrap() > 0);
+        let initial_pid = list[0].get("pid").unwrap().as_u64().unwrap();
+        assert!(initial_pid > 0);
+
+        // Upserting a name that sanitizes to an existing server's name (e.g., fake_ vs fake) returns 400.
+        let e = servers_upsert(
+            ws(),
+            Json(json!({ "name": "fake_", "command": script.to_str().unwrap() })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
 
         // A spec with neither transport is rejected up front (400) and not
         // saved.
@@ -1608,6 +1681,10 @@ done
         .0;
         assert_eq!(c.get("ok").unwrap(), true);
         assert_eq!(c.get("output").unwrap(), "echo: hi");
+
+        // Assert PID is preserved across tool calls (session reused)
+        let call_pid = state.mcp.read().await.meta_get("fake").unwrap().pid;
+        assert_eq!(Some(initial_pid as u32), call_pid);
 
         // Permission tiers: a server-level Deny row blocks the tool; a
         // per-tool Allow row overrides it.
@@ -1740,6 +1817,8 @@ done
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].get("status").unwrap(), "connected");
 
+        assert!(state.coder_perms.read().await.get("default").unwrap().tools.contains_key("mcp__fake__echo"));
+
         // Delete kills the session and removes the spec; a second delete 404s.
         let d = server_delete(ws(), AxumPath(String::from("fake")))
             .await
@@ -1747,6 +1826,9 @@ done
             .0;
         assert_eq!(d.get("ok").unwrap(), true);
         assert_eq!(d.get("removed").unwrap(), true);
+
+        // Verify coder_perms cleanup
+        assert!(!state.coder_perms.read().await.get("default").unwrap().tools.contains_key("mcp__fake__echo"));
         let r = servers_get(ws()).await.0;
         let names: Vec<&str> = r
             .get("servers")
