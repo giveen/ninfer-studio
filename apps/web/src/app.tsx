@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Activity, Code2, Cpu, MessagesSquare, Moon, Settings2, Layers, Sun, Terminal } from 'lucide-react';
+import { Activity, Code2, Cpu, MessagesSquare, Monitor, Moon, Settings2, Layers, Sun, Terminal } from 'lucide-react';
 import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
 import { formatBytes, formatPct } from './lib/format';
-import { applyTheme, getStoredTheme, type ThemeMode } from './lib/theme';
+import { applyTheme, getStoredTheme, subscribeTheme, type ThemeMode } from './lib/theme';
 import { CoderSafetyProvider } from './lib/coderSafety';
 import { ChatAgentProvider } from './lib/chatAgent';
 import { ChatScreen } from './screens/ChatScreen';
@@ -88,7 +88,24 @@ export function App() {
 
   useEffect(() => {
     applyTheme(theme);
+    if (theme === 'system') {
+      const cleanup = subscribeTheme(() => {
+        applyTheme('system');
+      });
+      return cleanup;
+    }
   }, [theme]);
+
+  const nextTheme: Record<ThemeMode, ThemeMode> = {
+    dark: 'light',
+    light: 'system',
+    system: 'dark',
+  };
+  const themeLabels: Record<ThemeMode, string> = {
+    dark: 'Switch to light theme',
+    light: 'Switch to system theme',
+    system: 'Switch to dark theme',
+  };
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -114,12 +131,18 @@ export function App() {
         ))}
         <button
           type="button"
-          onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          onClick={() => setTheme((t) => nextTheme[t])}
+          title={themeLabels[theme]}
+          aria-label={themeLabels[theme]}
           className="mt-auto flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
         >
-          {theme === 'dark' ? <Sun size={18} strokeWidth={1.8} /> : <Moon size={18} strokeWidth={1.8} />}
+          {theme === 'dark' ? (
+            <Sun size={18} strokeWidth={1.8} />
+          ) : theme === 'light' ? (
+            <Monitor size={18} strokeWidth={1.8} />
+          ) : (
+            <Moon size={18} strokeWidth={1.8} />
+          )}
         </button>
       </nav>
 
