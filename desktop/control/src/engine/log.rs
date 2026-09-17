@@ -1,5 +1,7 @@
 //! Per-port engine log files + size-cap rotation.
 
+pub const ENGINE_START_MARKER: &str = "=== ENGINE START ===";
+
 pub fn log_path_for(data_dir: &std::path::Path, port: u16) -> String {
     data_dir
         .join(format!("engine-{port}.log"))
@@ -15,10 +17,11 @@ pub fn log_path_for(data_dir: &std::path::Path, port: u16) -> String {
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_KEEP_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
+const TRUNCATION_MARKER: &[u8] = b"--- log truncated: earlier entries removed to cap file size ---\n";
+
 /// If the engine log at `path` is already over the size cap, rewrite it down
 /// to just its last `LOG_KEEP_TAIL_BYTES` (trimmed to a clean line boundary)
-/// instead of leaving it to grow unbounded. Called right before each start,
-/// so the cap is enforced once per engine launch rather than continuously.
+/// via a temporary file + atomic rename instead of truncating in place.
 pub async fn rotate_log_if_large(path: &str) {
     let Ok(md) = tokio::fs::metadata(path).await else {
         return;
@@ -34,14 +37,35 @@ pub async fn rotate_log_if_large(path: &str) {
         let start = len.saturating_sub(LOG_KEEP_TAIL_BYTES);
         f.seek(SeekFrom::Start(start))?;
         let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
+        f.take(LOG_KEEP_TAIL_BYTES).read_to_end(&mut buf)?;
+
         // Drop a leading partial line so the kept tail starts cleanly.
         if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
             buf.drain(..=nl);
         }
-        let mut out = std::fs::File::create(&path)?; // truncates in place
-        out.write_all(b"--- log truncated: earlier entries removed to cap file size ---\n")?;
-        out.write_all(&buf)?;
+
+        // Strip previous truncation marker lines to avoid accumulation
+        while buf.starts_with(b"--- log truncated:") {
+            if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                buf.drain(..=nl);
+            } else {
+                buf.clear();
+                break;
+            }
+        }
+
+        let tmp_path = format!("{path}.tmp");
+        {
+            let mut out = std::fs::File::create(&tmp_path)?;
+            out.write_all(TRUNCATION_MARKER)?;
+            out.write_all(&buf)?;
+            out.flush()?;
+            out.sync_all()?;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
         Ok(())
     })
     .await;
@@ -50,10 +74,14 @@ pub async fn rotate_log_if_large(path: &str) {
 #[cfg(test)]
 mod log_rotation_tests {
     use super::{LOG_KEEP_TAIL_BYTES, MAX_LOG_BYTES, rotate_log_if_large};
+    use std::io::Write;
 
     fn tmp_log(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ninfier-logrotate-test-{}", std::process::id()));
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ninfier-logrotate-test-{unique_id}"));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(name)
     }
@@ -71,11 +99,8 @@ mod log_rotation_tests {
     #[tokio::test]
     async fn caps_a_large_log_to_its_tail() {
         let path = tmp_log("large.log");
-        // Build a log well past MAX_LOG_BYTES out of numbered, easily
-        // recognizable lines so we can verify the kept content is really the
-        // tail and nothing from the dropped head survives.
         let line = "x".repeat(100);
-        let target = MAX_LOG_BYTES + LOG_KEEP_TAIL_BYTES; // guarantee rotation fires
+        let target = MAX_LOG_BYTES + LOG_KEEP_TAIL_BYTES;
         let mut body = String::new();
         let mut i: u64 = 0;
         while (body.len() as u64) < target {
@@ -104,15 +129,12 @@ mod log_rotation_tests {
             content.starts_with("--- log truncated"),
             "should carry the truncation marker"
         );
-        // The very last line written must survive (nothing lost off the end).
         assert!(
             content
                 .trim_end()
                 .ends_with(&format!("{last_line_no} {line}"))
         );
-        // An early line must NOT survive (the head was actually dropped).
         assert!(!content.contains(&format!("\n0 {line}\n")));
-        // No partial line at the top of the kept tail (other than the marker).
         let mut lines = content.lines();
         assert!(lines.next().unwrap().starts_with("--- log truncated"));
         for l in lines {
@@ -131,7 +153,49 @@ mod log_rotation_tests {
     async fn missing_file_is_a_noop() {
         let path = tmp_log("does-not-exist.log");
         let _ = std::fs::remove_file(&path);
-        rotate_log_if_large(path.to_str().unwrap()).await; // must not panic
+        rotate_log_if_large(path.to_str().unwrap()).await;
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn rotation_uses_tmp_file_and_preserves_open_handles() {
+        let path = tmp_log("open_handle.log");
+        let line = "y".repeat(100);
+        let target = MAX_LOG_BYTES + 1024;
+        let mut body = String::new();
+        let mut i: u64 = 0;
+        while (body.len() as u64) < target {
+            body.push_str(&format!("{i} {line}\n"));
+            i += 1;
+        }
+
+        // Open handle before rotation
+        let mut open_handle = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        open_handle.write_all(body.as_bytes()).unwrap();
+        open_handle.flush().unwrap();
+
+        // Perform atomic rotation
+        rotate_log_if_large(path.to_str().unwrap()).await;
+
+        // Lingering handle writes to orphaned inode
+        open_handle
+            .write_all(b"lingering write after rotation\n")
+            .unwrap();
+        open_handle.flush().unwrap();
+
+        // Check new rotated file does NOT contain NUL byte padding
+        let new_content = std::fs::read(&path).unwrap();
+        assert!(
+            !new_content.contains(&0u8),
+            "Rotated file should not contain NUL byte sparse padding"
+        );
+        let text = String::from_utf8_lossy(&new_content);
+        assert!(text.starts_with("--- log truncated"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

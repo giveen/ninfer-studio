@@ -186,7 +186,13 @@ async fn open_engine_log(state: &S, port: u16) -> Result<(String, tokio::fs::Fil
         .open(&log_file_path)
         .await
     {
-        Ok(log) => Ok((log_file_path, log)),
+        Ok(mut log) => {
+            use tokio::io::AsyncWriteExt;
+            let marker = format!("{}\n", super::log::ENGINE_START_MARKER);
+            let _ = log.write_all(marker.as_bytes()).await;
+            let _ = log.flush().await;
+            Ok((log_file_path, log))
+        }
         Err(_) => Err(json!({ "ok": false, "message": "could not open engine log file" })),
     }
 }

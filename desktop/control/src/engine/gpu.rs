@@ -84,6 +84,10 @@ fn read_vram_status_from_file(path: &std::path::Path) -> Option<(f64, f64)> {
         }
         let tail = String::from_utf8_lossy(&buf);
         for line in tail.lines().rev() {
+            if line.contains(super::log::ENGINE_START_MARKER) {
+                // Stopped at the current engine run boundary before finding any capacity line
+                return None;
+            }
             if is_capacity_line(line) {
                 // Return the parsed result of the MOST RECENT capacity line found.
                 // If it fails to parse (e.g. corrupted numbers), return None (honest unknown)
@@ -223,6 +227,30 @@ mod vram_tests {
 
         let res = read_vram_status_from_file(&file_path);
         assert!(res.is_none(), "Expected None when latest capacity line is corrupted rather than falling back to stale line");
+
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn vram_status_stops_at_engine_start_marker() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_vram_engine_marker.log");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+
+        // Previous run capacity line
+        writeln!(
+            file,
+            "2026-09-10 17:00:00.000  INFO  capacity | runtime 5.0 GiB | free 15.0 GiB"
+        )
+        .unwrap();
+
+        // New engine launch marker
+        writeln!(file, "{}", crate::engine::log::ENGINE_START_MARKER).unwrap();
+        writeln!(file, "2026-09-10 18:00:00.000  INFO  starting engine...").unwrap();
+        file.flush().unwrap();
+
+        let res = read_vram_status_from_file(&file_path);
+        assert!(res.is_none(), "Expected None when new engine run has not logged a capacity line yet");
 
         let _ = std::fs::remove_file(file_path);
     }
