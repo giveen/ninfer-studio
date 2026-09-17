@@ -9,7 +9,7 @@ import {
   isLiveMetricsStale,
   useLatestRequestMetrics,
 } from '../lib/liveMetrics';
-import { Badge, Button, CodeBlock, SectionCard, Stat, cn } from '../components/ui';
+import { Badge, Button, CodeBlock, SectionCard, Stat, TabNav, cn } from '../components/ui';
 import { BasicsTab } from './engine/BasicsTab';
 import { PerformanceTab } from './engine/PerformanceTab';
 import { AdvancedTab } from './engine/AdvancedTab';
@@ -294,23 +294,7 @@ export function EngineScreen({
 
   return (
     <div className="h-full overflow-y-auto">
-      <nav className="sticky top-0 z-20 border-b border-line bg-panel/95 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl gap-1 px-5 py-1.5">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={cn(
-                'shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors',
-                tab === t.id ? 'border-accent/40 bg-accent/12 text-accent' : 'border-line bg-inset text-mute hover:border-line2 hover:text-ink',
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-      </nav>
+      <TabNav tabs={TABS} activeTab={tab} onTabChange={setTab} maxWidth="max-w-5xl" />
       <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
         {status?.vram?.under && (
           <div className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-[13px] text-warn">
@@ -498,7 +482,7 @@ export function EngineScreen({
           </SectionCard>
         )}
 
-        <div className={cn(tab !== 'basics' && 'hidden')}>
+        <div role="tabpanel" id="panel-basics" aria-labelledby="tab-basics" className={cn(tab !== 'basics' && 'hidden')}>
           <BasicsTab
             profile={profile}
             set={set}
@@ -510,7 +494,7 @@ export function EngineScreen({
             applyPreset={applyPreset}
           />
         </div>
-        <div className={cn(tab !== 'performance' && 'hidden')}>
+        <div role="tabpanel" id="panel-performance" aria-labelledby="tab-performance" className={cn(tab !== 'performance' && 'hidden')}>
           <PerformanceTab
             profile={profile}
             set={set}
@@ -522,10 +506,10 @@ export function EngineScreen({
             draftRange={draftRange}
           />
         </div>
-        <div className={cn(tab !== 'advanced' && 'hidden')}>
+        <div role="tabpanel" id="panel-advanced" aria-labelledby="tab-advanced" className={cn(tab !== 'advanced' && 'hidden')}>
           <AdvancedTab profile={profile} set={set} setU={setU} />
         </div>
-        <div className={cn(tab !== 'profiles' && 'hidden')}>
+        <div role="tabpanel" id="panel-profiles" aria-labelledby="tab-profiles" className={cn(tab !== 'profiles' && 'hidden')}>
           <ProfilesTab
             profile={profile}
             setProfile={setProfile}
@@ -538,10 +522,10 @@ export function EngineScreen({
             setSaved={setSaved}
           />
         </div>
-        <div className={cn(tab !== 'cloud' && 'hidden')}>
+        <div role="tabpanel" id="panel-cloud" aria-labelledby="tab-cloud" className={cn(tab !== 'cloud' && 'hidden')}>
           <CloudTab settings={settings} onUpdate={onUpdateSettings} />
         </div>
-        <div className={cn(tab !== 'usage' && 'hidden')}>
+        <div role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" className={cn(tab !== 'usage' && 'hidden')}>
           <UsageTrackerTab active={tab === 'usage'} />
         </div>
 

@@ -4,7 +4,7 @@ import { getConfig, saveConfig, startEngineUpdate } from '../../lib/api';
 import type { AppSettings, StatusPayload } from '../../lib/types';
 import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField, Toggle } from '../../components/ui';
 
-export function EngineTab({ status }: { status: StatusPayload | null }) {
+export function EngineTab({ status, active = true }: { status: StatusPayload | null; active?: boolean }) {
   const [form, setForm] = useState<AppSettings | null>(null);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,8 +30,8 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
   }, []);
 
   useEffect(() => {
-    fetchConfig();
-  }, [fetchConfig]);
+    if (active) fetchConfig();
+  }, [active, fetchConfig]);
 
   const update = status?.update ?? null;
   const updating = !!update && !update.done;

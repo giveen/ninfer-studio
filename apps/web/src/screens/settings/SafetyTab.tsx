@@ -326,7 +326,7 @@ export function SafetyTab({ active = true }: { active?: boolean }) {
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
+    <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
       <SectionCard title="Safe Mode" icon={<Shield size={15} />} description="Blocks clearly destructive shell commands before they run.">
         <div className="flex items-center justify-between gap-3">
           <p className="text-[12.5px] text-faint">Blocks <code className="font-mono">rm -rf /</code>, <code className="font-mono">git push --force</code>, <code className="font-mono">mkfs</code>, piping downloads into a shell, and similar.</p>

@@ -11,7 +11,7 @@ import { mcpToolTier, type PermTier } from '../../lib/coderTools';
 import type { StatusPayload } from '../../lib/types';
 import { ToggleRow, TierRow } from './settingsHelpers';
 
-export function AgentTab({ status }: { status: StatusPayload | null }) {
+export function AgentTab({ status, active = true }: { status: StatusPayload | null; active?: boolean }) {
   const {
     agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled,
     memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
@@ -51,7 +51,7 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
   // the servers on demand — so fire-and-forget and render when it lands.
   const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
   useEffect(() => {
-    if (!computerUseEnabled) {
+    if (!computerUseEnabled || !active) {
       setMcpTools([]);
       return;
     }
@@ -60,10 +60,10 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
       .then((r) => { if (live) setMcpTools(r.tools); })
       .catch(() => { if (live) setMcpTools([]); });
     return () => { live = false; };
-  }, [computerUseEnabled, computerUseDir]);
+  }, [computerUseEnabled, computerUseDir, active]);
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
+    <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
       <SectionCard
         title="Agent Mode"
         icon={<Bot size={15} />}

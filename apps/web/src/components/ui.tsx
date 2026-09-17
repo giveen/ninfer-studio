@@ -464,3 +464,56 @@ export function LogPane({ lines, autoScroll = true }: { lines: string[]; autoScr
     </div>
   );
 }
+
+// ---------------------------------------------------------------- Tab nav
+export interface TabNavItem<T extends string = string> {
+  id: T;
+  label: string;
+  icon?: React.ComponentType<{ size?: number; className?: string }>;
+}
+
+export function TabNav<T extends string>({
+  tabs,
+  activeTab,
+  onTabChange,
+  maxWidth = 'max-w-5xl',
+  className,
+}: {
+  tabs: Array<TabNavItem<T>>;
+  activeTab: T;
+  onTabChange: (id: T) => void;
+  maxWidth?: string;
+  className?: string;
+}) {
+  return (
+    <nav className={cn('sticky top-0 z-20 shrink-0 border-b border-line bg-panel/95 backdrop-blur', className)}>
+      <div className={cn('mx-auto flex gap-1 px-5 py-1.5', maxWidth)} role="tablist">
+        {tabs.map((t) => {
+          const isSelected = activeTab === t.id;
+          const Icon = t.icon;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              id={`tab-${t.id}`}
+              aria-selected={isSelected}
+              aria-controls={`panel-${t.id}`}
+              onClick={() => onTabChange(t.id)}
+              className={cn(
+                'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors',
+                isSelected
+                  ? 'border-accent/40 bg-accent/12 text-accent'
+                  : 'border-line bg-inset text-mute hover:border-line2 hover:text-ink',
+              )}
+            >
+              {Icon && <Icon size={13} />}
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+    </nav>
+  );
+}
+
