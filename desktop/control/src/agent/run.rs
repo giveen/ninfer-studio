@@ -635,7 +635,7 @@ fn default_max_steps() -> usize {
 /// before the loop task starts, so a client can attach within the same
 /// tick the run begins.
 pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
-    let (tx, _rx) = broadcast::channel(512);
+    let (tx, _rx) = broadcast::channel(2048);
     let (stop_tx, stop_rx) = watch::channel(false);
     let shared = Arc::new(RunShared {
         meta,
@@ -1168,37 +1168,65 @@ pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String
 
 /// First frame is the snapshot (`event: state`); then one frame per
 /// [`AgentEvent`]. Ends when the run's channel closes or the client goes
-/// away.
+/// away. Handles lagged subscribers by re-emitting a state snapshot.
 async fn sse_pump(run: Arc<RunShared>, out: tokio::sync::mpsc::Sender<bytes::Bytes>) {
     let mut rx = run.tx.subscribe();
+    let mut seq: u64 = 1;
     let snap = run.snapshot();
     let first = sse_frame(
+        seq,
         "state",
         &serde_json::to_string(&AgentEvent::State {
             snapshot: Box::new(snap),
         })
         .unwrap_or_default(),
     );
+    seq += 1;
     if out.send(first).await.is_err() {
         return; // client is already gone
     }
-    while let Ok(ev) = rx.recv().await {
-        let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
-        let name = v
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("event")
-            .to_string();
-        if out.send(sse_frame(&name, &v.to_string())).await.is_err() {
-            return;
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+                let name = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("event")
+                    .to_string();
+                let frame = sse_frame(seq, &name, &v.to_string());
+                seq += 1;
+                if out.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, run_id = %run.meta.id, "SSE client lagged; sending state snapshot resync");
+                let snap = run.snapshot();
+                let frame = sse_frame(
+                    seq,
+                    "state",
+                    &serde_json::to_string(&AgentEvent::State {
+                        snapshot: Box::new(snap),
+                    })
+                    .unwrap_or_default(),
+                );
+                seq += 1;
+                if out.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
         }
     }
 }
 
-/// One SSE frame: `event: <name>`, then one `data:` line per line of the
-/// (single-line) JSON payload.
-fn sse_frame(name: &str, data: &str) -> bytes::Bytes {
+/// One SSE frame: `id: <seq>`, `event: <name>`, then `data:` lines.
+fn sse_frame(id: u64, name: &str, data: &str) -> bytes::Bytes {
     let mut out = String::new();
+    out.push_str(&format!("id: {id}\n"));
     out.push_str(&format!("event: {name}\n"));
     for line in data.split('\n') {
         out.push_str("data: ");
