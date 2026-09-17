@@ -518,7 +518,7 @@ pub async fn repo_map(
 
         let mut map_out = String::new();
         let mut chars_used = 0;
-        let char_limit = 20000;
+        let char_limit = 10000;
 
         for (file, _score) in file_scores {
             let defs = &file_defs[&file];

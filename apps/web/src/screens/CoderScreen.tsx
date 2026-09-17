@@ -775,19 +775,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const refreshRepoMap = useCallback(async () => {
     const sys = CODER_SYSTEM;
     let ctx = '';
-    try {
-      const rMap = await coderRepoMap();
-      if (rMap && rMap.map) {
-        // Unlike conventions/skills/followed-files below, this comes straight
-        // from an AST scan of the whole repo with no size control of its own —
-        // cap it so a large codebase can't silently balloon every turn's prompt.
-        const REPO_MAP_CAP = 20000;
-        const map = rMap.map.length > REPO_MAP_CAP
-          ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
-          : rMap.map;
-        ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
-      }
-    } catch { /* ignore */ }
+    if (storeRef.current.config?.coderRepoMapEnabled !== false) {
+      try {
+        const rMap = await coderRepoMap();
+        if (rMap && rMap.map) {
+          // Unlike conventions/skills/followed-files below, this comes straight
+          // from an AST scan of the whole repo with no size control of its own —
+          // cap it so a large codebase can't silently balloon every turn's prompt.
+          const REPO_MAP_CAP = 10000;
+          const map = rMap.map.length > REPO_MAP_CAP
+            ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
+            : rMap.map;
+          ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
+        }
+      } catch { /* ignore */ }
+    }
     // Project conventions: AGENTS.md preferred, CLAUDE.md fallback — refreshed
     let convName = '';
     try {
