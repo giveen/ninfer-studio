@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles, Check } from 'lucide-react';
-import { Button, Field, SectionCard, TextField, Toggle } from '../../components/ui';
+import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
 import { testCloudConnection, type CloudTestResult, type CloudModelInfo } from '../../lib/api';
 
@@ -90,6 +90,8 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
 
   const [primaryDraft, setPrimaryDraft] = useState(currentPrimary);
   const [subagentDraft, setSubagentDraft] = useState(currentSubagent);
+  const [customPrimaryMode, setCustomPrimaryMode] = useState(false);
+  const [customSubagentMode, setCustomSubagentMode] = useState(false);
   const [modelsSavedNotice, setModelsSavedNotice] = useState(false);
 
   useEffect(() => {
@@ -239,6 +241,10 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   };
 
   const combinedList = Array.from(new Set([...models, primaryDraft, subagentDraft, currentPrimary, currentSubagent, ...COMMON_MODEL_FALLBACK].filter(Boolean)));
+  const modelSelectOptions = [
+    ...combinedList.map((m) => ({ value: m, label: m })),
+    { value: '__custom__', label: '+ Enter Custom Model...' },
+  ];
 
   return (
     <div className="space-y-4">
@@ -400,40 +406,104 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 )}
 
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                  <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active. Select from dropdown or type a custom model identifier.">
+                  <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active. Select from retrieved models or enter a custom model.">
                     <div className="space-y-1.5">
-                      <input
-                        list="main-agent-cloud-models"
-                        value={primaryDraft}
-                        onChange={(e) => setPrimaryDraft(e.target.value)}
-                        placeholder="Select or type model identifier..."
-                        className="h-8.5 w-full rounded-lg border border-line bg-inset px-2.5 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                      />
-                      <datalist id="main-agent-cloud-models">
-                        {combinedList.map((m) => (
-                          <option key={m} value={m} />
-                        ))}
-                      </datalist>
+                      {customPrimaryMode ? (
+                        <div className="flex items-center gap-2">
+                          <TextField
+                            value={primaryDraft}
+                            onChange={(v) => setPrimaryDraft(v)}
+                            placeholder="Custom model identifier..."
+                            className="text-[12.5px]"
+                          />
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCustomPrimaryMode(false)}
+                            title="Back to dropdown"
+                            className="shrink-0 border border-line/60"
+                          >
+                            Dropdown
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0">
+                            <SelectField
+                              value={combinedList.includes(primaryDraft) ? primaryDraft : '__custom__'}
+                              onChange={(v) => {
+                                if (v === '__custom__') {
+                                  setCustomPrimaryMode(true);
+                                } else {
+                                  setPrimaryDraft(v);
+                                }
+                              }}
+                              options={modelSelectOptions}
+                            />
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCustomPrimaryMode(true)}
+                            title="Type custom model"
+                            className="shrink-0 border border-line/60 text-[11.5px]"
+                          >
+                            Custom
+                          </Button>
+                        </div>
+                      )}
                       {modelInfoCaption(primaryDraft) && (
                         <p className="text-[11px] text-faint">{modelInfoCaption(primaryDraft)}</p>
                       )}
                     </div>
                   </Field>
 
-                  <Field label="Subagent Cloud Model" hint="Used for Scout probes, background workers, and Critic passes. Select from dropdown or type a custom model identifier.">
+                  <Field label="Subagent Cloud Model" hint="Used for Scout probes, background workers, and Critic passes. Select from retrieved models or enter a custom model.">
                     <div className="space-y-1.5">
-                      <input
-                        list="subagent-cloud-models"
-                        value={subagentDraft}
-                        onChange={(e) => setSubagentDraft(e.target.value)}
-                        placeholder="Select or type model identifier..."
-                        className="h-8.5 w-full rounded-lg border border-line bg-inset px-2.5 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
-                      />
-                      <datalist id="subagent-cloud-models">
-                        {combinedList.map((m) => (
-                          <option key={m} value={m} />
-                        ))}
-                      </datalist>
+                      {customSubagentMode ? (
+                        <div className="flex items-center gap-2">
+                          <TextField
+                            value={subagentDraft}
+                            onChange={(v) => setSubagentDraft(v)}
+                            placeholder="Custom model identifier..."
+                            className="text-[12.5px]"
+                          />
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCustomSubagentMode(false)}
+                            title="Back to dropdown"
+                            className="shrink-0 border border-line/60"
+                          >
+                            Dropdown
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0">
+                            <SelectField
+                              value={combinedList.includes(subagentDraft) ? subagentDraft : '__custom__'}
+                              onChange={(v) => {
+                                if (v === '__custom__') {
+                                  setCustomSubagentMode(true);
+                                } else {
+                                  setSubagentDraft(v);
+                                }
+                              }}
+                              options={modelSelectOptions}
+                            />
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCustomSubagentMode(true)}
+                            title="Type custom model"
+                            className="shrink-0 border border-line/60 text-[11.5px]"
+                          >
+                            Custom
+                          </Button>
+                        </div>
+                      )}
                       {modelInfoCaption(subagentDraft) && (
                         <p className="text-[11px] text-faint">{modelInfoCaption(subagentDraft)}</p>
                       )}
