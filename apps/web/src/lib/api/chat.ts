@@ -3,7 +3,7 @@
 // ChatScreen.tsx and (via lib/agentLoop) CoderScreen.tsx.
 
 import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
-import { API_BASE, getJSON, postJSON } from './core';
+import { API_BASE, getJSON, postJSON, fetchStream, isAbortError } from './core';
 import type { CoderMemory, CoderLearningKind } from './coder';
 
 // ---------------------------------------------------------------------------
@@ -201,8 +201,9 @@ export async function streamChat(
     cb.onDone?.(meta);
   };
 
+  let idle: import('./core').StreamIdleController | undefined;
   try {
-    const endpoint = API_BASE + '/v1/chat/completions';
+    const endpoint = '/v1/chat/completions';
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (opts?.baseUrl) {
       headers['x-ninfer-base-url'] = opts.baseUrl;
@@ -214,12 +215,18 @@ export async function streamChat(
       headers['x-ninfer-extra-headers'] = opts.extraHeaders;
     }
 
-    const r = await fetch(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal,
-    });
+    const fetched = await fetchStream(
+      endpoint,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      },
+      { idleTimeoutMs: 45_000, signal },
+    );
+    const r = fetched.response;
+    idle = fetched.idle;
+
     if (!r.ok || !r.body) {
       const text = await r.text().catch(() => '');
       let detail = `HTTP ${r.status}`;
@@ -298,6 +305,7 @@ export async function streamChat(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      idle?.touch();
       buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.indexOf('\n')) >= 0) {
@@ -332,12 +340,14 @@ export async function streamChat(
     }
     finish();
   } catch (e) {
-    if (e instanceof DOMException && e.name === 'AbortError') {
+    if (isAbortError(e, signal)) {
       meta.finishReason = meta.finishReason || 'cancelled';
       finish();
       return;
     }
     cb.onError?.(e instanceof Error ? e.message : String(e));
+  } finally {
+    idle?.dispose();
   }
 }
 

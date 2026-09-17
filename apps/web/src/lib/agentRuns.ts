@@ -26,7 +26,7 @@
 //  * `done`/`error` are terminal; the snapshot's `status` is always the
 //    ground truth a re-attaching client reads first.
 
-import { API_BASE, getJSON, postJSON } from './api/core';
+import { API_BASE, getJSON, postJSON, fetchStream } from './api/core';
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -329,47 +329,54 @@ export class RunStream {
   }
 
   private async consume(): Promise<void> {
-    const r = await fetch(`${API_BASE}/api/agent/runs/${encodeURIComponent(this.runId)}/events`, {
-      signal: this.ctrl.signal,
-    });
-    if (!r.ok || !r.body) {
-      // 404 → the run is gone; anything else → treat as a cut.
-      if (r.status === 404) {
-        this.onDrop('closed');
-        throw new Error('run gone');
+    const { response: r, idle } = await fetchStream(
+      `/api/agent/runs/${encodeURIComponent(this.runId)}/events`,
+      {},
+      { idleTimeoutMs: 60_000, signal: this.ctrl.signal },
+    );
+    try {
+      if (!r.ok || !r.body) {
+        // 404 → the run is gone; anything else → treat as a cut.
+        if (r.status === 404) {
+          this.onDrop('closed');
+          throw new Error('run gone');
+        }
+        throw new Error(`events → HTTP ${r.status}`);
       }
-      throw new Error(`events → HTTP ${r.status}`);
-    }
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    // The server re-sends the snapshot as its first frame (`event: state`)
-    // — apply it (it is newer than the one we fetched moments ago).
-    let sawStateFrame = false;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let sep: number;
-      while ((sep = buf.indexOf('\n\n')) !== -1) {
-        const frame = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        const ev = parseFrame(frame);
-        if (!ev) continue;
-        if (ev.type === 'state') {
-          if (!sawStateFrame) {
-            sawStateFrame = true;
-            this.onSnapshot((ev as unknown as { snapshot: RunSnapshot }).snapshot);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      // The server re-sends the snapshot as its first frame (`event: state`)
+      // — apply it (it is newer than the one we fetched moments ago).
+      let sawStateFrame = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        idle.touch();
+        buf += dec.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const ev = parseFrame(frame);
+          if (!ev) continue;
+          if (ev.type === 'state') {
+            if (!sawStateFrame) {
+              sawStateFrame = true;
+              this.onSnapshot((ev as unknown as { snapshot: RunSnapshot }).snapshot);
+            }
+            continue;
           }
-          continue;
+          this.onEvent(ev);
+          if (ev.type === 'done' || ev.type === 'error') {
+            this.terminal = true;
+            return;
+          }
         }
-        this.onEvent(ev);
-        if (ev.type === 'done' || ev.type === 'error') {
-          this.terminal = true;
-          return;
-        }
+        if (this.done) return;
       }
-      if (this.done) return;
+    } finally {
+      idle.dispose();
     }
   }
 }

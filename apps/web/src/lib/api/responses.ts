@@ -19,7 +19,7 @@
 
 import type { ChatParams } from '../types';
 import type { ChatStreamCallbacks } from './chat';
-import { API_BASE } from './core';
+import { API_BASE, fetchStream, isAbortError } from './core';
 
 /** Sampling fields this engine's /v1/responses build actually accepts.
  *  Anything else set to a non-default value must keep using Chat Completions
@@ -293,13 +293,20 @@ export async function streamResponses(
   const state = initResponsesState();
   let firstContentAt: number | null = null;
 
+  let idle: import('./core').StreamIdleController | undefined;
   try {
-    const r = await fetch(API_BASE + '/v1/responses', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
+    const fetched = await fetchStream(
+      '/v1/responses',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      { idleTimeoutMs: 45_000, signal },
+    );
+    const r = fetched.response;
+    idle = fetched.idle;
+
     if (!r.ok || !r.body) {
       const text = await r.text().catch(() => '');
       let detail = `HTTP ${r.status}`;
@@ -334,6 +341,7 @@ export async function streamResponses(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      idle?.touch();
       buf += decoder.decode(value, { stream: true });
       let idx: number;
       while ((idx = buf.indexOf('\n')) >= 0) {
@@ -360,11 +368,13 @@ export async function streamResponses(
     }
     cb.onDone?.(state.meta as any);
   } catch (e) {
-    if (e instanceof DOMException && e.name === 'AbortError') {
+    if (isAbortError(e, signal)) {
       state.meta.finishReason = state.meta.finishReason || 'cancelled';
       cb.onDone?.(state.meta as any);
       return;
     }
     cb.onError?.(e instanceof Error ? e.message : String(e));
+  } finally {
+    idle?.dispose();
   }
 }
