@@ -18,7 +18,7 @@
 // `agentLoop.ts` need zero changes to use this as an injected `StreamFn`.
 
 import type { ChatParams, MessageMeta } from '../types';
-import type { ChatStreamCallbacks } from './chat';
+import { streamChat, type ChatStreamCallbacks } from './chat';
 import { API_BASE, fetchStream, isAbortError } from './core';
 import { setLatestRequestMetrics } from '../liveMetrics';
 
@@ -304,6 +304,9 @@ export async function streamResponses(
   cb: ChatStreamCallbacks,
   opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean; source?: 'local' | 'remote' },
 ): Promise<void> {
+  if (opts?.source === 'remote' || (opts?.baseUrl && !opts.baseUrl.includes('127.0.0.1') && !opts.baseUrl.includes('localhost'))) {
+    return streamChat(ccReq, signal, cb, opts);
+  }
   const body = buildResponsesBody(ccReq);
   const t0 = performance.now();
   const state = initResponsesState();

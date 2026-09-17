@@ -209,10 +209,11 @@ export type StreamFn = (
 ) => Promise<void>;
 
 /** Picks the transport for a turn that didn't request one explicitly: the
- *  Responses API when the engine build is known to support it and `params`
+ *  Responses API when the local engine build is known to support it and `params`
  *  doesn't use a sampling knob Responses can't express, falling back to the
- *  proven Chat Completions path otherwise. */
-function resolveDefaultStreamFn(params: ChatParams): StreamFn {
+ *  proven Chat Completions path otherwise. Remote cloud endpoints always use streamChat. */
+function resolveDefaultStreamFn(params: ChatParams, opts?: { source?: 'local' | 'remote'; baseUrl?: string }): StreamFn {
+  if (opts?.source === 'remote' || !!opts?.baseUrl) return streamChat;
   return knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : streamChat;
 }
 
@@ -294,7 +295,7 @@ export async function streamTurn(opts: {
   const {
     model, system, messages, params, tools, cacheSystem,
     baseUrl, apiKey, extraHeaders, allowFallback, source,
-    signal, stream = resolveDefaultStreamFn(params), recoverMarkup = true, onDelta, onStreamError
+    signal, stream = resolveDefaultStreamFn(params, { source, baseUrl }), recoverMarkup = true, onDelta, onStreamError
   } = opts;
   let content = '';
   let reasoning = '';
