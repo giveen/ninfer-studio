@@ -382,6 +382,7 @@ struct UsageAccumulator {
     usage_obj: Option<Value>,
     timings_obj: Option<Value>,
     resp_model: Option<String>,
+    generated_chars: usize,
 }
 
 impl UsageAccumulator {
@@ -441,6 +442,20 @@ impl UsageAccumulator {
                     self.timings_obj = Some(t.clone());
                 }
             }
+            if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+                for choice in choices {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                            self.generated_chars += c.len();
+                        }
+                        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                            self.generated_chars += r.len();
+                        }
+                    } else if let Some(text) = choice.get("text").and_then(Value::as_str) {
+                        self.generated_chars += text.len();
+                    }
+                }
+            }
         }
     }
 }
@@ -483,6 +498,7 @@ impl Stream for UsageTapStream {
                     let usage_obj = this.acc.usage_obj.take();
                     let timings_obj = this.acc.timings_obj.take();
                     let resp_model = this.acc.resp_model.take();
+                    let generated_chars = this.acc.generated_chars;
                     // Pre-fill/decode timing is only meaningful for streamed
                     // responses (a single blob has no prefill/decode split).
                     let (prefill_ms, total_ms) = if ctx.streaming {
@@ -506,6 +522,7 @@ impl Stream for UsageTapStream {
                             usage_obj,
                             timings_obj,
                             resp_model,
+                            generated_chars,
                             prefill_ms,
                             total_ms,
                         )
@@ -568,6 +585,7 @@ async fn log_from_response_bytes(
         acc.usage_obj,
         acc.timings_obj,
         acc.resp_model,
+        acc.generated_chars,
         prefill_ms,
         total_ms,
     )
@@ -579,6 +597,7 @@ async fn log_usage_from_parsed(
     usage_obj: Option<Value>,
     timings_obj: Option<Value>,
     resp_model: Option<String>,
+    generated_chars: usize,
     prefill_ms: Option<u64>,
     total_ms: Option<u64>,
 ) {
@@ -635,8 +654,8 @@ async fn log_usage_from_parsed(
         decode_tok_per_sec = timings.get("predicted_per_second").and_then(Value::as_f64);
     }
 
-    if !found {
-        return;
+    if !found && completion_tokens == 0 && generated_chars > 0 {
+        completion_tokens = ((generated_chars + 3) / 4) as u64;
     }
     let _ = log_usage_event(
         &ctx.state,
