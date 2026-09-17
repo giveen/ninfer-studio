@@ -11,47 +11,12 @@
 
 use super::{ExecChild, SpawnReq, is_secret_env_var, shell_quote};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use tokio::process::Command;
 
-/// Validate an extra writable root path. Rejects:
-///   - Relative or non-existent paths
-///   - System danger roots (`/`, `/etc`, `$HOME`, etc.) that would override the read-only root bind
-pub fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
-    let p = Path::new(path_str.trim());
-    if !p.is_absolute() || !p.exists() {
-        return None;
-    }
-    let canonical = std::fs::canonicalize(p).ok()?;
-    let path_clean = canonical.to_string_lossy();
-
-    // System danger roots that must NEVER be re-bound read-write
-    const DANGER_ROOTS: &[&str] = &[
-        "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
-        "/root", "/run", "/sbin", "/sys", "/usr", "/var",
-    ];
-
-    for &danger in DANGER_ROOTS {
-        if path_clean == danger || path_clean == format!("{danger}/") {
-            tracing::warn!(path = %path_clean, "Rejecting dangerous writable_root bind");
-            return None;
-        }
-    }
-
-    // Reject user's root home directory ($HOME or /home/username)
-    if let Ok(home) = std::env::var("HOME") {
-        if let Ok(home_canon) = std::fs::canonicalize(&home) {
-            if canonical == home_canon {
-                tracing::warn!(path = %path_clean, "Rejecting root $HOME writable_root bind");
-                return None;
-            }
-        }
-    }
-
-    Some(canonical)
-}
+pub(crate) use super::validate_writable_root;
 
 /// Probe whether bubblewrap is *usable* on this machine (checked once per process).
 /// Probes `bwrap` directly without depending on `which` or `/usr/bin/true`.

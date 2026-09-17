@@ -58,6 +58,61 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Validate an extra writable root path. Rejects:
+///   - Relative or non-existent paths
+///   - System danger roots (`/`, `/etc`, `C:\`, `C:\Windows`, etc.) that would compromise containment
+///   - User's home directory ($HOME / %USERPROFILE%)
+pub(crate) fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
+    use std::path::Path;
+    let p = Path::new(path_str.trim());
+    if !p.is_absolute() || !p.exists() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(p).ok()?;
+    let path_clean = canonical.to_string_lossy();
+
+    const DANGER_ROOTS_UNIX: &[&str] = &[
+        "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
+        "/root", "/run", "/sbin", "/sys", "/usr", "/var",
+    ];
+
+    for &danger in DANGER_ROOTS_UNIX {
+        if path_clean == danger || path_clean == format!("{danger}/") {
+            tracing::warn!(path = %path_clean, "Rejecting dangerous writable_root bind");
+            return None;
+        }
+    }
+
+    let lower = path_clean.to_lowercase();
+    // Reject Windows drive roots (e.g., C:\, \\?\C:\) and system folders
+    let clean_trimmed = lower.trim_start_matches(r"\\?\");
+    if clean_trimmed.len() <= 3 && (clean_trimmed.ends_with(":\\") || clean_trimmed.ends_with(':')) {
+        tracing::warn!(path = %path_clean, "Rejecting drive root writable_root bind");
+        return None;
+    }
+    const DANGER_PATTERNS_WIN: &[&str] = &[
+        "\\windows", "\\program files", "\\program files (x86)", "\\system32"
+    ];
+    for &danger in DANGER_PATTERNS_WIN {
+        if clean_trimmed.ends_with(danger) || clean_trimmed.contains(&format!("{danger}\\")) {
+            tracing::warn!(path = %path_clean, "Rejecting system directory writable_root bind");
+            return None;
+        }
+    }
+
+    // Reject user's root home directory ($HOME or %USERPROFILE%)
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        if let Ok(home_canon) = std::fs::canonicalize(&home) {
+            if canonical == home_canon {
+                tracing::warn!(path = %path_clean, "Rejecting root user home writable_root bind");
+                return None;
+            }
+        }
+    }
+
+    Some(canonical)
+}
+
 /// Quote one argument for a `CreateProcessW` command line (MSVCRT rules):
 /// unquoted when safe, otherwise quoted with internal `"` encoded so the
 /// UCRT argv parser (`2N` backslashes + `"` → N + toggle; `2N+1` → N +
