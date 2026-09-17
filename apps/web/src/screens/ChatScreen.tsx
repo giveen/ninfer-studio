@@ -763,7 +763,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setAttachments([]);
       return;
     }
-    if (!engineUp) {
+    if (!engineUpOrCloud) {
       onNavigate('engine');
       return;
     }
@@ -798,7 +798,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting]);
+  }, [text, attachments, engineUpOrCloud, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting, appConfig]);
 
   // Send a suggested follow-up question straight away (bypassing the composer) —
   // always appends to the active conversation, which is the only one a
@@ -807,7 +807,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     async (content: string) => {
       const trimmed = content.trim();
       if (!trimmed || streaming || compacting) return;
-      if (!engineUp) {
+      if (!engineUpOrCloud) {
         onNavigate('engine');
         return;
       }
@@ -820,11 +820,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
       setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
       stick.current = true;
-    setAtBottom(true);
+      setAtBottom(true);
       const history: ChatMessage[] = modelHistory(base);
       await runStream(conv.id, history, 0, asstMsg.id);
     },
-    [streaming, compacting, engineUp, model, runningModel, convs, activeId, runStream, onNavigate],
+    [streaming, compacting, engineUpOrCloud, model, runningModel, convs, activeId, runStream, onNavigate, appConfig, params],
   );
 
   // --- message-level actions (hover toolbar) ---
