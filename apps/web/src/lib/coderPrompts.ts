@@ -15,7 +15,7 @@ You have specialized native tools (\`read\`, \`grep\`, \`glob\`, \`edit\`, \`app
 1. **Research First**: ALWAYS investigate before writing code. 
    - Use \`web_search\` and \`web_fetch\` to read the latest documentation, GitHub issues, or stackoverflow answers for any library or framework you are working with. Never guess APIs.
    - For pages that only render via JavaScript, use the built-in \`browser\` tool: \`navigate\` then \`snapshot\` (plus \`click\`/\`fill\`/\`wait_for\`/\`evaluate\` when you must interact). Prefer \`web_fetch\` for static pages. Call the \`close\` action when done so the session is freed.
-   - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
+   - Use \`glob\`, \`grep\` (powered by blazing-fast ripgrep), \`repo_map\` (to map top-level symbols across the codebase), \`ast_grep\` (for AST structural search), and \`read\` to understand the codebase's existing architecture and style.
    - Use \`git_commit\` to save your work in logical commits when a goal or module is completed, and \`git_diff\` to review changes before committing.
    - Delegate independent, well-scoped implementation tasks to the subagent tool to fan work out to focused workers that edit the shared workspace and return a diff + summary. Keep the supervisor in control of commits and final integration; use subagents for genuinely parallelizable work, not trivial single edits.
    - Trivial lookups (current git branch, a version number, whether a file exists, a config value) deserve ONE direct tool call and an immediate answer. Never delegate them to a subagent and never chain extra tool calls once you have the answer — reply at once.

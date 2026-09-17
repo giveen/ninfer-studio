@@ -530,7 +530,7 @@ pub async fn repo_map(
                 }
             }
             if chars_used + file_block.len() > char_limit {
-                map_out.push_str("... (remaining files omitted due to budget)\n");
+                map_out.push_str("... (remaining files omitted due to budget; use repo_map or ast_grep tools to search the codebase)\n");
                 break;
             }
             map_out.push_str(&file_block);

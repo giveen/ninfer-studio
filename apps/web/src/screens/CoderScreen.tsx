@@ -784,7 +784,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
           // cap it so a large codebase can't silently balloon every turn's prompt.
           const REPO_MAP_CAP = 10000;
           const map = rMap.map.length > REPO_MAP_CAP
-            ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
+            ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds context budget; use repo_map or ast_grep tools to search the codebase)'
             : rMap.map;
           ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
         }
