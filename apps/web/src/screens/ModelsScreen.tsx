@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
-import { convertModel, downloadModel, saveConfig, upgradeModel } from '../lib/api';
+import { useEffect, useState } from 'react';
+import { Download, ExternalLink, Layers, Play } from 'lucide-react';
+import { convertModel, downloadModel, saveConfig, saveProfileState, upgradeModel } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
-import type { DownloadRec, StatusPayload } from '../lib/types';
+import type { CatalogEntry, DownloadRec, StatusPayload } from '../lib/types';
 import { Badge, Button, Field, SectionCard, TextField, cn } from '../components/ui';
 
 function DlProgress({ dl }: { dl: DownloadRec }) {
@@ -41,16 +41,72 @@ function formatSpec(spec: string | undefined): string {
     .join(' or ');
 }
 
-export function ModelsScreen({ status }: { status: StatusPayload | null }) {
+const RECIPE_PRESETS: Record<string, any> = {
+  'qwen_moe': {
+    name: 'qwen-moe',
+    outName: 'qwen_moe.ninfer',
+    defaultComponents: ['text', 'vision', 'moe', 'mtp'],
+    warning: 'Requires Qwen MoE architecture with active router expert conversion.',
+    hasMtp: true,
+    hasMoe: true,
+  },
+  'qwen_moe_nvfp4': {
+    name: 'qwen-moe-nvfp4',
+    outName: 'qwen_moe_nvfp4.ninfer',
+    defaultComponents: ['text', 'vision', 'moe', 'mtp'],
+    warning: 'Requires Qwen MoE architecture. Requires a quantized NVFP4 source.',
+    hasMtp: true,
+    hasMoe: true,
+    needsQuantized: true,
+  },
+  'qwen3_6_35b_a3b': {
+    name: 'qwen3.6-35b-a3b',
+    outName: 'qwen3_6_35b_a3b.ninfer',
+    defaultComponents: ['text', 'vision', 'moe', 'mtp', 'dflash'],
+    warning: 'Requires Qwen3.6 MoE architecture (35B A3B active experts).',
+    hasMtp: true,
+    hasDflash: true,
+    hasMoe: true,
+  },
+  'qwen3_6_27b': {
+    name: 'qwen3.6-27b',
+    outName: 'qwen3_6_27b.ninfer',
+    defaultComponents: ['text', 'vision', 'mtp'],
+    warning: 'Requires Qwen3.6 Dense mathematics.',
+    hasMtp: true,
+  },
+  'qwen3_6_27b_nvfp4': {
+    name: 'qwen3.6-27b-nvfp4',
+    outName: 'qwen3_6_27b_nvfp4.ninfer',
+    defaultComponents: ['text', 'vision', 'mtp'],
+    warning: 'Requires Qwen3.6 Dense mathematics. Requires a quantized source.',
+    hasMtp: true,
+    needsQuantized: true,
+  },
+  'qwen3_8_27b': {
+    name: 'qwen3.8-27b',
+    outName: 'qwen3_8_27b.ninfer',
+    defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
+    warning: 'Requires Qwen3.8 Dense mathematics.',
+    hasMtp: true,
+    hasDflash2: true,
+  },
+  'qwen3_8_27b_nvfp4': {
+    name: 'qwen3.8-27b-nvfp4',
+    outName: 'qwen3_8_27b_nvfp4.ninfer',
+    defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
+    warning: 'Requires Qwen3.8 Dense mathematics. Requires a quantized source.',
+    hasMtp: true,
+    hasDflash2: true,
+    needsQuantized: true,
+  },
+};
+
+export function ModelsScreen({ status, onNavigate }: { status: StatusPayload | null; onNavigate?: (screen: any) => void }) {
   const artifacts = status?.artifacts || [];
   const downloads = status?.downloads || [];
   const modelsDir = status?.config.modelsDir || '';
   const runningArtifact = status?.engine?.artifact;
-
-  const local = useMemo(() => {
-    const localNames = new Set(artifacts.map((a) => a.file));
-    return { localNames };
-  }, [artifacts]);
 
   const [catalogError, setCatalogError] = useState<string | null>(null);
 
@@ -68,6 +124,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   const [dlFile, setDlFile] = useState('');
   const [dlError, setDlError] = useState<string | null>(null);
   const [hfTokenDraft, setHfTokenDraft] = useState('');
+  const [hfTokenError, setHfTokenError] = useState<string | null>(null);
   const hfTokenStored = !!status?.config.hfToken;
 
   const startCustom = async () => {
@@ -82,69 +139,13 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   };
 
   const saveHfToken = async () => {
-    await saveConfig({ hfToken: hfTokenDraft.trim() });
-    setHfTokenDraft('');
-  };
-
-  const RECIPE_PRESETS: Record<string, any> = {
-    'qwen_moe': {
-      name: 'qwen-moe',
-      outName: 'qwen_moe.ninfer',
-      defaultComponents: ['text', 'vision', 'moe', 'mtp'],
-      warning: 'Requires Qwen MoE architecture with active router expert conversion.',
-      hasMtp: true,
-      hasMoe: true,
-    },
-    'qwen_moe_nvfp4': {
-      name: 'qwen-moe-nvfp4',
-      outName: 'qwen_moe_nvfp4.ninfer',
-      defaultComponents: ['text', 'vision', 'moe', 'mtp'],
-      warning: 'Requires Qwen MoE architecture. Requires a quantized NVFP4 source.',
-      hasMtp: true,
-      hasMoe: true,
-      needsQuantized: true,
-    },
-    'qwen3_6_35b_a3b': {
-      name: 'qwen3.6-35b-a3b',
-      outName: 'qwen3_6_35b_a3b.ninfer',
-      defaultComponents: ['text', 'vision', 'moe', 'mtp', 'dflash'],
-      warning: 'Requires Qwen3.6 MoE architecture (35B A3B active experts).',
-      hasMtp: true,
-      hasDflash: true,
-      hasMoe: true,
-    },
-    'qwen3_6_27b': {
-      name: 'qwen3.6-27b',
-      outName: 'qwen3_6_27b.ninfer',
-      defaultComponents: ['text', 'vision', 'mtp'],
-      warning: 'Requires Qwen3.6 Dense mathematics.',
-      hasMtp: true,
-    },
-    'qwen3_6_27b_nvfp4': {
-      name: 'qwen3.6-27b-nvfp4',
-      outName: 'qwen3_6_27b_nvfp4.ninfer',
-      defaultComponents: ['text', 'vision', 'mtp'],
-      warning: 'Requires Qwen3.6 Dense mathematics. Requires a quantized source.',
-      hasMtp: true,
-      needsQuantized: true,
-    },
-    'qwen3_8_27b': {
-      name: 'qwen3.8-27b',
-      outName: 'qwen3_8_27b.ninfer',
-      defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
-      warning: 'Requires Qwen3.8 Dense mathematics.',
-      hasMtp: true,
-      hasDflash2: true,
-    },
-    'qwen3_8_27b_nvfp4': {
-      name: 'qwen3.8-27b-nvfp4',
-      outName: 'qwen3_8_27b_nvfp4.ninfer',
-      defaultComponents: ['text', 'vision', 'mtp', 'dflash2'],
-      warning: 'Requires Qwen3.8 Dense mathematics. Requires a quantized source.',
-      hasMtp: true,
-      hasDflash2: true,
-      needsQuantized: true,
-    },
+    setHfTokenError(null);
+    try {
+      await saveConfig({ hfToken: hfTokenDraft.trim() });
+      setHfTokenDraft('');
+    } catch (e) {
+      setHfTokenError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const [convRecipe, setConvRecipe] = useState('qwen_moe');
@@ -156,7 +157,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
   const [convMtp, setConvMtp] = useState('');
   const [convMoe, setConvMoe] = useState('');
   const [convQuantized, setConvQuantized] = useState('');
-  const [convExtraArgs, setConvExtraArgs] = useState('--proposal');
+  const [convExtraArgs, setConvExtraArgs] = useState('');
   const [convError, setConvError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -187,16 +188,15 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
     }
   };
 
-  const catalog = status?.artifacts ? status.artifacts : [];
-  const catalogEntries = (status && (status as any).catalog) || [];
+  const catalogEntries: CatalogEntry[] = status?.catalog || [];
 
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
-        {downloads.filter(d => d.action !== 'download' && (!d.done || d.failed)).length > 0 && (
+        {downloads.filter(d => d.action && d.action !== 'download' && (!d.done || d.failed)).length > 0 && (
           <SectionCard title="Active Operations" icon={<Layers size={15} />}>
             <div className="max-h-40 overflow-y-auto rounded-lg border border-line bg-inset p-2.5 font-mono text-[11px] leading-relaxed text-mute">
-              {downloads.filter(d => d.action !== 'download').slice(-5).map((d) => (
+              {downloads.filter(d => d.action && d.action !== 'download' && (!d.done || d.failed)).slice(-5).map((d) => (
                 <div key={d.id} className={cn('mb-1', d.failed && 'text-danger')}>
                   {d.failed ? '✗' : d.done ? '✓' : '⚙'} {d.action || 'job'} {d.file} — {d.done ? `exit ${d.exitCode}` : `pid ${d.pid}`}
                   {d.out && <div className="whitespace-pre-wrap text-[10.5px] opacity-70">{d.out.split('\n').slice(-3).join('\n')}</div>}
@@ -232,9 +232,22 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                       {(a.model || 'N').slice(0, 1)}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="truncate font-mono text-[13px] font-semibold text-ink">{a.file}</span>
-                        {runningArtifact === a.path && <Badge tone="ok">loaded</Badge>}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="truncate font-mono text-[13px] font-semibold text-ink">{a.file}</span>
+                          {runningArtifact === a.path && <Badge tone="ok">loaded</Badge>}
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          title="Start the engine with this artifact (Engine tab holds the launch profile)"
+                          onClick={async () => {
+                            await saveProfileState({ artifact: a.file });
+                            onNavigate?.('engine');
+                          }}
+                        >
+                          <Play size={12} /> launch
+                        </Button>
                       </div>
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
                         {a.model && <Badge tone="neutral">{a.model}</Badge>}
@@ -264,7 +277,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                             onClick={async () => {
                               const r = await upgradeModel(a.path);
                               if (!r.ok) {
-                                alert(r.message || 'Upgrade failed');
+                                setCatalogError(r.message || 'Upgrade failed');
                               }
                             }}
                           >
@@ -361,7 +374,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
 
         <SectionCard
           title="Registered catalog"
-          description="The five artifact identities NInfer explicitly supports. Weights and the embedded tokenizer, chat template, and media frontends are fixed per artifact."
+          description="Artifact identities NInfer explicitly supports. Weights and the embedded tokenizer, chat template, and media frontends are fixed per artifact."
           icon={<Download size={15} />}
         >
           {catalogError && <p className="mb-2.5 text-[12px] text-danger">{catalogError}</p>}
@@ -383,8 +396,8 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                     <td colSpan={6} className="py-4 text-faint">waiting for control plane status…</td>
                   </tr>
                 )}
-                {(catalogEntries.length ? catalogEntries : []).map((c: any) => {
-                  const local = artifacts.find((a) => a.file === c.file);
+                {catalogEntries.map((c) => {
+                  const localArtifact = artifacts.find((a) => a.file === c.file);
                   const latest = downloads
                     .filter((d) => d.file === c.file)
                     .sort((a, b) => b.startedAt - a.startedAt)[0];
@@ -397,9 +410,9 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                       <td className="py-2.5 pr-4"><Badge tone="info">{c.weights}</Badge></td>
                       <td className="py-2.5 pr-4 font-mono text-[11.5px] text-mute">{formatSpec(c.spec)}</td>
                       <td className="py-2.5 pr-4">
-                        {local ? (
+                        {localArtifact ? (
                           <span className="inline-flex items-center gap-1.5 font-mono text-[11.5px] text-ok">
-                            ✓ {formatBytes(local.size)}
+                            ✓ {formatBytes(localArtifact.size)}
                           </span>
                         ) : dl ? (
                           <DlProgress dl={dl} />
@@ -416,8 +429,17 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                       </td>
                       <td className="py-2.5">
                         <div className="flex items-center gap-1.5">
-                          {local ? (
-                            <Button size="sm" variant="subtle" title="Start the engine with this artifact (Engine tab holds the launch profile)" disabled={!!dl}>
+                          {localArtifact ? (
+                            <Button
+                              size="sm"
+                              variant="subtle"
+                              title="Start the engine with this artifact (Engine tab holds the launch profile)"
+                              disabled={!!dl}
+                              onClick={async () => {
+                                await saveProfileState({ artifact: localArtifact.file });
+                                onNavigate?.('engine');
+                              }}
+                            >
                               <Play size={12} /> launch
                             </Button>
                           ) : (
@@ -472,6 +494,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                   save
                 </Button>
               </div>
+              {hfTokenError && <p className="mt-1 text-[12px] text-danger">{hfTokenError}</p>}
             </Field>
             <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
               <Field label="HF repository" hint="e.g. neroued/Qwen3.8-27B-nvfp4-NInfer">
@@ -487,9 +510,9 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                 <Download size={13} /> download to {modelsDir?.split('/').pop() || 'models/'}
               </Button>
             </div>
-            {downloads.filter(d => d.action === 'download' || !d.action).length > 0 && (
+            {downloads.filter(d => d.action === 'download' || (!d.action && (d.file?.endsWith('.ninfer') || d.id?.startsWith('dl-')))).length > 0 && (
               <div className="max-h-40 overflow-y-auto rounded-lg border border-line bg-inset p-2.5 font-mono text-[11px] leading-relaxed text-mute">
-                {downloads.filter(d => d.action === 'download' || !d.action).slice(-5).map((d) => (
+                {downloads.filter(d => d.action === 'download' || (!d.action && (d.file?.endsWith('.ninfer') || d.id?.startsWith('dl-')))).slice(-5).map((d) => (
                   <div key={d.id} className={cn('mb-1', d.failed && 'text-danger')}>
                     {d.failed ? '✗' : d.done ? '✓' : '↓'} {d.file} — {d.done ? `exit ${d.exitCode}` : `pid ${d.pid}`}
                     {d.out && <div className="whitespace-pre-wrap text-[10.5px] opacity-70">{d.out.split('\n').slice(-3).join('\n')}</div>}
@@ -504,3 +527,4 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
     </div>
   );
 }
+

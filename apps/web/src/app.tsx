@@ -193,7 +193,7 @@ export function App() {
                 <LogScreen status={status} active={screen === 'log'} />
               </div>
               <div className={cn('h-full', screen !== 'models' && 'hidden')}>
-                <ModelsScreen status={status} />
+                <ModelsScreen status={status} onNavigate={setScreen} />
               </div>
               <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
                 <SettingsScreen status={status} />
