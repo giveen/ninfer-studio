@@ -7,6 +7,8 @@ import { useEffect, useRef, useState } from 'react';
 import type { AppSettings, ChatParams, ProfileState, SavedProfile, StatusPayload } from '../types';
 import { getJSON, postJSON } from './core';
 
+export const SECRET_MASK = '********';
+
 export function getStatus(): Promise<StatusPayload> {
   return getJSON<StatusPayload>('/api/status', 6000);
 }
@@ -22,7 +24,7 @@ export async function getEngineContextSize(model = 'qwen-coder'): Promise<number
   try {
     const data = await getJSON<{ data?: Array<{ id: string; max_model_len?: number }> }>('/v1/models');
     const models = data?.data ?? [];
-    const hit = models.find((m) => m.id === model) ?? models[0];
+    const hit = models.find((m) => m.id === model);
     return hit?.max_model_len != null ? hit.max_model_len : null;
   } catch {
     return null;
@@ -43,8 +45,8 @@ export function getProfileState(): Promise<ProfileState> {
 
 export function saveProfileState(
   patch: Partial<{ profile: import('../types').EngineProfile; artifact: string; saved: SavedProfile[] }>,
-): Promise<unknown> {
-  return postJSON('/api/profile-state', patch, 5000);
+): Promise<ProfileState> {
+  return postJSON<ProfileState>('/api/profile-state', patch, 5000);
 }
 
 // ---------------------------------------------------------------------------
@@ -72,9 +74,13 @@ export function useStatus(intervalMs = 2500): { status: StatusPayload | null; er
   const [status, setStatus] = useState<StatusPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const alive = useRef(true);
+  const inFlight = useRef(false);
+
   useEffect(() => {
     alive.current = true;
     const tick = async () => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       try {
         const s = await getStatus();
         if (!alive.current) return;
@@ -83,9 +89,11 @@ export function useStatus(intervalMs = 2500): { status: StatusPayload | null; er
       } catch (e) {
         if (!alive.current) return;
         setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        inFlight.current = false;
       }
     };
-    tick();
+    void tick();
     const t = setInterval(tick, intervalMs);
     return () => {
       alive.current = false;
@@ -131,8 +139,17 @@ export async function testCloudConnection(baseUrl?: string, apiKey?: string, ext
     if (res && typeof res.ok === 'boolean') {
       return res;
     }
-  } catch {
-    /* fallback to direct browser fetch if backend endpoint is unavailable */
+  } catch (e) {
+    /* fallback to direct browser fetch if backend endpoint is unavailable (e.g. 404 route missing) */
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes('HTTP 404')) {
+      return {
+        ok: false,
+        latencyMs: 0,
+        models: [],
+        error: msg,
+      };
+    }
   }
 
   const t0 = performance.now();
@@ -141,7 +158,7 @@ export async function testCloudConnection(baseUrl?: string, apiKey?: string, ext
     const url = base.endsWith('/models') ? base : `${base}/models`;
     const headers: Record<string, string> = {};
     const k = apiKey?.trim() ?? '';
-    if (k && k !== '********' && k !== '******** (saved)') {
+    if (k && k !== SECRET_MASK) {
       headers['Authorization'] = `Bearer ${k}`;
     }
     if (extraHeaders?.trim()) {
