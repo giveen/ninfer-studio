@@ -219,13 +219,20 @@ pub(crate) async fn usage_stats(
         Some(prompt as f64 * p.prompt_per_token + completion as f64 * p.completion_per_token)
     };
 
+    let is_local_engine_model = |m: &str| -> bool {
+        m == "ninfer"
+            || m.ends_with(".ninfer")
+            || m.ends_with(".gguf")
+            || (!m.contains('/') && !cloud_models.contains(m))
+    };
+
     let is_remote_event = |e: &Value| -> bool {
         let src = e.get("source").and_then(Value::as_str);
         if src == Some("remote") {
             return true;
         }
         if let Some(m) = e.get("model").and_then(Value::as_str) {
-            if m.contains('/') || cloud_models.contains(m) {
+            if !is_local_engine_model(m) {
                 return true;
             }
         }
