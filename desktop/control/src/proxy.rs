@@ -228,11 +228,23 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let source = req
-        .extensions()
-        .get::<RequestSource>()
-        .copied()
-        .unwrap_or(RequestSource::Local);
+    let base_url = headers
+        .get("x-ninfer-base-url")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let api_key_override = headers
+        .get("x-ninfer-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let source = if base_url.is_some() {
+        RequestSource::Remote
+    } else {
+        req.extensions()
+            .get::<RequestSource>()
+            .copied()
+            .unwrap_or(RequestSource::Local)
+    };
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
         Ok(b) => b,
@@ -259,15 +271,6 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     } else {
         None
     };
-
-    let base_url = headers
-        .get("x-ninfer-base-url")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let api_key_override = headers
-        .get("x-ninfer-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
 
     let port_opt = if base_url.is_none() {
         match route_port(&state, &body_bytes).await {
@@ -327,7 +330,7 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         }
     };
 
-    let target = if let Some(base) = base_url {
+    let target = if let Some(ref base) = base_url {
         let path = uri.path();
         let path = if path.starts_with("/v1/") {
             &path[3..]

@@ -432,10 +432,14 @@ impl UsageAccumulator {
                 self.resp_model = Some(m.to_string());
             }
             if let Some(u) = v.get("usage") {
-                self.usage_obj = Some(u.clone());
+                if !u.is_null() {
+                    self.usage_obj = Some(u.clone());
+                }
             }
             if let Some(t) = v.get("timings") {
-                self.timings_obj = Some(t.clone());
+                if !t.is_null() {
+                    self.timings_obj = Some(t.clone());
+                }
             }
         }
     }
