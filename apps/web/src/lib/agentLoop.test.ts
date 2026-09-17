@@ -32,6 +32,27 @@ function scriptedStream(turns: ScriptedTurn[]): StreamFn {
 }
 
 describe('runToolLoop', () => {
+  it.each([false, true])('rejects a failed stream before dispatching tools (partial: %s)', async (partial) => {
+    const handler = vi.fn(async () => 'unexpected');
+    const onStreamError = vi.fn();
+    const onAssistantTurn = vi.fn();
+    await expect(runToolLoop({
+      model: 'm', system: undefined, messages: [{ role: 'user', content: 'hi' }], params: PARAMS,
+      registry: { read: handler }, maxSteps: 5, signal: new AbortController().signal,
+      onStreamError, onAssistantTurn,
+      stream: async (_req, _signal, cb) => {
+        if (partial) {
+          cb.onContentDelta?.('Partial response');
+          cb.onToolCalls?.([{ id: 'read-1', name: 'read', arguments: '{}' }]);
+        }
+        cb.onError?.('Test connection lost');
+      },
+    })).rejects.toThrow('Test connection lost');
+    expect(onStreamError).toHaveBeenCalledWith('Test connection lost', 0);
+    expect(handler).not.toHaveBeenCalled();
+    expect(onAssistantTurn).not.toHaveBeenCalled();
+  });
+
   it('runs a plain content-only turn with no tool calls (stop: done, 0 turns consumed)', async () => {
     const res = await runToolLoop({
       model: 'm', system: undefined, messages: [{ role: 'user', content: 'hi' }], params: PARAMS,

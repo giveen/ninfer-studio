@@ -279,7 +279,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // the summary (and the context it carries) injected back into the model
       // after the visible context is cleared.
       const prior: ChatMessage[] = conv.compactedSummary
-        ? [{ role: 'user', content: frameCompactedSummary(conv.compactedSummary) }]
+        ? [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(conv.compactedSummary) }]
         : [];
       const summary = await summarizeConversation({
         model: useModel,
@@ -663,7 +663,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           const thresholdPct = params.compactAt ?? 80;
           if (convForCompact && limit && usedTok > 0 && usedTok >= (thresholdPct / 100) * limit) {
             const prior: ChatMessage[] = convForCompact.compactedSummary
-              ? [{ role: 'user', content: frameCompactedSummary(convForCompact.compactedSummary) }]
+              ? [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(convForCompact.compactedSummary) }]
               : [];
             const summary = await summarizeConversation({
               model: useModel,
@@ -1498,7 +1498,22 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
                   const i = visibleStart + sliceI;
-                  if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                  if (isCompactedMsg(m)) {
+                    return (
+                      <div id={`msg-${i}`} key={i}>
+                        <MessageRow
+                          m={{ ...m, displayName: m.displayName || 'Compaction Summary', collapsed: true }}
+                          convId={activeId ?? ''}
+                          index={i}
+                          isLast={i === messages.length - 1}
+                          streaming={false}
+                          locked={streaming || compacting}
+                          actions={msgActions}
+                          workspace={computerUseDir || undefined}
+                        />
+                      </div>
+                    );
+                  }
                   const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
                   return (
                     <Fragment key={i}>

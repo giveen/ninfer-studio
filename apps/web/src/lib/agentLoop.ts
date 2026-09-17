@@ -41,7 +41,10 @@ import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './type
 
 /** A compaction checkpoint message (the engine-side <compacted-summary> block). */
 export function isCompactedMsg(m: ChatMessage): boolean {
-  return m.role === 'user' && typeof m.content === 'string' && m.content.trimStart().startsWith('<compacted-summary>');
+  if (m.displayName === 'Compaction Summary') return true;
+  if (m.role !== 'user' || typeof m.content !== 'string') return false;
+  const s = m.content.trimStart();
+  return s.startsWith('<compacted-summary>') || s.startsWith('This is an automatically generated checkpoint');
 }
 
 /** Model context for a loaded transcript: from the most recent compaction
@@ -457,12 +460,19 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
         opts.onAppended?.([note], turns);
       }
     }
+    let streamError: string | undefined;
     const t = await streamTurn({
       model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
       baseUrl, apiKey, extraHeaders, allowFallback,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
-      onStreamError: (msg) => opts.onStreamError?.(msg, turns),
+      onStreamError: (msg) => {
+        streamError = msg;
+        opts.onStreamError?.(msg, turns);
+      },
     });
+    // Transports report errors via callbacks rather than rejecting. Do not
+    // treat an interrupted turn as success or dispatch its partial tool calls.
+    if (streamError !== undefined && !signal.aborted) throw new Error(streamError);
     finishReason = t.finishReason;
     meta = t.meta;
     // A response with neither content nor tool calls is a no-op — don't push

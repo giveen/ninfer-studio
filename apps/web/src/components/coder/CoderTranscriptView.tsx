@@ -75,11 +75,7 @@ export const CoderTranscriptView: React.FC<CoderTranscriptViewProps> = ({
         messageGroups.map((g, i) => (
           <React.Fragment key={i}>
             {g.type === 'compact' ? (
-              <div className="my-1 flex items-center gap-2 text-[10.5px] text-faint">
-                <span className="h-px flex-1 bg-line" />
-                <span className="flex items-center gap-1">✂ Context compacted</span>
-                <span className="h-px flex-1 bg-line" />
-              </div>
+              <ReportBlock message={{ ...g.items[0], displayName: g.items[0].displayName || 'Compaction Summary', collapsed: g.items[0].collapsed ?? true }} workspace={ws} />
             ) : g.type === 'trajectory' ? (
               <TrajectoryBlock items={g.items} workspace={ws} />
             ) : g.items[0].displayName && g.items[0].collapsed ? (

@@ -326,7 +326,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               useLocalCompactor: opts.appConfig?.cloudUseLocalCompactor !== false,
             });
             if (!summary) throw new Error('compaction produced no summary');
-            currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
+            currentMessages = [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(summary) }];
             opts.updateRunMessages((prev) => [...prev, ...currentMessages]);
             opts.noteRunTokens(0);
             opts.readPathsRef.current = new Set();

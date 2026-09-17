@@ -18,7 +18,7 @@ export function modelHistory(conv: Conversation): ChatMessage[] {
   const tail = conv.compactedSummary ? conv.messages.slice(conv.compactedCount ?? 0) : conv.messages;
   const filtered = tail.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
   if (conv.compactedSummary) {
-    const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
+    const prefix: ChatMessage = { role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(conv.compactedSummary) };
     return [prefix, ...filtered];
   }
   return filtered;
