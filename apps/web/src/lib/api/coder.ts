@@ -40,8 +40,9 @@ export interface CoderDirs {
   dirs: string[];
   error?: string;
 }
-export function coderDirs(root: string): Promise<CoderDirs> {
-  return getJSON<CoderDirs>(`/api/coder/dirs?root=${encodeURIComponent(root)}`);
+export function coderDirs(root: string, workspace?: string): Promise<CoderDirs> {
+  const ws = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderDirs>(`/api/coder/dirs?root=${encodeURIComponent(root)}${ws}`);
 }
 export function coderTree(depth = 3, root = '.', workspace?: string): Promise<CoderTree> {
   const ws = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
@@ -77,11 +78,12 @@ export function coderExec(command: string, cwd?: string, timeoutMs?: number, ses
   const fetchTimeoutMs = Math.max(15_000, (timeoutMs ?? 120_000) + 5_000);
   return postJSON<CoderExecResult>('/api/coder/exec', { command, cwd, timeoutMs, sessionId, background, workspace, approvalToken }, fetchTimeoutMs, signal);
 }
-export function coderJob(jobId: string, signal?: AbortSignal): Promise<CoderJob> {
-  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}`, 15_000, signal);
+export function coderJob(jobId: string, signal?: AbortSignal, workspace?: string): Promise<CoderJob> {
+  const ws = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}${ws}`, 15_000, signal);
 }
-export function coderJobKill(jobId: string): Promise<CoderJob> {
-  return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, {}, 15_000);
+export function coderJobKill(jobId: string, workspace?: string): Promise<CoderJob> {
+  return postJSON<CoderJob>(`/api/coder/jobs/${encodeURIComponent(jobId)}/kill`, { workspace }, 15_000);
 }
 export function coderGrep(
   pattern: string,
@@ -105,7 +107,7 @@ export interface CoderSearchResult {
 }
 export function coderSearch(query: string, limit = 15, signal?: AbortSignal, workspace?: string): Promise<CoderSearchResult> {
   const ws = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
-  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}${ws}`, 4000, signal);
+  return getJSON<CoderSearchResult>(`/api/coder/search?q=${encodeURIComponent(query)}&limit=${limit}${ws}`, 15000, signal);
 }
 export interface CoderDiffResult {
   files: Array<{ path: string; bar?: string }>;
@@ -132,24 +134,26 @@ export interface CoderBrowserResult {
   result?: unknown;
   found?: boolean;
   open?: boolean;
+  /** Idle duration in seconds reported directly from the underlying browser engine payload. */
   idle_seconds?: number;
   error?: string;
 }
 export function coderBrowser(action: string, args: Record<string, string | number> = {}, signal?: AbortSignal, approvalToken?: string, workspace?: string): Promise<CoderBrowserResult> {
   return postJSON<CoderBrowserResult>('/api/coder/browser', { action, ...args, approvalToken, workspace }, 45_000, signal);
 }
-export function coderSafeModeGet(): Promise<{ enabled: boolean }> {
-  return getJSON<{ enabled: boolean }>('/api/coder/safe-mode', 5000);
-}
-export function coderSafeModeSet(enabled: boolean): Promise<{ enabled: boolean }> {
-  return postJSON<{ enabled: boolean }>('/api/coder/safe-mode', { enabled }, 5000);
-}
-export function coderCommitApprovalGet(): Promise<{ enabled: boolean }> {
-  return getJSON<{ enabled: boolean }>('/api/coder/commit-approval', 5000);
-}
-export function coderCommitApprovalSet(enabled: boolean): Promise<{ enabled: boolean }> {
-  return postJSON<{ enabled: boolean }>('/api/coder/commit-approval', { enabled }, 5000);
-}
+const boolToggle = (path: string) => ({
+  get: () => getJSON<{ enabled: boolean }>(path, 5000),
+  set: (enabled: boolean) => postJSON<{ enabled: boolean }>(path, { enabled }, 5000),
+});
+
+const safeMode = boolToggle('/api/coder/safe-mode');
+export const coderSafeModeGet = safeMode.get;
+export const coderSafeModeSet = safeMode.set;
+
+const commitApproval = boolToggle('/api/coder/commit-approval');
+export const coderCommitApprovalGet = commitApproval.get;
+export const coderCommitApprovalSet = commitApproval.set;
+
 /** Mirrors the active workspace's tool permission tiers + denied paths to the
  *  control plane, so `deny`/denied-prefix (and, with a valid token from
  *  `coderPermsApprove`, `ask`) are enforced at the endpoint itself — not only
@@ -162,7 +166,7 @@ export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths:
  *  own dialog. Mints a short-lived, single-use token the client then attaches
  *  to the actual tool-call request as `approvalToken` — without this, the
  *  endpoint has no way to tell an approved call apart from one that skipped
- *  the dialog entirely. */
+ *  the dialog entirely. `scope` must match the tool call's target workspace/scope. */
 export function coderPermsApprove(tool: string, path?: string, scope?: string): Promise<{ token: string }> {
   return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path, scope }, 5000);
 }
@@ -212,15 +216,22 @@ export interface CoderLearning {
 }
 
 export interface CoderMemory {
+  /** Optional per-repo markdown memory bank content. */
+  bank?: string;
   /** Unstructured list of learnings; the active ones are filtered at runtime based on the domain schema. */
   learnings: CoderLearning[];
 }
 
-/** Read the current learnings for the active workspace. */
-export function coderMemoryGet(): Promise<CoderMemory> {
-  return getJSON<CoderMemory>('/api/coder/memory', 8000);
+/** Read the current memory bank + learnings for a workspace (falls back to active workspace). */
+export function coderMemoryGet(workspace?: string): Promise<CoderMemory> {
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+  return getJSON<CoderMemory>(`/api/coder/memory${qs}`, 8000);
 }
 
+/** Update the per-repo markdown memory bank text for a workspace. */
+export function coderMemorySetBank(bank: string, workspace?: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { bank, workspace }, 8000);
+}
 
 /** Append one structured learning (text + kind) and return the updated memory. */
 export function coderMemoryAddLearning(learning: {
@@ -232,13 +243,13 @@ export function coderMemoryAddLearning(learning: {
   value?: string;
   provenance?: string;
   task?: string;
-}, signal?: AbortSignal): Promise<CoderMemory> {
-  return postJSON<CoderMemory>('/api/coder/memory', { learning }, 8000, signal);
+}, signal?: AbortSignal, workspace?: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { learning, workspace }, 8000, signal);
 }
 
 /** Drop a single learning by id and return the updated memory. */
-export function coderMemoryDropLearning(id: string): Promise<CoderMemory> {
-  return postJSON<CoderMemory>('/api/coder/memory', { dropLearningId: id }, 8000);
+export function coderMemoryDropLearning(id: string, workspace?: string): Promise<CoderMemory> {
+  return postJSON<CoderMemory>('/api/coder/memory', { dropLearningId: id, workspace }, 8000);
 }
 
 export interface CoderCommit {
@@ -259,19 +270,22 @@ export interface CoderCommit {
  * `coderExec` (which executes in the workspace root), so no control-plane change
  * is needed. Returns [] when the workspace isn't a git repo or has no commits yet.
  */
-export async function coderGitLog(limit = 100): Promise<CoderCommit[]> {
+export async function coderGitLog(limit = 100, signal?: AbortSignal, workspace?: string, approvalToken?: string): Promise<CoderCommit[]> {
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
   const fmt = '%H%x1f%an%x1f%ar%x1f%ad%x1f%s%x1f%b%x1e';
-  const r = await coderExec(`git log --pretty=format:${fmt} -n ${limit}`);
+  const r = await coderExec(`git log --pretty=format:${fmt} -n ${safeLimit}`, undefined, undefined, undefined, false, signal, workspace, approvalToken);
   if (r.exitCode !== 0 || !r.stdout.trim()) return [];
+  return parseCoderGitLogStdout(r.stdout);
+}
+
+export function parseCoderGitLogStdout(stdout: string): CoderCommit[] {
   const HASH_RE = /^[0-9a-f]{7,40}$/;
-  return r.stdout
+  return stdout
     .split('\x1e')
     .map((rec) => rec.trim())
     .filter(Boolean)
     .map((rec): CoderCommit | null => {
       const parts = rec.split('\x1f');
-      // A record whose body happened to contain a separator byte would yield the
-      // wrong arity; skip it rather than mis-mapping author/date/subject (M1).
       if (parts.length !== 6 || !HASH_RE.test(parts[0] || '')) return null;
       const [hash, author, relDate, date, subject, body] = parts;
       return { hash, author, relDate, date, subject, body: (body || '').trim() };

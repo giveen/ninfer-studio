@@ -44,10 +44,11 @@ export function useCoderGit({ activeWsDir, activeWs, wsFlushed, running, onLog }
   const commitsSeqRef = useRef(0);
 
   const loadCommits = useCallback(async () => {
+    if (!activeWsDir) return;
     const seq = ++commitsSeqRef.current;
     setCommitsLoading(true);
     try {
-      const commits = await coderGitLog(100);
+      const commits = await coderGitLog(100, undefined, activeWsDir);
       if (seq !== commitsSeqRef.current) return; // a newer workspace/flush generation won
       setCommits(commits);
     } catch {
@@ -56,7 +57,7 @@ export function useCoderGit({ activeWsDir, activeWs, wsFlushed, running, onLog }
     } finally {
       if (seq === commitsSeqRef.current) setCommitsLoading(false);
     }
-  }, []);
+  }, [activeWsDir]);
 
   /** One-click revert: creates a new commit undoing `hash` (safe — itself revertable). */
   const revertCommit = useCallback(async (hash: string) => {

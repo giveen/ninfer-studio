@@ -40,7 +40,7 @@ export function useCoderMemory({ activeWsDir, wsFlushed, appliedDirRef }: UseCod
     if (!activeWsDir) return;
     const seq = ++seqRef.current;
     try {
-      const m = await coderMemoryGet();
+      const m = await coderMemoryGet(activeWsDir);
       // Same switch race as the tree: only adopt the newest response, and
       // only once the control is confirmed at this workspace.
       if (seq === seqRef.current) adoptMemory(m);
