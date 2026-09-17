@@ -76,7 +76,7 @@ export interface UseCoderAgentLoopOptions {
   verifyMode: boolean;
   runPostEditChecks: (result: any, preview: string, signal?: AbortSignal) => Promise<any>;
   criticMode: boolean;
-  runCritic: (diff: string, taskText: string) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
+  runCritic: (diff: string, taskText: string, signal?: AbortSignal) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
   persistLearnings: (learnings: any[], provenance: string, taskText: string) => Promise<void>;
   updateRunMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
   noteRunTokens: (n: number) => void;
@@ -669,7 +669,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               d = '';
             }
             if (d.trim()) {
-              const c = await opts.runCritic(d, taskText);
+              const c = await opts.runCritic(d, taskText, opts.abortRef.current?.signal);
               if (c.learnings.length) {
                 await opts.persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
               }

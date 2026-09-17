@@ -90,7 +90,7 @@ export interface UseCoderToolDispatcherOptions {
   runSubagent: (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps?: number, allowedTools?: string[], depth?: number) => Promise<string>;
   runWorker: (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps?: number, allowedTools?: string[], depth?: number) => Promise<{ summary: string; diff: string; ok: boolean }>;
   runIdeation: (task: string, model: string, signal: AbortSignal) => Promise<string>;
-  runCritic: (diff: string, task: string) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
+  runCritic: (diff: string, task: string, signal?: AbortSignal) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
   persistLearnings: (learnings: any[], provenance: string, task: string) => Promise<void>;
   isGitCommitCommand: (cmd: string) => boolean;
 }
@@ -697,7 +697,7 @@ export function useCoderToolDispatcher(opts: UseCoderToolDispatcherOptions) {
                     : `TASK (revise your previous implementation):\n${task}\n\nA code reviewer rejected your previous attempt with these issues — fix them:\n${critique}`;
                 res = await opts.runWorker('subagent', p, wmodel, toolSignal, 12, workerTools);
                 if (opts.criticMode && res.diff.trim()) {
-                  const c = await opts.runCritic(res.diff, task);
+                  const c = await opts.runCritic(res.diff, task, toolSignal);
                   criticApproved = c.approved;
                   if (c.learnings.length) {
                     await opts.persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', task);

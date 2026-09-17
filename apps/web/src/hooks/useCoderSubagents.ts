@@ -361,7 +361,8 @@ export function useCoderSubagents({
   const runCritic = useCallback(
     async (
       diff: string,
-      taskText: string
+      taskText: string,
+      signal?: AbortSignal
     ): Promise<{ approved: boolean; issues: string; learnings: any[] }> => {
       const fallbackModel = coderParams.criticModel || 'qwen-coder';
       const subConfig = resolveProviderConfig('subagent', appConfig, {
@@ -372,7 +373,7 @@ export function useCoderSubagents({
       const prompt = `CRITIC REVIEW:\nTask: ${taskText.slice(0, 1500)}\n\nDiff to review:\n${diff.slice(0, 12000)}`;
       let out = '';
       try {
-        const ctrl = new AbortController();
+        const sig = signal ?? new AbortController().signal;
         await streamChat(
           buildChatRequest(
             subConfig.model,
@@ -382,7 +383,7 @@ export function useCoderSubagents({
             {},
             coderParams.promptCache
           ),
-          ctrl.signal,
+          sig,
           {
             onContentDelta: (t: string) => {
               out += t;

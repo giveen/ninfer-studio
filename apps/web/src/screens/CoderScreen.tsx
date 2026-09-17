@@ -1397,14 +1397,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
       const taskText = [...messages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content
         || 'Review the current uncommitted changes for correctness and quality.';
-      const c = await runCritic(d.diff, taskText);
+      const c = await runCritic(d.diff, taskText, abortRef.current?.signal);
       if (c.learnings.length) {
         await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
       }
       addLog({
         type: c.approved ? 'bash' : 'error',
         label: 'critic',
-        detail: c.approved ? 'approved' : (c.issues || 'changes requested').slice(0, 300),
+        detail: c.approved ? 'approved (no issues found)' : `issues: ${c.issues.slice(0, 120)}`,
       });
     } catch (e) {
       addLog({ type: 'error', label: 'critic', detail: e instanceof Error ? e.message : String(e) });
@@ -1491,7 +1491,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       (async () => {
         let textContent = '';
         try {
-          await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } }, {
+          await trackedStream(req, abortRef.current?.signal ?? new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } }, {
             baseUrl: extractorCfg.baseUrl,
             apiKey: extractorCfg.apiKey,
             extraHeaders: extractorCfg.extraHeaders,
