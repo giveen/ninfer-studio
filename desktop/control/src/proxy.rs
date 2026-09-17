@@ -36,7 +36,7 @@ pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), St
 
         match eng_state {
             crate::types::EngineState::Starting => {
-                if crate::engine::engine_health(port).await {
+                if crate::engine::engine_health(&state, port).await {
                     let mut eng = state.engine.write().await;
                     if eng.state == crate::types::EngineState::Starting {
                         eng.state = crate::types::EngineState::Running;

@@ -103,7 +103,7 @@ async fn validate_launch(state: &S, cfg: &AppSettings) -> Result<std::path::Path
 async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Result<String, Value> {
     // adopt-don't-kill: something already serves this port — same single path
     // as the refresh adopter (same-port pid policy, no cross-port fallback).
-    if engine_health(port).await {
+    if engine_health(state.as_ref(), port).await {
         let mut eng = state.engine.write().await;
         adopt_external(&mut eng, state, port).await;
         // Record the artifact the user asked to start (adopt keeps whatever
@@ -310,7 +310,7 @@ fn spawn_health_poller(state: S, port: u16) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(2000)).await;
-            if engine_health(port).await {
+            if engine_health(state.as_ref(), port).await {
                 let mut eng = state.engine.write().await;
                 if eng.state == EngineState::Starting || eng.state == EngineState::Running {
                     eng.state = EngineState::Running;

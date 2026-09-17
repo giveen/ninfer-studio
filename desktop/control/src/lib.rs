@@ -349,7 +349,7 @@ pub async fn boot_adopt(state: &S) {
             .to_string(),
     );
     drop(eng);
-    if engine_health(port).await {
+    if engine_health(&state, port).await {
         refresh_engine_status(state).await;
         tracing::event!(
             name: "engine.adopt.found",

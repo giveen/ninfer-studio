@@ -20,7 +20,7 @@ pub async fn refresh_engine_status(state: &State) {
 
     if has_child {
         if let Some(port) = eng.port {
-            if engine_health(port).await {
+            if engine_health(state, port).await {
                 if eng.state != EngineState::Running {
                     eng.state = EngineState::Running;
                     if eng.model_id.is_none() {
@@ -45,7 +45,7 @@ pub async fn refresh_engine_status(state: &State) {
 
     if eng.state == EngineState::Stopped {
         if let Some(port) = eng.port
-            && engine_health(port).await
+            && engine_health(state, port).await
         {
             adopt_external(&mut eng, state, port).await;
         }
@@ -53,20 +53,20 @@ pub async fn refresh_engine_status(state: &State) {
         // a failed spawn must not mask a live engine: if the spawn targeted a
         // non-configured port and the configured port serves, restore its view
         let cfg_port = state.config.read().await.engine_port;
-        let port = if eng.port != Some(cfg_port) && engine_health(cfg_port).await {
+        let port = if eng.port != Some(cfg_port) && engine_health(state, cfg_port).await {
             Some(cfg_port)
         } else {
             eng.port
         };
         if let Some(port) = port
-            && engine_health(port).await
+            && engine_health(state, port).await
         {
             adopt_external(&mut eng, state, port).await;
         }
     } else if eng.state == EngineState::External
         && let Some(port) = eng.port
     {
-        if engine_health(port).await {
+        if engine_health(state, port).await {
             // keep pid fresh (the external process may restart) — same-port
             // policy as adoption, never a cross-port pid.
             let all = discover_engines().await;
