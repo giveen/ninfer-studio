@@ -225,10 +225,11 @@ export const agentRunsApi = {
     id: string,
     gateId: string,
     decision: 'once' | 'remember' | 'deny' | 'approve',
+    token?: string,
   ): Promise<{ ok: boolean; decision: string }> {
     return postJSON(
       `/api/agent/runs/${encodeURIComponent(id)}/gates/${encodeURIComponent(gateId)}`,
-      { decision },
+      { decision, token },
       5000,
     );
   },

@@ -1048,6 +1048,22 @@ pub(crate) async fn gate_decide(
         )
             .into_response();
     }
+    let approving = matches!(body.decision.as_str(), "once" | "remember" | "approve");
+    if approving
+        && body
+            .token
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        gs.slot = Some(slot);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "approving a gate requires a one-shot approvalToken from /api/coder/perms/approve"})),
+        )
+            .into_response();
+    }
     let decision = match (slot.pending.kind, body.decision.as_str()) {
         (GateKind::Risky, "once") => GateDecision::Once,
         (GateKind::Risky, "remember") => GateDecision::Remember,
@@ -1088,6 +1104,8 @@ pub(crate) async fn gate_decide(
 #[derive(Debug, Deserialize)]
 pub(crate) struct GateDecideBody {
     pub(crate) decision: String,
+    #[serde(default)]
+    pub(crate) token: Option<String>,
 }
 
 /// Normalize a shell command for approved-command matching (the client's
