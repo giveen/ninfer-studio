@@ -477,6 +477,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       try {
         const loopResult = await runToolLoop({
           model: useModel,
+          baseUrl,
+          apiKey,
+          extraHeaders,
+          allowFallback: runAllowFallback,
           system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
           messages: seedMessages,
           params,
@@ -747,6 +751,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
   const send = useCallback(async () => {
     const content = text.trim();
+    const resolvedConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+    console.log('[ChatScreen] send triggered:', { content, isCloudPrimary, engineUpOrCloud, resolvedModel: resolvedConfig.model, baseUrl: resolvedConfig.baseUrl });
     if (!content && !attachments.length) return;
     if (content.startsWith('/') && runCommand(content)) {
       setText('');
@@ -765,10 +771,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       return;
     }
     if (!engineUpOrCloud) {
+      console.warn('[ChatScreen] send blocked: engineUpOrCloud is false');
       onNavigate('engine');
       return;
     }
-    const { model: useModel } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+    const useModel = resolvedConfig.model;
     if (!useModel) return;
 
     let conv = convs.find((c) => c.id === activeId);

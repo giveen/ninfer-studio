@@ -237,6 +237,13 @@ export async function streamChat(
       headers['x-ninfer-extra-headers'] = opts.extraHeaders;
     }
 
+    console.log('[streamChat] Fetching /v1/chat/completions:', {
+      model: body.model,
+      baseUrl: opts?.baseUrl,
+      hasApiKey: !!opts?.apiKey,
+      extraHeaders: opts?.extraHeaders,
+    });
+
     const fetched = await fetchStream(
       endpoint,
       {
@@ -258,6 +265,7 @@ export async function streamChat(
       } catch {
         if (text) detail = text.slice(0, 400);
       }
+      console.error('[streamChat] Request error response:', r.status, detail, text);
       if (opts?.baseUrl && opts?.allowFallback !== false && (r.status === 429 || r.status >= 500)) {
         cb.onReasoningDelta?.(`\n⚠️ *Cloud API error (${detail}). Falling back to local engine...*\n\n`);
         const fallbackBody = { ...body, model: 'ninfer' };
@@ -266,6 +274,8 @@ export async function streamChat(
       cb.onError?.(`engine request failed: ${detail}`);
       return;
     }
+
+    console.log('[streamChat] Connected successfully, HTTP', r.status);
 
     const reader = r.body.getReader();
     const decoder = new TextDecoder();

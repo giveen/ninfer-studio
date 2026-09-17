@@ -381,13 +381,24 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         rb = rb.bearer_auth(&api_key);
     }
 
+    if base_url.is_some() {
+        tracing::info!("Proxying /v1 request to cloud: target={}", target);
+    }
+
     let resp = rb.body(body_bytes).send().await;
 
-    let Ok(resp) = resp else {
-        return (StatusCode::BAD_GATEWAY, "engine unreachable").into_response();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!("Proxy request to {} failed: {}", target, err);
+            return (StatusCode::BAD_GATEWAY, "engine unreachable").into_response();
+        }
     };
 
     let status = resp.status();
+    if base_url.is_some() {
+        tracing::info!("Cloud response from {}: {}", target, status);
+    }
     let mut resp_headers = HeaderMap::new();
 
     // Forward response headers from engine to client

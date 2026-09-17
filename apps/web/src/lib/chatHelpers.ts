@@ -335,19 +335,13 @@ export function resolveProviderConfig(
   fallbackModel?: string
 ): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string } {
   if (!appConfig?.cloudProviderEnabled) {
+    console.log('[resolveProviderConfig] Cloud disabled -> fallback:', fallbackModel || 'ninfer');
     return { model: fallbackModel || 'ninfer' };
   }
 
   const explicitProvider = params[`${role}Provider`] || params.provider;
   let globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
 
-  // Smart Task-Based Tiering: only downgrade a subagent call the caller has
-  // itself marked lightweight (`taskWeight: 'light'` — Scout probes,
-  // tagger/extractor classification, ideation, cut-off summaries, Critic
-  // review). A call that leaves taskWeight unset defaults to heavy, which
-  // covers the Worker (the subagent that actually writes code): tiering
-  // must never silently downgrade the one subagent role the user is most
-  // likely to have explicitly picked a strong cloud model for.
   if (appConfig.cloudSmartTiering && role === 'subagent' && params.taskWeight === 'light' && !explicitProvider && !params.forceCloud) {
     globalUseCloud = false;
   }
@@ -359,14 +353,17 @@ export function resolveProviderConfig(
     const fallbackDefault = role === 'primary'
       ? (appConfig.cloudProviderPrimaryModel || appConfig.cloudProviderDefaultModel || 'gpt-4o')
       : (appConfig.cloudProviderSubagentModel || appConfig.cloudProviderDefaultModel || 'gpt-4o-mini');
-    return {
+    const result = {
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
       extraHeaders: appConfig.cloudProviderExtraHeaders || undefined,
       model: params[`${role}CloudModel`] || params.cloudModel || roleModel || fallbackDefault,
     };
+    console.log('[resolveProviderConfig] Resolved cloud provider:', { role, model: result.model, baseUrl: result.baseUrl, hasApiKey: !!result.apiKey });
+    return result;
   }
 
+  console.log('[resolveProviderConfig] Resolved ninfer provider -> fallback:', fallbackModel || 'ninfer');
   return {
     model: fallbackModel && fallbackModel !== 'ninfer' ? fallbackModel : 'ninfer',
   };
