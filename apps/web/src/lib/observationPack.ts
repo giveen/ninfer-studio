@@ -13,7 +13,7 @@
 // Inspired by SoL-Pi's ObservationPack (github.com/NVlabs/SoL-Pi).
 
 import type { ChatMessage } from './types';
-import { CHARS_PER_TOKEN } from './format';
+import { CHARS_PER_TOKEN_CODE } from './format';
 import { summarizeOutputVerified, renderOutputReceipt } from './api/chat';
 
 const SUMMARY_THRESHOLD = 16 * 1024;
@@ -113,7 +113,7 @@ function countLines(text: string): number {
 }
 
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  return Math.ceil(text.length / CHARS_PER_TOKEN_CODE);
 }
 
 function completeLineExcerpt(text: string, budgetBytes: number, fromEnd: boolean): string {
