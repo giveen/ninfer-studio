@@ -14,13 +14,7 @@ export interface EngineActionResult {
 }
 
 export function startEngine(profile: unknown, artifact: string | null): Promise<EngineActionResult> {
-  // Empty strings are how the form represents "unset" for some fields, but the
-  // Rust control plane deserializes typed Option<u64>/Option<f64> fields — a ''
-  // value fails the whole profile parse there and (with its fallback) silently
-  // drops EVERY setting. Strip '' values here so the control plane receives a
-  // clean profile; `undefined` keys are dropped by JSON.stringify.
-  const clean = JSON.parse(JSON.stringify(profile, (_k, v) => (v === '' ? undefined : v)));
-  return postJSON<EngineActionResult>('/api/engine/start', { profile: clean, artifact }, 15_000);
+  return postJSON<EngineActionResult>('/api/engine/start', { profile, artifact }, 15_000);
 }
 
 export function stopEngine(externalPid?: number): Promise<EngineActionResult> {
@@ -28,7 +22,7 @@ export function stopEngine(externalPid?: number): Promise<EngineActionResult> {
 }
 
 export function startEngineUpdate(action: 'pull' | 'build'): Promise<EngineActionResult> {
-  return postJSON('/api/engine/update', { action });
+  return postJSON<EngineActionResult>('/api/engine/update', { action });
 }
 
 /** Server-computed launch command + restart-dirty verdict (single source of
@@ -42,16 +36,19 @@ export interface EngineArgsResult {
   dirty: boolean;
   /** The running engine serves the profile's port. */
   portMatch: boolean;
+  /** set by the control plane when the profile failed to deserialize */
+  profileParseError?: string;
 }
 
 export function engineArgs(profile: unknown, artifact: string | null): Promise<EngineArgsResult> {
-  // Same ''-stripping as startEngine: the dirty check compares against the
-  // profile the engine was ACTUALLY started with (already cleaned), so the
-  // form must be cleaned identically or empty fields read as "changed".
-  const clean = JSON.parse(JSON.stringify(profile, (_k, v) => (v === '' ? undefined : v)));
-  return postJSON<EngineArgsResult>('/api/engine/args', { profile: clean, artifact }, 8_000);
+  return postJSON<EngineArgsResult>('/api/engine/args', { profile, artifact }, 8_000);
 }
 
-export function getLogs(n = 400): Promise<{ lines: string[]; size: number }> {
-  return getJSON<{ lines: string[]; size: number }>(`/api/logs?n=${n}`, 6000);
+export interface LogResponse {
+  lines: string[];
+  size: number;
+}
+
+export function getLogs(n = 400): Promise<LogResponse> {
+  return getJSON<LogResponse>(`/api/logs?n=${encodeURIComponent(n)}`, 6000);
 }

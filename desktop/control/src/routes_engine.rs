@@ -218,8 +218,15 @@ pub(crate) async fn engine_args(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut sanitized = body.profile.clone().unwrap_or(Value::Null);
     sanitize_empty_strings(&mut sanitized);
-    let profile: EngineProfile =
-        serde_json::from_value(sanitized).unwrap_or_else(|_| EngineProfile::default());
+    let (profile, profile_parse_error) = match serde_json::from_value::<EngineProfile>(sanitized) {
+        Ok(p) => (p, None),
+        Err(e) => {
+            let msg = format!(
+                "engine profile could not be read ({e}); using defaults for preview — check the settings you changed"
+            );
+            (EngineProfile::default(), Some(msg))
+        }
+    };
     let artifact = body.artifact.clone().unwrap_or_default();
 
     let (eng, last, cfg) = (
@@ -276,11 +283,18 @@ pub(crate) async fn engine_args(
         args[i + 1] = "••••••••".to_string();
     }
 
-    Ok(Json(json!({
+    let mut res = json!({
         "args": args,
         "dirty": dirty,
         "portMatch": port_match,
-    })))
+    });
+    if let Some(err) = profile_parse_error
+        && let Value::Object(map) = &mut res
+    {
+        map.insert("profileParseError".to_string(), Value::String(err));
+    }
+
+    Ok(Json(res))
 }
 
 #[derive(Deserialize)]
@@ -296,4 +310,33 @@ pub(crate) async fn engine_stop(
     let body: Value = read_json(req).await?;
     let parsed: StopBody = serde_json::from_value(body).unwrap_or(StopBody { external_pid: None });
     Ok(Json(stop_engine(&state, parsed.external_pid).await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_empty_strings() {
+        let mut v = json!({
+            "model": "qwen",
+            "kvCapacity": "",
+            "nested": {
+                "gpu": "",
+                "ctx": 4096
+            }
+        });
+        sanitize_empty_strings(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "model": "qwen",
+                "kvCapacity": null,
+                "nested": {
+                    "gpu": null,
+                    "ctx": 4096
+                }
+            })
+        );
+    }
 }
