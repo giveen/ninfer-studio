@@ -93,6 +93,7 @@ async function runResearchAngle(opts: { model: string; angle: string; maxSteps: 
       toolNames: ['web_fetch', 'web_search', 'browser'],
       tools: [...CHAT_TOOLS, CHAT_BROWSER_TOOL],
       params: { thinking: false, maxTokens: 1024 },
+      hookMode: 'client',
     });
     id = started.id;
     if (opts.signal.aborted) { stop(); return '(aborted)'; }

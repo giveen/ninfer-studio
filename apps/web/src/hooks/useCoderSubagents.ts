@@ -103,6 +103,7 @@ export function useCoderSubagents({
             seed: coderParams.seed,
             maxTokens: 2048,
           },
+          hookMode: 'client',
           scope: activeWsDir,
         }, signal);
         id = started.id;
@@ -115,7 +116,13 @@ export function useCoderSubagents({
             id,
             () => {},
             (ev: any) => {
-              if (signal.aborted || ev.type !== 'approval_requested') return;
+              if (signal.aborted) return;
+              if (ev.type === 'hook_requested') {
+                const h = ev as unknown as { id: string };
+                void agentRunsApi.decideHook(id as string, h.id, { action: 'continue' }).catch(() => {});
+                return;
+              }
+              if (ev.type !== 'approval_requested') return;
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
@@ -287,6 +294,7 @@ export function useCoderSubagents({
             seed: coderParams.seed,
             maxTokens: 4096,
           },
+          hookMode: 'client',
           scope: activeWsDir,
         }, signal);
         const id = started.id;
@@ -305,7 +313,13 @@ export function useCoderSubagents({
             id,
             () => {},
             (ev: any) => {
-              if (signal.aborted || ev.type !== 'approval_requested') return;
+              if (signal.aborted) return;
+              if (ev.type === 'hook_requested') {
+                const h = ev as unknown as { id: string };
+                void agentRunsApi.decideHook(id, h.id, { action: 'continue' }).catch(() => {});
+                return;
+              }
+              if (ev.type !== 'approval_requested') return;
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
