@@ -193,9 +193,9 @@ pub struct State {
     /// Server-side agent runs (the loop that used to live in the webview).
     /// Runs keep going while no client is attached; a client attaches via
     /// `GET /api/agent/runs/{id}/events` (SSE) and never owns the loop.
-    /// See `crate::agent::run` for the registry and `crate::agent` for the
-    /// architecture notes.
     pub agent_runs: crate::agent::run::RunRegistry,
+    /// Shared HTTP client for proxied requests and remote checks (connection pooled).
+    pub http_client: reqwest::Client,
 }
 
 impl State {
@@ -204,6 +204,10 @@ impl State {
         dist_dir: std::path::PathBuf,
         event_tx: Option<UnboundedSender<AppEvent>>,
     ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(crate::proxy::ENGINE_PROXY_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_default();
         Self {
             config: tokio::sync::RwLock::new(AppSettings::default()),
             engine: tokio::sync::RwLock::new(EngineInner::default()),
@@ -227,6 +231,7 @@ impl State {
             dist_dir,
             remote: tokio::sync::Mutex::new(None),
             agent_runs: crate::agent::run::RunRegistry::default(),
+            http_client,
         }
     }
 
