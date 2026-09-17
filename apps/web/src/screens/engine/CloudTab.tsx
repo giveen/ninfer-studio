@@ -45,7 +45,7 @@ const PRESETS: ProviderPreset[] = [
     defaultPrimary: 'anthropic/claude-3.5-sonnet',
     defaultSubagent: 'openai/gpt-4o-mini',
     hint: 'Unified access to Claude, GPT-4, DeepSeek & open models',
-    extraHeaders: JSON.stringify({ 'HTTP-Referer': 'https://ninfier.studio', 'X-Title': 'NInfer Studio' }, null, 2),
+    extraHeaders: JSON.stringify({ 'HTTP-Referer': 'https://ninfer.studio', 'X-Title': 'NInfer Studio' }, null, 2),
   },
   {
     id: 'groq',
@@ -85,6 +85,23 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [testResult, setTestResult] = useState<CloudTestResult | null>(null);
   const [showHeaders, setShowHeaders] = useState(false);
 
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const debouncedOnUpdate = useCallback(
+    (patch: Partial<AppSettings>) => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = setTimeout(() => {
+        onUpdate(patch);
+      }, 500);
+    },
+    [onUpdate],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, []);
+
   useEffect(() => {
     if (settings?.cloudProviderExtraHeaders) {
       setShowHeaders(true);
@@ -95,10 +112,12 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
 
   const handleApiKeyChange = (v: string) => {
     setApiDraft(v);
-    onUpdate({ cloudProviderApiKey: v || undefined });
+    // Send empty string '' when cleared so it persists unsetting the key, rather than undefined (dropped by JSON.stringify)
+    debouncedOnUpdate({ cloudProviderApiKey: v });
   };
 
   const applyPreset = (preset: ProviderPreset) => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
     onUpdate({
       cloudProviderBaseUrl: preset.baseUrl,
       cloudProviderPrimaryModel: preset.defaultPrimary,
@@ -152,6 +171,13 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
         setModels(res.models);
         applyModelInfo(res.modelInfo);
       }
+    } catch (e) {
+      setTestResult({
+        ok: false,
+        error: e instanceof Error ? e.message : 'Connection test failed',
+        latencyMs: 0,
+        models: [],
+      });
     } finally {
       setTesting(false);
     }
@@ -161,7 +187,7 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
    *  provider reported pricing/context for — omitted entirely (not "—")
    *  when nothing is known, matching how the rest of this tab treats
    *  provider-reported optional metadata. */
-  const modelInfoCaption = (modelId: string): string | null => {
+  const modelInfoCaption = useCallback((modelId: string): string | null => {
     const info = modelInfo[modelId];
     if (!info) return null;
     const parts: string[] = [];
@@ -173,7 +199,8 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
       parts.push(`${fmt(info.pricePromptPerM)}/${fmt(info.priceCompletionPerM)} per M`);
     }
     return parts.length ? parts.join(' · ') : null;
-  };
+  }, [modelInfo]);
+
 
 
   const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
@@ -232,7 +259,7 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 <Field label="Base URL" hint="The API endpoint URL for the cloud provider (e.g., https://api.openai.com/v1).">
                   <TextField
                     value={settings.cloudProviderBaseUrl || ''}
-                    onChange={(v) => onUpdate({ cloudProviderBaseUrl: v || undefined })}
+                    onChange={(v) => debouncedOnUpdate({ cloudProviderBaseUrl: v })}
                     placeholder="https://api.openai.com/v1"
                   />
                 </Field>
@@ -265,11 +292,11 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                   {showHeaders ? 'Hide Custom Headers' : '+ Add Custom HTTP Headers (JSON)'}
                 </button>
                 {showHeaders && (
-                  <Field label="Custom HTTP Headers (JSON)" hint='JSON key-value object appended to cloud requests (e.g. {"HTTP-Referer": "https://ninfier.studio"}).'>
+                  <Field label="Custom HTTP Headers (JSON)" hint='JSON key-value object appended to cloud requests (e.g. {"HTTP-Referer": "https://ninfer.studio"}).'>
                     <textarea
                       value={settings.cloudProviderExtraHeaders || ''}
-                      onChange={(e) => onUpdate({ cloudProviderExtraHeaders: e.target.value })}
-                      placeholder='{\n  "HTTP-Referer": "https://ninfier.studio",\n  "X-Title": "NInfer Studio"\n}'
+                      onChange={(e) => debouncedOnUpdate({ cloudProviderExtraHeaders: e.target.value })}
+                      placeholder='{\n  "HTTP-Referer": "https://ninfer.studio",\n  "X-Title": "NInfer Studio"\n}'
                       rows={3}
                       className="w-full rounded-lg border border-line bg-inset px-3 py-2 font-mono text-[11.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
                     />
@@ -339,7 +366,7 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                       />
                       <TextField
                         value={settings.cloudProviderPrimaryModel || ''}
-                        onChange={(v) => onUpdate({ cloudProviderPrimaryModel: v })}
+                        onChange={(v) => debouncedOnUpdate({ cloudProviderPrimaryModel: v })}
                         placeholder="Custom model name..."
                         className="text-[12px]"
                       />
@@ -358,10 +385,11 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                       />
                       <TextField
                         value={settings.cloudProviderSubagentModel || ''}
-                        onChange={(v) => onUpdate({ cloudProviderSubagentModel: v })}
+                        onChange={(v) => debouncedOnUpdate({ cloudProviderSubagentModel: v })}
                         placeholder="Custom model name..."
                         className="text-[12px]"
                       />
+
                       {modelInfoCaption(subagentModel) && (
                         <p className="text-[11px] text-faint">{modelInfoCaption(subagentModel)}</p>
                       )}

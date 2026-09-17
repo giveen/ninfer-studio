@@ -42,10 +42,12 @@ interface BasicsTabProps {
 
 export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact, modelsDir, applyPreset }: BasicsTabProps) {
   const grid3 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-3';
+  const selectedArtifact = artifacts.find((a) => a.path === artifact);
+
   return (
     <div className="space-y-4">
-      <SectionCard title="Presets" description="One-click profiles. Applying one fills every option below — review the command before starting." icon={<Rocket size={15} />} collapsible>
-        <div className="flex flex-wrap items-start gap-2">
+      <SectionCard title="Presets" description="Quickly apply a tested profile baseline, then adjust below." icon={<Sparkles size={15} />}>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-4">
           {PRESETS.map((p) => (
             <PresetCard key={p.id} name={p.name} description={p.description} onApply={() => applyPreset(p.id)} />
           ))}
@@ -62,7 +64,7 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
                 ...artifacts.map((a) => ({ value: a.path, label: `${a.file}${a.weights ? ` · ${a.weights}` : ''}` })),
               ]}
             />
-            {artifacts.find(a => a.path === artifact)?.version !== undefined && artifacts.find(a => a.path === artifact)!.version! < 3 && (
+            {selectedArtifact?.version !== undefined && selectedArtifact.version < 3 && (
               <p className="mt-1 text-[11px] text-danger">⚠️ This artifact is v2. ninfer-serve requires v3. Please upgrade it in the Models tab.</p>
             )}
           </Field>
@@ -91,7 +93,7 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
           </Field>
         </div>
         {artifacts.length === 0 && (
-          <p className="mt-3 text-[12px] text-warn">No .ninfer artifacts found in {modelsDir} — download one from the Models tab first.</p>
+          <p className="mt-3 text-[12px] text-warn">No .ninfer artifacts found in {modelsDir || 'models directory'} — download one from the Models tab first.</p>
         )}
       </SectionCard>
     </div>

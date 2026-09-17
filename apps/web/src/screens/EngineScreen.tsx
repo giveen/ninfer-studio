@@ -18,6 +18,8 @@ import { CloudTab } from './engine/CloudTab';
 
 type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage' | 'cloud';
 
+export type EngineNotice = { tone: 'ok' | 'warn' | 'danger'; text: string };
+
 const TABS: Array<{ id: EngineTab; label: string }> = [
   { id: 'basics', label: 'Basics' },
   { id: 'performance', label: 'Performance' },

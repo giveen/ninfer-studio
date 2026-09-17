@@ -2,20 +2,20 @@ import { BookmarkPlus, Save } from 'lucide-react';
 import { Button, SectionCard, TextField } from '../../components/ui';
 import { BLANK_PROFILE } from '../../lib/presets';
 import type { EngineProfile, SavedProfile } from '../../lib/types';
-
-type Notice = { tone: 'ok' | 'warn' | 'danger'; text: string };
+import type { EngineNotice } from '../EngineScreen';
 
 interface ProfilesTabProps {
   profile: EngineProfile;
   setProfile: (p: EngineProfile) => void;
   setAppliedPresetId: (id: string | null) => void;
-  setNotice: (n: Notice | null) => void;
+  setNotice: (n: EngineNotice | null) => void;
   saveName: string;
   setSaveName: (v: string) => void;
   saveCurrent: () => void;
   saved: SavedProfile[];
   setSaved: (fn: (s: SavedProfile[]) => SavedProfile[]) => void;
 }
+
 
 export function ProfilesTab({ profile, setProfile, setAppliedPresetId, setNotice, saveName, setSaveName, saveCurrent, saved, setSaved }: ProfilesTabProps) {
   return (
