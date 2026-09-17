@@ -2,8 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// impls to redact secrets while still showing whether one is set, without
-/// leaking the value itself into a log line or panic message.
+/// Redact secrets while still showing whether one is set, without leaking the
+/// value itself into a log line or panic message.
 fn redacted(s: &str) -> &'static str {
     if s.is_empty() { "" } else { "***" }
 }
@@ -229,7 +229,7 @@ pub struct ModelPricing {
 /// `url` (streamable-HTTP transport — the current MCP spec, JSON or
 /// SSE-framed responses) must be set. Mirrors the shape opencode/continue/
 /// roo use in their MCP config files.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpServerSpec {
     /// Stable id (sanitized to `[A-Za-z0-9-]`); namespaced into tool names as
@@ -259,6 +259,34 @@ pub struct McpServerSpec {
     pub authorization: Option<String>,
 }
 
+impl fmt::Debug for McpServerSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_masked: std::collections::BTreeMap<_, _> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), if v.is_empty() { "" } else { "***" }))
+            .collect();
+        let headers_masked: std::collections::BTreeMap<_, _> = self
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), if v.is_empty() { "" } else { "***" }))
+            .collect();
+        f.debug_struct("McpServerSpec")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &env_masked)
+            .field("cwd", &self.cwd)
+            .field("url", &self.url)
+            .field("headers", &headers_masked)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|s| redacted(s)),
+            )
+            .finish()
+    }
+}
+
 impl McpServerSpec {
     /// Which transport this spec selects, or `None` when it's unusable as
     /// written (both or neither of `command`/`url` set — the upsert endpoint
@@ -266,12 +294,10 @@ impl McpServerSpec {
     pub(crate) fn transport(&self) -> Option<&str> {
         let cmd = self.command.as_deref().unwrap_or("").trim();
         let url = self.url.as_deref().unwrap_or("").trim();
-        if !cmd.is_empty() {
-            Some("stdio")
-        } else if !url.is_empty() {
-            Some("http")
-        } else {
-            None
+        match (!cmd.is_empty(), !url.is_empty()) {
+            (true, false) => Some("stdio"),
+            (false, true) => Some("http"),
+            _ => None,
         }
     }
 }
@@ -344,7 +370,7 @@ impl Default for AppSettings {
 }
 
 impl fmt::Debug for AppSettings {
-    /// Redacts `api_key`/`hf_token` — the API layer already masks both before
+    /// Redacts secret keys — the API layer already masks them before
     /// they ever reach a client (see `redact_config` in lib.rs); this impl
     /// keeps that guarantee even if the struct is ever printed directly (a
     /// stray log line, a panic message, ...).
@@ -354,10 +380,6 @@ impl fmt::Debug for AppSettings {
             .field("models_dir", &self.models_dir)
             .field("engine_port", &self.engine_port)
             .field("api_key", &redacted(&self.api_key))
-            .field(
-                "cloud_provider_api_key",
-                &redacted(&self.cloud_provider_api_key),
-            )
             .field("hf_cli", &self.hf_cli)
             .field("hf_token", &redacted(&self.hf_token))
             .field("build_command", &self.build_command)
@@ -366,10 +388,68 @@ impl fmt::Debug for AppSettings {
             .field("default_request_params", &self.default_request_params)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("coder_workspace", &self.coder_workspace)
+            .field("coder_sandbox", &self.coder_sandbox)
+            .field("sandbox_binds", &self.sandbox_binds)
+            .field("coder_safe_mode", &self.coder_safe_mode)
+            .field("coder_commit_approval", &self.coder_commit_approval)
             .field("coder_udiff_edit_enabled", &self.coder_udiff_edit_enabled)
             .field("coder_repo_map_enabled", &self.coder_repo_map_enabled)
+            .field("chat_agent_research", &self.chat_agent_research)
+            .field("chat_memory_enabled", &self.chat_memory_enabled)
+            .field("chat_reflection_enabled", &self.chat_reflection_enabled)
+            .field("chat_deep_research_enabled", &self.chat_deep_research_enabled)
+            .field("chat_reflection_model", &self.chat_reflection_model)
+            .field("chat_browser_tier", &self.chat_browser_tier)
+            .field("chat_memory_tool_tier", &self.chat_memory_tool_tier)
+            .field(
+                "chat_deep_research_max_angles",
+                &self.chat_deep_research_max_angles,
+            )
+            .field(
+                "chat_deep_research_max_steps",
+                &self.chat_deep_research_max_steps,
+            )
+            .field(
+                "chat_reflection_critique_max_tokens",
+                &self.chat_reflection_critique_max_tokens,
+            )
+            .field("remote_access_enabled", &self.remote_access_enabled)
+            .field("remote_access_port", &self.remote_access_port)
+            .field("chat_computer_use_enabled", &self.chat_computer_use_enabled)
+            .field("chat_computer_use_dir", &self.chat_computer_use_dir)
+            .field("chat_computer_use_perms", &self.chat_computer_use_perms)
             .field("currency_symbol", &self.currency_symbol)
             .field("cost_per_kwh", &self.cost_per_kwh)
+            .field("mcp_servers", &self.mcp_servers)
+            .field("cloud_provider_enabled", &self.cloud_provider_enabled)
+            .field("cloud_provider_base_url", &self.cloud_provider_base_url)
+            .field(
+                "cloud_provider_api_key",
+                &redacted(&self.cloud_provider_api_key),
+            )
+            .field(
+                "cloud_provider_default_model",
+                &self.cloud_provider_default_model,
+            )
+            .field(
+                "cloud_provider_primary_model",
+                &self.cloud_provider_primary_model,
+            )
+            .field(
+                "cloud_provider_subagent_model",
+                &self.cloud_provider_subagent_model,
+            )
+            .field(
+                "cloud_provider_extra_headers",
+                &self.cloud_provider_extra_headers,
+            )
+            .field("cloud_fallback_to_local", &self.cloud_fallback_to_local)
+            .field("cloud_smart_tiering", &self.cloud_smart_tiering)
+            .field("cloud_prune_context", &self.cloud_prune_context)
+            .field("cloud_use_local_compactor", &self.cloud_use_local_compactor)
+            .field("cloud_use_for_primary", &self.cloud_use_for_primary)
+            .field("cloud_use_for_subagent", &self.cloud_use_for_subagent)
+            .field("cloud_model_pricing", &self.cloud_model_pricing)
             .finish()
     }
 }
@@ -533,7 +613,15 @@ mod opt_number_or_auto {
                 .map(NumberOrAuto::Number)
                 .map(Some)
                 .map_err(|_| serde::de::Error::custom("kv-capacity: expected number or 'auto'")),
-            Some(serde_json::Value::Number(n)) => Ok(n.as_u64().map(NumberOrAuto::Number)),
+            Some(serde_json::Value::Number(n)) => {
+                if let Some(u) = n.as_u64() {
+                    Ok(Some(NumberOrAuto::Number(u)))
+                } else {
+                    Err(serde::de::Error::custom(
+                        "kv-capacity: expected non-negative integer or 'auto'",
+                    ))
+                }
+            }
             Some(_) => Err(serde::de::Error::custom(
                 "kv-capacity: expected number or 'auto'",
             )),
@@ -562,6 +650,7 @@ mod debug_redaction {
         let settings = AppSettings {
             api_key: SECRET.to_string(),
             hf_token: SECRET.to_string(),
+            cloud_provider_api_key: SECRET.to_string(),
             ..AppSettings::default()
         };
         let rendered = format!("{settings:?}");
@@ -577,6 +666,10 @@ mod debug_redaction {
         assert!(
             rendered.contains("hf_token: \"***\""),
             "expected a masked hf_token field: {rendered}"
+        );
+        assert!(
+            rendered.contains("cloud_provider_api_key: \"***\""),
+            "expected a masked cloud_provider_api_key field: {rendered}"
         );
     }
 
@@ -616,4 +709,78 @@ mod debug_redaction {
             "expected api_key: None: {rendered}"
         );
     }
+
+    #[test]
+    fn mcp_server_spec_transport_selection() {
+        let stdio_spec = McpServerSpec {
+            command: Some("node".into()),
+            ..Default::default()
+        };
+        assert_eq!(stdio_spec.transport(), Some("stdio"));
+
+        let http_spec = McpServerSpec {
+            url: Some("https://example.com/mcp".into()),
+            ..Default::default()
+        };
+        assert_eq!(http_spec.transport(), Some("http"));
+
+        let both_spec = McpServerSpec {
+            command: Some("node".into()),
+            url: Some("https://example.com/mcp".into()),
+            ..Default::default()
+        };
+        assert_eq!(both_spec.transport(), None);
+
+        let empty_spec = McpServerSpec::default();
+        assert_eq!(empty_spec.transport(), None);
+    }
+
+    #[test]
+    fn mcp_server_spec_debug_redaction() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("SECRET_ENV".to_string(), SECRET.to_string());
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), SECRET.to_string());
+
+        let spec = McpServerSpec {
+            name: "test-server".into(),
+            authorization: Some(SECRET.to_string()),
+            env,
+            headers,
+            ..Default::default()
+        };
+        let rendered = format!("{spec:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "McpServerSpec Debug leaked the secret: {rendered}"
+        );
+        assert!(rendered.contains("authorization: Some(\"***\")"));
+        assert!(rendered.contains("\"Authorization\": \"***\""));
+        assert!(rendered.contains("\"SECRET_ENV\": \"***\""));
+    }
+
+    #[test]
+    fn opt_number_or_auto_deserialization() {
+        #[derive(Deserialize)]
+        struct TestStruct {
+            #[serde(with = "opt_number_or_auto")]
+            kv: Option<NumberOrAuto>,
+        }
+
+        let valid_num: TestStruct = serde_json::from_str(r#"{"kv": 100}"#).unwrap();
+        assert_eq!(valid_num.kv, Some(NumberOrAuto::Number(100)));
+
+        let valid_auto: TestStruct = serde_json::from_str(r#"{"kv": "auto"}"#).unwrap();
+        assert_eq!(valid_auto.kv, Some(NumberOrAuto::Auto));
+
+        let valid_empty: TestStruct = serde_json::from_str(r#"{"kv": ""}"#).unwrap();
+        assert_eq!(valid_empty.kv, None);
+
+        let invalid_neg: Result<TestStruct, _> = serde_json::from_str(r#"{"kv": -5}"#);
+        assert!(invalid_neg.is_err());
+
+        let invalid_float: Result<TestStruct, _> = serde_json::from_str(r#"{"kv": 3.14}"#);
+        assert!(invalid_float.is_err());
+    }
 }
+

@@ -4,7 +4,7 @@
 
 use crate::engine::S;
 use crate::read_json;
-use crate::types::{AppSettings, EngineProfile, ProfileState, SavedProfile};
+use crate::types::{AppSettings, EngineProfile, McpServerSpec, ProfileState, SavedProfile};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Request, State as AxumState};
@@ -41,13 +41,13 @@ pub(crate) const SECRET_MASK: &str = "********";
 /// mask text on the wire to the real provider.
 pub(crate) fn resolve_secret(raw: Option<&str>, stored: &str) -> String {
     match raw.map(str::trim) {
-        Some(v) if !v.is_empty() && v != SECRET_MASK => v.to_string(),
+        Some(v) if !v.is_empty() && v != SECRET_MASK && v != "***" => v.to_string(),
         _ => stored.to_string(),
     }
 }
 
-/// Redact every secret field (`hfToken`, `apiKey`) before a config value
-/// reaches a client — see [`SECRET_MASK`].
+/// Redact every secret field (`hfToken`, `apiKey`, `cloudProviderApiKey`, and
+/// `mcpServers` secrets) before a config value reaches a client — see [`SECRET_MASK`].
 pub(crate) fn redact_config(mut v: Value) -> Value {
     let is_set = |field: &str| {
         v.get(field)
@@ -71,6 +71,35 @@ pub(crate) fn redact_config(mut v: Value) -> Value {
             "cloudProviderApiKey".into(),
             json!(if cloud_api_set { SECRET_MASK } else { "" }),
         );
+        if let Some(mcp_servers) = obj.get_mut("mcpServers").and_then(|m| m.as_array_mut()) {
+            for server in mcp_servers {
+                if let Some(sobj) = server.as_object_mut() {
+                    if let Some(auth) = sobj.get("authorization").and_then(|a| a.as_str()) {
+                        if !auth.is_empty() {
+                            sobj.insert("authorization".into(), json!(SECRET_MASK));
+                        }
+                    }
+                    if let Some(headers) = sobj.get_mut("headers").and_then(|h| h.as_object_mut()) {
+                        for (_k, val) in headers.iter_mut() {
+                            if let Some(s) = val.as_str() {
+                                if !s.is_empty() {
+                                    *val = json!(SECRET_MASK);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(env) = sobj.get_mut("env").and_then(|e| e.as_object_mut()) {
+                        for (_k, val) in env.iter_mut() {
+                            if let Some(s) = val.as_str() {
+                                if !s.is_empty() {
+                                    *val = json!(SECRET_MASK);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     v
 }
@@ -87,13 +116,16 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("modelsDir").and_then(|v| v.as_str()) {
         merged.models_dir = v.into();
     }
-    if let Some(v) = body.get("enginePort").and_then(|v| v.as_u64()) {
+    if let Some(v) = body.get("enginePort").and_then(|v| v.as_u64())
+        && (1024..=65535).contains(&v)
+        && (v as u16) != merged.remote_access_port
+    {
         merged.engine_port = v as u16;
     }
     if let Some(v) = body.get("apiKey").and_then(|v| v.as_str()) {
         // "********" = untouched field (the UI only ever has the mask) — keep
         // the stored secret. Any other value, including "", replaces it.
-        if v != SECRET_MASK {
+        if v != SECRET_MASK && v != "***" {
             merged.api_key = v.into();
         }
     }
@@ -103,12 +135,24 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("hfToken").and_then(|v| v.as_str()) {
         // "********" = untouched field (the UI only ever has the mask) — keep
         // the stored secret. Any other value, including "", replaces it.
-        if v != SECRET_MASK {
+        if v != SECRET_MASK && v != "***" {
             merged.hf_token = v.into();
         }
     }
     if let Some(v) = body.get("buildCommand").and_then(|v| v.as_str()) {
         merged.build_command = v.into();
+    }
+    if let Some(v) = body.get("lintCommand").and_then(|v| v.as_str()) {
+        merged.lint_command = v.into();
+    }
+    if let Some(v) = body.get("testCommand").and_then(|v| v.as_str()) {
+        merged.test_command = v.into();
+    }
+    if let Some(v) = body.get("defaultRequestParams").and_then(|v| v.as_str()) {
+        merged.default_request_params = v.into();
+    }
+    if let Some(v) = body.get("reasoningEffort").and_then(|v| v.as_str()) {
+        merged.reasoning_effort = v.into();
     }
     if let Some(v) = body.get("coderWorkspace").and_then(|v| v.as_str()) {
         merged.coder_workspace = v.into();
@@ -121,6 +165,30 @@ pub(crate) async fn set_config(
             .iter()
             .filter_map(|x| x.as_str().map(String::from))
             .collect();
+    }
+    if let Some(v) = body.get("coderSafeMode").and_then(|v| v.as_bool()) {
+        merged.coder_safe_mode = v;
+    }
+    if let Some(v) = body.get("coderCommitApproval").and_then(|v| v.as_bool()) {
+        merged.coder_commit_approval = v;
+    }
+    if let Some(v) = body.get("coderUdiffEditEnabled").and_then(|v| v.as_bool()) {
+        merged.coder_udiff_edit_enabled = v;
+    }
+    if let Some(v) = body.get("coderRepoMapEnabled").and_then(|v| v.as_bool()) {
+        merged.coder_repo_map_enabled = v;
+    }
+    if let Some(v) = body.get("chatAgentResearch").and_then(|v| v.as_bool()) {
+        merged.chat_agent_research = v;
+    }
+    if let Some(v) = body.get("chatMemoryEnabled").and_then(|v| v.as_bool()) {
+        merged.chat_memory_enabled = v;
+    }
+    if let Some(v) = body.get("chatReflectionEnabled").and_then(|v| v.as_bool()) {
+        merged.chat_reflection_enabled = v;
+    }
+    if let Some(v) = body.get("chatDeepResearchEnabled").and_then(|v| v.as_bool()) {
+        merged.chat_deep_research_enabled = v;
     }
     if let Some(v) = body.get("chatReflectionModel").and_then(|v| v.as_str()) {
         merged.chat_reflection_model = v.into();
@@ -156,6 +224,15 @@ pub(crate) async fn set_config(
     {
         merged.chat_reflection_critique_max_tokens = v as u32;
     }
+    if let Some(v) = body.get("remoteAccessEnabled").and_then(|v| v.as_bool()) {
+        merged.remote_access_enabled = v;
+    }
+    if let Some(v) = body.get("remoteAccessPort").and_then(|v| v.as_u64())
+        && (1024..=65535).contains(&v)
+        && (v as u16) != merged.engine_port
+    {
+        merged.remote_access_port = v as u16;
+    }
     if let Some(v) = body.get("chatComputerUseEnabled").and_then(|v| v.as_bool()) {
         merged.chat_computer_use_enabled = v;
     }
@@ -169,9 +246,38 @@ pub(crate) async fn set_config(
         merged.currency_symbol = v.into();
     }
     if let Some(v) = body.get("costPerKwh").and_then(|v| v.as_f64())
+        && v.is_finite()
         && v >= 0.0
     {
         merged.cost_per_kwh = v;
+    }
+    if let Some(mcp_val) = body.get("mcpServers").and_then(|v| v.as_array()) {
+        let mut new_specs = Vec::new();
+        for item in mcp_val {
+            if let Ok(mut spec) = serde_json::from_value::<McpServerSpec>(item.clone()) {
+                if let Some(existing) = merged.mcp_servers.iter().find(|s| s.name == spec.name) {
+                    if matches!(spec.authorization.as_deref(), Some(SECRET_MASK) | Some("***")) {
+                        spec.authorization = existing.authorization.clone();
+                    }
+                    for (k, v) in &mut spec.headers {
+                        if v == SECRET_MASK || v == "***" {
+                            if let Some(old_v) = existing.headers.get(k) {
+                                *v = old_v.clone();
+                            }
+                        }
+                    }
+                    for (k, v) in &mut spec.env {
+                        if v == SECRET_MASK || v == "***" {
+                            if let Some(old_v) = existing.env.get(k) {
+                                *v = old_v.clone();
+                            }
+                        }
+                    }
+                }
+                new_specs.push(spec);
+            }
+        }
+        merged.mcp_servers = new_specs;
     }
     if let Some(v) = body.get("cloudProviderEnabled").and_then(|v| v.as_bool()) {
         merged.cloud_provider_enabled = v;
@@ -181,6 +287,7 @@ pub(crate) async fn set_config(
     }
     if let Some(v) = body.get("cloudProviderApiKey").and_then(|v| v.as_str())
         && v != SECRET_MASK
+        && v != "***"
     {
         merged.cloud_provider_api_key = v.into();
     }
