@@ -2,13 +2,16 @@ import { Terminal, AlertTriangle } from 'lucide-react';
 import type { StatusPayload } from '../lib/types';
 import { useEngineLogs, LOG_TAIL_LINES } from '../lib/liveLogs';
 import { LogPane } from '../components/ui';
+import { formatBytes } from '../lib/format';
 
-// Dedicated Engine log tab: displays the shared engine-log tail with live polling
-// and staleness feedback when the control plane or log file is unreadable.
-export function LogScreen({ status }: { status: StatusPayload | null }) {
+/** Dedicated Engine log tab: displays the shared engine-log tail with live polling
+ *  when active and staleness feedback when the control plane or log file is unreadable. */
+export function LogScreen({ status, active = true }: { status: StatusPayload | null; active?: boolean }) {
   const engine = status?.engine;
   const logPath = engine?.logPath;
-  const logs = useEngineLogs();
+  const logs = useEngineLogs(active);
+
+  const engineRunning = engine?.state === 'running' || engine?.state === 'external';
 
   return (
     <div className="flex h-full flex-col">
@@ -22,14 +25,21 @@ export function LogScreen({ status }: { status: StatusPayload | null }) {
         ) : (
           <span className="text-[11.5px] text-faint">log appears when the engine starts</span>
         )}
+        {!engineRunning && engine?.state && (
+          <span className="rounded bg-inset px-1.5 py-0.5 font-mono text-[10.5px] text-faint border border-line">
+            {engine.state}
+          </span>
+        )}
         {logs.isStale && (
           <span className="flex items-center gap-1 rounded bg-warn/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warn" title={logs.error ?? 'Polling paused or delayed'}>
             <AlertTriangle size={11} />
-            stale
+            {logs.error ? 'disconnected' : 'stale'}
           </span>
         )}
         <span className="ml-auto font-mono text-[11px] text-faint">
-          {logs.length ? `${logs.length} lines (last ${LOG_TAIL_LINES})` : ''}
+          {logs.length
+            ? `${logs.length} lines${logs.size > 0 ? ` (${formatBytes(logs.size)})` : ''} · tail of ${LOG_TAIL_LINES}`
+            : ''}
         </span>
       </div>
       <div className="min-h-0 flex-1 p-3">

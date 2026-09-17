@@ -190,7 +190,7 @@ export function App() {
                 <EngineScreen status={status} />
               </div>
               <div className={cn('h-full', screen !== 'log' && 'hidden')}>
-                <LogScreen status={status} />
+                <LogScreen status={status} active={screen === 'log'} />
               </div>
               <div className={cn('h-full', screen !== 'models' && 'hidden')}>
                 <ModelsScreen status={status} />

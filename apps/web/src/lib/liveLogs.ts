@@ -33,15 +33,23 @@ export function getLogsState(): EngineLogsState {
   };
 }
 
+export function resetLogs() {
+  lines = [];
+  lastSize = -1;
+  lastOkAt = null;
+  lastError = null;
+  listeners.forEach((l) => l());
+}
+
 async function tick() {
   if (inFlight) return; // never stack polls on a slow control plane
-  if (typeof document !== 'undefined' && document.hidden) return; // pause when tab is hidden
+  if (typeof document !== 'undefined' && document.hidden) return; // pause when browser tab is hidden
   inFlight = (async () => {
     try {
       const r = await getLogs(LOG_TAIL_LINES);
       lastOkAt = Date.now();
       lastError = null;
-      if (r.size === lastSize) return; // no new content appended -> skip re-render notify
+      if (r.size === lastSize && r.lines.length === lines.length) return; // no new content appended -> skip re-render notify
       lastSize = r.size;
       lines = r.lines;
       listeners.forEach((l) => l());
@@ -54,17 +62,19 @@ async function tick() {
   })();
 }
 
-/** Subscribe to the shared engine-log tail. Polling starts with the first
- *  subscriber and stops when the last one unmounts. */
-export function useEngineLogs(): string[] & EngineLogsState {
+/** Subscribe to the shared engine-log tail. Polling starts when the first active
+ *  subscriber mounts and stops when all subscribers unmount or become inactive. */
+export function useEngineLogs(active: boolean = true): string[] & EngineLogsState {
   const [state, setState] = useState<EngineLogsState>(getLogsState);
 
   useEffect(() => {
+    if (!active) return;
+
     const notify = () => setState(getLogsState());
     listeners.add(notify);
 
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && active) {
         void tick();
       }
     };
@@ -87,7 +97,7 @@ export function useEngineLogs(): string[] & EngineLogsState {
         timer = null;
       }
     };
-  }, []);
+  }, [active]);
 
   return Object.assign([...state.lines], state);
 }
