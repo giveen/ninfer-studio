@@ -154,7 +154,7 @@ export async function streamChat(
   body: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
-  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean; source?: 'remote' | 'local' }
 ): Promise<void> {
   const t0 = performance.now();
   const meta: MessageMeta = {};
@@ -227,6 +227,11 @@ export async function streamChat(
   try {
     const endpoint = '/v1/chat/completions';
     const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (opts?.source) {
+      headers['x-ninfer-source'] = opts.source;
+    } else if (opts?.baseUrl) {
+      headers['x-ninfer-source'] = 'remote';
+    }
     if (opts?.baseUrl) {
       headers['x-ninfer-base-url'] = opts.baseUrl;
     }
@@ -387,6 +392,7 @@ export interface StreamToStringOpts {
   baseUrl?: string;
   apiKey?: string;
   extraHeaders?: string;
+  source?: 'local' | 'remote';
   onDelta?: (text: string) => void;
 }
 
@@ -417,7 +423,7 @@ export function streamToString(
         },
         onError: (m) => reject(new Error(m)),
       },
-      { baseUrl: opts?.baseUrl, apiKey: opts?.apiKey, extraHeaders: opts?.extraHeaders }
+      { baseUrl: opts?.baseUrl, apiKey: opts?.apiKey, extraHeaders: opts?.extraHeaders, source: opts?.source }
     );
   });
 }
@@ -484,6 +490,7 @@ export function summarizeConversation(opts: {
   baseUrl?: string;
   apiKey?: string;
   extraHeaders?: string;
+  source?: 'local' | 'remote';
   systemPrompt?: string;
   history: ChatMessage[];
   onDelta?: (text: string) => void;
@@ -510,22 +517,22 @@ export function summarizeConversation(opts: {
 
   const estTokens = sanitizedHistory.reduce((acc, m) => acc + Math.ceil(m.content.length / 3.5), 0);
 
-  const runPass = (model: string, baseUrl?: string, apiKey?: string, extraHeaders?: string) => {
+  const runPass = (model: string, baseUrl?: string, apiKey?: string, extraHeaders?: string, source?: 'local' | 'remote') => {
     const body = buildChatRequest(model, opts.systemPrompt, [...sanitizedHistory, instruction], summaryParams);
     const signal = opts.signal ?? AbortSignal.timeout(180_000);
-    return streamToString(body, signal, { baseUrl, apiKey, extraHeaders, onDelta: opts.onDelta });
+    return streamToString(body, signal, { baseUrl, apiKey, extraHeaders, source, onDelta: opts.onDelta });
   };
 
   const localMax = opts.localMaxContext ?? 8192;
   const useLocal = opts.useLocalCompactor !== false && !!opts.baseUrl && estTokens <= localMax;
   if (useLocal) {
     // Try local NInfer compactor first; fallback to cloud if local is unreachable.
-    return runPass('ninfer', undefined, undefined, undefined).catch(() =>
-      runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders)
+    return runPass('ninfer', undefined, undefined, undefined, 'local').catch(() =>
+      runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders, opts.source)
     );
   }
 
-  return runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders);
+  return runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders, opts.source);
 }
 
 // ---------------------------------------------------------------------------

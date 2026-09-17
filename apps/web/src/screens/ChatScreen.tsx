@@ -267,7 +267,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
       return;
     }
-    const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+    const { model: useModel, baseUrl, apiKey, extraHeaders, source: resolvedSource } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     if (!useModel) return;
 
     setCompacting(true);
@@ -286,6 +286,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         baseUrl,
         apiKey,
         extraHeaders,
+        source: resolvedSource,
         systemPrompt: params.systemPrompt,
         history: [...prior, ...conv.messages],
         signal: ac.signal,
@@ -318,7 +319,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+      const { model: useModel, baseUrl, apiKey, extraHeaders, source: resolvedSource } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
       const runAllowFallback = effectiveAppConfig?.cloudFallbackToLocal !== false;
       setStreaming(true);
       setStreamingConvId(convId);
@@ -351,7 +352,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           const maxAngles = deepResearchMaxAngles;
           setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
           try {
-            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal, baseUrl, apiKey, extraHeaders });
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal, baseUrl, apiKey, extraHeaders, source: resolvedSource });
             if (report && !ac.signal.aborted) {
               const researchMsg: ChatMessage = {
                 role: 'user',
@@ -480,6 +481,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           baseUrl,
           apiKey,
           extraHeaders,
+          source: resolvedSource,
           allowFallback: runAllowFallback,
           system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
           messages: seedMessages,

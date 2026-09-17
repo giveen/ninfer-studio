@@ -205,7 +205,7 @@ export type StreamFn = (
   req: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
-  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean; source?: 'local' | 'remote' }
 ) => Promise<void>;
 
 /** Picks the transport for a turn that didn't request one explicitly: the
@@ -284,6 +284,7 @@ export async function streamTurn(opts: {
   apiKey?: string;
   extraHeaders?: string;
   allowFallback?: boolean;
+  source?: 'local' | 'remote';
   signal: AbortSignal;
   stream?: StreamFn;
   recoverMarkup?: boolean;
@@ -292,7 +293,7 @@ export async function streamTurn(opts: {
 }): Promise<TurnResult> {
   const {
     model, system, messages, params, tools, cacheSystem,
-    baseUrl, apiKey, extraHeaders, allowFallback,
+    baseUrl, apiKey, extraHeaders, allowFallback, source,
     signal, stream = resolveDefaultStreamFn(params), recoverMarkup = true, onDelta, onStreamError
   } = opts;
   let content = '';
@@ -315,7 +316,7 @@ export async function streamTurn(opts: {
       onDone: (m) => { meta = { ...meta, ...m }; finishReason = m.finishReason; },
       onError: (msg) => { onStreamError?.(msg); },
     },
-    { baseUrl, apiKey, extraHeaders, allowFallback }
+    { baseUrl, apiKey, extraHeaders, allowFallback, source }
   );
 
   let recoveredFromMarkup: TurnResult['recoveredFromMarkup'] = null;
@@ -410,6 +411,7 @@ export interface ToolLoopOptions {
   apiKey?: string;
   extraHeaders?: string;
   allowFallback?: boolean;
+  source?: 'local' | 'remote';
   cacheSystem?: boolean;
   /** Append a fresh `contextNoteMessage()` (date/time) to real history
    *  before every internal turn of this loop — persisted, not discarded;
@@ -443,7 +445,7 @@ export interface ToolLoopResult {
 export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult> {
   const {
     model, system, params, tools, registry, maxSteps, signal, stream,
-    baseUrl, apiKey, extraHeaders, allowFallback,
+    baseUrl, apiKey, extraHeaders, allowFallback, source,
     cacheSystem, appendDateTime, recoverMarkup
   } = opts;
   let messages = [...opts.messages];
@@ -463,7 +465,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
     let streamError: string | undefined;
     const t = await streamTurn({
       model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
-      baseUrl, apiKey, extraHeaders, allowFallback,
+      baseUrl, apiKey, extraHeaders, allowFallback, source,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
       onStreamError: (msg) => {
         streamError = msg;

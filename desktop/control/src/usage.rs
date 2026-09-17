@@ -223,13 +223,17 @@ pub(crate) async fn usage_stats(
         m == "ninfer"
             || m.ends_with(".ninfer")
             || m.ends_with(".gguf")
-            || (!m.contains('/') && !cloud_models.contains(m))
+            || m.ends_with(".safetensors")
+            || m.ends_with(".bin")
     };
 
     let is_remote_event = |e: &Value| -> bool {
         let src = e.get("source").and_then(Value::as_str);
         if src == Some("remote") {
             return true;
+        }
+        if src == Some("local") {
+            return false;
         }
         if let Some(m) = e.get("model").and_then(Value::as_str) {
             if !is_local_engine_model(m) {

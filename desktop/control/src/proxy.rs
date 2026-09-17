@@ -237,8 +237,14 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let source = if base_url.is_some() {
+    let explicit_source = headers
+        .get("x-ninfer-source")
+        .and_then(|v| v.to_str().ok());
+
+    let source = if explicit_source == Some("remote") || base_url.is_some() {
         RequestSource::Remote
+    } else if explicit_source == Some("local") {
+        RequestSource::Local
     } else {
         req.extensions()
             .get::<RequestSource>()

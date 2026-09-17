@@ -367,10 +367,10 @@ export function resolveProviderConfig(
   appConfig: AppSettings | null,
   params: Record<string, any>,
   fallbackModel?: string
-): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string } {
+): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string; source: 'remote' | 'local' } {
   if (!appConfig?.cloudProviderEnabled) {
     console.log('[resolveProviderConfig] Cloud disabled -> fallback:', fallbackModel || 'ninfer');
-    return { model: fallbackModel || 'ninfer' };
+    return { model: fallbackModel || 'ninfer', source: 'local' };
   }
 
   const explicitProvider = params[`${role}Provider`] || params.provider;
@@ -388,6 +388,7 @@ export function resolveProviderConfig(
       ? (appConfig.cloudProviderPrimaryModel || appConfig.cloudProviderDefaultModel || 'gpt-4o')
       : (appConfig.cloudProviderSubagentModel || appConfig.cloudProviderDefaultModel || 'gpt-4o-mini');
     const result = {
+      source: 'remote' as const,
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
       extraHeaders: appConfig.cloudProviderExtraHeaders || undefined,
@@ -399,6 +400,7 @@ export function resolveProviderConfig(
 
   console.log('[resolveProviderConfig] Resolved ninfer provider -> fallback:', fallbackModel || 'ninfer');
   return {
+    source: 'local',
     model: fallbackModel && fallbackModel !== 'ninfer' ? fallbackModel : 'ninfer',
   };
 }

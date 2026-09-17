@@ -466,6 +466,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                   primaryCloudModel: opts.coderParams.primaryCloudModel,
                 });
                 const streamOpts = {
+                  source: primaryConfig.source,
                   baseUrl: primaryConfig.baseUrl,
                   apiKey: primaryConfig.apiKey,
                   extraHeaders: primaryConfig.extraHeaders,

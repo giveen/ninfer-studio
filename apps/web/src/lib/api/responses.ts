@@ -302,6 +302,7 @@ export async function streamResponses(
   ccReq: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean; source?: 'local' | 'remote' },
 ): Promise<void> {
   const body = buildResponsesBody(ccReq);
   const t0 = performance.now();
@@ -310,11 +311,22 @@ export async function streamResponses(
 
   let idle: import('./core').StreamIdleController | undefined;
   try {
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (opts?.source) {
+      headers['x-ninfer-source'] = opts.source;
+    } else if (opts?.baseUrl) {
+      headers['x-ninfer-source'] = 'remote';
+    }
+    if (opts?.baseUrl) headers['x-ninfer-base-url'] = opts.baseUrl;
+    if (opts?.apiKey) headers['x-ninfer-api-key'] = opts.apiKey;
+    if (opts?.extraHeaders) headers['x-ninfer-extra-headers'] = opts.extraHeaders;
+    if (opts?.allowFallback === false) headers['x-ninfer-allow-fallback'] = 'false';
+
     const fetched = await fetchStream(
       '/v1/responses',
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify(body),
       },
       { idleTimeoutMs: 180_000, connectTimeoutMs: 60_000, signal },
