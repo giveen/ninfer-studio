@@ -60,6 +60,7 @@ pub struct EngineInner {
     pub adopted: bool,
     pub fail_reason: Option<String>,
     pub deadline: Option<u64>, // unix ms
+    pub spawn_epoch: u64,
 }
 
 impl EngineInner {

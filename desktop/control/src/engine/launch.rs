@@ -61,18 +61,24 @@ async fn validate_launch(state: &S, cfg: &AppSettings) -> Result<std::path::Path
             "message": reason,
         }));
     }
-    // Resolve the engine binary from the configured path. Accepts (private
-    // Windows support):
+    // Resolve the engine binary from the configured path. Accepts:
     //   * a direct file path, e.g. E:\ninfer-windows-...\ninfer-serve.exe
-    //   * a directory containing ninfer-serve.exe (Windows release layout)
-    //   * a directory with build/apps/ninfer-serve (Linux dev checkout)
+    //   * a directory containing ninfer-serve.exe / ninfer-serve (Windows / Linux layout)
+    //   * a directory with build/apps/ninfer-serve (.exe on Windows) (dev checkout)
     let configured = std::path::Path::new(ninfer_path);
+    let dev_bin_name = if cfg!(windows) {
+        "build/apps/ninfer-serve.exe"
+    } else {
+        "build/apps/ninfer-serve"
+    };
     let engine_binary = if configured.is_file() {
         configured.to_path_buf()
     } else if configured.join("ninfer-serve.exe").is_file() {
         configured.join("ninfer-serve.exe")
+    } else if configured.join("ninfer-serve").is_file() {
+        configured.join("ninfer-serve")
     } else {
-        configured.join("build").join("apps").join("ninfer-serve")
+        configured.join(dev_bin_name)
     };
     if !engine_binary.is_file() {
         let reason = format!(
@@ -141,10 +147,10 @@ async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Res
     let artifact_path = std::path::Path::new(&artifact);
 
     // Check for v2 artifacts which are no longer supported by ninfer-serve
-    if let Ok(mut f) = std::fs::File::open(artifact_path) {
-        use std::io::Read;
+    if let Ok(mut f) = tokio::fs::File::open(artifact_path).await {
+        use tokio::io::AsyncReadExt;
         let mut magic = [0u8; 8];
-        if f.read_exact(&mut magic).is_ok()
+        if f.read_exact(&mut magic).await.is_ok()
             && (magic.starts_with(b"NINFER\0") || magic.starts_with(b"NINPRT\0"))
         {
             let version = magic[7] as u32;
@@ -198,8 +204,9 @@ async fn spawn_and_attach(
     log_file_path: String,
     log: tokio::fs::File,
 ) -> Value {
-    {
+    let epoch = {
         let mut eng = state.engine.write().await;
+        eng.spawn_epoch += 1;
         eng.state = EngineState::Starting;
         eng.port = Some(port);
         eng.artifact = Some(artifact.to_string());
@@ -212,14 +219,10 @@ async fn spawn_and_attach(
         eng.adopted = false;
         eng.fail_reason = None;
         eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
-    }
+        eng.spawn_epoch
+    };
 
     let mut cmd = tokio::process::Command::new(engine_binary);
-    // Attach the FULL built command line. `args` carries every flag from the
-    // user's profile (--port, --max-context, --kv-dtype, …); it was previously
-    // only recorded into state.argv for display while the spawned process got
-    // the artifact alone — so packaged apps launched engines at pure defaults
-    // no matter what the GUI said.
     cmd.arg(artifact)
         .args(args)
         .current_dir(engine_binary.parent().unwrap_or(std::path::Path::new(".")))
@@ -237,23 +240,24 @@ async fn spawn_and_attach(
     };
     let pid = child.id();
 
-    // pump stdout+stderr into the log file
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    let log_clone_a = log.try_clone().await.ok();
+    let log_clone_b = log.try_clone().await.ok();
+
     if let Some(stdout) = stdout
-        && let Ok(la) = log.try_clone().await
+        && let Some(mut la) = log_clone_a
     {
         tokio::spawn(async move {
-            let mut la = la;
             let mut so = stdout;
             let _ = tokio::io::copy(&mut so, &mut la).await;
         });
     }
     if let Some(stderr) = stderr
-        && let Ok(lb) = log.try_clone().await
+        && let Some(mut lb) = log_clone_b
     {
         tokio::spawn(async move {
-            let mut lb = lb;
             let mut se = stderr;
             let _ = tokio::io::copy(&mut se, &mut lb).await;
         });
@@ -270,31 +274,33 @@ async fn spawn_and_attach(
         eng.pid = pid;
     }
 
-    spawn_reaper(state.clone());
-    spawn_health_poller(state.clone(), port);
+    spawn_reaper(state.clone(), epoch);
+    spawn_health_poller(state.clone(), port, epoch);
 
     let eng = state.engine.read().await;
     json!({ "ok": true, "engine": public_engine(&eng) })
 }
 
-/// Watch the spawned child and record its exit. The handle stays in
-/// `state.child` (cleared only once the process is actually gone) so the
-/// liveness checks in `refresh_engine_status` and the health poller keep
-/// seeing a *live* child instead of a false "process exited" / "external".
-fn spawn_reaper(state: S) {
+/// Watch the spawned child and record its exit. Bound to a specific `epoch`.
+fn spawn_reaper(state: S, epoch: u64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            if state.engine.read().await.spawn_epoch != epoch {
+                return; // Stale reaper from prior spawn
+            }
             let exited = {
                 let mut g = state.child.lock().await;
                 match g.as_mut() {
                     Some(c) => c.try_wait().ok().flatten().is_some(),
-                    None => return, // slot cleared (e.g. by stop_engine) — nothing to watch
+                    None => return,
                 }
             };
             if exited {
                 let mut eng = state.engine.write().await;
-                if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+                if eng.spawn_epoch == epoch
+                    && (eng.state == EngineState::Starting || eng.state == EngineState::Running)
+                {
                     eng.mark_exited();
                 }
                 *state.child.lock().await = None;
@@ -305,27 +311,45 @@ fn spawn_reaper(state: S) {
 }
 
 /// Poll engine health until it reports ready or the startup deadline passes,
-/// then mark it failed and kill the child.
-fn spawn_health_poller(state: S, port: u16) {
+/// then mark it failed and kill the child. Bound to a specific `epoch`.
+fn spawn_health_poller(state: S, port: u16, epoch: u64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(2000)).await;
+            if state.engine.read().await.spawn_epoch != epoch {
+                return; // Stale poller from prior spawn
+            }
+
             if engine_health(state.as_ref(), port).await {
+                if state.engine.read().await.spawn_epoch != epoch {
+                    return;
+                }
+                // Perform model info probe outside of engine write lock
+                let (mid, mctx) = engine_model_info(state.as_ref(), port).await;
+
                 let mut eng = state.engine.write().await;
-                if eng.state == EngineState::Starting || eng.state == EngineState::Running {
+                if eng.spawn_epoch == epoch
+                    && (eng.state == EngineState::Starting || eng.state == EngineState::Running)
+                {
                     eng.state = EngineState::Running;
                     if eng.model_id.is_none() {
-                        let (mid, mctx) = engine_model_info(state.as_ref(), port).await;
                         eng.assign_model_info(mid, mctx);
                     }
                 }
                 return;
             }
+
+            if state.engine.read().await.spawn_epoch != epoch {
+                return;
+            }
+
             let mut eng = state.engine.write().await;
-            if let Some(deadline) = eng.deadline
+            if eng.spawn_epoch == epoch
+                && let Some(deadline) = eng.deadline
                 && now_ms() > deadline
             {
-                eng.mark_failed(start_timeout_message());
+                let msg = start_timeout_message();
+                fail_and_emit(&mut eng, state.as_ref(), msg.clone(), msg);
                 drop(eng);
                 let mut c = state.child.lock().await;
                 if let Some(c) = c.as_mut() {
@@ -354,8 +378,24 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     };
 
     let args = build_serve_args(&profile, port);
-    // remember what we're about to start (dirty-check source for the UI)
-    {
+
+    let (log_file_path, log) = match open_engine_log(state, port).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let resp = spawn_and_attach(
+        state,
+        &engine_binary,
+        &artifact,
+        &args,
+        port,
+        log_file_path,
+        log,
+    )
+    .await;
+
+    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         let last_start = LastStart {
             port,
             profile: profile.clone(),
@@ -371,45 +411,47 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         .await;
     }
 
-    let (log_file_path, log) = match open_engine_log(state, port).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    resp
+}
 
-    spawn_and_attach(
-        state,
-        &engine_binary,
-        &artifact,
-        &args,
-        port,
-        log_file_path,
-        log,
-    )
-    .await
+/// Gracefully terminate a spawned child process with SIGTERM, waiting up to 8s
+/// before escalating to SIGKILL.
+async fn graceful_kill_child(proc: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = proc.id() {
+            let _ = signal_engine_pid(pid);
+        }
+        if tokio::time::timeout(Duration::from_secs(8), proc.wait())
+            .await
+            .is_err()
+        {
+            let _ = proc.start_kill();
+            let _ = proc.wait().await;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = proc.start_kill();
+        let _ = proc.wait().await;
+    }
 }
 
 pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
-    // 1) our own child: SIGTERM with 8s grace
-    {
-        let child = state.child.lock().await;
-        if child.is_some() {
-            drop(child);
-            {
-                let mut eng = state.engine.write().await;
-                eng.begin_stopping();
-            }
-            let proc = state.child.lock().await.take();
-            if let Some(mut proc) = proc {
-                let _ = proc.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(8), proc.wait()).await;
-                let mut eng = state.engine.write().await;
-                eng.reset_stopped();
-                return json!({ "ok": true, "message": "engine stopped" });
-            }
+    // 1) our own child: SIGTERM with 8s grace using atomic single-lock take
+    let child_proc = state.child.lock().await.take();
+    if let Some(mut proc) = child_proc {
+        {
+            let mut eng = state.engine.write().await;
+            eng.begin_stopping();
         }
+        graceful_kill_child(&mut proc).await;
+        let mut eng = state.engine.write().await;
+        eng.reset_stopped();
+        return json!({ "ok": true, "message": "engine stopped" });
     }
 
-    // 2) explicit pid or adopted external
+    // 2) explicit pid or adopted external (validated against discover_engines)
     let target = {
         let eng = state.engine.read().await;
         external_pid.or(eng.pid)
@@ -420,17 +462,11 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
             (eng.state == EngineState::External, eng.port)
         };
         if is_external {
-            // Same pid policy as adoption: only signal the process actually
-            // serving this engine's port (see `resolve_external_pid`).
             let all = discover_engines().await;
             let cfg_port = state.config.read().await.engine_port;
             let pid = resolve_external_pid(&all, port, cfg_port);
             match pid {
                 None => {
-                    // the port is served (we only get here with the engine already
-                    // health-probed) but its owning process could not be
-                    // identified. Report honestly and keep the state `external` —
-                    // the next reconcile re-checks health and keeps the adoption.
                     return json!({
                         "ok": false,
                         "message": "external engine is serving, but its process could not be identified — stop it manually (Ctrl+C in its terminal window)"
@@ -452,6 +488,17 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
         return json!({ "ok": false, "message": "no engine process is running" });
     };
 
+    // Validate that target PID is a valid discovered ninfer-serve process owned by current user
+    let all = discover_engines().await;
+    let cfg_port = state.config.read().await.engine_port;
+    let validated_pid = resolve_external_pid(&all, state.engine.read().await.port, cfg_port);
+    if validated_pid != Some(target) && !all.iter().any(|d| d.pid == target) {
+        return json!({
+            "ok": false,
+            "message": format!("target pid {target} is not a valid discovered ninfer-serve process")
+        });
+    }
+
     {
         let mut eng = state.engine.write().await;
         eng.begin_stopping();
@@ -470,8 +517,7 @@ pub async fn stop_engine(state: &S, external_pid: Option<u32>) -> Value {
 /// Signal a foreign engine process to stop.
 /// POSIX: SIGTERM via `kill(1)` (avoids a libc dependency).
 /// Windows: no portable graceful signal exists for a foreign console process,
-/// so force-kill via `taskkill /F` — the same thing tokio already does when
-/// stopping our own child on Windows.
+/// so force-kill via `taskkill /F`.
 fn signal_engine_pid(pid: u32) -> bool {
     #[cfg(not(windows))]
     {
@@ -507,4 +553,39 @@ pub fn public_engine(eng: &EngineInner) -> Value {
         "adopted": eng.adopted,
         "failReason": eng.fail_reason,
     })
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_message_matches_constant() {
+        assert!(start_timeout_message().contains("3 minutes"));
+    }
+
+    #[test]
+    fn public_engine_serialization_shape() {
+        let eng = EngineInner {
+            state: EngineState::Running,
+            pid: Some(1234),
+            port: Some(8080),
+            artifact: Some("model.ninfer".to_string()),
+            model_id: Some("qwen2.5-coder".to_string()),
+            max_context: Some(32768),
+            argv: Some(vec!["model.ninfer".to_string(), "--port".to_string(), "8080".to_string()]),
+            started_at: Some(1000),
+            log_path: Some("/tmp/engine-8080.log".to_string()),
+            adopted: false,
+            fail_reason: None,
+            deadline: None,
+            spawn_epoch: 1,
+        };
+        let pub_json = public_engine(&eng);
+        assert_eq!(pub_json["pid"], 1234);
+        assert_eq!(pub_json["port"], 8080);
+        assert_eq!(pub_json["artifact"], "model.ninfer");
+        assert_eq!(pub_json["modelId"], "qwen2.5-coder");
+        assert_eq!(pub_json["maxContext"], 32768);
+    }
 }
