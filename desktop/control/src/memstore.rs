@@ -204,22 +204,23 @@ pub fn mem_rand_suffix() -> String {
 /// or a stale rewrite can clobber a newer append. Keyed by store dir so
 /// distinct stores (different workspaces, or Coder vs Chat) never contend.
 pub fn mem_lock(state: &S, store: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut map = state.memory_locks.lock().unwrap();
+    let mut map = state.memory_locks.lock().unwrap_or_else(|p| p.into_inner());
     map.entry(store.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
-/// `{learnings}` — the shape every memory GET (and the tail of every
+/// `{bank, learnings}` — the shape every memory GET (and the tail of every
 /// memory POST) returns.
 pub async fn read_bank_and_learnings(dir: &Path) -> Value {
+    let bank = read_mem_file(dir, "bank.md", "").await;
     let learnings = read_learnings(dir).await;
-    json!({"learnings": learnings})
+    json!({"bank": bank, "learnings": learnings})
 }
 
 /// Apply the standard POST body shape to `dir` under its store lock, then
-/// return the refreshed `{learnings}`. At most one of the two
-/// fields is expected per call, matching every existing caller:
+/// return the refreshed `{bank, learnings}`:
+///   `{ bank }`            replace the markdown bank wholesale
 ///   `{ learning: {...} }` append one structured learning
 ///   `{ dropLearningId }`  drop a single learning (file rewritten, rest kept)
 pub async fn apply_memory_update(
@@ -230,6 +231,11 @@ pub async fn apply_memory_update(
     let store_key = dir.to_string_lossy().into_owned();
     let store_lock = mem_lock(state, &store_key);
     let _guard = store_lock.lock().await;
+
+    if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
+        write_mem_file(dir, "bank.md", bank).await?;
+    }
+
     if let Some(learning) = req.get("learning").and_then(|v| v.as_object())
         && let Some(text) = learning.get("text").and_then(|v| v.as_str())
     {
@@ -274,19 +280,24 @@ pub async fn apply_memory_update(
         let _ = f.sync_all().await;
     }
     if let Some(drop_id) = req.get("dropLearningId").and_then(|v| v.as_str()) {
-        let keep: Vec<Value> = read_learnings(dir)
-            .await
-            .into_iter()
-            .filter(|l| l.get("id").and_then(|v| v.as_str()) != Some(drop_id))
-            .collect();
-        let content = if keep.is_empty() {
+        let raw = read_mem_file(dir, "learnings.jsonl", "").await;
+        let mut keep_lines = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                if v.get("id").and_then(|v| v.as_str()) == Some(drop_id) {
+                    continue;
+                }
+            }
+            keep_lines.push(trimmed);
+        }
+        let content = if keep_lines.is_empty() {
             String::new()
         } else {
-            keep.iter()
-                .map(|l| serde_json::to_string(l).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n"
+            keep_lines.join("\n") + "\n"
         };
         write_mem_file(dir, "learnings.jsonl", &content).await?;
     }

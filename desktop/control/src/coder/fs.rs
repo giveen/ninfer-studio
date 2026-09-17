@@ -12,8 +12,20 @@ use axum::http::StatusCode;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
+
+static FILE_LOCKS: LazyLock<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn file_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let key = path.to_string_lossy().to_string();
+    let mut map = FILE_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 pub async fn tree(
     AxumState(state): AxumState<S>,
@@ -26,6 +38,19 @@ pub async fn tree(
         .unwrap_or(3)
         .clamp(1, 6);
     let rel = params.get("root").map(|s| s.as_str()).unwrap_or(".");
+    let scope = params
+        .get("scope")
+        .or_else(|| params.get("workspace"))
+        .map(String::as_str)
+        .unwrap_or("default");
+    enforce_perm(
+        &state,
+        scope,
+        "read",
+        Some(rel),
+        params.get("approvalToken").map(String::as_str),
+    )
+    .await?;
     let base = within_ws(&ws_root, rel)?;
     let root_rel = rel_of(&ws_root, &base);
     let ws_owned = ws_root.clone();
@@ -38,66 +63,78 @@ pub async fn tree(
 }
 
 /// Recursive directory listing (blocking): dirs first, then files, both by
-/// name. `rel` uses forward slashes (`.` for the workspace root).
+/// name. `rel` uses forward slashes (`.` for the workspace root). Capped at
+/// 5,000 nodes total to avoid megabyte payload explosions.
 fn tree_nodes(root: &Path, rel: &str, depth: usize, max_depth: usize) -> Vec<Value> {
-    if depth > max_depth {
-        return Vec::new();
-    }
-    let dir = if rel == "." {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut items: Vec<(String, bool, Option<u64>)> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_dir() {
-            if CODER_IGNORE.contains(&name.as_str()) {
-                continue;
-            }
-            items.push((name, true, None));
-        } else if ft.is_file() {
-            let size = entry.metadata().map(|m| m.len()).ok();
-            items.push((name, false, size));
+    fn collect(
+        root: &Path,
+        rel: &str,
+        depth: usize,
+        max_depth: usize,
+        count: &mut usize,
+    ) -> Vec<Value> {
+        if depth > max_depth || *count >= 5000 {
+            return Vec::new();
         }
-    }
-    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    items
-        .into_iter()
-        .map(|(name, is_dir, size)| {
+        let dir = if rel == "." {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let mut items: Vec<(String, bool, Option<u64>)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                if CODER_IGNORE.contains(&name.as_str()) {
+                    continue;
+                }
+                items.push((name, true, None));
+            } else if ft.is_file() {
+                let size = entry.metadata().map(|m| m.len()).ok();
+                items.push((name, false, size));
+            }
+        }
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut res = Vec::new();
+        for (name, is_dir, size) in items {
+            if *count >= 5000 {
+                break;
+            }
+            *count += 1;
             let child_rel = if rel == "." {
                 name.clone()
             } else {
                 format!("{rel}/{name}")
             };
             if is_dir {
-                let children = if depth == max_depth {
+                let children = if depth == max_depth || *count >= 5000 {
                     None
                 } else {
-                    Some(tree_nodes(root, &child_rel, depth + 1, max_depth))
+                    Some(collect(root, &child_rel, depth + 1, max_depth, count))
                 };
                 match children {
-                    Some(c) => {
-                        json!({"name": name, "path": child_rel, "kind": "dir", "children": c})
-                    }
-                    None => json!({"name": name, "path": child_rel, "kind": "dir"}),
+                    Some(c) => res.push(json!({"name": name, "path": child_rel, "kind": "dir", "children": c})),
+                    None => res.push(json!({"name": name, "path": child_rel, "kind": "dir"})),
                 }
             } else {
                 match size {
-                    Some(s) => json!({"name": name, "path": child_rel, "kind": "file", "size": s}),
-                    None => json!({"name": name, "path": child_rel, "kind": "file"}),
+                    Some(s) => res.push(json!({"name": name, "path": child_rel, "kind": "file", "size": s})),
+                    None => res.push(json!({"name": name, "path": child_rel, "kind": "file"})),
                 }
             }
-        })
-        .collect()
+        }
+        res
+    }
+    let mut count = 0;
+    collect(root, rel, depth, max_depth, &mut count)
 }
 
 pub async fn fs_read(
@@ -123,12 +160,28 @@ pub async fn fs_read(
     )
     .await?;
     let full = within_ws(&ws_root, rel)?;
-    let buf = tokio::fs::read(&full).await.map_err(|_| {
+    let meta = tokio::fs::metadata(&full).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("file not found: {rel}")})),
         )
     })?;
+    if meta.len() > 50 * 1024 * 1024 {
+        return Ok(Json(
+            json!({"path": rel, "binary": true, "note": "file too large — not shown"}),
+        ));
+    }
+    use tokio::io::AsyncReadExt as _;
+    let mut file = tokio::fs::File::open(&full).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("file not found: {rel}")})),
+        )
+    })?;
+    let mut buf = Vec::new();
+    let read_limit = (MAX_READ_BYTES + 1) as u64;
+    let _ = file.take(read_limit).read_to_end(&mut buf).await;
+
     if buf.iter().take(8000).any(|&b| b == 0) {
         return Ok(Json(
             json!({"path": rel, "binary": true, "note": "binary file — not shown"}),
@@ -179,6 +232,12 @@ pub async fn fs_write(
             ));
         }
     };
+    if rel.split(['/', '\\']).any(|p| p == ".git" || CODER_IGNORE.contains(&p)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "writing to .git or ignored metadata paths is not allowed"})),
+        ));
+    }
     enforce_perm(
         &state,
         &perm_scope(&req),
@@ -197,6 +256,9 @@ pub async fn fs_write(
             ));
         }
     };
+    let lock = file_lock(&full);
+    let _guard = lock.lock().await;
+
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             (
@@ -209,7 +271,7 @@ pub async fn fs_write(
         .await
         .map(|m| m.is_file())
         .unwrap_or(false);
-    tokio::fs::write(&full, &content).await.map_err(|e| {
+    crate::atomic_write_secret(&full, &content).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write failed: {e}")})),
@@ -234,6 +296,12 @@ pub async fn fs_edit(
             ));
         }
     };
+    if rel.split(['/', '\\']).any(|p| p == ".git" || CODER_IGNORE.contains(&p)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "editing .git or ignored metadata paths is not allowed"})),
+        ));
+    }
     enforce_perm(
         &state,
         &perm_scope(&req),
@@ -259,6 +327,10 @@ pub async fn fs_edit(
         .get("replaceAll")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    let lock = file_lock(&full);
+    let _guard = lock.lock().await;
+
     let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
@@ -266,73 +338,18 @@ pub async fn fs_edit(
         )
     })?;
 
-    // Exact path first, with the same uniqueness guard as the sidecar.
-    let occurrences = file_text.match_indices(&old).count();
-    let (replaced, count) = if occurrences > 0 {
-        if !replace_all && occurrences > 1 {
-            return Ok(Json(
-                json!({"path": rel, "replacements": 0, "error": "old_string is not unique — pass replaceAll:true to replace all"}),
-            ));
+    let (replaced, count) = match apply_edit_hunk(&file_text, &old, &new, replace_all) {
+        Ok(res) => res,
+        Err(err) => {
+            return Ok(Json(json!({
+                "path": rel,
+                "replacements": 0,
+                "error": err,
+            })));
         }
-        let count = if replace_all { occurrences } else { 1 };
-        let replaced = if replace_all {
-            file_text.replace(&old, &new)
-        } else {
-            file_text.replacen(&old, &new, 1)
-        };
-        (replaced, count)
-    } else {
-        // Whitespace-agnostic fallback: slide a trimmed-line window over the file.
-        let old_lines: Vec<&str> = {
-            let mut v: Vec<&str> = old.split('\n').collect();
-            while v.first().is_some_and(|l| l.trim().is_empty()) {
-                v.remove(0);
-            }
-            while v.last().is_some_and(|l| l.trim().is_empty()) {
-                v.pop();
-            }
-            v
-        };
-        if old_lines.is_empty() {
-            return Ok(Json(
-                json!({"path": rel, "replacements": 0, "error": "old_string is empty or only whitespace"}),
-            ));
-        }
-        let file_lines: Vec<&str> = file_text.split('\n').collect();
-        let is_match_at = |i: usize| {
-            file_lines.len() - i >= old_lines.len()
-                && old_lines
-                    .iter()
-                    .enumerate()
-                    .all(|(j, o)| file_lines[i + j].trim() == o.trim())
-        };
-        let hits: Vec<usize> = (0..=file_lines.len().saturating_sub(old_lines.len()))
-            .filter(|&i| is_match_at(i))
-            .collect();
-        if hits.is_empty() {
-            return Ok(Json(
-                json!({"path": rel, "replacements": 0, "error": "old_string not found (even with fuzzy whitespace matching)"}),
-            ));
-        }
-        if hits.len() > 1 && !replace_all {
-            return Ok(Json(
-                json!({"path": rel, "replacements": 0, "error": "old_string matched multiple locations fuzzily — make it more specific or pass replaceAll:true"}),
-            ));
-        }
-        let mut out: Vec<String> = file_lines.iter().map(|s| s.to_string()).collect();
-        // Splice back-to-front so earlier indices stay valid.
-        let targets: Vec<usize> = if replace_all {
-            hits.clone()
-        } else {
-            vec![hits[0]]
-        };
-        for &i in targets.iter().rev() {
-            out.splice(i..i + old_lines.len(), [new.clone()]);
-        }
-        (out.join("\n"), targets.len())
     };
 
-    tokio::fs::write(&full, &replaced).await.map_err(|e| {
+    crate::atomic_write_secret(&full, &replaced).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write failed: {e}")})),
@@ -340,6 +357,7 @@ pub async fn fs_edit(
     })?;
     Ok(Json(json!({"path": rel, "replacements": count})))
 }
+
 /// Apply one old→new replacement: exact match first (with the uniqueness
 /// guard), then a whitespace-agnostic line-window fallback. Pure helper for
 /// atomic multi-hunk patches — every hunk must match or nothing is written.
@@ -349,6 +367,10 @@ fn apply_edit_hunk(
     new: &str,
     replace_all: bool,
 ) -> Result<(String, usize), String> {
+    if old.trim().is_empty() {
+        return Err("old_string is empty or only whitespace".into());
+    }
+    let is_crlf = file_text.contains("\r\n");
     let occurrences = file_text.match_indices(old).count();
     if occurrences > 0 {
         if !replace_all && occurrences > 1 {
@@ -392,10 +414,11 @@ fn apply_edit_hunk(
     let mut out: Vec<String> = file_lines.iter().map(|s| s.to_string()).collect();
     let targets: Vec<usize> = if replace_all { hits } else { vec![hits[0]] };
     let count = targets.len();
+    let line_sep = if is_crlf { "\r\n" } else { "\n" };
     for &i in targets.iter().rev() {
         out.splice(i..i + old_lines.len(), [new.to_string()]);
     }
-    Ok((out.join("\n"), count))
+    Ok((out.join(line_sep), count))
 }
 
 pub async fn fs_patch(
@@ -412,6 +435,12 @@ pub async fn fs_patch(
             ));
         }
     };
+    if rel.split(['/', '\\']).any(|p| p == ".git" || CODER_IGNORE.contains(&p)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "patching .git or ignored metadata paths is not allowed"})),
+        ));
+    }
     enforce_perm(
         &state,
         &perm_scope(&req),
@@ -453,6 +482,10 @@ pub async fn fs_patch(
             }
         }
     }
+
+    let lock = file_lock(&full);
+    let _guard = lock.lock().await;
+
     let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
@@ -475,7 +508,7 @@ pub async fn fs_patch(
             }
         }
     }
-    tokio::fs::write(&full, &working).await.map_err(|e| {
+    crate::atomic_write_secret(&full, &working).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write failed: {e}")})),
@@ -498,6 +531,12 @@ pub async fn fs_udiff(
             ));
         }
     };
+    if rel.split(['/', '\\']).any(|p| p == ".git" || CODER_IGNORE.contains(&p)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "editing .git or ignored metadata paths is not allowed"})),
+        ));
+    }
     enforce_perm(
         &state,
         &perm_scope(&req),
@@ -517,6 +556,9 @@ pub async fn fs_udiff(
             ));
         }
     };
+
+    let lock = file_lock(&full);
+    let _guard = lock.lock().await;
 
     let file_text = tokio::fs::read_to_string(&full).await.map_err(|_| {
         (
@@ -539,7 +581,7 @@ pub async fn fs_udiff(
         )
     })?;
 
-    tokio::fs::write(&full, &applied).await.map_err(|e| {
+    crate::atomic_write_secret(&full, &applied).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write failed: {e}")})),
@@ -554,7 +596,7 @@ pub async fn fs_b64(
     AxumState(state): AxumState<S>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    const MAX_ATTACH_BYTES: usize = 50 * 1024 * 1024;
+    const MAX_ATTACH_BYTES: u64 = 50 * 1024 * 1024;
     let ws_root = resolve_ws(&state, req.get("workspace").and_then(|v| v.as_str())).await?;
     let rel = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p,
@@ -565,21 +607,35 @@ pub async fn fs_b64(
             ));
         }
     };
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "read",
+        Some(rel),
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let full = within_ws(&ws_root, rel)?;
-    let buf = tokio::fs::read(&full).await.map_err(|_| {
+    let meta = tokio::fs::metadata(&full).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("file not found: {rel}")})),
         )
     })?;
-    if buf.len() > MAX_ATTACH_BYTES {
+    if meta.len() > MAX_ATTACH_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(
-                json!({"error": format!("file is {} bytes; attachment limit is 50 MB", buf.len())}),
+                json!({"error": format!("file is {} bytes; attachment limit is 50 MB", meta.len())}),
             ),
         ));
     }
+    let buf = tokio::fs::read(&full).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("read failed: {e}")})),
+        )
+    })?;
     let ext = rel.rsplit('.').next().unwrap_or("").to_lowercase();
     let mime = match ext.as_str() {
         "png" => "image/png",
