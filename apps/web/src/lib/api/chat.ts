@@ -374,43 +374,50 @@ export function summarizeConversation(opts: {
   useLocalCompactor?: boolean;
 }): Promise<string> {
   const instruction: ChatMessage = { role: 'user', content: COMPACTION_INSTRUCTION };
-  // Thinking off for the condensation pass; bound the output so it can't run away.
   const summaryParams: ChatParams = {
     thinking: false,
     reasoningEffort: '',
     preserveThinking: false,
     maxTokens: opts.maxTokens ?? 2048,
   };
-  let targetModel = opts.model;
-  let targetBaseUrl = opts.baseUrl;
-  let targetApiKey = opts.apiKey;
-  let targetExtraHeaders = opts.extraHeaders;
 
-  // Local AI Context Summarizer: If useLocalCompactor is active, route the compaction pass
-  // to the zero-cost local NInfer engine instead of sending thousands of compaction tokens to paid cloud APIs.
-  if (opts.useLocalCompactor !== false && opts.baseUrl) {
-    targetModel = 'ninfer';
-    targetBaseUrl = undefined;
-    targetApiKey = undefined;
-    targetExtraHeaders = undefined;
+  // Bound history to prevent context overflow if history is already past context bounds.
+  // Preserve the first user message (original intent) and recent conversation messages.
+  let sanitizedHistory = opts.history;
+  if (sanitizedHistory.length > 40) {
+    const firstUser = sanitizedHistory.find((m) => m.role === 'user');
+    const recent = sanitizedHistory.slice(-35);
+    sanitizedHistory = firstUser && !recent.includes(firstUser) ? [firstUser, ...recent] : recent;
   }
 
-  const body = buildChatRequest(targetModel, opts.systemPrompt, [...opts.history, instruction], summaryParams);
-  const signal = opts.signal ?? AbortSignal.timeout(180_000);
-  return new Promise<string>((resolve, reject) => {
-    let acc = '';
-    streamChat(body, signal, {
-      onContentDelta: (d) => {
-        acc += d;
-        opts.onDelta?.(d);
-      },
-      onDone: () => {
-        if (signal.aborted) { reject(new DOMException('Compaction aborted', 'AbortError')); return; }
-        resolve(acc.trim());
-      },
-      onError: (m) => reject(new Error(m)),
-    }, { baseUrl: targetBaseUrl, apiKey: targetApiKey, extraHeaders: targetExtraHeaders });
-  });
+  const runPass = (model: string, baseUrl?: string, apiKey?: string, extraHeaders?: string) => {
+    const body = buildChatRequest(model, opts.systemPrompt, [...sanitizedHistory, instruction], summaryParams);
+    const signal = opts.signal ?? AbortSignal.timeout(180_000);
+    return new Promise<string>((resolve, reject) => {
+      let acc = '';
+      streamChat(body, signal, {
+        onContentDelta: (d) => {
+          acc += d;
+          opts.onDelta?.(d);
+        },
+        onDone: () => {
+          if (signal.aborted) { reject(new DOMException('Compaction aborted', 'AbortError')); return; }
+          resolve(acc.trim());
+        },
+        onError: (m) => reject(new Error(m)),
+      }, { baseUrl, apiKey, extraHeaders });
+    });
+  };
+
+  const useLocal = opts.useLocalCompactor !== false && !!opts.baseUrl;
+  if (useLocal) {
+    // Try local NInfer compactor first; fallback to cloud if local is unreachable.
+    return runPass('ninfer', undefined, undefined, undefined).catch(() =>
+      runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders)
+    );
+  }
+
+  return runPass(opts.model, opts.baseUrl, opts.apiKey, opts.extraHeaders);
 }
 
 // ---------------------------------------------------------------------------
