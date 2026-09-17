@@ -317,7 +317,7 @@ export async function streamResponses(
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       },
-      { idleTimeoutMs: 45_000, signal },
+      { idleTimeoutMs: 60_000, connectTimeoutMs: 60_000, signal },
     );
     const r = fetched.response;
     idle = fetched.idle;

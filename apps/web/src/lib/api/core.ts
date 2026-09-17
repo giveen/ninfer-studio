@@ -95,8 +95,8 @@ export async function fetchStream(
   init: RequestInit = {},
   options: { connectTimeoutMs?: number; idleTimeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ response: Response; idle: StreamIdleController }> {
-  const idle = new StreamIdleController(options.idleTimeoutMs ?? 30_000, options.signal);
-  const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
+  const idle = new StreamIdleController(options.idleTimeoutMs ?? 60_000, options.signal);
+  const connectTimeoutMs = options.connectTimeoutMs ?? 60_000;
   // Bounds only the wait for response headers — a long-running body (e.g. a
   // large prompt still prefilling) must not be killed by it, so the timer is
   // cleared as soon as fetch() resolves; AbortSignal.timeout() can't be
