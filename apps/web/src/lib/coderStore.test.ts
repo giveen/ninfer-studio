@@ -199,6 +199,32 @@ describe('coderStore', () => {
       const loaded = loadStore();
       expect(loaded).toEqual({ activeWs: '', activeConv: '', workspaces: {} });
     });
+
+    it('prunes store and retries save on QuotaExceededError', () => {
+      const conv = emptyConv('conv-1');
+      conv.ledger = Array.from({ length: 400 }, (_, i) => ({ id: `l-${i}`, time: i, type: 'bash', label: `cmd ${i}` }));
+      conv.checkpoints = Array.from({ length: 15 }, (_, i) => ({ id: `cp-${i}`, time: i, label: `cp ${i}`, commit: '123', messageCount: 1, ledgerCount: 1, todos: [] }));
+      const store: CoderStore = {
+        activeWs: '/tmp/repo',
+        activeConv: 'conv-1',
+        workspaces: {
+          '/tmp/repo': { expanded: true, conversations: { 'conv-1': conv }, order: ['conv-1'], activeConv: 'conv-1' },
+        },
+      };
+
+      const setItemSpy = vi.spyOn(localStorage, 'setItem');
+      setItemSpy.mockImplementationOnce(() => {
+        throw new Error('QuotaExceededError');
+      });
+
+      const saved = saveStore(store);
+      expect(saved).toBe(true);
+      expect(setItemSpy).toHaveBeenCalledTimes(2);
+
+      const loaded = loadStore();
+      expect(loaded.workspaces['/tmp/repo'].conversations['conv-1'].ledger.length).toBeLessThanOrEqual(300);
+      setItemSpy.mockRestore();
+    });
   });
 
   describe('todoSystemBlock', () => {

@@ -1582,9 +1582,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   // Persist conversations + per-workspace permissions across reloads (debounced).
   useEffect(() => {
     saveStoreDebounced(store, 500, () => {
-      addLog({ type: 'error', label: 'storage', detail: 'Failed to persist conversation store to localStorage (quota exceeded or private mode)' });
+      console.warn('[storage] Failed to persist conversation store to localStorage (quota exceeded or private mode)');
     });
-  }, [store, addLog]);
+  }, [store]);
   // Persist sampling params across reloads.
   useEffect(() => {
     try {

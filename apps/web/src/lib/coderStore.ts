@@ -154,13 +154,43 @@ export function normalizeStore(s: CoderStore): CoderStore {
   }
   return { activeWs, activeConv, workspaces };
 }
+export function pruneStoreForStorage(store: CoderStore): CoderStore {
+  const cloned: CoderStore = JSON.parse(JSON.stringify(store));
+  for (const [wsKey, ws] of Object.entries(cloned.workspaces)) {
+    for (const [convId, conv] of Object.entries(ws.conversations)) {
+      const isActive = wsKey === cloned.activeWs && convId === cloned.activeConv;
+      // Cap ledger entries (active: 300, non-active: 50)
+      const maxLedger = isActive ? 300 : 50;
+      if (conv.ledger && conv.ledger.length > maxLedger) {
+        conv.ledger = conv.ledger.slice(-maxLedger);
+      }
+      // Cap checkpoints (active: 10, non-active: 2)
+      if (conv.checkpoints && conv.checkpoints.length > (isActive ? 10 : 2)) {
+        conv.checkpoints = conv.checkpoints.slice(-(isActive ? 10 : 2));
+      }
+      // Truncate non-active conversation messages if excessive (keep last 60 messages)
+      if (!isActive && conv.messages && conv.messages.length > 60) {
+        conv.messages = conv.messages.slice(-60);
+      }
+    }
+  }
+  return cloned;
+}
+
 export function saveStore(store: CoderStore): boolean {
   try {
     localStorage.setItem(CONV_KEY, JSON.stringify(store));
     return true;
   } catch (err) {
-    console.warn('Failed to persist conversation store to localStorage:', err);
-    return false;
+    console.warn('Failed to persist conversation store to localStorage, attempting pruned save...', err);
+    try {
+      const pruned = pruneStoreForStorage(store);
+      localStorage.setItem(CONV_KEY, JSON.stringify(pruned));
+      return true;
+    } catch (prunedErr) {
+      console.warn('Failed to persist pruned conversation store to localStorage:', prunedErr);
+      return false;
+    }
   }
 }
 
