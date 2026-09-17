@@ -664,7 +664,21 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
     prune_terminal_runs(&mut runs);
     runs.insert(shared.meta.id.clone(), shared.clone());
     drop(runs);
-    tokio::spawn(engine_loop::run(state.clone(), shared.clone()));
+    let s_shared = shared.clone();
+    let state_owned = (*state).clone();
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let res = std::panic::AssertUnwindSafe(engine_loop::run(state_owned, s_shared.clone()))
+            .catch_unwind()
+            .await;
+        if res.is_err() && !s_shared.status().is_terminal() {
+            s_shared.mark_terminal(
+                RunStatus::Error,
+                None,
+                Some("run loop panicked unexpectedly".into()),
+            );
+        }
+    });
     shared
 }
 

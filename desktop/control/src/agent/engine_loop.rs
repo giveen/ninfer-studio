@@ -551,6 +551,9 @@ fn count_lines(text: &str) -> u64 {
 /// Up to `budget` bytes of complete lines, from the start or the end.
 fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        return String::new();
+    }
     let mut selected: Vec<&str> = Vec::new();
     let mut selected_bytes = 0usize;
     let mut index = if from_end {
@@ -559,13 +562,6 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
         0
     };
     loop {
-        if from_end {
-            if index == 0 {
-                break;
-            }
-        } else if index >= lines.len() {
-            break;
-        }
         let line = lines[index];
         if selected_bytes + line.len() > budget {
             break;
@@ -576,11 +572,17 @@ fn complete_line_excerpt(text: &str, budget: usize, from_end: bool) -> String {
             selected.push(line);
         }
         selected_bytes += line.len();
-        index = if from_end {
-            index.saturating_sub(1)
+        if from_end {
+            if index == 0 {
+                break;
+            }
+            index -= 1;
         } else {
-            index + 1
-        };
+            index += 1;
+            if index >= lines.len() {
+                break;
+            }
+        }
     }
     selected.concat()
 }
@@ -850,7 +852,7 @@ pub(crate) async fn stream_turn(
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut meta = Map::new();
-    let mut line_buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut first_chunk: Option<u64> = None;
 
     let mut stream = stream;
@@ -864,9 +866,10 @@ pub(crate) async fn stream_turn(
         if first_chunk.is_none() {
             first_chunk = Some(started.elapsed().as_millis() as u64);
         }
-        line_buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = line_buf.find('\n') {
-            let line: String = line_buf.drain(..=pos).collect();
+        buf.extend_from_slice(&bytes);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches(['\n', '\r']);
             let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
                 continue;
@@ -1085,12 +1088,14 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             &meta.model,
             meta.base_url.as_deref(),
             meta.api_key.as_deref(),
-            "You are an IDEATION pass before implementation. Do NOT write any code and do NOT solve the task. Identify the core difficulty, then list 2-4 genuinely distinct candidate approaches (different algorithms/data structures/designs -- not variations of one idea), noting a pitfall for each. Prose only, no code blocks, under 250 words.",
+            meta.extra_headers.as_deref(),
+            crate::agent::tools::IDEATION_SYSTEM,
             &task,
             Some(0.4),
             Some(1024),
-            Duration::from_secs(30)
-        ).await;
+            Duration::from_secs(30),
+        )
+        .await;
         if let Ok(plan_text) = c {
             shared.append(json!({
                 "role": "assistant",
@@ -1182,6 +1187,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                     if !use_local
                         && meta.base_url.is_some()
                         && meta.allow_fallback
+                        && attempt < 3
                         && matches!(e.status, Some(s) if s == 429 || s >= 500)
                     {
                         use_local = true;
@@ -1209,7 +1215,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 }
             }
         }
-        let turn = turn.expect("Ok branch set it, errors returned");
+        let Some(turn) = turn else { return };
 
         // Append the assistant message (raw reasoning; content with any
         // consumed markup stripped) and record the turn's accounting.
@@ -1233,7 +1239,24 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             live.last_meta = Some(turn.meta.clone());
         }
 
+        // Tell the model about calls it made with names its tool set doesn't
+        // declare (instead of silently dropping them). Sent as user role so
+        // build_request preserves it in transcript.
+        if !turn.dropped.is_empty() {
+            let names = turn.dropped.join(", ");
+            shared.append(json!({
+                "role": "user",
+                "content": format!(
+                    "[System Notice: You called tools that are not available in this session: {names}. Use only the tools listed in your system prompt.]"
+                ),
+            }));
+        }
+
         if turn.tool_calls.is_empty() {
+            if !turn.dropped.is_empty() {
+                turns += 1;
+                continue;
+            }
             if turn.finish_reason.as_deref() == Some("length")
                 && !turn.content.trim().is_empty()
                 && matches!(meta.kind.as_str(), "worker" | "coder")
@@ -1245,12 +1268,15 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                     &shared.meta.model,
                     shared.meta.base_url.as_deref(),
                     shared.meta.api_key.as_deref(),
+                    shared.meta.extra_headers.as_deref(),
                     "A worker's reply was CUT OFF by the token limit mid-generation. Summarize its partial attempt in 3-5 sentences: which approach it was pursuing, what it established, how far it got, and what remains unfinished. Do not try to finish the work yourself.",
                     &snippet,
                     None,
                     Some(512),
-                    Duration::from_secs(30)
-                ).await.unwrap_or_else(|e| format!("(summarization failed: {e})"));
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap_or_else(|e| format!("(summarization failed: {e})"));
                 shared.append(json!({
                     "role": "user",
                     "content": format!("[Worker partial summary: {sum}]")
@@ -1258,8 +1284,17 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 // Token limit mid-turn: hand the next step a continuation
                 // note (the partial reply above stays in the transcript).
                 shared.append(json!({ "role": "user", "content": CUTOFF_NOTE }));
-                turns += 1;
-                continue;
+                match await_turn_hook(&shared, &turn, turns, est_tokens).await {
+                    HookOutcome::Finish => {
+                        finish(&shared, "done");
+                        return;
+                    }
+                    HookOutcome::Continue => {
+                        turns += 1;
+                        continue;
+                    }
+                    HookOutcome::Aborted => return,
+                }
             }
             if turn.content.trim().is_empty() && turn.reasoning.trim().is_empty() {
                 finish_err(
@@ -1289,27 +1324,44 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             });
         }
 
-        // Dispatch in parallel (the client's Promise.all), each leg racing
-        // the stop flag so a stop cancels in-flight tools, not just the
-        // next loop pass.
-        let legs: Vec<_> = turn
-            .tool_calls
-            .iter()
-            .map(|tc| {
+        // Dispatch mutating tools sequentially to prevent race conditions;
+        // dispatch pure read tools concurrently with join_all.
+        let has_mutating = turn.tool_calls.iter().any(|tc| is_mutating_tool(&tc.name));
+        let results = if has_mutating {
+            let mut res_vec = Vec::with_capacity(turn.tool_calls.len());
+            for tc in &turn.tool_calls {
                 let state = state.clone();
                 let run = shared.clone();
                 let (name, args) = (tc.name.clone(), tc.arguments.clone());
-                async move {
-                    let parsed: Value =
-                        serde_json::from_str(&args).unwrap_or(Value::Object(Map::new()));
-                    tokio::select! {
-                        r = tools::dispatch(&state, &run, &name, &parsed) => r,
-                        _ = run.wait_stop() => json!({ "error": "run stopped" }),
+                let parsed: Value = serde_json::from_str(&args)
+                    .unwrap_or_else(|e| json!({ "error": format!("invalid JSON arguments: {e}") }));
+                let r = tokio::select! {
+                    r = tools::dispatch(&state, &run, &name, &parsed) => r,
+                    _ = run.wait_stop() => json!({ "error": "run stopped" }),
+                };
+                res_vec.push(r);
+            }
+            res_vec
+        } else {
+            let legs: Vec<_> = turn
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let state = state.clone();
+                    let run = shared.clone();
+                    let (name, args) = (tc.name.clone(), tc.arguments.clone());
+                    async move {
+                        let parsed: Value = serde_json::from_str(&args)
+                            .unwrap_or_else(|e| json!({ "error": format!("invalid JSON arguments: {e}") }));
+                        tokio::select! {
+                            r = tools::dispatch(&state, &run, &name, &parsed) => r,
+                            _ = run.wait_stop() => json!({ "error": "run stopped" }),
+                        }
                     }
-                }
-            })
-            .collect();
-        let results = join_all(legs).await;
+                })
+                .collect();
+            join_all(legs).await
+        };
 
         for (tc, result) in turn.tool_calls.iter().zip(results) {
             let text = result.to_string();
@@ -1329,19 +1381,6 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             }));
         }
 
-        // Tell the model about calls it made with names its tool set doesn't
-        // declare (instead of silently dropping them).
-        if !turn.dropped.is_empty() {
-            let names = turn.dropped.join(", ");
-            shared.append(json!({
-                "role": "system",
-                "content": format!(
-                    "You called tools that are not available in this session: {names}. \
-            Use only the tools listed above."
-                ),
-            }));
-        }
-
         if let Some(ref critic_model) = meta.critic {
             let turn_input = format!("Turn {} completed. Content: {}", turns, turn.content);
             let critic_sys = "You are a CRITIC reviewing the agent's progress. Evaluate whether the agent is making progress toward the goal or going in circles.";
@@ -1351,6 +1390,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 critic_model.as_str().unwrap_or_default(),
                 shared.meta.base_url.as_deref(),
                 shared.meta.api_key.as_deref(),
+                shared.meta.extra_headers.as_deref(),
                 critic_sys,
                 &turn_input,
                 Some(0.4),
@@ -1360,7 +1400,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             .await;
             if let Ok(critique) = c {
                 shared.append(json!({
-                    "role": "system",
+                    "role": "user",
                     "content": format!("[Critic Review]\n{critique}")
                 }));
             }
@@ -1545,6 +1585,14 @@ pub(crate) fn todo_system_block(todos: &Value) -> String {
     )
 }
 
+/// Returns true if a tool mutates state (files, commands, git, etc.) and must execute sequentially.
+pub(crate) fn is_mutating_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write" | "edit" | "apply_patch" | "udiff_edit" | "bash" | "todo_write" | "git_commit"
+    )
+}
+
 /// One-shot engine chat for the auxiliary passes (worker ideation, critic
 /// review): stream `/v1/chat/completions` and return the final content. No
 /// usage tap, no events — these are best-effort helper calls.
@@ -1555,6 +1603,7 @@ pub(crate) async fn chat_once(
     model: &str,
     base_url: Option<&str>,
     api_key_override: Option<&str>,
+    extra_headers: Option<&str>,
     system: &str,
     user: &str,
     temperature: Option<f64>,
@@ -1592,6 +1641,19 @@ pub(crate) async fn chat_once(
         .post(&url)
         .header("content-type", "application/json")
         .body(raw);
+    if let Some(eh) = extra_headers
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh)
+    {
+        for (k, v) in parsed {
+            if let Some(s) = v.as_str() {
+                let name: Result<reqwest::header::HeaderName, _> = k.parse();
+                let value: Result<reqwest::header::HeaderValue, _> = s.parse();
+                if let (Ok(name), Ok(value)) = (name, value) {
+                    req = req.header(name, value);
+                }
+            }
+        }
+    }
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key.as_str());
     }
@@ -2206,5 +2268,48 @@ mod tests {
         assert_eq!(snap.status, RunStatus::Stopped);
         assert_eq!(snap.stop.as_deref(), Some("aborted"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn complete_line_excerpt_from_end_includes_line_zero() {
+        let single_line = "single line\n";
+        let excerpt = complete_line_excerpt(single_line, 100, true);
+        assert_eq!(excerpt, "single line\n");
+
+        let multi = "line 1\nline 2\nline 3\n";
+        let excerpt_multi = complete_line_excerpt(multi, 100, true);
+        assert_eq!(excerpt_multi, "line 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn build_request_preserves_user_system_notices() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "[System Notice: You called tools that are not available in this session: foo.]" }),
+            json!({ "role": "user", "content": "[Critic Review]\nNeeds refactoring" }),
+        ];
+        let req = build_request("m", None, &msgs, &json!({}), &json!([]), false);
+        let out_msgs = req["messages"].as_array().unwrap();
+        assert_eq!(out_msgs.len(), 2);
+        assert_eq!(out_msgs[0]["role"], "user");
+        assert!(out_msgs[0]["content"].as_str().unwrap().contains("System Notice"));
+        assert_eq!(out_msgs[1]["role"], "user");
+        assert!(out_msgs[1]["content"].as_str().unwrap().contains("Critic Review"));
+    }
+
+    #[test]
+    fn tool_mutation_classification() {
+        assert!(is_mutating_tool("write"));
+        assert!(is_mutating_tool("edit"));
+        assert!(is_mutating_tool("apply_patch"));
+        assert!(is_mutating_tool("udiff_edit"));
+        assert!(is_mutating_tool("bash"));
+        assert!(is_mutating_tool("todo_write"));
+        assert!(is_mutating_tool("git_commit"));
+
+        assert!(!is_mutating_tool("read"));
+        assert!(!is_mutating_tool("grep"));
+        assert!(!is_mutating_tool("glob"));
+        assert!(!is_mutating_tool("repo_search"));
+        assert!(!is_mutating_tool("obs_recall"));
     }
 }
