@@ -7,6 +7,7 @@ import { formatBytes, formatPct } from './lib/format';
 import { applyTheme, getStoredTheme, subscribeTheme, type ThemeMode } from './lib/theme';
 import { CoderSafetyProvider } from './lib/coderSafety';
 import { ChatAgentProvider } from './lib/chatAgent';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ChatScreen } from './screens/ChatScreen';
 import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
@@ -37,7 +38,7 @@ function EnginePill({ status }: { status: StatusPayload | null }) {
     failed: { dot: 'bg-danger', label: 'failed' },
     external: { dot: 'bg-info', label: e.adopted ? 'external' : 'running' },
   };
-  const m = map[e.state] || map.stopped;
+  const m = map[e.state] || { dot: 'bg-faint', label: e.state || 'unknown' };
   return (
     <span
       className="inline-flex items-center gap-2 rounded-full border border-line bg-panel px-3 py-1.5 text-[12px] text-mute"
@@ -66,7 +67,7 @@ function GpuChip({ status }: { status: StatusPayload | null }) {
         />
       </span>
       <span className="font-mono text-[11.5px]">
-        {formatBytes(g.memUsedMiB! * 1024 * 1024)} / {formatBytes(g.memTotalMiB! * 1024 * 1024)}
+        {g.memUsedMiB != null ? formatBytes(g.memUsedMiB * 1024 * 1024) : '—'} / {formatBytes(g.memTotalMiB * 1024 * 1024)}
       </span>
       <span className="font-mono text-[11.5px] text-faint">{g.utilPct ?? 0}%</span>
       <span className="text-[10.5px] uppercase tracking-wider">{formatPct(g.memUsedMiB, g.memTotalMiB)} vram</span>
@@ -81,10 +82,19 @@ export function App() {
   const { status, error } = useStatus(2500);
 
   useEffect(() => {
+    let cancelled = false;
     getCoderWorkspace()
-      .then((w) => setCoderWs(w.workspace))
+      .then((w) => {
+        if (!cancelled && w?.workspace) setCoderWs(w.workspace);
+      })
       .catch(() => undefined);
-  }, []);
+    if (status?.config?.coderWorkspace) {
+      setCoderWs(status.config.coderWorkspace);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [status?.config?.coderWorkspace]);
 
   useEffect(() => {
     applyTheme(theme);
@@ -107,6 +117,8 @@ export function App() {
     system: 'Switch to dark theme',
   };
 
+  const activePort = status?.engine?.port ?? status?.config?.enginePort;
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* left rail */}
@@ -117,6 +129,7 @@ export function App() {
         {NAV.map((n) => (
           <button
             key={n.id}
+            type="button"
             onClick={() => setScreen(n.id)}
             title={n.label}
             aria-label={n.label}
@@ -158,9 +171,9 @@ export function App() {
             <GpuChip status={status} />
           </div>
           <div className="ml-auto flex items-center gap-3 text-[11.5px] text-faint">
-            {status?.config && (
+            {activePort != null && (
               <span className="font-mono">
-                engine <span className="text-mute">:{status.config.enginePort}</span>
+                engine <span className="text-mute">:{activePort}</span>
               </span>
             )}
             {error && (
@@ -181,22 +194,34 @@ export function App() {
           <CoderSafetyProvider>
             <ChatAgentProvider>
               <div className={cn('h-full', screen !== 'chat' && 'hidden')}>
-                <ChatScreen status={status} onNavigate={setScreen} />
+                <ErrorBoundary name="Chat Screen">
+                  <ChatScreen status={status} onNavigate={setScreen} />
+                </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'code' && 'hidden')}>
-                <CoderScreen coderWs={coderWs} />
+                <ErrorBoundary name="Code Screen">
+                  <CoderScreen coderWs={coderWs} />
+                </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'engine' && 'hidden')}>
-                <EngineScreen status={status} />
+                <ErrorBoundary name="Engine Screen">
+                  <EngineScreen status={status} />
+                </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'log' && 'hidden')}>
-                <LogScreen status={status} active={screen === 'log'} />
+                <ErrorBoundary name="Log Screen">
+                  <LogScreen status={status} active={screen === 'log'} />
+                </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'models' && 'hidden')}>
-                <ModelsScreen status={status} onNavigate={setScreen} />
+                <ErrorBoundary name="Models Screen">
+                  <ModelsScreen status={status} onNavigate={setScreen} />
+                </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
-                <SettingsScreen status={status} />
+                <ErrorBoundary name="Settings Screen">
+                  <SettingsScreen status={status} />
+                </ErrorBoundary>
               </div>
             </ChatAgentProvider>
           </CoderSafetyProvider>
@@ -205,3 +230,4 @@ export function App() {
     </div>
   );
 }
+
