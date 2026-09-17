@@ -690,21 +690,15 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
     match name {
         "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree"
         | "memory" => {
-            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) {
-                body["workspace"] = json!(scope);
-            }
+            body["workspace"] = json!(scope);
         }
         "bash" => {
             if body.get("cwd").map(|v| v.is_null()).unwrap_or(true) {
                 body["cwd"] = json!(scope);
             }
-            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) {
-                body["workspace"] = json!(scope);
-            }
+            body["workspace"] = json!(scope);
         }
-        "repo_search" | "repo_map" | "git_diff" | "web_fetch" | "web_search" | "browser"
-            if body.get("workspace").map(|v| v.is_null()).unwrap_or(true) =>
-        {
+        "repo_search" | "repo_map" | "git_diff" | "web_fetch" | "web_search" | "browser" => {
             body["workspace"] = json!(scope);
         }
         _ => {}

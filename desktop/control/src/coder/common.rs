@@ -265,7 +265,11 @@ pub(crate) async fn enforce_perm(
     approval_token: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let all_perms = state.coder_perms.read().await;
-    let perms = all_perms.get(scope).cloned().unwrap_or_default();
+    let perms = all_perms
+        .get(scope)
+        .or_else(|| all_perms.get("default"))
+        .cloned()
+        .unwrap_or_default();
     drop(all_perms);
     let tier = tier_for(&perms, tool);
     if tier == PermTier::Deny {
