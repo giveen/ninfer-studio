@@ -332,7 +332,7 @@ export class RunStream {
     const { response: r, idle } = await fetchStream(
       `/api/agent/runs/${encodeURIComponent(this.runId)}/events`,
       {},
-      { idleTimeoutMs: 60_000, signal: this.ctrl.signal },
+      { idleTimeoutMs: 180_000, signal: this.ctrl.signal },
     );
     try {
       if (!r.ok || !r.body) {

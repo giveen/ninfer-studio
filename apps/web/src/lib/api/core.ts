@@ -46,7 +46,7 @@ export class StreamIdleController {
   public readonly signal: AbortSignal;
 
   constructor(
-    public readonly idleTimeoutMs = 30_000,
+    public readonly idleTimeoutMs = 180_000,
     private callerSignal?: AbortSignal,
   ) {
     this.signal = callerSignal
@@ -95,7 +95,7 @@ export async function fetchStream(
   init: RequestInit = {},
   options: { connectTimeoutMs?: number; idleTimeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ response: Response; idle: StreamIdleController }> {
-  const idle = new StreamIdleController(options.idleTimeoutMs ?? 60_000, options.signal);
+  const idle = new StreamIdleController(options.idleTimeoutMs ?? 180_000, options.signal);
   const connectTimeoutMs = options.connectTimeoutMs ?? 60_000;
   // Bounds only the wait for response headers — a long-running body (e.g. a
   // large prompt still prefilling) must not be killed by it, so the timer is
