@@ -160,6 +160,7 @@ mod adopt_policy_tests {
         DiscoveredEngine {
             pid,
             port,
+            start_time: None,
             argv: vec![],
             artifact: None,
         }
