@@ -389,6 +389,40 @@ pub async fn serve_until_ready(
     axum::serve(listener, build_router(state, true)).await
 }
 
+/// Resolve the control plane port from `NINFIER_STUDIO_PORT` env var, falling back to 8787.
+pub fn control_plane_port() -> u16 {
+    std::env::var("NINFIER_STUDIO_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8787)
+}
+
+/// Unified boot sequence for both standalone dev mode and the Tauri desktop app:
+/// 1. Boot-time engine adoption (`boot_adopt`)
+/// 2. Remote Access listener initialization (`remote::boot_start`), with conflict checks
+/// 3. Loopback server binding (`serve_until_ready`)
+pub async fn boot(
+    state: S,
+    port: u16,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+) -> std::io::Result<()> {
+    boot_adopt(&state).await;
+
+    let remote_port = state.config.read().await.remote_access_port;
+    if remote_port == port {
+        tracing::event!(
+            name: "remote_access.port_conflict",
+            tracing::Level::WARN,
+            port,
+            "Remote Access port ({port}) conflicts with control plane port ({port}); disabling Remote Access on boot"
+        );
+    } else {
+        remote::boot_start(&state).await;
+    }
+
+    serve_until_ready(state, port, ready).await
+}
+
 /// Boot-time adoption of an externally running engine on the configured port.
 pub async fn boot_adopt(state: &S) {
     let port = state.config.read().await.engine_port;
@@ -538,6 +572,17 @@ pub fn default_dist_dir() -> PathBuf {
 pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     let data_dir = default_data_dir();
     let dist_dir = default_dist_dir();
+    let dist_index = dist_dir.join("index.html");
+    if !dist_index.exists() {
+        tracing::event!(
+            name: "control_plane.dist.missing",
+            tracing::Level::WARN,
+            dist_dir = ?dist_dir,
+            index_path = ?dist_index,
+            "web dist UI missing at {:?} (run 'pnpm build' in apps/web) — API active, but static web UI will return 404",
+            dist_index
+        );
+    }
     let state = Arc::new(State::new(data_dir, dist_dir, event_tx));
     // load persisted config
     let p = state.data_dir.join("config.json");

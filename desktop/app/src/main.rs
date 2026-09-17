@@ -22,11 +22,11 @@ use mimalloc::MiMalloc;
 use tauri::{Manager, WindowEvent};
 
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static ALLOCATOR: MiMalloc = MiMalloc;
 
 use ninfier_control::engine::S;
 use ninfier_control::types::AppEvent;
-use ninfier_control::{boot_adopt, init_state, serve_until_ready};
+use ninfier_control::{boot, control_plane_port, init_state};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(feature = "tray")]
@@ -183,10 +183,7 @@ fn main() {
             }
 
             // ---- control plane on a dedicated tokio runtime ------------------
-            let port: u16 = std::env::var("NINFIER_STUDIO_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8787);
+            let port = control_plane_port();
 
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
             std::thread::spawn(move || {
@@ -197,9 +194,7 @@ fn main() {
                 rt.block_on(async move {
                     let state = init_state(Some(ev_tx)).await;
                     *control_state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
-                    boot_adopt(&state).await;
-                    ninfier_control::remote::boot_start(&state).await;
-                    if let Err(e) = serve_until_ready(state, port, Some(ready_tx)).await {
+                    if let Err(e) = boot(state, port, Some(ready_tx)).await {
                         tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {error}");
                     }
                 });
