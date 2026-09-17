@@ -171,7 +171,7 @@ describe('runToolLoop', () => {
       ]),
     });
     expect(handler).not.toHaveBeenCalled();
-    const nudge = res.messages.find((m) => m.role === 'system');
+    const nudge = res.messages.find((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('[System: your tool-call markup'));
     expect(nudge?.content).toContain('bash');
     expect(nudge?.content).toContain('web_search');
     expect(res.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'I cannot run shell commands here.' });
