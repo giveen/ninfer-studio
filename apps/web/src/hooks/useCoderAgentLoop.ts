@@ -2,7 +2,7 @@ import { useRef, useCallback } from 'react';
 import type { ChatMessage, AgentToolCall, ChatParams } from '../lib/types';
 import type { CoderMemory } from '../lib/api/coder';
 import type { LogEntry, TodoItem, CoderStore } from '../lib/coderStore';
-import type { McpToolInfo } from '../lib/api';
+import type { McpToolInfo, ChatStreamCallbacks } from '../lib/api';
 import type { CoderParams, QueuedItem } from '../components/coder/CoderComposer';
 import {
   getStatus,
@@ -86,6 +86,13 @@ export interface UseCoderAgentLoopOptions {
   storeRef: React.MutableRefObject<CoderStore>;
   setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
   runSubagent: (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps?: number, allowedTools?: string[], depth?: number) => Promise<string>;
+  stream?: (
+    req: Record<string, unknown>,
+    signal: AbortSignal,
+    label: string,
+    cb: ChatStreamCallbacks,
+    opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
+  ) => Promise<unknown>;
 }
 
 export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
@@ -453,12 +460,16 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                   primaryProvider: opts.coderParams.primaryProvider,
                   primaryCloudModel: opts.coderParams.primaryCloudModel,
                 });
-                return streamChat(r, sig, cb, {
+                const streamOpts = {
                   baseUrl: primaryConfig.baseUrl,
                   apiKey: primaryConfig.apiKey,
                   extraHeaders: primaryConfig.extraHeaders,
                   allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
-                });
+                };
+                if (opts.stream) {
+                  return opts.stream(r, sig, 'coder', cb, streamOpts);
+                }
+                return streamChat(r, sig, cb, streamOpts);
               },
               onStreamError: (msg) => {
                 streamErrorMsg = msg;

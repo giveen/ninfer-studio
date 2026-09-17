@@ -70,7 +70,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const activeConv = store.activeConv;
   const activeMeta = store.workspaces[activeWs]?.conversations[activeConv];
   /** Effective workspace directory: worktree if set, otherwise the main workspace root. */
-  const activeWsDir = activeMeta?.worktree ? `${activeWs}/${activeMeta.worktree}` : activeWs;
+  const activeWsDir = activeMeta?.worktree
+    ? `${activeWs}/${activeMeta.worktree}`.replace(/\\/g, '/').replace(/\/+/g, '/')
+    : activeWs;
 
   const initialMeta = activeMeta;
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
@@ -78,7 +80,18 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [running, setRunning] = useState(false);
   const [appConfig, setAppConfig] = useState<any>(null);
   useEffect(() => {
-    getConfig().then(setAppConfig).catch(() => {});
+    let timer: number | null = null;
+    const fetchCfg = () => {
+      getConfig()
+        .then(setAppConfig)
+        .catch(() => {
+          timer = window.setTimeout(fetchCfg, 5000);
+        });
+    };
+    fetchCfg();
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+    };
   }, []);
   // When the agent pauses via ask_user, this holds the question and the run halts
   // until the user answers (release blocker #5 — human-in-the-loop).
@@ -123,11 +136,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   /** Briefly highlights the todos panel so a freshly-created list (empty →
    *  populated) catches the eye instead of silently appearing in the sidebar. */
   const [todosJustCreated, setTodosJustCreated] = useState(false);
+  const flashTimerRef = useRef<number | null>(null);
   const flashTodosCreated = () => {
     setTodosJustCreated(false);
     requestAnimationFrame(() => setTodosJustCreated(true));
-    window.setTimeout(() => setTodosJustCreated(false), 1800);
+    if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      setTodosJustCreated(false);
+      flashTimerRef.current = null;
+    }, 1800);
   };
+  useEffect(() => {
+    return () => {
+      if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    };
+  }, []);
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
   // Re-pointed control-plane workspace + flush counter (see the workspace effect below);
@@ -196,7 +219,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!llmPhase) return;
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
-  }, [llmPhase ? 1 : 0]);
+  }, [!!llmPhase]);
   // Commit panel collapse state lives in useCoderGit.
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
@@ -530,7 +553,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   /** Create a fresh conversation inside a workspace and make it active. */
   const newChat = (ws: string = activeWs) => {
-    if (running) return; // don't start a new conversation mid-run (P0 #2)
+    if (running) {
+      addLog({ type: 'error', label: 'chat', detail: 'Cannot create new conversation while an agent run is in flight. Stop the current run first.' });
+      return;
+    }
     if (!ws) return;
     const id = newConvId();
     setStore((prev) => {
@@ -549,7 +575,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   /** Fork the active conversation: duplicate its transcript into a new thread. */
   const forkConversation = () => {
-    if (running || !activeWs || !activeConv) return;
+    if (running) {
+      addLog({ type: 'error', label: 'chat', detail: 'Cannot fork conversation while an agent run is in flight. Stop the current run first.' });
+      return;
+    }
+    if (!activeWs || !activeConv) return;
     const src = storeRef.current.workspaces[activeWs]?.conversations[activeConv];
     if (!src) return;
     const id = newConvId();
@@ -1043,9 +1073,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     const target = typeof args.path === 'string' ? args.path : '';
     if (target) {
+      const normTarget = target.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
       const hit = perms.denyPaths.find((d) => {
-        const clean = d.trim().replace(/\/+$/, '');
-        return clean !== '' && (target === clean || target.startsWith(clean + '/'));
+        const clean = d.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+        return clean !== '' && (normTarget === clean || normTarget.startsWith(clean + '/'));
       });
       if (hit) return `Denied by workspace permissions (path is under denied prefix "${hit.trim()}").`;
     }
@@ -1168,6 +1199,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     [/\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b/i, 'installs a global package'],
   ];
   const detectRisky = (cmd: string): string | null => {
+    const trimmed = cmd.trim();
+    if (isReadOnlyCommand(trimmed)) return null;
     for (const [re, why] of RISKY_PATTERNS) if (re.test(cmd)) return why;
     return null;
   };
@@ -1181,8 +1214,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const addApprovedCommand = (cmd: string) => {
     const norm = normalizeCommand(cmd);
+    const targetWs = runConvRef.current?.ws ?? storeRef.current.activeWs;
     setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
+      const wsd = prev.workspaces[targetWs];
       if (!wsd) return prev;
       const cur = wsd.perms?.approvedCommands || [];
       if (cur.includes(norm)) return prev;
@@ -1190,7 +1224,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         ...prev,
         workspaces: {
           ...prev.workspaces,
-          [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: [...cur, norm] } },
+          [targetWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: [...cur, norm] } },
         },
       };
     });
@@ -1381,6 +1415,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     activeWs,
     activeConv,
     activeWsDir,
+    stream: trackedStream,
     setRunConv,
     setRunning,
     stoppedRef,
