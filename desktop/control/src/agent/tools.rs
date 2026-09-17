@@ -1126,4 +1126,25 @@ mod tests {
         assert_eq!(out, None);
         assert!(snap.pending_approvals.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_all_advertised_tools_have_dispatch_arms() {
+        let state = fresh_state();
+        let tools = [
+            "read", "grep", "glob", "write", "edit", "apply_patch", "udiff_edit",
+            "bash", "bash_poll", "web_fetch", "web_search", "browser", "git_diff", "repo_search",
+            "ask_user", "todo_write", "obs_recall", "delegate", "subagent",
+            "memory_update", "memory_recall", "git_commit", "git_branch", "git_worktree", "git_pr", "ast_grep"
+        ];
+        let shared = crate::agent::run::test_run(&state, "coder", &tools, None);
+        for t in tools {
+            let res = dispatch(&state, &shared, t, &serde_json::json!({})).await;
+            let err_msg = res.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                !err_msg.starts_with("unknown tool"),
+                "Tool '{t}' has no dispatch arm in tools.rs! Returned error: {err_msg}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
+    }
 }

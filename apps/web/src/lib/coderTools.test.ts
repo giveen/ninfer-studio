@@ -38,6 +38,13 @@ describe('coderTools', () => {
       const filtered = filterToolsByConfig(TOOLS, { coderRepoMapEnabled: false });
       expect(filtered.some((t) => t.function.name === 'repo_map')).toBe(false);
     });
+
+    it('ensures every advertised tool in TOOLS is categorized', () => {
+      const allCategoryTools = new Set([...READONLY_TOOL_NAMES, ...WORKER_TOOL_NAMES, ...MUTATING_TOOLS]);
+      for (const tool of TOOLS) {
+        expect(allCategoryTools.has(tool.function.name)).toBe(true);
+      }
+    });
   });
 
   describe('filterToolAllowList', () => {
