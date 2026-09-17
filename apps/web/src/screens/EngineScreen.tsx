@@ -5,9 +5,8 @@ import { BLANK_PROFILE, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
 import {
-  getLatestRequestMetrics,
-  subscribeLatestRequestMetrics,
-  type LiveRequestMetrics,
+  isLiveMetricsStale,
+  useLatestRequestMetrics,
 } from '../lib/liveMetrics';
 import { Badge, Button, CodeBlock, SectionCard, Stat, cn } from '../components/ui';
 import { BasicsTab } from './engine/BasicsTab';
@@ -38,41 +37,28 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex flex-col gap-0.5">
       <span className="text-[10.5px] uppercase tracking-wider text-faint">{label}</span>
-      <span className="font-mono text-[14px] leading-none text-ink">{value}</span>
+      <span className="font-mono text-sm font-medium text-main">{value}</span>
     </div>
   );
 }
 
-export function EngineScreen({ status }: { status: StatusPayload | null }) {
-  const engine = status?.engine;
-  const gpu = status?.gpu;
-  const artifacts = status?.artifacts || [];
-  const [profile, setProfile] = useState<EngineProfile>(() => ({ ...PRESETS[1].profile }));
-  /** The preset the current profile came from (badge next to the launch command). */
-  const [appliedPresetId, setAppliedPresetId] = useState<string | null>(() => PRESETS[1].id);
+export function EngineScreen({
+  engine,
+  settings: _settings,
+  onSaveConfig: _onSaveConfig,
+}: {
+  engine: StatusPayload | null;
+  settings: AppSettings;
+  onSaveConfig: (c: Partial<AppSettings>) => Promise<void>;
+}) {
+  const [tab, setTab] = useState<EngineTab>('basics');
+  const [profile, setProfile] = useState<EngineProfile>({ ...PRESETS[1].profile });
   const [artifact, setArtifact] = useState<string>('');
   const [saved, setSaved] = useState<SavedProfile[]>([]);
+  const [appliedPresetId, setAppliedPresetId] = useState<string | null>(PRESETS[1].id);
   const [loaded, setLoaded] = useState(false);
-  const [saveName, setSaveName] = useState('');
-  const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
-  const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
-  useEffect(() => {
-    if (!notice) return;
-    const t = setTimeout(() => setNotice(null), 5000);
-    return () => clearTimeout(t);
-  }, [notice]);
-  const [tab, setTab] = useState<EngineTab>('basics');
+  const [busy, setBusy] = useState(false);
 
-  // Global request-default settings (reasoning effort). The Engine screen is
-  // where the user picks thinking levels, but the value is applied by the proxy
-  // to every request as a chat_template_kwargs default.
-  const [settings, setSettings] = useState<AppSettings | null>(null);
-  useEffect(() => {
-    getConfig().then(setSettings).catch(() => undefined);
-  }, []);
-
-  // Hydrate the engine profile, chosen artifact, and saved named profiles from
-  // the user's profile dir on the control plane (survives app restarts).
   useEffect(() => {
     let cancelled = false;
     getProfileState()
@@ -95,11 +81,11 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
 
   // Live token metrics from the most recent chat request (lifted from the SSE
   // `timings`/`usage` so they show here, not just in the chat footer).
-  const [liveMetrics, setLiveMetrics] = useState<LiveRequestMetrics | null>(getLatestRequestMetrics());
-  useEffect(() => subscribeLatestRequestMetrics(setLiveMetrics), []);
+  const liveMetrics = useLatestRequestMetrics();
+  const isStale = isLiveMetricsStale(liveMetrics);
 
-  const running = engine?.state === 'running' || engine?.state === 'external';
-  const starting = engine?.state === 'starting' || engine?.state === 'stopping';
+  const running = engine?.engine?.state === 'running' || engine?.engine?.state === 'external';
+  const starting = engine?.engine?.state === 'starting' || engine?.engine?.state === 'stopping';
 
   // The restart-dirty verdict is computed by the control plane (single source
   // of truth; debounced + sequenced so a stale response can't answer a newer
@@ -403,9 +389,11 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
 
         {/* live token metrics from the most recent chat request */}
         {liveMetrics?.meta && (
-          <div className="rounded-lg border border-line bg-inset px-3.5 py-3">
+          <div className={cn("rounded-lg border border-line bg-inset px-3.5 py-3 transition-opacity", isStale && "opacity-60")}>
             <div className="mb-2 flex items-center justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-faint">last request metrics</span>
+              <span className="text-[11px] font-medium uppercase tracking-wider text-faint">
+                last request metrics {isStale && <span className="normal-case font-normal text-warn/80 ml-1">(stale)</span>}
+              </span>
               <span className="font-mono text-[10.5px] text-faint">{liveMetrics.model} · {formatTime(liveMetrics.at)}</span>
             </div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
