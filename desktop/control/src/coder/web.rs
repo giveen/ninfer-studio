@@ -2,8 +2,8 @@
 
 //! Web tools for the coder harness: `web_fetch` (HTML→text with resolved
 //! image/link Markdown, SSRF-guarded against loopback/LAN/metadata
-//! targets, manual redirect re-checking) and `web_search` (DuckDuckGo HTML
-//! endpoint scraping, like the sidecar).
+//! targets, manual redirect re-checking with pinned DNS) and `web_search`
+//! (DuckDuckGo HTML endpoint scraping, like the sidecar).
 
 use super::common::{enforce_perm, perm_scope};
 use crate::engine::S;
@@ -11,21 +11,21 @@ use axum::Json;
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// Keep the first `max` chars of `s`, reporting whether it was cut.
+/// Keep the first `max` chars of `s`, reporting whether it was cut. Single-pass.
 fn truncate_chars(s: &str, max: usize) -> (String, bool) {
-    if s.chars().count() > max {
-        (s.chars().take(max).collect(), true)
+    if let Some((idx, _)) = s.char_indices().nth(max) {
+        (s[..idx].to_string(), true)
     } else {
         (s.to_string(), false)
     }
 }
 
 static TEXT_SEL: LazyLock<scraper::Selector> = LazyLock::new(|| {
-    scraper::Selector::parse("*:not(script):not(style):not(noscript)").expect("text selector")
+    scraper::Selector::parse("*:not(head):not(script):not(style):not(noscript)").expect("text selector")
 });
 static IMG_SEL: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse("img[src]").expect("img selector"));
@@ -40,23 +40,37 @@ static DDG_SNIP: LazyLock<scraper::Selector> =
 static COLLAPSE_WS: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[ \t\x0b\x0c\r\n]+").expect("html regex"));
 
-/// HTML→text over a real DOM (html5ever via `scraper`): every text node whose
-/// parent isn't `script`/`style`/`noscript`, in document order, followed by
-/// the page's images and links as absolute Markdown `![alt](url)`/`[text](url)`
-/// references (resolved against `base`, the page's own URL — `src`/`href`
-/// are frequently relative). Without these, a model asked to "show a
-/// picture" or cite a source has no real URL to reach for and either
-/// hallucinates one or links to the page itself instead of the image.
-/// Entities come decoded from the parser; whitespace is collapsed. The
-/// sidecar uses Readability+Turndown (Node-only) for the same shape of
-/// output — plain text plus a Markdown-preserved image/link.
+static SEARCH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("search client")
+});
+
+/// HTML→text over a real DOM (html5ever via `scraper`): text nodes outside
+/// `head`/`script`/`style`/`noscript`, in document order, followed by
+/// absolute Markdown image/link references resolved against `base`.
 fn html_to_text(html: &str, base: &reqwest::Url) -> String {
     use scraper::node::Node;
     let dom = scraper::Html::parse_document(html);
     let mut out = String::new();
     for el in dom.select(&TEXT_SEL) {
-        // Direct text children only: each text node has exactly one parent,
-        // so nothing is duplicated and script/style subtrees stay excluded.
+        let mut parent = el.parent();
+        let mut in_head = false;
+        while let Some(p) = parent {
+            if let Some(element) = p.value().as_element() {
+                if element.name() == "head" {
+                    in_head = true;
+                    break;
+                }
+            }
+            parent = p.parent();
+        }
+        if in_head {
+            continue;
+        }
+
         for child in el.children() {
             if let Node::Text(t) = child.value() {
                 out.push_str(&t.text);
@@ -134,9 +148,8 @@ fn html_to_text(html: &str, base: &reqwest::Url) -> String {
 }
 
 /// True when `ip` is a globally-routable address — i.e. not loopback,
-/// private (RFC 1918 / ULA), link-local, CGNAT, multicast, broadcast, or
-/// unspecified. Used to keep `web_fetch` off the loopback control plane and
-/// the local network (SSRF).
+/// private (RFC 1918 / ULA), link-local, CGNAT, benchmarking, documentation,
+/// NAT64, 6to4 internal, multicast, broadcast, or unspecified.
 fn is_global_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_global_ipv4(v4),
@@ -156,26 +169,57 @@ fn is_global_ipv4(ip: &Ipv4Addr) -> bool {
         || ip.is_documentation()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || o[0] == 0                              // "this network"
-        || (o[0] == 100 && (o[1] & 0xc0) == 64)) // 100.64.0.0/10 CGNAT
+        || o[0] == 0                              // 0.0.0.0/8 "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)   // 100.64.0.0/10 CGNAT
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)   // 198.18.0.0/15 Benchmarking
+        || (o[0] & 0xf0) == 240)                  // 240.0.0.0/4 Reserved
 }
 
 fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
-    let seg0 = ip.segments()[0];
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_global_ipv4(&v4);
+    }
+    let seg = ip.segments();
+    // 6to4 (2002::/16) embeds IPv4 in segments[1..3]
+    if seg[0] == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        if !is_global_ipv4(&v4) {
+            return false;
+        }
+    }
+    // NAT64 well-known prefix (64:ff9b::/96)
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 {
+        let v4 = Ipv4Addr::new(
+            (seg[5] >> 8) as u8,
+            (seg[5] & 0xff) as u8,
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+        );
+        if !is_global_ipv4(&v4) {
+            return false;
+        }
+    }
+
     !(ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || (seg0 & 0xfe00) == 0xfc00  // fc00::/7 unique local
-        || (seg0 & 0xffc0) == 0xfe80) // fe80::/10 link-local
+        || (seg[0] & 0xfe00) == 0xfc00            // fc00::/7 Unique Local
+        || (seg[0] & 0xffc0) == 0xfe80            // fe80::/10 Link-Local
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // 2001:db8::/32 Documentation
+        || (seg[0] == 0x0100 && seg[1] == 0))     // 100::/64 Discard prefix
 }
 
-/// Reject `url` unless its scheme is http(s) and its host resolves only to
-/// globally-routable addresses — blocks fetching the loopback control plane
-/// (or any other internal/LAN service) via a tool an agent can call on
-/// untrusted content (fetched pages, files in the workspace).
-pub(crate) async fn ensure_public_http_url(
+/// Validate scheme and host for `url`, perform DNS lookup, check ALL returned IP
+/// addresses against global routability rules, and return the resolved `SocketAddr`
+/// vector alongside the original host string.
+pub(crate) async fn resolve_and_validate_public_url(
     url: &reqwest::Url,
-) -> Result<(), (StatusCode, Json<Value>)> {
+) -> Result<(String, Vec<SocketAddr>), (StatusCode, Json<Value>)> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -188,43 +232,80 @@ pub(crate) async fn ensure_public_http_url(
             Json(json!({"error": "url has no host"})),
         )
     })?;
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_global_ip(&ip) {
-            Ok(())
-        } else {
-            Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": "refusing to fetch a private/loopback/link-local address"})),
-            ))
-        };
-    }
     let port = url.port_or_known_default().unwrap_or(80);
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("dns lookup failed: {e}")})),
-            )
-        })?
-        .peekable();
-    if addrs.peek().is_none() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "dns lookup returned no addresses"})),
-        ));
-    }
-    for addr in addrs {
-        if !is_global_ip(&addr.ip()) {
+
+    let addrs: Vec<SocketAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_global_ip(&ip) {
             return Err((
                 StatusCode::FORBIDDEN,
-                Json(
-                    json!({"error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")}),
-                ),
+                Json(json!({"error": "refusing to fetch a private/loopback/link-local address"})),
             ));
         }
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let lookup_addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("dns lookup failed: {e}")})),
+                )
+            })?
+            .collect();
+
+        if lookup_addrs.is_empty() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "dns lookup returned no addresses"})),
+            ));
+        }
+
+        for addr in &lookup_addrs {
+            if !is_global_ip(&addr.ip()) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": format!("refusing to fetch {host}: resolves to a private/loopback/link-local address")
+                    })),
+                ));
+            }
+        }
+        lookup_addrs
+    };
+
+    Ok((host.to_string(), addrs))
+}
+
+pub(crate) async fn ensure_public_http_url(
+    url: &reqwest::Url,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    resolve_and_validate_public_url(url).await.map(|_| ())
+}
+
+/// Stream response body up to `max_bytes` using `.chunk()`. Prevents unbounded
+/// memory allocation from infinite streams or huge files.
+async fn read_bounded_body(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), (StatusCode, Json<Value>)> {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("read failed: {e}")})),
+        )
+    })? {
+        if buf.len() + chunk.len() > max_bytes {
+            let take = max_bytes.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..take]);
+            truncated = true;
+            break;
+        } else {
+            buf.extend_from_slice(&chunk);
+        }
     }
-    Ok(())
+    Ok((buf, truncated))
 }
 
 pub async fn web_fetch(
@@ -249,35 +330,44 @@ pub async fn web_fetch(
         req.get("approvalToken").and_then(|v| v.as_str()),
     )
     .await?;
+
     let mut url = reqwest::Url::parse(&raw).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "invalid url"})),
         )
     })?;
-    let client = reqwest::Client::builder()
-        .user_agent("ninfier-studio/0.1")
-        .timeout(Duration::from_secs(25))
-        // Redirects are followed manually below so each hop can be
-        // re-checked against the SSRF guard — otherwise a public URL could
-        // 302 straight into the loopback control plane or the LAN.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("client failed: {e}")})),
-            )
-        })?;
+
     let mut redirects = 0u8;
     let resp = loop {
-        ensure_public_http_url(&url).await?;
+        let (host_str, addrs) = resolve_and_validate_public_url(&url).await?;
+
+        // Pin the client's DNS resolver for `host_str` to the exact checked `addrs`,
+        // eliminating DNS rebinding (TOCTOU) windows between check and request.
+        let client = reqwest::Client::builder()
+            .user_agent("ninfier-studio/0.1")
+            .timeout(Duration::from_secs(25))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host_str, &addrs)
+            .build()
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("client failed: {e}")})),
+                )
+            })?;
+
         let resp = client.get(url.clone()).send().await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("fetch failed: {e}")})),
             )
         })?;
+
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            break resp;
+        }
+
         if resp.status().is_redirection() {
             let Some(location) = resp
                 .headers()
@@ -303,6 +393,7 @@ pub async fn web_fetch(
         }
         break resp;
     };
+
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -310,19 +401,18 @@ pub async fn web_fetch(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let mut bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("read failed: {e}")})),
-            )
-        })?
-        .to_vec();
-    bytes.truncate(2 * 1024 * 1024);
+
+    let (bytes, byte_truncated) = read_bounded_body(resp, 2 * 1024 * 1024).await?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
-    let (content, ct) = if content_type.contains("html") {
+
+    let ct_low = content_type.to_lowercase();
+    let is_html = ct_low.contains("text/html")
+        || ct_low.contains("application/xhtml+xml")
+        || ct_low.contains("text/xml")
+        || ct_low.contains("application/xml")
+        || ct_low.ends_with("+xml");
+
+    let (content, ct) = if is_html {
         (html_to_text(&text, &url), "text/markdown".to_string())
     } else {
         let ct = if content_type.is_empty() {
@@ -332,7 +422,10 @@ pub async fn web_fetch(
         };
         (text, ct)
     };
-    let (content, truncated) = truncate_chars(&content, 200_000);
+
+    let (content, char_truncated) = truncate_chars(&content, 200_000);
+    let truncated = byte_truncated || char_truncated;
+
     Ok(Json(
         json!({"url": url.to_string(), "status": status, "contentType": ct, "content": content, "truncated": truncated}),
     ))
@@ -352,37 +445,60 @@ fn pct_encode(s: &str) -> String {
 }
 
 /// Decode `%XX` sequences (leaves `+` alone — DuckDuckGo redirect params use
-/// percent-encoding, not form-encoding).
+/// percent-encoding, not form-encoding). Preserves malformed `%` or `%X` sequences.
 fn pct_decode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
-    let mut it = s.bytes();
-    while let Some(b) = it.next() {
-        if b == b'%' {
-            let hi = it.next().unwrap_or(b'0');
-            let lo = it.next().unwrap_or(b'0');
-            let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-            bytes.push(hex(hi) << 4 | hex(lo));
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let next1 = chars.peek().copied();
+            let next2 = chars.clone().nth(1);
+            if let (Some(h1), Some(h2)) = (next1, next2)
+                && let (Some(d1), Some(d2)) = (h1.to_digit(16), h2.to_digit(16))
+            {
+                chars.next();
+                chars.next();
+                bytes.push((d1 << 4 | d2) as u8);
+            } else {
+                bytes.push(b'%');
+            }
         } else {
-            bytes.push(b);
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Unwrap a DuckDuckGo `/l/?...&uddg=<target>&...` redirect, if present.
+/// Validates scheme to ensure only http/https target URLs are returned.
 fn resolve_ddg_href(href: &str) -> String {
     if let Some(i) = href.find("uddg=") {
         let rest = &href[i + 5..];
         let end = rest.find('&').unwrap_or(rest.len());
         let decoded = pct_decode(&rest[..end]);
-        if !decoded.is_empty() {
-            return decoded;
+        if let Ok(parsed) = reqwest::Url::parse(&decoded) {
+            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+                return decoded;
+            }
         }
+        return String::new();
     }
     if let Some(stripped) = href.strip_prefix("//") {
-        return format!("https:{stripped}");
+        let candidate = format!("https:{stripped}");
+        if let Ok(parsed) = reqwest::Url::parse(&candidate) {
+            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+                return candidate;
+            }
+        }
+        return String::new();
     }
-    href.to_string()
+    if let Ok(parsed) = reqwest::Url::parse(href) {
+        if parsed.scheme() == "http" || parsed.scheme() == "https" {
+            return href.to_string();
+        }
+    }
+    String::new()
 }
 
 /// Scrape DuckDuckGo's html endpoint the way the sidecar does (`.result`
@@ -445,17 +561,8 @@ pub async fn web_search(
         req.get("approvalToken").and_then(|v| v.as_str()),
     )
     .await?;
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64)")
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("client failed: {e}")})),
-            )
-        })?;
-    let html = client
+
+    let resp = SEARCH_CLIENT
         .get(format!(
             "https://html.duckduckgo.com/html/?q={}",
             pct_encode(&query)
@@ -467,16 +574,23 @@ pub async fn web_search(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("search failed: {e}")})),
             )
-        })?
-        .text()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("read failed: {e}")})),
-            )
         })?;
-    Ok(Json(json!({"results": parse_ddg(&html), "query": query})))
+
+    let (bytes, _byte_truncated) = read_bounded_body(resp, 2 * 1024 * 1024).await?;
+    let html = String::from_utf8_lossy(&bytes).into_owned();
+    let results = parse_ddg(&html);
+
+    let hint = if results.is_empty() {
+        Some("No results found. (Note: DuckDuckGo may have rate-limited or challenged the request).")
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "results": results,
+        "query": query,
+        "hint": hint,
+    })))
 }
 
 #[cfg(test)]
@@ -484,7 +598,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn global_ip_classification_blocks_internal_ranges() {
+    fn global_ip_classification_blocks_internal_and_reserved_ranges() {
         let blocked = [
             "127.0.0.1",
             "127.53.0.1",
@@ -493,12 +607,16 @@ mod tests {
             "192.168.1.1",
             "169.254.169.254", // cloud metadata
             "100.64.0.1",      // CGNAT
+            "198.18.0.1",      // Benchmarking
+            "240.1.1.1",       // Reserved
             "0.0.0.0",
             "255.255.255.255",
             "::1",
             "fe80::1",
             "fc00::1",
             "fd12::1",
+            "2001:db8::1",     // IPv6 Documentation
+            "64:ff9b::10.0.0.1", // NAT64 loopback/private
             "::ffff:127.0.0.1", // IPv4-mapped loopback
         ];
         for ip in blocked {
@@ -541,21 +659,18 @@ mod tests {
     }
 
     #[test]
-    fn html_to_text_strips_markup() {
+    fn html_to_text_strips_markup_and_head_title() {
         let base = reqwest::Url::parse("https://example.com/page").unwrap();
         let out = html_to_text(
-            "<html><head><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>",
+            "<html><head><title>My Title</title><style>x{}</style></head><body><h1>Hi &amp; bye</h1><script>evil()</script><p>a  b</p></body></html>",
             &base,
         );
-        assert!(!out.contains('<'));
+        assert!(!out.contains("My Title"));
         assert!(!out.contains("evil()"));
         assert!(out.contains("Hi & bye"));
         assert!(out.contains('a'));
     }
 
-    /// A model asked to show a picture or cite a source needs a real,
-    /// absolute URL — not just a page's stripped-down text — so the
-    /// fetched page's images/links are appended as resolved Markdown refs.
     #[test]
     fn html_to_text_preserves_image_and_link_urls() {
         let base = reqwest::Url::parse("https://example.com/blog/post").unwrap();
@@ -581,6 +696,23 @@ mod tests {
     fn pct_round_trip() {
         assert_eq!(pct_encode("a b+c~d"), "a%20b%2Bc~d");
         assert_eq!(pct_decode("a%20b%2Bc~d"), "a b+c~d");
+        assert_eq!(pct_decode("100%_complete_%G1"), "100%_complete_%G1");
+    }
+
+    #[test]
+    fn resolve_ddg_href_filters_unsafe_schemes() {
+        assert_eq!(
+            resolve_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage"),
+            "https://example.com/page"
+        );
+        assert_eq!(
+            resolve_ddg_href("//duckduckgo.com/l/?uddg=javascript%3Aalert%281%29"),
+            ""
+        );
+        assert_eq!(
+            resolve_ddg_href("//duckduckgo.com/l/?uddg=data%3Atext%2Fhtml%2Cevil"),
+            ""
+        );
     }
 
     #[test]
@@ -601,5 +733,15 @@ mod tests {
             Some("some snippet here")
         );
         assert!(parse_ddg("<html><body>no results</body></html>").is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_redirect_rechecks_ssrf_and_blocks_loopback() {
+        let public_base = reqwest::Url::parse("http://93.184.216.34/").unwrap();
+        let private_redirect = public_base.join("http://127.0.0.1/secret").unwrap();
+        assert!(ensure_public_http_url(&private_redirect).await.is_err());
+
+        let proto_relative = public_base.join("//127.0.0.1/secret").unwrap();
+        assert!(ensure_public_http_url(&proto_relative).await.is_err());
     }
 }

@@ -268,6 +268,9 @@ pub async fn perms_approve(
 
 /// Reject when `tool` is tiered `deny`, when it's tiered `ask` without a
 /// valid matching approval token, or when `rel` sits under a denied prefix.
+/// (Note: tools taking external URLs or command arguments like `web_fetch`,
+/// `web_search`, `grep`, and `exec` pass `rel: None` as `denyPaths` targets
+/// workspace file paths).
 pub(crate) async fn enforce_perm(
     state: &S,
     scope: &str,
