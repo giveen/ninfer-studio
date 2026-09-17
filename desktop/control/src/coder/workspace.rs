@@ -7,12 +7,11 @@
 
 use super::common::is_safe_base_dir;
 use crate::engine::S;
-use crate::types::strip_extended_prefix;
 use axum::Json;
 use axum::extract::{Query, State as AxumState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Serialize)]
 pub struct WorkspaceResp {
@@ -44,32 +43,29 @@ pub async fn workspace_set(
 ) -> Json<WorkspaceResp> {
     let raw = req.path.unwrap_or_default().trim().to_string();
     let (ws, exists) = if !raw.is_empty() {
-        let ws_path = match std::fs::canonicalize(Path::new(&raw)) {
-            Ok(p) => p,
-            Err(_) => {
-                if std::fs::create_dir_all(&raw).is_ok() {
-                    std::fs::canonicalize(Path::new(&raw)).unwrap_or(PathBuf::from(&raw))
-                } else {
-                    PathBuf::from(&raw)
-                }
+        let (ws_path_str, exists) = tokio::task::spawn_blocking(move || {
+            let p = Path::new(&raw);
+            if let Ok(canonical) = p.canonicalize() {
+                let plain = crate::coder::common::canonicalize_ws_path(&raw);
+                let is_dir = canonical.is_dir();
+                if is_dir { (plain, true) } else { (String::new(), false) }
+            } else {
+                (String::new(), false)
             }
-        };
-        // canonicalize() on Windows returns the extended-length form
-        // (`\\?\C:\...`); the UI keys workspaces by the plain picker path,
-        // so strip the prefix or the store duplicates the workspace on the
-        // next start.
-        let plain = strip_extended_prefix(&ws_path.to_string_lossy()).to_string();
-        let exists = ws_path.is_dir();
-        (plain, exists)
+        })
+        .await
+        .unwrap_or((String::new(), false));
+        (ws_path_str, exists)
     } else {
         (String::new(), false)
     };
 
-    state.config.write().await.coder_workspace = ws.clone();
+    let mut config_guard = state.config.write().await;
+    config_guard.coder_workspace = ws.clone();
 
-    let cfg = state.config.read().await.clone();
-    if let Ok(json) = serde_json::to_string_pretty(&cfg)
-        && is_safe_base_dir(&state.data_dir)
+    // Guard writes to State::data_dir (process config location)
+    if is_safe_base_dir(&state.data_dir)
+        && let Ok(json) = serde_json::to_string_pretty(&*config_guard)
     {
         let path = state.data_dir.join("config.json");
         let _ = crate::atomic_write_secret(&path, json).await;
@@ -99,8 +95,11 @@ pub async fn dirs(Query(params): Query<std::collections::HashMap<String, String>
             Ok(mut rd) => {
                 let mut dirs = Vec::new();
                 while let Ok(Some(e)) = rd.next_entry().await {
-                    if let Ok(ft) = e.file_type().await
-                        && ft.is_dir()
+                    if dirs.len() >= 1000 {
+                        break;
+                    }
+                    if let Ok(meta) = tokio::fs::metadata(e.path()).await
+                        && meta.is_dir()
                     {
                         dirs.push(e.file_name().to_string_lossy().into_owned());
                     }
@@ -124,12 +123,96 @@ fn expand_home(p: &str) -> String {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/".to_string());
-    let home = home.trim_end_matches('/');
+    let home = home.trim_end_matches('/').trim_end_matches('\\');
     if p.is_empty() || p == "~" {
         return home.to_string();
     }
-    match p.strip_prefix("~/") {
-        Some(rest) => format!("{home}/{rest}"),
-        None => p.to_string(),
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        format!("{home}/{rest}")
+    } else {
+        p.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_home_normalization() {
+        unsafe {
+            std::env::set_var("HOME", "/Users/testuser");
+        }
+        assert_eq!(expand_home("~"), "/Users/testuser");
+        assert_eq!(expand_home("~/code"), "/Users/testuser/code");
+        assert_eq!(expand_home("~\\code"), "/Users/testuser/code");
+        assert_eq!(expand_home("/var/tmp"), "/var/tmp");
+    }
+
+    #[tokio::test]
+    async fn workspace_set_existing_and_nonexistent_paths() {
+        use axum::extract::State as AxumState;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-ws-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("valid_ws")).unwrap();
+
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        let ws = || AxumState(state.clone());
+
+        // Valid existing path adopts cleanly
+        let res1 = workspace_set(
+            ws(),
+            Json(WorkspaceReq {
+                path: Some(tmp.join("valid_ws").to_string_lossy().into()),
+            }),
+        )
+        .await
+        .0;
+        assert!(res1.exists);
+        assert!(!res1.workspace.is_empty());
+
+        // Non-existent path is rejected without creating host directories
+        let non_existent = tmp.join("does_not_exist/sub");
+        let res2 = workspace_set(
+            ws(),
+            Json(WorkspaceReq {
+                path: Some(non_existent.to_string_lossy().into()),
+            }),
+        )
+        .await
+        .0;
+        assert!(!res2.exists);
+        assert_eq!(res2.workspace, "");
+        assert!(!non_existent.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn dirs_symlink_traversal() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("real_dir")).unwrap();
+
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(tmp.join("real_dir"), tmp.join("sym_dir"));
+
+        let query = std::collections::HashMap::from([(
+            "root".to_string(),
+            tmp.to_string_lossy().to_string(),
+        )]);
+        let res = dirs(Query(query)).await.0;
+        let dir_list = res["dirs"].as_array().unwrap();
+
+        assert!(dir_list.iter().any(|d| d == "real_dir"));
+        #[cfg(unix)]
+        assert!(
+            dir_list.iter().any(|d| d == "sym_dir"),
+            "symlinked directory should appear in picker: {res:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

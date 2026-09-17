@@ -42,6 +42,21 @@ pub(crate) fn is_safe_base_dir(base: &Path) -> bool {
     base.is_absolute() && !base.components().any(|c| matches!(c, Component::ParentDir))
 }
 
+/// Canonicalize a workspace path string, stripping Windows extended-length
+/// prefixes (`\\?\`) and trailing slashes, so workspace bucket keys match across endpoints.
+pub(crate) fn canonicalize_ws_path(raw: &str) -> String {
+    let clean = raw.trim();
+    if clean.is_empty() {
+        return String::new();
+    }
+    let p = Path::new(clean);
+    let ws_path = p.canonicalize().unwrap_or_else(|_| PathBuf::from(clean));
+    crate::types::strip_extended_prefix(&ws_path.to_string_lossy())
+        .trim_end_matches('/')
+        .trim_end_matches('\\')
+        .to_string()
+}
+
 /// Canonical workspace root, or a 400 when none is configured.
 pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     if ws.is_empty() {
@@ -50,8 +65,8 @@ pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)>
             Json(json!({"error": "no workspace configured"})),
         ));
     }
-    let p = PathBuf::from(ws);
-    Ok(p.canonicalize().unwrap_or(p))
+    let norm = canonicalize_ws_path(ws);
+    Ok(PathBuf::from(norm))
 }
 
 /// Resolve this request's workspace root. An explicit `workspace` (request
@@ -185,13 +200,26 @@ pub struct ApprovalTicket {
 /// The perms bucket key a caller supplies via an optional `scope` or `workspace`
 /// request field (falls back to "default").
 pub(crate) fn perm_scope(req: &Value) -> String {
-    req.get("scope")
+    if let Some(s) = req
+        .get("scope")
         .and_then(|v| v.as_str())
-        .or_else(|| req.get("workspace").and_then(|v| v.as_str()))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("default")
-        .to_string()
+    {
+        return s.to_string();
+    }
+    if let Some(ws) = req
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let norm = canonicalize_ws_path(ws);
+        if !norm.is_empty() {
+            return norm;
+        }
+    }
+    "default".to_string()
 }
 
 /// The effective tier for `name` under `perms`. Default is `allow`.
