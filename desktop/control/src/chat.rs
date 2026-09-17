@@ -57,7 +57,7 @@ pub async fn memory_get(
             Json(json!({ "error": "chat memory is disabled" })),
         ));
     }
-    Ok(Json(read_bank_and_learnings(&chat_memory_dir(&state)).await))
+    Ok(Json(read_bank_and_learnings(&chat_memory_dir(&state)).await?))
 }
 
 /// POST /api/chat/memory — same body shape as `/api/coder/memory`

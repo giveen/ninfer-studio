@@ -13,11 +13,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Read a memory file, returning `def` when it doesn't exist.
-pub async fn read_mem_file(dir: &Path, name: &str, def: &str) -> String {
+/// Read a memory file, returning empty string when it doesn't exist (`NotFound`).
+pub async fn read_mem_file(dir: &Path, name: &str) -> std::io::Result<String> {
     match tokio::fs::read_to_string(dir.join(name)).await {
-        Ok(t) => t,
-        Err(_) => def.to_string(),
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -42,8 +43,13 @@ fn levenshtein(a: &str, b: &str) -> usize {
     result
 }
 
-pub async fn read_learnings(dir: &Path) -> Vec<Value> {
-    let raw = read_mem_file(dir, "learnings.jsonl", "").await;
+pub async fn read_learnings(dir: &Path) -> Result<Vec<Value>, (StatusCode, Json<Value>)> {
+    let raw = read_mem_file(dir, "learnings.jsonl").await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("read learnings failed: {e}")})),
+        )
+    })?;
     let entries: Vec<Value> = raw
         .split('\n')
         .map(|l| l.trim())
@@ -74,16 +80,18 @@ pub async fn read_learnings(dir: &Path) -> Vec<Value> {
                 if s.0 == comp && s.1 == scope {
                     let k1 = &s.2;
                     let k2 = key;
+                    let k1_chars = k1.chars().count();
+                    let k2_chars = k2.chars().count();
                     // Require exact match for short keys or CLI flags to prevent shadowing
-                    let is_match = if k1.len() < 10
-                        || k2.len() < 10
+                    let is_match = if k1_chars < 10
+                        || k2_chars < 10
                         || k1.starts_with('-')
                         || k2.starts_with('-')
                     {
                         k1 == k2
                     } else {
-                        // Scale threshold by length: ~1 edit per 8 characters
-                        levenshtein(k1, k2) <= (k1.len().min(k2.len()) / 8)
+                        // Scale threshold by character length: ~1 edit per 8 characters
+                        levenshtein(k1, k2) <= (k1_chars.min(k2_chars) / 8)
                     };
 
                     if is_match {
@@ -107,10 +115,10 @@ pub async fn read_learnings(dir: &Path) -> Vec<Value> {
         }
     }
 
-    verified
+    Ok(verified)
 }
 
-/// Create the memory dir and write a file.
+/// Create the memory dir and write a file atomically.
 pub async fn write_mem_file(
     dir: &Path,
     name: &str,
@@ -122,7 +130,7 @@ pub async fn write_mem_file(
             Json(json!({"error": format!("mkdir failed: {e}")})),
         )
     })?;
-    tokio::fs::write(dir.join(name), content)
+    crate::atomic_write(&dir.join(name), content)
         .await
         .map_err(|e| {
             (
@@ -136,13 +144,8 @@ pub async fn write_mem_file(
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC) — the same shape as Node's
 /// `new Date().toISOString()` (Hinnant's civil-from-days algorithm).
 pub fn iso_now() -> (String, u64) {
-    let (secs, ms_part) = {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        (ms / 1000, ms % 1000)
-    };
+    let ms = crate::types::now_ms();
+    let (secs, ms_part) = (ms / 1000, ms % 1000);
     let rem = secs % 86_400;
     let (y, m, d) = civil_from_days(secs / 86_400);
     (
@@ -156,7 +159,7 @@ pub fn iso_now() -> (String, u64) {
             rem % 60,
             ms_part
         ),
-        secs * 1000 + ms_part,
+        ms,
     )
 }
 
@@ -181,8 +184,7 @@ fn civil_from_days(days: u64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// 5-char base36 suffix for learning ids — cheap entropy, no extra dep
-/// (the sidecar uses `Math.random().toString(36).slice(2, 7)`).
+/// 5-char base36 suffix for learning ids with uniform rejection sampling.
 pub fn mem_rand_suffix() -> String {
     use std::sync::atomic::AtomicU64;
     static CTR: AtomicU64 = AtomicU64::new(0x2545F4914F6CDD1D);
@@ -190,32 +192,52 @@ pub fn mem_rand_suffix() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let n = now_ns
+    let mut state = now_ns
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add(CTR.fetch_add(0x9E3779B97F4A7C15, Ordering::SeqCst));
     const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    (0..5)
-        .map(|i| ALPHABET[((n >> (6 + 6 * i)) % 36) as usize] as char)
-        .collect()
+    let mut suffix = String::with_capacity(5);
+    for _ in 0..5 {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut val = (state >> 32) as u32;
+        while val >= (u32::MAX - (u32::MAX % 36)) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            val = (state >> 32) as u32;
+        }
+        suffix.push(ALPHABET[(val % 36) as usize] as char);
+    }
+    suffix
 }
 
 /// Per-store mutation lock: a POST is a read-modify-write (a drop rewrites
-/// the whole JSONL), so concurrent writers to the same store must serialize
-/// or a stale rewrite can clobber a newer append. Keyed by store dir so
-/// distinct stores (different workspaces, or Coder vs Chat) never contend.
-pub fn mem_lock(state: &S, store: &str) -> Arc<tokio::sync::Mutex<()>> {
+/// the whole JSONL), so concurrent writers to the same store must serialize.
+/// Keyed by canonical store dir so path spellings match, and unused entries
+/// (`strong_count == 1`) are evicted to prevent unbounded lock map growth.
+pub fn mem_lock(state: &S, dir: impl AsRef<Path>) -> Arc<tokio::sync::Mutex<()>> {
+    let dir = dir.as_ref();
+    let key = dir
+        .canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
     let mut map = state.memory_locks.lock();
-    map.entry(store.to_string())
+    map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    map.entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
 /// `{bank, learnings}` — the shape every memory GET (and the tail of every
 /// memory POST) returns.
-pub async fn read_bank_and_learnings(dir: &Path) -> Value {
-    let bank = read_mem_file(dir, "bank.md", "").await;
-    let learnings = read_learnings(dir).await;
-    json!({"bank": bank, "learnings": learnings})
+pub async fn read_bank_and_learnings(dir: &Path) -> Result<Value, (StatusCode, Json<Value>)> {
+    let bank = read_mem_file(dir, "bank.md").await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("read bank failed: {e}")})),
+        )
+    })?;
+    let learnings = read_learnings(dir).await?;
+    Ok(json!({"bank": bank, "learnings": learnings}))
 }
 
 /// Apply the standard POST body shape to `dir` under its store lock, then
@@ -228,17 +250,37 @@ pub async fn apply_memory_update(
     dir: &Path,
     req: &Value,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    let store_key = dir.to_string_lossy().into_owned();
-    let store_lock = mem_lock(state, &store_key);
+    let store_lock = mem_lock(state, dir);
     let _guard = store_lock.lock().await;
 
     if let Some(bank) = req.get("bank").and_then(|v| v.as_str()) {
         write_mem_file(dir, "bank.md", bank).await?;
     }
 
-    if let Some(learning) = req.get("learning").and_then(|v| v.as_object())
-        && let Some(text) = learning.get("text").and_then(|v| v.as_str())
-    {
+    if let Some(learning_val) = req.get("learning") {
+        let Some(learning) = learning_val.as_object() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "'learning' must be a JSON object"})),
+            ));
+        };
+        let text = learning
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if text.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "'learning.text' is required and cannot be empty"})),
+            ));
+        }
+        if text.chars().count() > 10_000 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "'learning.text' exceeds maximum length of 10000 characters"})),
+            ));
+        }
         let (ts, now_ms) = iso_now();
         let entry = json!({
             "id": format!("l_{now_ms}_{}", mem_rand_suffix()),
@@ -279,8 +321,14 @@ pub async fn apply_memory_update(
         })?;
         let _ = f.sync_all().await;
     }
+
     if let Some(drop_id) = req.get("dropLearningId").and_then(|v| v.as_str()) {
-        let raw = read_mem_file(dir, "learnings.jsonl", "").await;
+        let raw = read_mem_file(dir, "learnings.jsonl").await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("read learnings failed during drop: {e}")})),
+            )
+        })?;
         let mut keep_lines = Vec::new();
         for line in raw.lines() {
             let trimmed = line.trim();
@@ -302,7 +350,7 @@ pub async fn apply_memory_update(
         write_mem_file(dir, "learnings.jsonl", &content).await?;
     }
 
-    Ok(read_bank_and_learnings(dir).await)
+    read_bank_and_learnings(dir).await
 }
 
 #[cfg(test)]
@@ -382,6 +430,82 @@ mod tests {
             learnings[0].get("text").and_then(|v| v.as_str()),
             Some("pnpm")
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn drop_learning_preserves_unparseable_lines() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-memstore-unparseable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        let file_path = tmp.join("learnings.jsonl");
+        let line1 = r#"{"id": "l_1", "text": "valid 1", "kind": "tip"}"#;
+        let line2 = r#"RAW_CORRUPT_NON_JSON_LINE"#;
+        let line3 = r#"{"id": "l_2", "text": "valid 2", "kind": "tip"}"#;
+        std::fs::write(&file_path, format!("{line1}\n{line2}\n{line3}\n")).unwrap();
+
+        let r = apply_memory_update(&state, &tmp, &json!({"dropLearningId": "l_1"}))
+            .await
+            .unwrap();
+        let learnings = r.get("learnings").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(learnings.len(), 1);
+        assert_eq!(learnings[0].get("id").and_then(|v| v.as_str()), Some("l_2"));
+
+        let disk_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(disk_content.contains(line2), "Unparseable line must be preserved on disk");
+        assert!(disk_content.contains("l_2"));
+        assert!(!disk_content.contains("l_1"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn post_learning_payload_validation() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-memstore-val-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        // Missing text
+        let err = apply_memory_update(&state, &tmp, &json!({"learning": {"kind": "tip"}}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Empty text
+        let err = apply_memory_update(&state, &tmp, &json!({"learning": {"text": "  "}}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Over-long text
+        let err = apply_memory_update(&state, &tmp, &json!({"learning": {"text": "a".repeat(10_001)}}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn mem_lock_canonicalization_and_eviction() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-memstore-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        let lock1 = mem_lock(&state, &tmp);
+        let dot_path = tmp.join(".");
+        let lock2 = mem_lock(&state, &dot_path);
+        assert!(Arc::ptr_eq(&lock1, &lock2), "Lock keying must canonicalize paths");
+
+        drop(lock1);
+        drop(lock2);
+        let _lock3 = mem_lock(&state, &tmp);
+        assert_eq!(state.memory_locks.lock().len(), 1, "Unused lock entries should be evicted");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

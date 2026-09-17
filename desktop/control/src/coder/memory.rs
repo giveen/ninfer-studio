@@ -136,7 +136,7 @@ pub async fn memory_get(
         Ok(dir) => dir,
         Err(e) => return Err(e),
     };
-    Ok(Json(read_bank_and_learnings(&dir).await))
+    Ok(Json(read_bank_and_learnings(&dir).await?))
 }
 
 /// POST /api/coder/memory — apply at most one of the three body shapes and
@@ -350,7 +350,8 @@ mod tests {
             &state.data_dir,
             &memory_ws(&ws_a.to_string_lossy()),
         ))
-        .await;
+        .await
+        .unwrap();
         assert_eq!(on_disk.len(), 1);
 
         // Second append, then drop the first — rewrite keeps the rest.
