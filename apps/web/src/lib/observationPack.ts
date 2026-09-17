@@ -14,7 +14,7 @@
 
 import type { ChatMessage } from './types';
 import { CHARS_PER_TOKEN_CODE } from './format';
-import { summarizeOutputVerified, renderOutputReceipt } from './api/chat';
+import { summarizeOutputVerified, formatSummarizedOutput } from './api/chat';
 
 const SUMMARY_THRESHOLD = 16 * 1024;
 const SUMMARY_TAIL = 1500;
@@ -374,7 +374,7 @@ export async function maybeSummarizeTool(
     });
     if (!receipt) return resultStr;
     const tail = text.slice(-SUMMARY_TAIL);
-    const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+    const wrapped = formatSummarizedOutput(text.length, receipt, tail);
     applyResultPlaceholder(res, wrapped);
     res._summarized = true;
     return JSON.stringify(res);

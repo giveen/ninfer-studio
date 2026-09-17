@@ -26,7 +26,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, formatSummarizedOutput, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { resolveProviderConfig } from '../lib/chatHelpers';
@@ -1130,7 +1130,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // or outcome-mismatched) receipt — either way, fall back untouched.
       if (!receipt) return resultStr;
       const tail = text.slice(-SUMMARY_TAIL);
-      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+      const wrapped = formatSummarizedOutput(text.length, receipt, tail);
       applyResultPlaceholder(res, wrapped);
       res._summarized = true;
       return JSON.stringify(res);
