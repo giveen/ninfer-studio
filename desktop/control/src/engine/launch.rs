@@ -5,7 +5,7 @@ use super::health::{argv_max_context, engine_health, engine_model_info};
 use super::log::{log_path_for, rotate_log_if_large};
 use super::status::{adopt_external, resolve_external_pid};
 use crate::types::{
-    AppEvent, AppSettings, EngineInner, EngineProfile, EngineState, LastStart, State,
+    AppEvent, AppSettings, EngineInner, EngineProfile, EngineState, EngineStatus, LastStart, State,
     build_serve_args, now_ms,
 };
 use serde_json::{Value, json};
@@ -546,19 +546,21 @@ fn signal_engine_pid(pid: u32) -> bool {
 }
 
 pub fn public_engine(eng: &EngineInner) -> Value {
-    json!({
-        "state": eng.state,
-        "pid": eng.pid,
-        "port": eng.port,
-        "artifact": eng.artifact,
-        "modelId": eng.model_id,
-        "maxContext": eng.max_context.or_else(|| argv_max_context(eng.argv.as_ref())),
-        "argv": eng.argv,
-        "startedAt": eng.started_at,
-        "logPath": eng.log_path,
-        "adopted": eng.adopted,
-        "failReason": eng.fail_reason,
-    })
+    let status = EngineStatus {
+        state: eng.state,
+        pid: eng.pid,
+        port: eng.port,
+        artifact: eng.artifact.clone(),
+        model_id: eng.model_id.clone(),
+        max_context: eng.max_context.or_else(|| argv_max_context(eng.argv.as_ref())),
+        argv: eng.argv.clone(),
+        started_at: eng.started_at,
+        log_path: eng.log_path.clone(),
+        adopted: eng.adopted,
+        fail_reason: eng.fail_reason.clone(),
+        fail_hint: None,
+    };
+    serde_json::to_value(status).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@
 // Rust guideline compliant 2026-07-28
 
 use crate::types::{GpuApp, GpuStats};
-use serde_json::json;
 use std::process::Stdio;
 
 /// Hard cap per `nvidia-smi` query (the sidecar uses 3s for `execFile`;
@@ -174,15 +173,7 @@ pub async fn gpu_stats() -> GpuStats {
 
 /// Serialize GpuStats to a JSON value (same field names as the web types).
 pub fn gpu_value(g: &GpuStats) -> serde_json::Value {
-    json!({
-        "available": g.available,
-        "name": g.name,
-        "memUsedMiB": g.mem_used_mib,
-        "memTotalMiB": g.mem_total_mib,
-        "utilPct": g.util_pct,
-        "powerDrawW": g.power_draw_w,
-        "apps": g.apps,
-    })
+    serde_json::to_value(g).unwrap_or_default()
 }
 
 #[cfg(test)]

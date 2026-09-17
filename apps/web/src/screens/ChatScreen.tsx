@@ -646,7 +646,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           // Look up the engine actually serving `useModel`, not just the
           // first/primary one — matters when multiple engines with different
           // context sizes are running (same fix as ctxLimit above).
-          const limit = allEngines.find((e) => e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
+          const limit = allEngines.find((e) => e.artifact === useModel || e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
           const convForCompact = convsRef.current.find((c) => c.id === convId);
           const msgsForCompact = convForCompact?.messages ?? [];
           // The final reply is the last assistant message (past the original
@@ -1151,7 +1151,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // just the first/primary engine) — matters once more than one engine with
   // a different context size is running. Falls back to the primary engine
   // when the model isn't found among the known engines yet.
-  const ctxLimit = allEngines.find((e) => e.modelId === (model || runningModel))?.maxContext ?? status?.engine?.maxContext ?? null;
+  const targetModel = model || runningModel;
+  const ctxLimit = allEngines.find((e) => e.artifact === targetModel || e.modelId === targetModel)?.maxContext ?? status?.engine?.maxContext ?? null;
   // A backward scan instead of `[...messages].reverse().find(...)` — the
   // spread+reverse copied the whole conversation's message array on every
   // single streamed token (onContentDelta re-renders this component per
