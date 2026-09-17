@@ -8,6 +8,7 @@ import {
   applyResponsesEvent,
   initResponsesState,
 } from './responses';
+import { buildChatRequest } from './chat';
 import type { ChatParams } from '../types';
 
 const BASE_PARAMS: ChatParams = { thinking: true };
@@ -109,6 +110,30 @@ describe('buildResponsesBody', () => {
     expect(body.tool_choice).toBe('auto');
     expect(body.tools).toEqual([{ type: 'function', name: 'web_search', description: undefined, parameters: {} }]);
   });
+  it('correctly reshapes a buildChatRequest output into a valid Responses body', () => {
+    const ccReq = buildChatRequest(
+      'model-a',
+      'sys prompt',
+      [{ role: 'user', content: 'user msg' }],
+      { maxTokens: 1024, temperature: 0.7, topP: 0.8, reasoningEffort: 'high' },
+      { tools: [{ type: 'function', function: { name: 't1', parameters: {} } }] },
+    );
+    const responsesBody = buildResponsesBody(ccReq);
+    expect(responsesBody).toEqual({
+      model: 'model-a',
+      input: [
+        { role: 'system', content: 'sys prompt' },
+        { role: 'user', content: 'user msg' },
+      ],
+      stream: true,
+      max_output_tokens: 1024,
+      temperature: 0.7,
+      top_p: 0.8,
+      reasoning: { effort: 'high' },
+      tools: [{ type: 'function', name: 't1', description: undefined, parameters: {} }],
+      tool_choice: 'auto',
+    });
+  });
 });
 
 describe('applyResponsesEvent', () => {
@@ -180,10 +205,26 @@ describe('applyResponsesEvent', () => {
     expect(state.meta.finishReason).toBe('length');
   });
 
-  it('response.failed surfaces the error message', () => {
+  it('response.incomplete event sets completed=true and finishReason=length', () => {
+    const state = initResponsesState();
+    const effect = applyResponsesEvent(
+      JSON.stringify({
+        type: 'response.incomplete',
+        response: { usage: { input_tokens: 50, output_tokens: 100 }, incomplete_details: { reason: 'max_output_tokens' } },
+      }),
+      state,
+    );
+    expect(state.completed).toBe(true);
+    expect(state.meta.finishReason).toBe('length');
+    expect(effect.error).toBeUndefined();
+    expect(effect.usage).toBeDefined();
+  });
+
+  it('response.failed surfaces the error message and sets state.errored=true', () => {
     const state = initResponsesState();
     const effect = applyResponsesEvent(JSON.stringify({ type: 'response.failed', response: { error: { message: 'boom' } } }), state);
     expect(effect.error).toBe('boom');
+    expect(state.errored).toBe(true);
   });
 
   it('an unknown event type is a no-op', () => {
@@ -197,3 +238,4 @@ describe('applyResponsesEvent', () => {
     expect(applyResponsesEvent('{not json', state)).toEqual({});
   });
 });
+

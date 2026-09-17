@@ -267,7 +267,7 @@ export async function streamTurn(opts: {
   onDelta?: (kind: 'content' | 'reasoning', text: string) => void;
   onStreamError?: (message: string) => void;
 }): Promise<TurnResult> {
-  const { model, system, messages, params, tools, cacheSystem, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
+  const { model, system, messages, params, tools, cacheSystem, signal, stream = resolveDefaultStreamFn(params), recoverMarkup = true, onDelta, onStreamError } = opts;
   let content = '';
   let reasoning = '';
   let toolCalls: AgentToolCall[] = [];

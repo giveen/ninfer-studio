@@ -17,7 +17,7 @@
 // stream back into the same ChatStreamCallbacks — so `streamTurn` /
 // `agentLoop.ts` need zero changes to use this as an injected `StreamFn`.
 
-import type { ChatParams } from '../types';
+import type { ChatParams, MessageMeta } from '../types';
 import type { ChatStreamCallbacks } from './chat';
 import { API_BASE, fetchStream, isAbortError } from './core';
 
@@ -121,14 +121,14 @@ interface CCMessage {
  *  transport). */
 export function toResponsesItems(m: CCMessage): Array<Record<string, unknown>> {
   if (m.role === 'tool') {
-    return [{ type: 'function_call_output', call_id: m.tool_call_id, output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') }];
+    return [{ type: 'function_call_output', call_id: m.tool_call_id ?? '', output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') }];
   }
   const items: Array<Record<string, unknown>> = [];
   const hasText = typeof m.content === 'string' ? m.content.trim().length > 0 : Array.isArray(m.content) && m.content.length > 0;
   if (hasText) items.push({ role: m.role, content: m.content });
   if (m.role === 'assistant' && m.tool_calls?.length) {
     for (const tc of m.tool_calls) {
-      items.push({ type: 'function_call', call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments });
+      items.push({ type: 'function_call', call_id: tc.id ?? '', name: tc.function.name, arguments: tc.function.arguments });
     }
   }
   return items;
@@ -179,14 +179,7 @@ export function buildResponsesBody(req: Record<string, unknown>): Record<string,
 // Streaming: parse the confirmed event/data SSE stream into ChatStreamCallbacks
 // ---------------------------------------------------------------------------
 
-interface ResponsesMeta {
-  promptTokens?: number;
-  completionTokens?: number;
-  cachedTokens?: number;
-  reasoningTokens?: number;
-  ttftMs?: number;
-  finishReason?: string;
-}
+export type ResponsesMeta = MessageMeta;
 
 /** Mutable accumulator threaded through one stream's worth of events —
  *  `calls`/`itemIdToCallId` collect tool-call pieces that arrive across
@@ -199,10 +192,11 @@ export interface ResponsesState {
   itemIdToCallId: Map<string, string>;
   meta: ResponsesMeta;
   completed: boolean;
+  errored: boolean;
 }
 
 export function initResponsesState(): ResponsesState {
-  return { calls: new Map(), itemIdToCallId: new Map(), meta: {}, completed: false };
+  return { calls: new Map(), itemIdToCallId: new Map(), meta: {}, completed: false, errored: false };
 }
 
 /** What one parsed SSE event should cause the caller to emit — `state` is
@@ -222,37 +216,41 @@ export interface ResponsesEventEffect {
  *  the original inline `try { JSON.parse } catch { return }` — a single bad
  *  line must never abort an otherwise-healthy stream). */
 export function applyResponsesEvent(payload: string, state: ResponsesState): ResponsesEventEffect {
-  let chunk: Record<string, any>;
+  let chunk: Record<string, unknown>;
   try {
-    chunk = JSON.parse(payload);
+    chunk = JSON.parse(payload) as Record<string, unknown>;
   } catch {
     return {};
   }
-  switch (chunk.type) {
+  const type = typeof chunk.type === 'string' ? chunk.type : '';
+  switch (type) {
     case 'response.output_text.delta':
-      return { contentDelta: chunk.delta ?? '' };
+      return { contentDelta: typeof chunk.delta === 'string' ? chunk.delta : '' };
     case 'response.reasoning_text.delta':
-      return { reasoningDelta: chunk.delta ?? '' };
+      return { reasoningDelta: typeof chunk.delta === 'string' ? chunk.delta : '' };
     case 'response.output_item.added': {
-      if (chunk.item?.type === 'function_call' && chunk.item.call_id) {
-        state.itemIdToCallId.set(chunk.item.id, chunk.item.call_id);
-        state.calls.set(chunk.item.call_id, { name: chunk.item.name ?? '', arguments: '' });
+      const item = chunk.item as { id?: string; type?: string; call_id?: string; name?: string } | undefined;
+      if (item?.type === 'function_call' && item.call_id && item.id) {
+        state.itemIdToCallId.set(item.id, item.call_id);
+        state.calls.set(item.call_id, { name: item.name ?? '', arguments: '' });
       }
       return {};
     }
     case 'response.function_call_arguments.done': {
       // Fall back to item_id as the key if output_item.added somehow wasn't
       // seen first, so the call is never silently dropped.
-      const callId = state.itemIdToCallId.get(chunk.item_id) ?? chunk.item_id;
+      const itemId = typeof chunk.item_id === 'string' ? chunk.item_id : '';
+      const callId = state.itemIdToCallId.get(itemId) ?? itemId;
       const entry = state.calls.get(callId) ?? { name: '', arguments: '' };
-      entry.name = chunk.name ?? entry.name;
-      entry.arguments = chunk.arguments ?? '';
-      state.calls.set(callId, entry);
+      entry.name = typeof chunk.name === 'string' ? chunk.name : entry.name;
+      entry.arguments = typeof chunk.arguments === 'string' ? chunk.arguments : '';
+      if (callId) state.calls.set(callId, entry);
       return {};
     }
     case 'response.completed': {
       state.completed = true;
-      const usage = chunk.response?.usage;
+      const resp = chunk.response as { usage?: any; output?: any[]; status?: string } | undefined;
+      const usage = resp?.usage;
       if (usage) {
         state.meta.promptTokens = usage.input_tokens;
         state.meta.completionTokens = usage.output_tokens;
@@ -262,18 +260,34 @@ export function applyResponsesEvent(payload: string, state: ResponsesState): Res
       // Reconcile the final call list against the server's own output array
       // (authoritative call_id/name/arguments), in case any per-event
       // bookkeeping above missed something.
-      const output = Array.isArray(chunk.response?.output) ? chunk.response.output : [];
+      const output = Array.isArray(resp?.output) ? resp.output : [];
       for (const item of output) {
         if (item?.type === 'function_call' && item.call_id) {
           state.calls.set(item.call_id, { name: item.name ?? '', arguments: item.arguments ?? '' });
         }
       }
-      state.meta.finishReason = output.some((i: any) => i?.type === 'function_call') ? 'tool_calls' : (chunk.response?.status === 'incomplete' ? 'length' : 'stop');
+      state.meta.finishReason = output.some((i: any) => i?.type === 'function_call')
+        ? 'tool_calls'
+        : (resp?.status === 'incomplete' ? 'length' : 'stop');
       return usage ? { usage } : {};
     }
-    case 'response.failed':
     case 'response.incomplete': {
-      const msg = chunk.response?.error?.message || chunk.response?.incomplete_details?.reason || 'response did not complete';
+      state.completed = true;
+      state.meta.finishReason = 'length';
+      const resp = chunk.response as { usage?: any } | undefined;
+      const usage = resp?.usage;
+      if (usage) {
+        state.meta.promptTokens = usage.input_tokens;
+        state.meta.completionTokens = usage.output_tokens;
+        state.meta.cachedTokens = usage.input_tokens_details?.cached_tokens;
+        state.meta.reasoningTokens = usage.output_tokens_details?.reasoning_tokens;
+      }
+      return usage ? { usage } : {};
+    }
+    case 'response.failed': {
+      state.errored = true;
+      const resp = chunk.response as { error?: { message?: string } } | undefined;
+      const msg = resp?.error?.message || 'response did not complete';
       return { error: String(msg) };
     }
     default:
@@ -320,57 +334,64 @@ export async function streamResponses(
       return;
     }
 
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
 
-    // Responses SSE carries both `event:` and `data:` lines per event; the
-    // JSON payload's own `type` field always mirrors the `event:` line, so
-    // only `data:` lines need parsing — `event:`/blank lines are no-ops.
-    const handleDataLine = (payload: string) => {
-      const effect = applyResponsesEvent(payload, state);
-      if (effect.contentDelta !== undefined) {
-        if (firstContentAt === null) firstContentAt = performance.now();
-        cb.onContentDelta?.(effect.contentDelta);
-      }
-      if (effect.reasoningDelta !== undefined) cb.onReasoningDelta?.(effect.reasoningDelta);
-      if (effect.usage) cb.onUsage?.(effect.usage, state.meta as any);
-      if (effect.error) cb.onError?.(effect.error);
-    };
+      // Responses SSE carries both `event:` and `data:` lines per event; the
+      // JSON payload's own `type` field always mirrors the `event:` line, so
+      // only `data:` lines need parsing — `event:`/blank lines are no-ops.
+      const handleDataLine = (payload: string) => {
+        const effect = applyResponsesEvent(payload, state);
+        if (effect.contentDelta !== undefined) {
+          if (firstContentAt === null) firstContentAt = performance.now();
+          cb.onContentDelta?.(effect.contentDelta);
+        }
+        if (effect.reasoningDelta !== undefined) cb.onReasoningDelta?.(effect.reasoningDelta);
+        if (effect.usage) cb.onUsage?.(effect.usage, state.meta);
+        if (effect.error) cb.onError?.(effect.error);
+      };
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      idle?.touch();
-      buf += decoder.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx).replace(/\r$/, '');
-        buf = buf.slice(idx + 1);
-        if (line.startsWith('data:')) {
-          const payload = line.slice(5).trim();
-          if (payload) handleDataLine(payload);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        idle?.touch();
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).replace(/\r$/, '');
+          buf = buf.slice(idx + 1);
+          if (line.startsWith('data:')) {
+            const payload = line.slice(5).trim();
+            if (payload) handleDataLine(payload);
+          }
         }
       }
-    }
-    if (buf.trim().startsWith('data:')) {
-      const payload = buf.trim().slice(5).trim();
-      if (payload) handleDataLine(payload);
+      if (buf.trim().startsWith('data:')) {
+        const payload = buf.trim().slice(5).trim();
+        if (payload) handleDataLine(payload);
+      }
+    } finally {
+      try { await reader?.cancel(); } catch {}
     }
 
     if (firstContentAt !== null) state.meta.ttftMs = firstContentAt - t0;
     if (state.calls.size) {
       cb.onToolCalls?.([...state.calls.entries()].map(([id, c]) => ({ id, name: c.name, arguments: c.arguments })));
     }
-    if (!state.completed) {
+    if (!state.completed && !state.errored) {
       cb.onError?.('The response stream ended before completion — the connection may have dropped.');
       return;
     }
-    cb.onDone?.(state.meta as any);
+    if (state.completed) {
+      cb.onDone?.(state.meta);
+    }
   } catch (e) {
     if (isAbortError(e, signal)) {
       state.meta.finishReason = state.meta.finishReason || 'cancelled';
-      cb.onDone?.(state.meta as any);
+      cb.onDone?.(state.meta);
       return;
     }
     cb.onError?.(e instanceof Error ? e.message : String(e));
@@ -378,3 +399,4 @@ export async function streamResponses(
     idle?.dispose();
   }
 }
+
