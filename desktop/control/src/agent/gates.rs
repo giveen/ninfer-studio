@@ -13,7 +13,16 @@ use crate::engine::S;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::oneshot;
+
+pub(crate) const GATE_TIMEOUT: Duration = Duration::from_secs(300);
+static GATE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_gate_id(prefix: &str) -> String {
+    format!("{prefix}_{}_{}", now_ms(), GATE_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
 
 // ---------------------------------------------------------------------------
 // Approval gate
@@ -26,7 +35,7 @@ pub(crate) async fn await_approval(
     name: &str,
     args: &Value,
 ) -> Option<String> {
-    let aid = format!("appr_{:x}_{}", now_ms(), std::process::id());
+    let aid = next_gate_id("appr");
     let rel = rel_detail(name, args);
     let preview: String = serde_json::to_string(args)
         .unwrap_or_default()
@@ -59,8 +68,16 @@ pub(crate) async fn await_approval(
 
     let decision = tokio::select! {
         d = rx => d.unwrap_or(ApprovalDecision::Denied),
+        _ = tokio::time::sleep(GATE_TIMEOUT) => {
+            run.approvals.lock().unwrap_or_else(|p| p.into_inner()).remove(&aid);
+            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.pending_approvals.retain(|p| p.id != aid);
+            return None;
+        }
         _ = run.wait_stop() => {
             run.approvals.lock().unwrap_or_else(|p| p.into_inner()).remove(&aid);
+            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.pending_approvals.retain(|p| p.id != aid);
             return None;
         }
     };
@@ -85,7 +102,18 @@ pub(crate) fn rel_detail(name: &str, args: &Value) -> Option<String> {
         "bash" | "ast_grep" | "git_commit" => get("command")
             .or_else(|| get("pattern"))
             .or_else(|| get("message")),
-        _ => None,
+        "delegate" | "subagent" => get("prompt")
+            .or_else(|| get("role"))
+            .or_else(|| get("agent")),
+        "git_branch" | "git_worktree" => get("name")
+            .or_else(|| get("branch"))
+            .or_else(|| get("path")),
+        "todo_write" => get("task").or_else(|| get("title")),
+        "memory_update" => get("content").or_else(|| get("key")),
+        _ => get("path")
+            .or_else(|| get("url"))
+            .or_else(|| get("query"))
+            .or_else(|| get("command")),
     }
 }
 
@@ -101,7 +129,13 @@ pub(crate) async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
     if question.is_empty() {
         return json!({ "error": "question is required" });
     }
-    let qid = format!("q_{:x}_{}", now_ms(), std::process::id());
+    {
+        let live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+        if live.user_question.is_some() {
+            return json!({ "error": "another user question is already pending" });
+        }
+    }
+    let qid = next_gate_id("q");
     let (tx, rx) = oneshot::channel();
     *run.question_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
     {
@@ -120,14 +154,22 @@ pub(crate) async fn ask_user(run: &Arc<RunShared>, args: &Value) -> Value {
 
     let answer = tokio::select! {
         a = rx => a.unwrap_or_default(),
+        _ = tokio::time::sleep(GATE_TIMEOUT) => {
+            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.user_question = None;
+            *run.question_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return json!({ "error": "timed out waiting for user response (5 minutes)" });
+        }
         _ = run.wait_stop() => {
             let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
             live.user_question = None;
+            *run.question_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
             return json!({ "error": "run stopped while waiting for the user" });
         }
     };
     let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
     live.user_question = None;
+    *run.question_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
     drop(live);
     Value::String(answer)
 }
@@ -181,6 +223,14 @@ static RISKY_PATTERNS_SRC: &[(&str, &str)] = &[
         r"(?i)\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b",
         "installs a global package",
     ),
+    (
+        r"(?i)\brm\s+-[rRf]*[rf][rRf]*\b",
+        "recursively deletes directories or files",
+    ),
+    (
+        r"(?i)\b(mkfs|fdisk|parted|dd\s+if=)\b",
+        "formats or overwrites disk partitions",
+    ),
 ];
 
 static RISKY_PATTERNS: std::sync::LazyLock<Vec<(Regex, &'static str)>> =
@@ -198,6 +248,9 @@ pub(crate) fn detect_risky(cmd: &str) -> Option<&'static str> {
         .find(|(re, _)| re.is_match(cmd))
         .map(|(_, why)| *why)
 }
+
+static GIT_COMMIT_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\bcommit\b").expect("static git commit regex"));
 
 /// Cheap guard for the commit-approval gate (the client's
 /// `isGitCommitCommand`, ported).
@@ -218,7 +271,7 @@ pub(crate) fn is_git_commit_command(cmd: &str) -> bool {
     {
         return false;
     }
-    Regex::new(r"\bcommit\b").expect("static").is_match(c)
+    GIT_COMMIT_RE.is_match(c)
 }
 
 /// Approved-command matching (the client's `isApprovedCommand`, ported).
@@ -239,7 +292,7 @@ pub(crate) async fn await_gate(
     command: String,
     reason: Option<String>,
 ) -> GateDecision {
-    let gid = format!("gate_{:x}_{}", now_ms(), std::process::id());
+    let gid = next_gate_id("gate");
     let (tx, rx) = oneshot::channel();
     {
         let mut gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
@@ -265,6 +318,10 @@ pub(crate) async fn await_gate(
     });
     let decision = tokio::select! {
         d = rx => d.unwrap_or(GateDecision::Deny),
+        _ = tokio::time::sleep(GATE_TIMEOUT) => {
+            run.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot = None;
+            return GateDecision::Deny;
+        }
         _ = run.wait_stop() => {
             run.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot = None;
             return GateDecision::Deny;
@@ -287,4 +344,41 @@ pub(crate) fn run_depth(state: &S, run: &Arc<RunShared>) -> usize {
         cur = runs.get(&pid).and_then(|r| r.meta.parent.clone());
     }
     depth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_risky() {
+        assert!(detect_risky("git push origin main --force").is_some());
+        assert!(detect_risky("sudo rm -rf /").is_some());
+        assert!(detect_risky("mkfs.ext4 /dev/sdb1").is_some());
+        assert!(detect_risky("cargo build").is_none());
+    }
+
+    #[test]
+    fn test_is_git_commit_command() {
+        assert!(is_git_commit_command("git commit -m 'feat: init'"));
+        assert!(is_git_commit_command("sudo git commit -m 'fix'"));
+        assert!(!is_git_commit_command("git status"));
+        assert!(!is_git_commit_command("giti commit"));
+    }
+
+    #[test]
+    fn test_rel_detail() {
+        let val = json!({"path": "/foo/bar.txt"});
+        assert_eq!(rel_detail("read", &val), Some("/foo/bar.txt".into()));
+
+        let delegate_val = json!({"prompt": "Do task"});
+        assert_eq!(rel_detail("delegate", &delegate_val), Some("Do task".into()));
+    }
+
+    #[test]
+    fn test_next_gate_id_uniqueness() {
+        let id1 = next_gate_id("test");
+        let id2 = next_gate_id("test");
+        assert_ne!(id1, id2);
+    }
 }

@@ -527,7 +527,12 @@ impl RunShared {
             live.updated_at = now_ms();
             live.pending_approvals.clear();
             live.user_question = None;
+            live.pending_hook = None;
         }
+        self.approvals.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.question_tx.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot = None;
+        self.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(message) = &error {
             let _ = self.tx.send(AgentEvent::Error {
                 message: message.clone(),
@@ -981,6 +986,13 @@ pub(crate) async fn approve(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     let approved = body.decision == "approve";
     if approved
         && body
@@ -1014,7 +1026,9 @@ pub(crate) async fn approve(
         ApprovalDecision::Denied
     };
     let _ = sender.send(decision);
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ =
         r.tx.send(AgentEvent::ApprovalResolved { id: aid, approved });
     Json(json!({ "ok": true, "approved": approved })).into_response()
@@ -1046,6 +1060,13 @@ pub(crate) async fn gate_decide(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     let mut gs = r.gate_state.lock().unwrap_or_else(|p| p.into_inner());
     let Some(slot) = gs.slot.take() else {
         return (
@@ -1107,7 +1128,9 @@ pub(crate) async fn gate_decide(
     };
     let _ = slot.tx.send(decision);
     drop(gs);
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::GateResolved {
         id: id_out,
         kind,
@@ -1143,6 +1166,23 @@ pub(crate) async fn answer(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
+    {
+        let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+        if live.user_question.as_ref().map(|q| &q.id) != Some(&qid) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "no pending question with that id"})),
+            )
+                .into_response();
+        }
+    }
     let Some(sender) = r
         .question_tx
         .lock()
@@ -1156,7 +1196,9 @@ pub(crate) async fn answer(
             .into_response();
     };
     let _ = sender.send(body.answer.clone());
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::UserQuestionAnswered {
         id: qid,
         answer: body.answer,
@@ -1355,6 +1397,13 @@ pub(crate) async fn hook_decision(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     // The id must be the pending one — a stale decision from an earlier pause
     // must not resolve the current one (two clients racing, a late reply).
     {
@@ -1395,7 +1444,9 @@ pub(crate) async fn hook_decision(
         let mut live = r.live.lock().unwrap_or_else(|p| p.into_inner());
         live.pending_hook = None;
     }
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::HookResolved { id: hid, action });
     Json(json!({ "ok": true })).into_response()
 }
