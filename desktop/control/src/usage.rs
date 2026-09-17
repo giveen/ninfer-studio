@@ -320,9 +320,9 @@ pub(crate) async fn usage_stats(
         .iter()
         .map(|(day, agg)| {
             let day_hit_rate = if agg.prompt_tokens > 0 {
-                agg.cached_tokens as f64 / agg.prompt_tokens as f64
+                Some(agg.cached_tokens as f64 / agg.prompt_tokens as f64)
             } else {
-                0.0
+                None
             };
             json!({
                 "day": day,

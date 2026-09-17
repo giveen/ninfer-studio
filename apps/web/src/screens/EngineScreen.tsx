@@ -531,8 +531,9 @@ export function EngineScreen({
           <CloudTab settings={settings} onUpdate={onUpdateSettings} />
         </div>
         <div className={cn(tab !== 'usage' && 'hidden')}>
-          <UsageTrackerTab />
+          <UsageTrackerTab active={tab === 'usage'} />
         </div>
+
       </div>
     </div>
   );

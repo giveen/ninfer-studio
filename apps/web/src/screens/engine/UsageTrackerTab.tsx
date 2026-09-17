@@ -56,7 +56,7 @@ function fillDailySeries(series: UsageDailyPoint[], days: number): UsageDailyPoi
     const d = new Date(today);
     d.setUTCDate(d.getUTCDate() - i);
     const key = d.toISOString().slice(0, 10);
-    out.push(byDay.get(key) ?? { day: key, tokens: 0, requests: 0, cacheHitRate: 0, models: {}, kwh: 0, cloudCostUsd: 0 });
+    out.push(byDay.get(key) ?? { day: key, tokens: 0, requests: 0, cacheHitRate: null, models: {}, kwh: 0, cloudCostUsd: 0 });
   }
   return out;
 }
@@ -81,7 +81,7 @@ function heatCellClass(count: number, max: number): string {
   return 'bg-accent/20';
 }
 
-export function UsageTrackerTab() {
+export function UsageTrackerTab({ active = true }: { active?: boolean }) {
   const [rangeDays, setRangeDays] = useState<RangeDays>('30');
   const [source, setSource] = useState<UsageSource>('all');
   const days = Number(rangeDays);
@@ -125,6 +125,15 @@ export function UsageTrackerTab() {
     refresh();
     loadCostConfig();
   };
+
+  const prevActiveRef = useRef(false);
+  useEffect(() => {
+    if (active && !prevActiveRef.current) {
+      refreshAll();
+    }
+    prevActiveRef.current = active;
+  }, [active]);
+
   const estCost = totals ? totals.energyKwh * costPerKwh : 0;
   const costPerMillionTokens = totals && costPerKwh > 0 && totals.tokenUsage > 0 ? (estCost / totals.tokenUsage) * 1_000_000 : null;
 
