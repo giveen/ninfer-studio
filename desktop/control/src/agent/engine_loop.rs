@@ -1072,6 +1072,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
     let meta = shared.meta.clone();
     let max_steps = meta.max_steps;
     let mut turns = 0usize;
+    shared.set_turns(0);
 
     if meta.plan {
         let task = {
@@ -1255,6 +1256,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         if turn.tool_calls.is_empty() {
             if !turn.dropped.is_empty() {
                 turns += 1;
+                shared.set_turns(turns);
                 continue;
             }
             if turn.finish_reason.as_deref() == Some("length")
@@ -1291,6 +1293,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                     }
                     HookOutcome::Continue => {
                         turns += 1;
+                        shared.set_turns(turns);
                         continue;
                     }
                     HookOutcome::Aborted => return,
@@ -1310,6 +1313,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
                 }
                 HookOutcome::Continue => {
                     turns += 1;
+                    shared.set_turns(turns);
                     continue;
                 }
                 HookOutcome::Aborted => return, // already marked Stopped
@@ -1417,6 +1421,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
             HookOutcome::Continue => {}
         }
         turns += 1;
+        shared.set_turns(turns);
     }
 }
 

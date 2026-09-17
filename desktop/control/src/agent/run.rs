@@ -365,9 +365,10 @@ pub struct RunMeta {
     pub label: String,
     pub model: String,
     pub base_url: Option<String>,
+    #[serde(skip)]
     pub api_key: Option<String>,
     /// JSON object string of extra headers forwarded to the cloud provider.
-    #[serde(default)]
+    #[serde(skip)]
     pub extra_headers: Option<String>,
     /// Fall back to the local engine on cloud 429/5xx (default true for cloud runs).
     #[serde(default = "default_allow_fallback")]
@@ -450,6 +451,15 @@ fn shared_hook_mode(r: &RunShared) -> HookMode {
 
 impl RunShared {
     pub fn snapshot(&self) -> RunSnapshot {
+        let hook_mode_val = shared_hook_mode(self);
+        let pending_gate_val = self
+            .gate_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slot
+            .as_ref()
+            .map(|s| s.pending.clone());
+
         let live = lock(&self.live);
         let meta = &self.meta;
         RunSnapshot {
@@ -476,21 +486,21 @@ impl RunShared {
             last_meta: live.last_meta.clone(),
             pending_approvals: live.pending_approvals.clone(),
             user_question: live.user_question.clone(),
-            hook_mode: match shared_hook_mode(self) {
+            hook_mode: match hook_mode_val {
                 HookMode::Auto => "auto".to_string(),
                 HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
-            pending_gate: self
-                .gate_state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .slot
-                .as_ref()
-                .map(|s| s.pending.clone()),
+            pending_gate: pending_gate_val,
             plan: meta.plan,
             todo_rev: live.todo_rev,
         }
+    }
+
+    pub fn set_turns(&self, turns: usize) {
+        let mut live = lock(&self.live);
+        live.turns = turns;
+        live.updated_at = now_ms();
     }
 
     pub fn status(&self) -> RunStatus {
@@ -910,20 +920,22 @@ pub(crate) async fn list(AxumState(state): AxumState<S>) -> Response {
     let mut out: Vec<Value> = runs
         .values()
         .map(|r| {
-            let snap = r.snapshot();
+            let meta = &r.meta;
+            let live = lock(&r.live);
+            let pending_approvals_count = live.pending_approvals.len();
             json!({
-                "id": snap.id,
-                "kind": snap.kind,
-                "label": snap.label,
-                "model": snap.model,
-                "status": snap.status,
-                "turns": snap.turns,
-                "maxSteps": snap.max_steps,
-                "createdAt": snap.created_at,
-                "updatedAt": snap.updated_at,
-                "stop": snap.stop,
-                "parent": snap.parent,
-                "pendingApprovals": snap.pending_approvals.len(),
+                "id": meta.id,
+                "kind": meta.kind,
+                "label": meta.label,
+                "model": meta.model,
+                "status": live.status,
+                "turns": live.turns,
+                "maxSteps": meta.max_steps,
+                "createdAt": meta.created_at,
+                "updatedAt": live.updated_at,
+                "stop": live.stop,
+                "parent": meta.parent,
+                "pendingApprovals": pending_approvals_count,
             })
         })
         .collect();
