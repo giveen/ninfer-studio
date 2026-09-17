@@ -202,6 +202,7 @@ export type StreamFn = (
   req: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
 ) => Promise<void>;
 
 /** Picks the transport for a turn that didn't request one explicitly: the
@@ -276,13 +277,21 @@ export async function streamTurn(opts: {
   params: ChatParams;
   tools?: unknown[];
   cacheSystem?: boolean;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
+  allowFallback?: boolean;
   signal: AbortSignal;
   stream?: StreamFn;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string) => void;
   onStreamError?: (message: string) => void;
 }): Promise<TurnResult> {
-  const { model, system, messages, params, tools, cacheSystem, signal, stream = resolveDefaultStreamFn(params), recoverMarkup = true, onDelta, onStreamError } = opts;
+  const {
+    model, system, messages, params, tools, cacheSystem,
+    baseUrl, apiKey, extraHeaders, allowFallback,
+    signal, stream = resolveDefaultStreamFn(params), recoverMarkup = true, onDelta, onStreamError
+  } = opts;
   let content = '';
   let reasoning = '';
   let toolCalls: AgentToolCall[] = [];
@@ -293,14 +302,18 @@ export async function streamTurn(opts: {
     tools && tools.length ? { tools } : undefined,
     cacheSystem,
   );
-  await stream(req, signal, {
-    onContentDelta: (t) => { content += t; onDelta?.('content', t); },
-    onReasoningDelta: (t) => { reasoning += t; onDelta?.('reasoning', t); },
-    onToolCalls: (c) => { toolCalls = c; },
-    onUsage: (_u, m) => { meta = m; },
-    onDone: (m) => { meta = { ...meta, ...m }; finishReason = m.finishReason; },
-    onError: (msg) => { onStreamError?.(msg); },
-  });
+  await stream(
+    req, signal,
+    {
+      onContentDelta: (t) => { content += t; onDelta?.('content', t); },
+      onReasoningDelta: (t) => { reasoning += t; onDelta?.('reasoning', t); },
+      onToolCalls: (c) => { toolCalls = c; },
+      onUsage: (_u, m) => { meta = m; },
+      onDone: (m) => { meta = { ...meta, ...m }; finishReason = m.finishReason; },
+      onError: (msg) => { onStreamError?.(msg); },
+    },
+    { baseUrl, apiKey, extraHeaders, allowFallback }
+  );
 
   let recoveredFromMarkup: TurnResult['recoveredFromMarkup'] = null;
   let dropped: string[] = [];
@@ -390,6 +403,10 @@ export interface ToolLoopOptions {
   maxSteps: number;
   signal: AbortSignal;
   stream?: StreamFn;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
+  allowFallback?: boolean;
   cacheSystem?: boolean;
   /** Append a fresh `contextNoteMessage()` (date/time) to real history
    *  before every internal turn of this loop — persisted, not discarded;
@@ -421,7 +438,11 @@ export interface ToolLoopResult {
  *  appends the assistant message, then either stops (no calls, halt, empty,
  *  abort, budget) or dispatches through the registry and continues. */
 export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult> {
-  const { model, system, params, tools, registry, maxSteps, signal, stream, cacheSystem, appendDateTime, recoverMarkup } = opts;
+  const {
+    model, system, params, tools, registry, maxSteps, signal, stream,
+    baseUrl, apiKey, extraHeaders, allowFallback,
+    cacheSystem, appendDateTime, recoverMarkup
+  } = opts;
   let messages = [...opts.messages];
   let turns = 0;
   let finishReason: string | undefined;
@@ -438,6 +459,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
     }
     const t = await streamTurn({
       model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
+      baseUrl, apiKey, extraHeaders, allowFallback,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
       onStreamError: (msg) => opts.onStreamError?.(msg, turns),
     });
