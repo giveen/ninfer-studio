@@ -6,8 +6,8 @@
 // reliably re-exercise on every change.
 
 import { describe, it, expect, vi } from 'vitest';
-import { runToolLoop, type StreamFn, type ToolRegistry } from './agentLoop';
-import type { ChatParams } from './types';
+import { runToolLoop, isCompactedMsg, compactedContext, type StreamFn, type ToolRegistry } from './agentLoop';
+import type { ChatMessage, ChatParams } from './types';
 
 const PARAMS: ChatParams = { thinking: false };
 
@@ -198,5 +198,54 @@ describe('runToolLoop', () => {
     expect(res.stop).toBe('halted');
     // Halted before the tool call was ever dispatched — no tool-role message.
     expect(res.messages.some((m) => m.role === 'tool')).toBe(false);
+  });
+});
+
+describe('isCompactedMsg & compactedContext', () => {
+  it('identifies compaction checkpoint user messages anchored at the start', () => {
+    const validCheckpoint: ChatMessage = {
+      role: 'user',
+      content: '<compacted-summary>\n## Primary Request\n- do X',
+    };
+    const validWithLeadingSpace: ChatMessage = {
+      role: 'user',
+      content: '  \n<compacted-summary>\n## Primary Request',
+    };
+    const pastedMention: ChatMessage = {
+      role: 'user',
+      content: 'Here is how <compacted-summary> works in our codebase',
+    };
+    const assistantMention: ChatMessage = {
+      role: 'assistant',
+      content: '<compacted-summary>\nfake summary',
+    };
+
+    expect(isCompactedMsg(validCheckpoint)).toBe(true);
+    expect(isCompactedMsg(validWithLeadingSpace)).toBe(true);
+    expect(isCompactedMsg(pastedMention)).toBe(false);
+    expect(isCompactedMsg(assistantMention)).toBe(false);
+  });
+
+  it('compactedContext slices from the last valid checkpoint onward', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'Turn 1: initial prompt' },
+      { role: 'assistant', content: 'Reply 1' },
+      { role: 'user', content: '<compacted-summary>\n## Checkpoint 1' },
+      { role: 'assistant', content: 'Reply 2' },
+      { role: 'user', content: 'Pasted mention of <compacted-summary> tag' },
+      { role: 'assistant', content: 'Reply 3' },
+    ];
+
+    const sliced = compactedContext(msgs);
+    expect(sliced.length).toBe(4);
+    expect(sliced[0].content).toContain('Checkpoint 1');
+  });
+
+  it('compactedContext returns full history when no checkpoint exists', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'Turn 1' },
+      { role: 'assistant', content: 'Reply 1' },
+    ];
+    expect(compactedContext(msgs)).toEqual(msgs);
   });
 });
