@@ -64,7 +64,6 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// literal `"`) reproduces the argument byte-for-byte. Pure string logic —
 /// kept out of the `cfg(windows)` module so its round-trip is testable (and
 /// tested) on every platform's CI.
-#[cfg(any(windows, test))]
 pub(crate) fn arg_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
@@ -76,23 +75,21 @@ pub(crate) fn arg_quote(s: &str) -> String {
     }
     let mut out = String::from("\"");
     let mut backslashes = 0usize;
-    for b in s.bytes() {
-        match b {
-            b'\\' => backslashes += 1,
-            b'"' => {
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
                 out.push_str(&"\\".repeat(2 * backslashes + 1));
                 out.push('"');
                 backslashes = 0;
             }
             _ => {
                 out.push_str(&"\\".repeat(backslashes));
-                out.push(b as char);
+                out.push(c);
                 backslashes = 0;
             }
         }
     }
-    // A trailing backslash run is followed by the closing quote, and MSVCRT
-    // halves such runs — so double it to encode the run literally.
     out.push_str(&"\\".repeat(2 * backslashes));
     out.push('"');
     out
@@ -274,7 +271,7 @@ mod quoting_tests {
     /// line.
     fn msvcrt_parse_arg(encoded: &str) -> String {
         let b: Vec<u8> = encoded.as_bytes().to_vec();
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let mut in_quotes = false;
         let mut i = 0usize;
         // The parser skips leading whitespace before each argument.
@@ -282,7 +279,7 @@ mod quoting_tests {
             i += 1;
         }
         if i >= b.len() {
-            return out;
+            return String::new();
         }
         loop {
             let mut copy_character = true;
@@ -292,7 +289,7 @@ mod quoting_tests {
                 numslash += 1;
             }
             if i < b.len() && b[i] == b'"' {
-                if numslash.is_multiple_of(2) {
+                if numslash % 2 == 0 {
                     // `""` inside a quoted string is a literal `"` (the UCRT
                     // special case); `arg_quote` never relies on it — it
                     // always emits an odd backslash run before a literal
@@ -307,17 +304,26 @@ mod quoting_tests {
                 numslash /= 2;
             }
             for _ in 0..numslash {
-                out.push('\\');
+                out.push(b'\\');
             }
             if i >= b.len() || (!in_quotes && (b[i] == b' ' || b[i] == b'\t')) {
                 break;
             }
             if copy_character {
-                out.push(b[i] as char);
+                out.push(b[i]);
             }
             i += 1;
         }
-        out
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    #[test]
+    fn shell_quoting_escapes_single_quotes_and_preserves_utf8() {
+        use super::shell_quote;
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("it's a test"), "'it'\\''s a test'");
+        assert_eq!(shell_quote("données 'café'"), "'données '\\''café'\\'''");
     }
 
     #[test]
@@ -327,6 +333,7 @@ mod quoting_tests {
         assert_eq!(arg_quote("C:\\Git\\bin\\bash"), "\"C:\\Git\\bin\\bash\"");
         assert_eq!(arg_quote("a b"), "\"a b\"");
         assert_eq!(arg_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(arg_quote("say \"données\""), "\"say \\\"données\\\"\"");
         // Trailing run: doubled so the closing quote survives the parser.
         assert_eq!(arg_quote("trail\\"), "\"trail\\\\\"");
         // Run NOT followed by a quote: copied verbatim (MSVCRT only treats
@@ -353,6 +360,8 @@ mod quoting_tests {
             "grep -r \"'single' and \\\"double\\\"\" .",
             "echo $HOME && echo `id`",
             "printf '%s\\n' line1 line2",
+            "echo \"données et café\"",
+            "cd \"/home/user/日本語\" && ls",
         ] {
             let encoded = arg_quote(script);
             let parsed = msvcrt_parse_arg(&encoded);
