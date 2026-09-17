@@ -151,6 +151,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const engineUp = upEngines.length > 0;
   const runningModel = upEngines[0]?.modelId || '';
 
+  const primaryProviderConfig = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+  const isCloudPrimary = !!(
+    appConfig?.cloudProviderEnabled &&
+    (params.primaryProvider === 'cloud' ||
+      (appConfig.cloudUseForPrimary && params.primaryProvider !== 'ninfer'))
+  );
+  const engineUpOrCloud = engineUp || isCloudPrimary;
+  const effectiveRunningModel = runningModel || (isCloudPrimary ? primaryProviderConfig.model : '');
+
   // Hydrate conversations + chat params from the user's profile dir on the
   // control plane (survives a fresh install / AppImage run). Then keep them in
   // sync: any change is written back through the API.
@@ -179,18 +188,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // (multi-engine setups), and that disagreement must NOT keep resetting.
   const syncedRunningModelRef = useRef('');
   useEffect(() => {
-    // Keep the selector pointed at the running engine's actual id. The engine
-    // only answers to the id it was started with — if it changes underneath
-    // us (the user restarts it with a different model/artifact), a selection
-    // still pointed at the old id 404s on every turn, forever, until this
-    // fires. Comparing against the *previous* runningModel (not the current
-    // `model`) is what makes this fire again after such a restart, not just
-    // on the very first engine-up.
-    if (runningModel && runningModel !== syncedRunningModelRef.current) {
-      setModel(runningModel);
-      syncedRunningModelRef.current = runningModel;
+    if (effectiveRunningModel && effectiveRunningModel !== syncedRunningModelRef.current) {
+      setModel(effectiveRunningModel);
+      syncedRunningModelRef.current = effectiveRunningModel;
     }
-  }, [runningModel]);
+  }, [effectiveRunningModel]);
 
   // Probe once per engine readiness change whether /v1/responses is
   // implemented (community forks may not have it) — cached, so `send` can
@@ -255,7 +257,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const runCompact = useCallback(async () => {
     if (compacting) return;
     setNotice(null);
-    if (!engineUp) {
+    if (!engineUpOrCloud) {
       onNavigate('engine');
       return;
     }
@@ -304,14 +306,14 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setCompacting(false);
       abortRef.current = null;
     }
-  }, [compacting, engineUp, convs, activeId, model, runningModel, params, onNavigate]);
+  }, [compacting, engineUpOrCloud, convs, activeId, model, runningModel, params, onNavigate]);
 
   // Stream an assistant reply into the LAST message of `convId`, given the prior
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
     async (convId: string, history: ChatMessage[], _depth = 0, placeholderId?: string) => {
-      if (!engineUp) {
+      if (!engineUpOrCloud) {
         onNavigate('engine');
         return;
       }
@@ -1395,7 +1397,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           </div>
         )}
 
-        {!engineUp && (
+        {!engineUpOrCloud && (
           <div className="flex shrink-0 items-center gap-3 border-b border-warn/20 bg-warn/8 px-4 py-2 text-[12.5px] text-warn">
             <span>
               The engine is {engine?.state === 'starting' ? 'starting' : 'not running'} — messages will be sent once it is ready.
@@ -1630,7 +1632,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   onFiles(files);
                 }
               }}
-              placeholder={engineUp ? `Message ${model || 'engine'}…  (Enter to send, Shift+Enter for newline)` : 'Engine is offline — open the Engine tab to start it'}
+              placeholder={
+                engineUpOrCloud
+                  ? `Message ${isCloudPrimary ? (primaryProviderConfig.model || 'cloud model') : (model || 'engine')}…  (Enter to send, Shift+Enter for newline)`
+                  : 'Engine is offline — open the Engine tab to start it'
+              }
               className="max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
             />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-1">
@@ -1676,7 +1682,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   </Button>
                 </>
               ) : (
-                <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUp}>
+                <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUpOrCloud}>
                   <Send size={13} /> send
                 </Button>
               )}
