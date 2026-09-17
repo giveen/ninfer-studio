@@ -224,6 +224,21 @@ pub async fn perms_approve(
         }
     };
     let scope = perm_scope(&req);
+    let all_perms = state.coder_perms.read().await;
+    let perms = all_perms
+        .get(&scope)
+        .or_else(|| all_perms.get("default"))
+        .cloned()
+        .unwrap_or_default();
+    drop(all_perms);
+    let tier = tier_for(&perms, &tool);
+    if tier != PermTier::Ask {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("'{tool}' is not in 'ask' tier for scope '{scope}'")})),
+        ));
+    }
+
     let rel = req
         .get("path")
         .and_then(|v| v.as_str())
@@ -261,13 +276,31 @@ pub(crate) async fn enforce_perm(
     approval_token: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let all_perms = state.coder_perms.read().await;
-    let perms = all_perms
-        .get(scope)
-        .or_else(|| all_perms.get("default"))
-        .cloned()
-        .unwrap_or_default();
-    drop(all_perms);
-    let tier = tier_for(&perms, tool);
+    let mut matched_perms = Vec::new();
+    if let Some(p) = all_perms.get(scope) {
+        matched_perms.push(p);
+    }
+    if scope != "default" {
+        if let Some(p) = all_perms.get("default") {
+            matched_perms.push(p);
+        }
+    }
+    let default_perm = CoderPerms::default();
+    if matched_perms.is_empty() {
+        matched_perms.push(&default_perm);
+    }
+
+    let mut tier = PermTier::Allow;
+    for p in &matched_perms {
+        let t = tier_for(p, tool);
+        if t == PermTier::Deny {
+            tier = PermTier::Deny;
+            break;
+        } else if t == PermTier::Ask {
+            tier = PermTier::Ask;
+        }
+    }
+
     if tier == PermTier::Deny {
         return Err((
             StatusCode::FORBIDDEN,
@@ -306,16 +339,18 @@ pub(crate) async fn enforce_perm(
     if let Some(rel) = rel {
         let norm_rel = normalize_rel_path(rel);
         if !norm_rel.is_empty() {
-            let hit = perms.deny_paths.iter().find(|d| {
-                let clean = normalize_rel_path(d);
-                !clean.is_empty()
-                    && (norm_rel == clean || norm_rel.starts_with(&format!("{clean}/")))
-            });
-            if let Some(hit) = hit {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
-                ));
+            for p in &matched_perms {
+                let hit = p.deny_paths.iter().find(|d| {
+                    let clean = normalize_rel_path(d);
+                    !clean.is_empty()
+                        && (norm_rel == clean || norm_rel.starts_with(&format!("{clean}/")))
+                });
+                if let Some(hit) = hit {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
+                    ));
+                }
             }
         }
     }

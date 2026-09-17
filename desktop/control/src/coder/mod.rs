@@ -298,6 +298,17 @@ mod tests {
                 .await
                 .is_err()
         );
+        // Normalized path bypass attempts are also rejected.
+        assert!(
+            fs_write(ws(), Json(json!({"path": "./secret/x.txt", "content": "no"})))
+                .await
+                .is_err()
+        );
+        assert!(
+            fs_write(ws(), Json(json!({"path": "ok/../secret/x.txt", "content": "no"})))
+                .await
+                .is_err()
+        );
         assert!(
             fs_write(ws(), Json(json!({"path": "ok/x.txt", "content": "yes"})))
                 .await
@@ -376,7 +387,7 @@ mod tests {
 
         let _ = perms_set(
             ws(),
-            Json(json!({"tools": {"write": "ask"}, "denyPaths": []})),
+            Json(json!({"tools": {"write": "ask", "read": "ask"}, "denyPaths": []})),
         )
         .await;
 
@@ -389,15 +400,15 @@ mod tests {
         assert!(!tmp.join("a.txt").exists());
 
         // Wrong tool's token: still rejected.
-        let bash_token = perms_approve(ws(), Json(json!({"tool": "bash"})))
+        let read_token = perms_approve(ws(), Json(json!({"tool": "read"})))
             .await
             .unwrap()
             .0;
-        let bash_token = bash_token.get("token").and_then(|v| v.as_str()).unwrap();
+        let read_token = read_token.get("token").and_then(|v| v.as_str()).unwrap();
         assert!(
             fs_write(
                 ws(),
-                Json(json!({"path": "a.txt", "content": "x", "approvalToken": bash_token}))
+                Json(json!({"path": "a.txt", "content": "x", "approvalToken": read_token}))
             )
             .await
             .is_err()
