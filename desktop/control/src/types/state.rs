@@ -189,7 +189,7 @@ pub struct State {
     /// Live task for the Remote Access listener (`remote::start`/`stop`).
     /// `None` when off; the persisted `remote_access_enabled`/`_port` in
     /// `config` describe the desired state, this is the actual running one.
-    pub remote: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub remote: tokio::sync::Mutex<Option<crate::remote::RemoteSlot>>,
     /// Server-side agent runs (the loop that used to live in the webview).
     /// Runs keep going while no client is attached; a client attaches via
     /// `GET /api/agent/runs/{id}/events` (SSE) and never owns the loop.
