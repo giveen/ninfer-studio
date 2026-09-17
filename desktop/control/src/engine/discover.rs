@@ -2,15 +2,6 @@
 
 //! Discovery of externally-running `ninfer-serve` processes (/proc on Linux, tasklist+netstat on Windows).
 
-/// Scan for running `ninfer-serve` processes.
-#[allow(dead_code)]
-pub async fn find_external_serve_pids() -> Vec<u32> {
-    discover_engines()
-        .await
-        .into_iter()
-        .map(|d| d.pid)
-        .collect()
-}
 
 /// A locally-running ninfer-serve process discovered via /proc or tasklist/netstat.
 #[derive(Debug, Clone, PartialEq, Eq)]

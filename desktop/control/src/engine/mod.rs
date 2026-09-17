@@ -1,16 +1,21 @@
 //! Engine process supervision: spawn / health-poll / stop / adopt-external.
 //!
 //! One file per concern:
-//! health - /health + /v1/models probing, argv fallback
 //! discover - external ninfer-serve discovery (/proc, tasklist+netstat)
-//! status - reconcile in-memory state with reality, adopt-external policy
-//! log - per-port engine log files + size-cap rotation
-//! gpu - VRAM accounting from the engine log
-//! launch - spawn / stop / signal + the public engine view
+//! gpu      - VRAM accounting from the engine log
+//! health   - /health + /v1/models probing, argv fallback
+//! launch   - spawn / stop / signal + the public engine view
+//! log      - per-port engine log files + size-cap rotation
+//! status   - reconcile in-memory state with reality, adopt-external policy
 //!
-//! Every public handler/type is re-exported here so `lib.rs` (and the
-//! `crate::engine::S` users in `coder/`) keep using `engine::...` paths
-//! unchanged.
+//! Directory Invariant (MUST be preserved across all module edits):
+//!   Modules in `engine/` share the process slot (`state.child`), the per-port log file,
+//!   and `state.engine`. Readers of engine state or log content MUST verify against the active
+//!   run's identity (`spawn_epoch` on `EngineInner` or `ENGINE_START_MARKER` in log files)
+//!   rather than assuming values in a slot or log file belong to the current run.
+//!
+//! Every router-facing entry point and shared type is re-exported here for `routes_engine.rs`,
+//! `lib.rs`, and the `crate::engine::S` users in `coder/`.
 
 // Rust guideline compliant 2026-07-28
 
@@ -27,7 +32,7 @@ mod launch;
 mod log;
 mod status;
 
-pub use discover::{DiscoveredEngine, discover_engines, find_external_serve_pids};
+pub use discover::{DiscoveredEngine, discover_engines};
 pub use gpu::{VRAM_FLOOR_GIB, vram_status};
 pub use health::{engine_health, engine_model_info};
 pub use launch::{fail_and_emit, public_engine, start_engine, stop_engine};
