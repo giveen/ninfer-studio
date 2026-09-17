@@ -311,7 +311,7 @@ pub async fn exec(
             .cloned()
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
         let wrapped = format!(
-            "cd {} 2>/dev/null || true\n{}\nprintf '\\n{cwd_marker}%s{cwd_marker}\\n' \"$PWD\"",
+            "cd {} 2>/dev/null || true\n{}\n_ec=$?\nprintf '\\n{cwd_marker}%s{cwd_marker}\\n' \"$PWD\"\nexit $_ec",
             shell_quote(&base),
             command
         );
