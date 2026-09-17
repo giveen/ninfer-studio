@@ -463,7 +463,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
       const names = [...new Set(t.dropped)];
       const available = (tools ?? []).map(toolNameOf).filter((n): n is string => n !== null);
       const note: ChatMessage = {
-        role: 'system',
+        role: 'user',
         content: available.length
           ? `[System: your tool-call markup for ${names.join(', ')} was ignored — those tools are not available right now. Available tools: ${available.join(', ')}. Call one of the available tools using the native tool-call format, or answer directly in prose.]`
           : `[System: your tool-call markup for ${names.join(', ')} was ignored — no tools are available in this conversation. Answer directly in prose.]`,
