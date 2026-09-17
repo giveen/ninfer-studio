@@ -26,6 +26,11 @@ pub(crate) const CODER_IGNORE: &[&str] = &[
     "__pycache__",
     ".venv",
     "venv",
+    ".tox",
+    "Pods",
+    "out",
+    ".gradle",
+    ".idea",
 ];
 
 /// Whether `base` is safe to use as a config-write directory: absolute and
@@ -51,15 +56,7 @@ pub(crate) fn coder_root(ws: &str) -> Result<PathBuf, (StatusCode, Json<Value>)>
 
 /// Resolve this request's workspace root. An explicit `workspace` (request
 /// body/query field) takes precedence over the single global `coderWorkspace`
-/// pointer on `AppSettings` — every coder tool call that reads/writes files or
-/// runs a shell was previously confined to whatever repo the backend happened
-/// to be pointed at, with no way for a specific conversation to address its
-/// own workspace independent of what another tab/conversation last set. A
-/// caller that already knows its target (the UI always does — each open
-/// conversation tracks its own workspace dir) should pass it explicitly;
-/// omitting it preserves the old fallback-to-global behavior for any caller
-/// not yet updated. Mirrors `memory.rs`'s `resolve_mem_dir`, which already
-/// used this pattern for the self-improving memory store.
+/// pointer on `AppSettings`.
 pub(crate) async fn resolve_ws(
     state: &S,
     override_path: Option<&str>,
@@ -71,10 +68,33 @@ pub(crate) async fn resolve_ws(
     coder_root(&ws)
 }
 
-/// Resolve a workspace-relative path, rejecting traversal outside the root.
-/// Purely lexical (mirrors the sidecar's `path.resolve` + `path.relative`
-/// check): works for not-yet-created paths, and an absolute `rel` replaces
-/// the root before the containment check rejects it.
+/// Normalize a relative path string into canonical lexical relative form
+/// (strips `./`, resolves `..` components lexically, trims trailing slashes).
+pub(crate) fn normalize_rel_path(rel: &str) -> String {
+    use std::path::Component;
+    let clean = rel.trim();
+    if clean.is_empty() || clean == "." {
+        return String::new();
+    }
+    let p = Path::new(clean);
+    let mut comps = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                comps.pop();
+            }
+            Component::Normal(s) => {
+                comps.push(s.to_string_lossy());
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    comps.join("/")
+}
+
+/// Resolve a workspace-relative path, rejecting traversal outside the root
+/// and enforcing symlink containment.
 pub(crate) fn within_ws(root: &Path, rel: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     use std::path::Component;
     let rel = rel.trim();
@@ -109,7 +129,18 @@ pub(crate) fn within_ws(root: &Path, rel: &str) -> Result<PathBuf, (StatusCode, 
             Json(json!({"error": "path escapes workspace"})),
         ));
     }
-    Ok(joined)
+    if let Ok(canon) = norm.canonicalize() {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if !canon.starts_with(&canon_root) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "path escapes workspace via symlink"})),
+            ));
+        }
+        Ok(canon)
+    } else {
+        Ok(norm)
+    }
 }
 
 /// Display path of `p` relative to the workspace root (`.` for the root).
@@ -132,18 +163,6 @@ pub enum PermTier {
 
 /// The active workspace's tool permissions, pushed here by the web UI
 /// (`perms_set`) whenever the user edits them or switches workspaces.
-///
-/// The UI is normally what decides whether to call a coder endpoint at all
-/// — but that's a client-side dispatcher the agent can route around (e.g.
-/// its allowed `bash` tool can `curl` straight at an endpoint whose own
-/// tool tier is `deny`). `enforce_perm` re-checks `deny` and `denyPaths`
-/// at the endpoint itself so that bypass doesn't work. `ask` means "pause
-/// and prompt a human", which only the client's own dialog can actually do
-/// — but the endpoint itself still requires proof that dialog ran and was
-/// approved: a short-lived, single-use token minted by `perms_approve` the
-/// moment the human clicks Approve (see `ApprovalTicket`). Without this, a
-/// caller that skipped the dialog entirely (a direct request to the
-/// endpoint) was treated exactly like `allow`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CoderPerms {
@@ -151,15 +170,10 @@ pub struct CoderPerms {
     pub deny_paths: Vec<String>,
 }
 
-/// How long an approval token stays valid after `perms_approve` mints it —
-/// long enough to cover the round-trip to the actual tool call, short enough
-/// that a stale token from an old, already-resolved dialog can't be reused.
+/// How long an approval token stays valid after `perms_approve` mints it.
 const APPROVAL_TTL: Duration = Duration::from_secs(60);
 
-/// A human's one-time sign-off on a specific `ask`-tiered tool call, scoped to
-/// the caller's `scope` (see `coder_perms` on `State`), the tool, and (when
-/// the tool takes one) the path prefix approved. Minted by `perms_approve`,
-/// consumed by `enforce_perm`.
+/// A human's one-time sign-off on a specific `ask`-tiered tool call.
 #[derive(Debug)]
 pub struct ApprovalTicket {
     scope: String,
@@ -168,11 +182,8 @@ pub struct ApprovalTicket {
     expires_at: Instant,
 }
 
-/// The perms bucket key a caller supplies via an optional `scope` request
-/// field (falls back to `workspace` when `scope` is absent, since fs/exec/
-/// grep/glob callers already send that; falls back further to a fixed
-/// default bucket when neither is present, preserving pre-scoping behavior
-/// for a caller that sends neither).
+/// The perms bucket key a caller supplies via an optional `scope` or `workspace`
+/// request field (falls back to "default").
 pub(crate) fn perm_scope(req: &Value) -> String {
     req.get("scope")
         .and_then(|v| v.as_str())
@@ -183,11 +194,7 @@ pub(crate) fn perm_scope(req: &Value) -> String {
         .to_string()
 }
 
-/// The effective tier for `name` under `perms`: the per-tool row wins; for
-/// a namespaced MCP name (`mcp__<server>__<tool>`) a row for the server-level
-/// key `mcp__<server>` applies when no per-tool row exists (see `mcp.rs`) —
-/// one row then covers every tool a server exposes, with per-tool overrides.
-/// Non-MCP names never consult a server row. Default is `allow`.
+/// The effective tier for `name` under `perms`. Default is `allow`.
 pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
     if let Some(t) = perms.tools.get(name) {
         return *t;
@@ -202,11 +209,7 @@ pub(crate) fn tier_for(perms: &CoderPerms, name: &str) -> PermTier {
     PermTier::Allow
 }
 
-/// `POST /api/coder/perms/approve` — body `{tool, path?, scope?}`. Called by
-/// the web UI's approval dialog at the moment a human clicks Approve on an
-/// `ask`-tiered tool call, in addition to (not instead of) resolving that
-/// dialog's own in-memory promise. Returns `{token}`, which the client then
-/// attaches to the actual tool-call request as `approvalToken`.
+/// `POST /api/coder/perms/approve` — body `{tool, path?, scope?}`.
 pub async fn perms_approve(
     AxumState(state): AxumState<S>,
     Json(req): Json<Value>,
@@ -224,7 +227,7 @@ pub async fn perms_approve(
     let rel = req
         .get("path")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .map(normalize_rel_path)
         .filter(|s| !s.is_empty());
     let token = format!(
         "apr_{:x}_{}",
@@ -235,7 +238,7 @@ pub async fn perms_approve(
     );
     let now = Instant::now();
     let mut approvals = state.coder_approvals.lock().await;
-    approvals.retain(|_, t| t.expires_at > now); // opportunistic cleanup
+    approvals.retain(|_, t| t.expires_at > now);
     approvals.insert(
         token.clone(),
         ApprovalTicket {
@@ -249,14 +252,7 @@ pub async fn perms_approve(
 }
 
 /// Reject when `tool` is tiered `deny`, when it's tiered `ask` without a
-/// valid matching approval token, or when `rel` (a workspace-relative path,
-/// for tools that take one) sits under a denied prefix. Tiers resolve
-/// through `tier_for`, so namespaced MCP names (`mcp__<server>__<tool>`)
-/// fall back to the server-level `mcp__<server>` row. Mirrors the
-/// frontend's `checkPerm`: exact match or `rel` starting with `"<prefix>/"`.
-/// `scope` selects which caller's tier bucket applies (see `perm_scope`) —
-/// two independent callers (e.g. Coder and Chat's Computer Use) using
-/// different scopes never see or affect each other's tiers.
+/// valid matching approval token, or when `rel` sits under a denied prefix.
 pub(crate) async fn enforce_perm(
     state: &S,
     scope: &str,
@@ -281,20 +277,20 @@ pub(crate) async fn enforce_perm(
     if tier == PermTier::Ask {
         let now = Instant::now();
         let mut approvals = state.coder_approvals.lock().await;
+        let norm_rel = rel.map(normalize_rel_path);
         let matches = approval_token
             .and_then(|t| approvals.get(t))
             .is_some_and(|tk| {
                 tk.expires_at > now
                     && tk.scope == scope
                     && tk.tool == tool
-                    && match (&tk.rel, rel) {
+                    && match (&tk.rel, norm_rel.as_deref()) {
                         (None, _) => true,
                         (Some(tr), Some(r)) => r == tr || r.starts_with(&format!("{tr}/")),
                         (Some(_), None) => false,
                     }
             });
         if matches {
-            // Single-use: an approval covers exactly the one call it was granted for.
             if let Some(t) = approval_token {
                 approvals.remove(t);
             }
@@ -308,15 +304,19 @@ pub(crate) async fn enforce_perm(
         }
     }
     if let Some(rel) = rel {
-        let hit = perms.deny_paths.iter().find(|d| {
-            let clean = d.trim().trim_end_matches('/');
-            !clean.is_empty() && (rel == clean || rel.starts_with(&format!("{clean}/")))
-        });
-        if let Some(hit) = hit {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
-            ));
+        let norm_rel = normalize_rel_path(rel);
+        if !norm_rel.is_empty() {
+            let hit = perms.deny_paths.iter().find(|d| {
+                let clean = normalize_rel_path(d);
+                !clean.is_empty()
+                    && (norm_rel == clean || norm_rel.starts_with(&format!("{clean}/")))
+            });
+            if let Some(hit) = hit {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("path is under denied prefix \"{}\"", hit.trim())})),
+                ));
+            }
         }
     }
     Ok(())
@@ -326,7 +326,12 @@ pub async fn perms_get(
     AxumState(state): AxumState<S>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let scope = q.get("scope").map(String::as_str).unwrap_or("default");
+    let scope = q
+        .get("scope")
+        .or_else(|| q.get("workspace"))
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("default");
     let all_perms = state.coder_perms.read().await;
     Json(
         serde_json::to_value(all_perms.get(scope).cloned().unwrap_or_default())
@@ -336,17 +341,45 @@ pub async fn perms_get(
 
 pub async fn perms_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
     let scope = perm_scope(&req);
-    if let Ok(parsed) = serde_json::from_value::<CoderPerms>(req) {
-        let mut all_perms = state.coder_perms.write().await;
-        all_perms.insert(scope.clone(), parsed);
-        return Json(
-            serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default())
-                .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
-        );
+    let mut all_perms = state.coder_perms.write().await;
+    let mut entry = all_perms.get(&scope).cloned().unwrap_or_default();
+    if let Some(tools_val) = req.get("tools")
+        && let Ok(tools) =
+            serde_json::from_value::<std::collections::HashMap<String, PermTier>>(tools_val.clone())
+    {
+        entry.tools.extend(tools);
     }
-    let all_perms = state.coder_perms.read().await;
+    if let Some(paths_val) = req.get("denyPaths").or_else(|| req.get("deny_paths"))
+        && let Ok(paths) = serde_json::from_value::<Vec<String>>(paths_val.clone())
+    {
+        entry.deny_paths = paths;
+    }
+    all_perms.insert(scope.clone(), entry.clone());
     Json(
-        serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default())
+        serde_json::to_value(entry)
             .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_rel_path() {
+        assert_eq!(normalize_rel_path("secret/x"), "secret/x");
+        assert_eq!(normalize_rel_path("./secret/x"), "secret/x");
+        assert_eq!(normalize_rel_path("a/../secret/x"), "secret/x");
+        assert_eq!(normalize_rel_path("secret/"), "secret");
+        assert_eq!(normalize_rel_path("."), "");
+    }
+
+    #[test]
+    fn test_within_ws_lexical_containment() {
+        let root = Path::new("/tmp/workspace");
+        assert!(within_ws(root, "src/main.rs").is_ok());
+        assert!(within_ws(root, "./src/main.rs").is_ok());
+        assert!(within_ws(root, "a/../src/main.rs").is_ok());
+        assert!(within_ws(root, "../secret").is_err());
+    }
 }
