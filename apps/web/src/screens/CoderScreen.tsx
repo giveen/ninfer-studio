@@ -78,7 +78,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
-  const [appConfig, setAppConfig] = useState<any>(null);
+  const [appConfig, setAppConfig] = useState<Awaited<ReturnType<typeof getConfig>> | null>(null);
+  const appConfigRef = useRef(appConfig);
+  appConfigRef.current = appConfig;
   useEffect(() => {
     let timer: number | null = null;
     const fetchCfg = () => {
@@ -775,7 +777,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const refreshRepoMap = useCallback(async () => {
     const sys = CODER_SYSTEM;
     let ctx = '';
-    if (storeRef.current.config?.coderRepoMapEnabled !== false) {
+    if (appConfigRef.current?.coderRepoMapEnabled !== false) {
       try {
         const rMap = await coderRepoMap();
         if (rMap && rMap.map) {

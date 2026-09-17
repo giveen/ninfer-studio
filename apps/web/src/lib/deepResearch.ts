@@ -88,7 +88,6 @@ async function runResearchAngle(opts: { model: string; angle: string; maxSteps: 
       baseUrl: opts.baseUrl,
       apiKey: opts.apiKey,
       extraHeaders: opts.extraHeaders,
-      source: opts.source,
       system: RESEARCH_ANGLE_SYSTEM,
       maxSteps: opts.maxSteps,
       toolSet: 'chat',
