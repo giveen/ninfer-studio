@@ -1,14 +1,15 @@
-// Theme preference: a client-only setting (not synced through the control
-// plane — it's a per-machine display preference, not app config) applied as
-// a `data-theme` attribute on <html> so theme.css's `:root[data-theme='light']`
-// overrides take effect. Persisted to localStorage; a tiny inline script in
-// index.html also applies it synchronously before first paint so switching
-// to light doesn't flash dark on reload.
-export type ThemeMode = 'dark' | 'light';
+// Theme preference: a client-only setting applied as a `data-theme` attribute
+// and `color-scheme` CSS property on <html>.
+// Supports 3 modes: 'dark' | 'light' | 'system'.
+// Only explicit 'dark' or 'light' choices are stored in localStorage.
+// 'system' matches the OS color scheme dynamically via matchMedia.
 
-const STORAGE_KEY = 'ninfier-theme';
+export type ThemeMode = 'dark' | 'light' | 'system';
+export type ResolvedTheme = 'dark' | 'light';
 
-function getSystemTheme(): ThemeMode {
+export const STORAGE_KEY = 'ninfier-theme';
+
+export function getSystemTheme(): ResolvedTheme {
   try {
     return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   } catch {
@@ -21,17 +22,54 @@ export function getStoredTheme(): ThemeMode {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored === 'light' || stored === 'dark') return stored;
   } catch {
-    // fall through to the OS preference
+    // fall through to 'system'
   }
-  // No explicit choice yet — match the OS instead of always defaulting dark.
-  return getSystemTheme();
+  return 'system';
 }
 
-export function applyTheme(mode: ThemeMode) {
-  document.documentElement.setAttribute('data-theme', mode);
-  try {
-    localStorage.setItem(STORAGE_KEY, mode);
-  } catch {
-    // localStorage unavailable (private mode, etc.) — theme just won't persist
+export function resolveTheme(mode: ThemeMode): ResolvedTheme {
+  if (mode === 'system') {
+    return getSystemTheme();
   }
+  return mode;
+}
+
+export function applyTheme(mode: ThemeMode): ResolvedTheme {
+  const resolved = resolveTheme(mode);
+  if (typeof document !== 'undefined') {
+    document.documentElement.setAttribute('data-theme', resolved);
+    document.documentElement.style.colorScheme = resolved;
+  }
+  try {
+    if (mode === 'system') {
+      localStorage.removeItem(STORAGE_KEY);
+    } else {
+      localStorage.setItem(STORAGE_KEY, mode);
+    }
+  } catch {
+    // localStorage unavailable (private mode, etc.)
+  }
+  return resolved;
+}
+
+export function subscribeTheme(onChange: (resolved: ResolvedTheme) => void): () => void {
+  if (typeof window === 'undefined' || !window.matchMedia) {
+    return () => {};
+  }
+  const mq = window.matchMedia('(prefers-color-scheme: light)');
+  const listener = () => {
+    onChange(mq.matches ? 'light' : 'dark');
+  };
+  if (mq.addEventListener) {
+    mq.addEventListener('change', listener);
+  } else if ('addListener' in mq) {
+    (mq as unknown as { addListener: (l: () => void) => void }).addListener(listener);
+  }
+  return () => {
+    if (mq.removeEventListener) {
+      mq.removeEventListener('change', listener);
+    } else if ('removeListener' in mq) {
+      (mq as unknown as { removeListener: (l: () => void) => void }).removeListener(listener);
+    }
+  };
 }
