@@ -57,15 +57,15 @@ pub(crate) async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
     let models = list_models(&state).await;
     let downloads = downloads_public(&state).await;
     let update = update_public(&state).await;
-    let config = serde_json::to_value(&*state.config.read().await).unwrap();
+    let config = serde_json::to_value(&*state.config.read().await).unwrap_or_else(|_| json!({}));
     Json(json!({
         "engine": engine,
         "engines": engines,
-        "lastStart": serde_json::to_value(&*last_start).unwrap(),
+        "lastStart": serde_json::to_value(&*last_start).unwrap_or_else(|_| json!(null)),
         "gpu": gpu,
         "vram": vram,
         "config": redact_config(config),
-        "artifacts": models["artifacts"],
+        "artifacts": models.get("artifacts").cloned().unwrap_or_else(|| json!([])),
         "catalog": ARTIFACTS,
         "downloads": downloads,
         "update": update,
@@ -75,37 +75,38 @@ pub(crate) async fn status(AxumState(state): AxumState<S>) -> Json<Value> {
 /// The primary engine plus every locally-discovered ninfer-serve process on
 /// other ports (read-only external entries: pid, port, artifact, model, argv).
 pub(crate) async fn engines_public(state: &S) -> Vec<Value> {
-    let primary = state.engine.read().await;
-    let mut out = vec![public_engine(&primary)];
-    let p_port = primary.port;
-    let p_pid = primary.pid;
-    for d in discover_engines().await {
-        let Some(port) = d.port else {
-            continue;
-        };
-        if p_port == Some(port) || p_pid == Some(d.pid) {
-            continue;
-        }
-        let (model, _) = engine_model_info(state, port).await;
-        out.push(json!({
-            "state": crate::types::EngineState::External,
-            "pid": d.pid,
-            "port": port,
-            "artifact": d.artifact,
-            "modelId": model,
-            "argv": d.argv,
-            "startedAt": null,
-            "logPath": null,
-            "adopted": true,
-            "failReason": null,
-        }));
-    }
-    out
-}
+    let (primary_engine, p_port, p_pid) = {
+        let primary = state.engine.read().await;
+        (public_engine(&primary), primary.port, primary.pid)
+    };
+    let mut out = vec![primary_engine];
+    let discovered = discover_engines().await;
 
-#[derive(Deserialize)]
-pub(crate) struct UpdateBody {
-    action: Option<String>,
+    let futures = discovered.into_iter().filter_map(|d| {
+        let port = d.port?;
+        if p_port == Some(port) || p_pid == Some(d.pid) {
+            return None;
+        }
+        Some(async move {
+            let (model, _) = engine_model_info(state, port).await;
+            json!({
+                "state": crate::types::EngineState::External,
+                "pid": d.pid,
+                "port": port,
+                "artifact": d.artifact,
+                "modelId": model,
+                "argv": d.argv,
+                "startedAt": null,
+                "logPath": null,
+                "adopted": true,
+                "failReason": null,
+            })
+        })
+    });
+
+    let external_engines = futures_util::future::join_all(futures).await;
+    out.extend(external_engines);
+    out
 }
 
 pub(crate) async fn engine_update(
@@ -113,9 +114,19 @@ pub(crate) async fn engine_update(
     req: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let parsed: UpdateBody = serde_json::from_value(body).unwrap_or(UpdateBody { action: None });
-    let action = parsed.action.unwrap_or_default();
-    Ok(Json(start_update(&state, &action).await))
+    let action = body
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let res = start_update(&state, action).await;
+    if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let msg = res
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("update failed");
+        return Err((StatusCode::BAD_REQUEST, msg.to_string()));
+    }
+    Ok(Json(res))
 }
 
 /// Recursively replace empty-string values with null. The web form uses "" as
@@ -163,12 +174,7 @@ pub(crate) async fn engine_start(
     let (profile, profile_parse_error) = match serde_json::from_value::<EngineProfile>(sanitized) {
         Ok(p) => (p, None),
         Err(e) => {
-            let msg = format!(
-                "engine profile could not be read ({e}); the engine will start with defaults — check the settings you changed"
-            );
-            // The raw (pre-parse) profile can carry `apiKey` — never log it
-            // verbatim, even on a parse failure the typed EngineProfile
-            // (whose Debug impl already redacts it) never gets constructed.
+            let msg = format!("engine profile could not be read ({e})");
             let mut redacted_profile = profile_val.clone();
             if let Value::Object(map) = &mut redacted_profile
                 && map
@@ -188,16 +194,20 @@ pub(crate) async fn engine_start(
             (EngineProfile::default(), Some(msg))
         }
     };
+
+    if let Some(err) = profile_parse_error {
+        return Ok(Json(json!({
+            "ok": false,
+            "message": err,
+            "profileParseError": err
+        })));
+    }
+
     let artifact = body
         .get("artifact")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let mut result = start_engine(&state, profile, artifact).await;
-    if let Some(err) = profile_parse_error
-        && let Value::Object(map) = &mut result
-    {
-        map.insert("profileParseError".to_string(), Value::String(err));
-    }
+    let result = start_engine(&state, profile, artifact).await;
     Ok(Json(result))
 }
 
@@ -259,44 +269,46 @@ pub(crate) async fn engine_args(
     };
     let artifact = body.artifact.clone().unwrap_or_default();
 
-    let (eng, last, cfg) = (
-        state.engine.read().await,
-        state.last_start.read().await,
-        state.config.read().await,
-    );
-    let port = profile.port.unwrap_or(cfg.engine_port);
-    let running = matches!(
-        eng.state,
-        crate::types::EngineState::Running | crate::types::EngineState::External
-    );
-    let port_match = eng.port.map(|p| p == port).unwrap_or(true);
-    let running_args = eng.argv.as_deref().filter(|a| !a.is_empty());
+    let (running, eng_port, running_args) = {
+        let eng = state.engine.read().await;
+        (
+            matches!(
+                eng.state,
+                crate::types::EngineState::Running | crate::types::EngineState::External
+            ),
+            eng.port,
+            eng.argv.clone(),
+        )
+    };
+    let default_port = state.config.read().await.engine_port;
+    let port = profile.port.unwrap_or(default_port);
+    let port_match = eng_port.map(|p| p == port).unwrap_or(true);
     let form = build_serve_args(&profile, port);
 
     // Mirror of the UI's dirty rule: only meaningful for a matching port, and
     // an unreadable argv (adopted external engine) must never read as "changed".
     let dirty = if running && port_match {
-        match running_args {
+        match running_args.as_deref().filter(|a| !a.is_empty()) {
             Some(ra) => {
                 let running_artifact = extract_artifact(ra);
                 !args_equal(ra, &form)
-                    || base_name(&artifact)
-                        != base_name(running_artifact.unwrap_or(""))
+                    || base_name(&artifact) != base_name(running_artifact.unwrap_or(""))
             }
-            None => match last.as_ref() {
-                // The UI normalizes "" to null for the artifact, so an empty
-                // artifact here means "none" as well.
-                Some(ls) => {
-                    let art_opt = if artifact.is_empty() {
-                        None
-                    } else {
-                        Some(artifact.as_str())
-                    };
-                    let running_form = build_serve_args(&ls.profile, ls.port);
-                    ls.artifact.as_deref() != art_opt || !args_equal(&running_form, &form)
+            None => {
+                let last = state.last_start.read().await;
+                match last.as_ref() {
+                    Some(ls) => {
+                        let art_opt = if artifact.is_empty() {
+                            None
+                        } else {
+                            Some(artifact.as_str())
+                        };
+                        let running_form = build_serve_args(&ls.profile, ls.port);
+                        ls.artifact.as_deref() != art_opt || !args_equal(&running_form, &form)
+                    }
+                    None => false,
                 }
-                None => false,
-            },
+            }
         }
     } else {
         false
@@ -326,24 +338,36 @@ pub(crate) async fn engine_args(
     Ok(Json(res))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct StopBody {
-    external_pid: Option<u32>,
-}
-
 pub(crate) async fn engine_stop(
     AxumState(state): AxumState<S>,
     req: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
-    let parsed: StopBody = serde_json::from_value(body).unwrap_or(StopBody { external_pid: None });
-    Ok(Json(stop_engine(&state, parsed.external_pid).await))
+    let external_pid = body
+        .get("externalPid")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let res = stop_engine(&state, external_pid).await;
+    if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let msg = res
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stop failed");
+        return Err((StatusCode::BAD_REQUEST, msg.to_string()));
+    }
+    Ok(Json(res))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{State, now_ms};
+    use std::sync::Arc;
+
+    fn test_state() -> S {
+        let dir = std::env::temp_dir().join(format!("ninfer_routes_engine_test_{}", now_ms()));
+        Arc::new(State::new(dir.clone(), dir, None))
+    }
 
     #[test]
     fn test_sanitize_empty_strings() {
@@ -368,4 +392,30 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test]
+    async fn test_engine_args_malformed_profile() {
+        let state = test_state();
+        let body = EngineArgsBody {
+            profile: Some(json!({ "port": "not_a_number" })),
+            artifact: Some("model.ninfer".into()),
+        };
+
+        let res = engine_args(AxumState(state), Json(body)).await.unwrap();
+        assert!(res.0.get("profileParseError").is_some());
+        assert_eq!(res.0["portMatch"], true);
+    }
+
+    #[tokio::test]
+    async fn test_engine_start_malformed_profile_refuses_launch() {
+        let state = test_state();
+        let req = Request::builder()
+            .body(Body::from(json!({ "profile": { "port": "invalid" } }).to_string()))
+            .unwrap();
+
+        let res = engine_start(AxumState(state), req).await.unwrap();
+        assert_eq!(res.0["ok"], false);
+        assert!(res.0.get("profileParseError").is_some());
+    }
 }
+
