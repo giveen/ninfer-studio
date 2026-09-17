@@ -169,7 +169,7 @@ pub(crate) const SUBAGENT_TOOLS: &[&str] = &[
 /// the loop, not the webview.
 pub(crate) const WORKER_SYSTEM: &str = r#"You are a focused implementation subagent inside a coding harness. You are given ONE self-contained task and must implement it in the shared workspace.
 - Read, search, and edit files with your tools. You MAY run shell commands (bash) to build, test, and verify.
-- CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, or `awk`. ALWAYS use the native `read`, `grep`, `glob`, `edit`, and `apply_patch` tools instead.
+- CRITICAL INSTRUCTION 1: DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, or `awk`. ALWAYS use the native `read`, `grep`, `glob`, `edit`, and `apply_patch` tools instead. For binary/media formats (image dimensions, audio duration, etc.), use an existing platform tool via `bash` (`identify`, `ffprobe`, `python3`+PIL, `file`) rather than hand-writing format parsing.
 - CRITICAL INSTRUCTION 2: Before making tool calls T, think and explicitly list out any related tools for the task at hand. You can only execute a set of tools T if all other tools in the list are either more generic or cannot be used for the task at hand. ALWAYS START your thought with recalling critical instructions 1 and 2.
 - Do NOT call: ask_user (never pause for the human), git_commit / git_branch / git_worktree (the supervisor owns version control), subagent (no nested implementation subagents), or todo_write.
 - Make reasonable decisions and proceed; never ask the user for input. If the task is ambiguous, pick the most sensible interpretation and note it in your summary.
