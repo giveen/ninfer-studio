@@ -48,6 +48,8 @@ const CODER_TOOLS: &[&str] = &[
     "web_search",
     "browser",
     "memory",
+    "memory_update",
+    "memory_recall",
     "obs_recall",
     "delegate",
     "subagent",
@@ -323,14 +325,18 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             if text.is_empty() {
                 return json!({ "error": "text is required" });
             }
-            return match crate::chat::memory_set(
+            let mut payload = json!({ "learning": { "text": text, "kind": kind } });
+            if let Some(scope) = run.scope_opt() {
+                payload["workspace"] = json!(scope);
+            }
+            return match crate::coder::memory::memory_set(
                 axum::extract::State(state.clone()),
-                Json(json!({ "learning": { "text": text, "kind": kind } })),
+                Json(payload),
             )
             .await
             {
                 Ok(Json(res)) => {
-                    json!({ "ok": true, "learnings": res.get("learnings").and_then(|v| v.as_array()).map(|a| a.len()) })
+                    json!({ "ok": true, "kind": kind, "learnings": res.get("learnings").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) })
                 }
                 Err((_, Json(e))) => e,
             };
@@ -348,9 +354,17 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10)
                 .clamp(1, 30) as usize;
-            let mem = crate::chat::memory_get(axum::extract::State(state.clone()))
-                .await
-                .0;
+            let mem_res = crate::coder::memory::memory_get(
+                axum::extract::State(state.clone()),
+                axum::extract::Query(crate::coder::memory::MemQuery {
+                    workspace: run.scope_opt().map(|s| s.to_string()),
+                }),
+            )
+            .await;
+            let mem = match mem_res {
+                Ok(Json(v)) => v,
+                Err((_, Json(e))) => return e,
+            };
             let learnings = mem
                 .get("learnings")
                 .and_then(|v| v.as_array())
