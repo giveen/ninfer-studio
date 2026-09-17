@@ -11,6 +11,16 @@ use axum::extract::{Request, State as AxumState};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
+/// Truncate a string to at most `max_chars` Unicode characters safely without
+/// panicking on multi-byte UTF-8 character boundaries.
+pub(crate) fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if let Some((idx, _)) = s.char_indices().nth(max_chars) {
+        &s[..idx]
+    } else {
+        s
+    }
+}
+
 pub(crate) async fn get_config(AxumState(state): AxumState<S>) -> Json<Value> {
     let mut c = state.config.read().await.clone();
     // An empty `chat_computer_use_dir` means "never customized" — not
@@ -111,10 +121,10 @@ pub(crate) async fn set_config(
     let body: Value = read_json(req).await?;
     let mut merged: AppSettings = state.config.read().await.clone();
     if let Some(v) = body.get("ninferPath").and_then(|v| v.as_str()) {
-        merged.ninfer_path = v.into();
+        merged.ninfer_path = crate::strip_extended_prefix(v).into();
     }
     if let Some(v) = body.get("modelsDir").and_then(|v| v.as_str()) {
-        merged.models_dir = v.into();
+        merged.models_dir = crate::strip_extended_prefix(v).into();
     }
     if let Some(v) = body.get("enginePort").and_then(|v| v.as_u64())
         && (1024..=65535).contains(&v)
@@ -155,7 +165,7 @@ pub(crate) async fn set_config(
         merged.reasoning_effort = v.into();
     }
     if let Some(v) = body.get("coderWorkspace").and_then(|v| v.as_str()) {
-        merged.coder_workspace = v.into();
+        merged.coder_workspace = crate::strip_extended_prefix(v).into();
     }
     if let Some(v) = body.get("coderSandbox").and_then(|v| v.as_bool()) {
         merged.coder_sandbox = v;
@@ -163,7 +173,7 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("sandboxBinds").and_then(|v| v.as_array()) {
         merged.sandbox_binds = v
             .iter()
-            .filter_map(|x| x.as_str().map(String::from))
+            .filter_map(|x| x.as_str().map(|s| crate::strip_extended_prefix(s).to_string()))
             .collect();
     }
     if let Some(v) = body.get("coderSafeMode").and_then(|v| v.as_bool()) {
@@ -239,7 +249,9 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("chatComputerUseDir").and_then(|v| v.as_str()) {
         merged.chat_computer_use_dir = v.into();
     }
-    if let Some(v) = body.get("chatComputerUsePerms").and_then(|v| v.as_str()) {
+    if let Some(v) = body.get("chatComputerUsePerms").and_then(|v| v.as_str())
+        && matches!(v, "allow" | "ask" | "deny")
+    {
         merged.chat_computer_use_perms = v.into();
     }
     if let Some(v) = body.get("currencySymbol").and_then(|v| v.as_str()) {
@@ -247,7 +259,7 @@ pub(crate) async fn set_config(
     }
     if let Some(v) = body.get("costPerKwh").and_then(|v| v.as_f64())
         && v.is_finite()
-        && v >= 0.0
+        && (0.0..=1000.0).contains(&v)
     {
         merged.cost_per_kwh = v;
     }
@@ -366,7 +378,7 @@ pub(crate) async fn cloud_test(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
-        .unwrap_or_default();
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build HTTP client: {e}")))?;
 
     let mut req_builder = client.get(&url);
     if !api_key.trim().is_empty() {
@@ -394,11 +406,7 @@ pub(crate) async fn cloud_test(
             let status = res.status();
             if !status.is_success() {
                 let text = res.text().await.unwrap_or_default();
-                let err_msg = if text.len() > 200 {
-                    &text[..200]
-                } else {
-                    &text
-                };
+                let err_msg = truncate_str(&text, 200);
                 return Ok(Json(json!({
                     "ok": false,
                     "latencyMs": latency_ms,
@@ -406,7 +414,17 @@ pub(crate) async fn cloud_test(
                     "error": format!("HTTP {status}: {}", if err_msg.is_empty() { "request failed" } else { err_msg })
                 })));
             }
-            let data: Value = res.json().await.unwrap_or_default();
+            let data: Value = match res.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(Json(json!({
+                        "ok": false,
+                        "latencyMs": latency_ms,
+                        "models": [],
+                        "error": format!("response from provider was not valid JSON: {e}")
+                    })));
+                }
+            };
             let mut models = Vec::new();
             let mut model_info = Vec::new();
             // Pricing/context-length keyed by model id, merged into the
@@ -467,7 +485,14 @@ pub(crate) async fn cloud_test(
             if !pricing.is_empty() {
                 let mut merged = state.config.read().await.clone();
                 merged.cloud_model_pricing.extend(pricing);
-                let _ = persist_config(&state, &merged).await;
+                if let Err(e) = persist_config(&state, &merged).await {
+                    tracing::event!(
+                        name: "cloud_test.pricing_persist.failed",
+                        tracing::Level::WARN,
+                        error = %e.1,
+                        "failed to persist cloud model pricing",
+                    );
+                }
             }
             Ok(Json(json!({
                 "ok": true,
@@ -533,14 +558,25 @@ pub(crate) async fn persist_config(
 // Persisted to <data>/profile.json so it survives a restart; mirrors the web
 // app's former browser-localStorage blob.
 // ---------------------------------------------------------------------------
-pub(crate) async fn profile_state_get(AxumState(state): AxumState<S>) -> Json<Value> {
+pub(crate) async fn profile_state_get(
+    AxumState(state): AxumState<S>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let p = state.data_dir.join("profile.json");
     match tokio::fs::read_to_string(&p).await {
         Ok(raw) => match serde_json::from_str::<ProfileState>(&raw) {
-            Ok(ps) => Json(serde_json::to_value(&ps).unwrap_or_else(|_| json!({}))),
-            Err(_) => Json(json!({ "profile": null, "artifact": "", "saved": [] })),
+            Ok(ps) => Ok(Json(serde_json::to_value(&ps).unwrap_or_else(|_| json!({})))),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("corrupt profile.json file: {e}"),
+            )),
         },
-        Err(_) => Json(json!({ "profile": null, "artifact": "", "saved": [] })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Json(json!({ "profile": null, "artifact": "", "saved": [] })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read profile.json: {e}"),
+        )),
     }
 }
 
@@ -549,11 +585,20 @@ pub(crate) async fn profile_state_set(
     req: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
-    let mut current: ProfileState = {
-        let p = state.data_dir.join("profile.json");
-        match tokio::fs::read_to_string(&p).await {
-            Ok(raw) => serde_json::from_str::<ProfileState>(&raw).unwrap_or_default(),
-            Err(_) => ProfileState::default(),
+    let p = state.data_dir.join("profile.json");
+    let mut current: ProfileState = match tokio::fs::read_to_string(&p).await {
+        Ok(raw) => serde_json::from_str::<ProfileState>(&raw).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("corrupt profile.json file: {e}"),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProfileState::default(),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read profile.json: {e}"),
+            ));
         }
     };
     if let Some(v) = body.get("profile")
@@ -571,7 +616,6 @@ pub(crate) async fn profile_state_set(
     {
         current.saved = s;
     }
-    let p = state.data_dir.join("profile.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(
             name: "profile_state.persist.failed",
@@ -606,14 +650,25 @@ pub(crate) async fn profile_state_set(
 // stored as raw JSON) so chat history survives a fresh install / AppImage run —
 // previously it lived in the webview localStorage, which is origin-bound.
 // ---------------------------------------------------------------------------
-pub(crate) async fn conversations_get(AxumState(state): AxumState<S>) -> Json<Value> {
+pub(crate) async fn conversations_get(
+    AxumState(state): AxumState<S>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let p = state.data_dir.join("chats.json");
     match tokio::fs::read_to_string(&p).await {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(v) => Json(v),
-            Err(_) => Json(json!({ "conversations": [], "params": null, "presets": [] })),
+            Ok(v) => Ok(Json(v)),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("corrupt chats.json file: {e}"),
+            )),
         },
-        Err(_) => Json(json!({ "conversations": [], "params": null, "presets": [] })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Json(json!({ "conversations": [], "params": null, "presets": [] })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read chats.json: {e}"),
+        )),
     }
 }
 
@@ -622,11 +677,20 @@ pub(crate) async fn conversations_set(
     req: Request<Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body = read_json(req).await?;
-    let mut current: Value = {
-        let p = state.data_dir.join("chats.json");
-        match tokio::fs::read_to_string(&p).await {
-            Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
+    let p = state.data_dir.join("chats.json");
+    let mut current: Value = match tokio::fs::read_to_string(&p).await {
+        Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("corrupt chats.json file: {e}"),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read chats.json: {e}"),
+            ));
         }
     };
     if let Some(v) = body.get("conversations")
@@ -642,7 +706,6 @@ pub(crate) async fn conversations_set(
     {
         current["presets"] = v.clone();
     }
-    let p = state.data_dir.join("chats.json");
     if let Err(e) = tokio::fs::create_dir_all(&state.data_dir).await {
         tracing::event!(
             name: "conversations.persist.failed",
@@ -671,3 +734,101 @@ pub(crate) async fn conversations_set(
     }
     Ok(Json(json!({ "ok": true })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{State, now_ms};
+    use std::sync::Arc;
+
+    fn test_state() -> S {
+        let dir = std::env::temp_dir().join(format!("ninfer_config_test_{}", now_ms()));
+        Arc::new(State::new(dir.clone(), dir, None))
+    }
+
+    #[test]
+    fn test_truncate_str_utf8() {
+        let ascii = "hello world";
+        assert_eq!(truncate_str(ascii, 5), "hello");
+
+        let unicode = "données_personnelles_fr";
+        assert_eq!(truncate_str(unicode, 7), "données");
+
+        let short = "abc";
+        assert_eq!(truncate_str(short, 10), "abc");
+    }
+
+    #[test]
+    fn test_resolve_secret_and_redact_config() {
+        assert_eq!(resolve_secret(Some("********"), "stored_key"), "stored_key");
+        assert_eq!(resolve_secret(Some("***"), "stored_key"), "stored_key");
+        assert_eq!(resolve_secret(Some(""), "stored_key"), "stored_key");
+        assert_eq!(resolve_secret(Some("new_key"), "stored_key"), "new_key");
+
+        let cfg = json!({
+            "apiKey": "real_api_key",
+            "hfToken": "real_hf_token",
+            "cloudProviderApiKey": "real_cloud_key",
+            "mcpServers": [
+                {
+                    "name": "srv1",
+                    "authorization": "Bearer secret",
+                    "headers": { "X-Key": "secret_header" },
+                    "env": { "FOO": "secret_env" }
+                }
+            ]
+        });
+        let redacted = redact_config(cfg);
+        assert_eq!(redacted["apiKey"], SECRET_MASK);
+        assert_eq!(redacted["hfToken"], SECRET_MASK);
+        assert_eq!(redacted["cloudProviderApiKey"], SECRET_MASK);
+        assert_eq!(redacted["mcpServers"][0]["authorization"], SECRET_MASK);
+        assert_eq!(redacted["mcpServers"][0]["headers"]["X-Key"], SECRET_MASK);
+        assert_eq!(redacted["mcpServers"][0]["env"]["FOO"], SECRET_MASK);
+    }
+
+    #[tokio::test]
+    async fn test_conversations_corrupt_file_handling() {
+        let state = test_state();
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+
+        // 1. Missing file returns default empty conversations
+        let get_res = conversations_get(AxumState(state.clone())).await.unwrap();
+        assert_eq!(get_res.0["conversations"], json!([]));
+
+        // 2. Corrupt file returns 500 error instead of silently returning []
+        let chats_file = state.data_dir.join("chats.json");
+        std::fs::write(&chats_file, "{ invalid json ...").unwrap();
+
+        let get_err = conversations_get(AxumState(state.clone())).await;
+        assert!(get_err.is_err());
+        assert_eq!(get_err.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // 3. conversations_set on corrupt file returns 500 without overwriting
+        let req = Request::builder()
+            .body(Body::from(json!({ "conversations": [{"id": "1"}] }).to_string()))
+            .unwrap();
+        let set_err = conversations_set(AxumState(state.clone()), req).await;
+        assert!(set_err.is_err());
+        assert_eq!(set_err.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_profile_state_corrupt_file_handling() {
+        let state = test_state();
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+
+        // 1. Missing file returns default empty profile state
+        let get_res = profile_state_get(AxumState(state.clone())).await.unwrap();
+        assert_eq!(get_res.0["artifact"], "");
+
+        // 2. Corrupt file returns 500 error
+        let profile_file = state.data_dir.join("profile.json");
+        std::fs::write(&profile_file, "corrupt content").unwrap();
+
+        let get_err = profile_state_get(AxumState(state.clone())).await;
+        assert!(get_err.is_err());
+        assert_eq!(get_err.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
