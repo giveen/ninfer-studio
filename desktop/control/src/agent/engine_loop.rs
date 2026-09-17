@@ -294,7 +294,7 @@ pub fn compacted_context(messages: &[Value]) -> &[Value] {
         if m.get("role").and_then(|v| v.as_str()) == Some("user")
             && m.get("content")
                 .and_then(|v| v.as_str())
-                .is_some_and(|c| c.contains("<compacted-summary>"))
+                .is_some_and(|c| c.trim_start().starts_with("<compacted-summary>"))
         {
             return &messages[i..];
         }

@@ -34,7 +34,7 @@ import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './type
 
 /** A compaction checkpoint message (the engine-side <compacted-summary> block). */
 export function isCompactedMsg(m: ChatMessage): boolean {
-  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
+  return m.role === 'user' && typeof m.content === 'string' && m.content.trimStart().startsWith('<compacted-summary>');
 }
 
 /** Model context for a loaded transcript: from the most recent compaction
