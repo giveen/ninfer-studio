@@ -26,6 +26,9 @@ use tokio::sync::{broadcast, oneshot, watch};
 /// (deep research x many tabs) from pinning this process's memory.
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 16;
 
+/// Hard ceiling on total retained runs (active + terminal) in memory.
+pub(crate) const MAX_STORED_RUNS: usize = 64;
+
 /// SSE event payload — one JSON object per server-sent event, `type`-tagged.
 /// Clients attach at any time; the first frame is always a `state` snapshot
 /// (see [`events`]), so a late client never starts blind.
@@ -652,13 +655,39 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
             .build()
             .unwrap_or_default(),
     });
-    state
+    let mut runs = state
         .agent_runs
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(shared.meta.id.clone(), shared.clone());
+        .unwrap_or_else(|p| p.into_inner());
+    prune_terminal_runs(&mut runs);
+    runs.insert(shared.meta.id.clone(), shared.clone());
+    drop(runs);
     tokio::spawn(engine_loop::run(state.clone(), shared.clone()));
     shared
+}
+
+/// Evict oldest terminal runs if total stored runs exceeds `MAX_STORED_RUNS`.
+pub(crate) fn prune_terminal_runs(runs: &mut HashMap<String, Arc<RunShared>>) {
+    if runs.len() < MAX_STORED_RUNS {
+        return;
+    }
+    let mut terminal: Vec<(String, u64)> = runs
+        .iter()
+        .filter_map(|(id, r)| {
+            let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+            if live.status.is_terminal() {
+                Some((id.clone(), live.updated_at))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    terminal.sort_by_key(|(_, updated_at)| *updated_at);
+    let to_remove = (runs.len() + 1).saturating_sub(MAX_STORED_RUNS);
+    for (id, _) in terminal.into_iter().take(to_remove) {
+        runs.remove(&id);
+    }
 }
 
 /// `POST /api/agent/runs` — start a run. Returns `{id, status}`; follow the
