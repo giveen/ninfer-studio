@@ -41,6 +41,9 @@ const CODER_TOOLS: &[&str] = &[
     "bash_poll",
     "git_diff",
     "git_commit",
+    "git_branch",
+    "git_worktree",
+    "git_pr",
     "ast_grep",
     "repo_search",
     "repo_map",
@@ -425,8 +428,77 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             }
             return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
         }
+        "git_branch" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let branch_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let cmd = match action {
+                "list" => "git branch --list".to_string(),
+                "create" => {
+                    if branch_name.is_empty() {
+                        return json!({ "error": "branch name required for action 'create'" });
+                    }
+                    format!("git checkout -b {}", q(branch_name))
+                }
+                "switch" => {
+                    if branch_name.is_empty() {
+                        return json!({ "error": "branch name required for action 'switch'" });
+                    }
+                    format!("git switch {}", q(branch_name))
+                }
+                _ => return json!({ "error": format!("unknown action: {action} (use list, create, or switch)") }),
+            };
+            let mut body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                body["cwd"] = json!(scope);
+                body["workspace"] = json!(scope);
+            }
+            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
+        }
+        "git_worktree" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let cmd = match action {
+                "list" => "git worktree list".to_string(),
+                "add" => {
+                    if path.is_empty() || branch.is_empty() {
+                        return json!({ "error": "path and branch required for action 'add'" });
+                    }
+                    format!("git worktree add -B {} {} {} || git worktree add -b {} {}", q(branch), q(path), q(branch), q(branch), q(path))
+                }
+                _ => return json!({ "error": format!("unknown action: {action} (use list or add)") }),
+            };
+            let mut body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                body["cwd"] = json!(scope);
+                body["workspace"] = json!(scope);
+            }
+            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
+        }
+        "git_pr" => {
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let body_text = args.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("");
+            if title.is_empty() {
+                return json!({ "error": "title is required" });
+            }
+            let base_flag = if base.is_empty() { String::new() } else { format!("--base {}", q(base)) };
+            let cmd = format!("gh pr create --title {} --body {} {base_flag} || git push origin HEAD", q(title), q(body_text));
+            let mut body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                body["cwd"] = json!(scope);
+                body["workspace"] = json!(scope);
+            }
+            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
+        }
         "ast_grep" => {
-            // Same invocation the client made through exec: `sg -p '…' -l lang`.
+            let sg_installed = std::process::Command::new("sg")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !sg_installed {
+                return json!({ "error": "ast-grep ('sg') is not installed on this system. Use 'grep' or 'glob' instead." });
+            }
             let pattern = args
                 .get("pattern")
                 .and_then(|v| v.as_str())
