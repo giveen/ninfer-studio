@@ -1,26 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Check, Copy, GitCommit, Globe, Plus, Plug, RefreshCw, Shield, ShieldCheck, Trash2 } from 'lucide-react';
 import { Badge, Button, cn, SectionCard, Segmented, TextField } from '../../components/ui';
 import { useCoderSafety } from '../../lib/coderSafety';
 import { loadDefaultPerms, saveDefaultPerms } from '../../lib/coderStore';
 import { TOOLS, type PermConfig, type PermTier } from '../../lib/coderTools';
+import { coderPermsSet } from '../../lib/api/coder';
 import { getRemoteAccessStatus, startRemoteAccess, stopRemoteAccess, type RemoteAccessStatus } from '../../lib/api/remote';
 import { mcpServersGet, mcpServersUpsert, mcpServerDelete, mcpServerRestart, type McpServerInfo, type McpServerSpec } from '../../lib/api/mcp';
-
-function ToggleRow({ on, onToggle, onTitle, offTitle, onLabel = 'ON', offLabel = 'OFF' }: {
-  on: boolean; onToggle: (next: boolean) => void; onTitle: string; offTitle: string; onLabel?: string; offLabel?: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={() => onToggle(!on)}
-      className={cn('rounded px-2.5 py-1 text-[11px] font-medium', on ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
-      title={on ? onTitle : offTitle}
-    >
-      {on ? onLabel : offLabel}
-    </button>
-  );
-}
+import { ToggleRow, TierRow } from './settingsHelpers';
 
 // ---------------------------------------------------------------------------
 // MCP (Model Context Protocol) servers — external tool servers owned by the
@@ -83,9 +70,10 @@ function parseKvList(raw: string): Record<string, string> {
   return out;
 }
 
-function McpServersCard({ perms, onServerTier }: {
+function McpServersCard({ perms, onServerTier, active = true }: {
   perms: PermConfig;
   onServerTier: (server: string, tier: PermTier) => void;
+  active?: boolean;
 }) {
   const [servers, setServers] = useState<McpServerInfo[]>([]);
   const [err, setErr] = useState('');
@@ -95,18 +83,20 @@ function McpServersCard({ perms, onServerTier }: {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<McpDraft>(EMPTY_MCP_DRAFT);
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     mcpServersGet()
       .then((r) => setServers(r.servers))
       .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
-  };
+  }, []);
+
   // Connections come up asynchronously after a save/restart, so keep the
-  // status column live instead of forcing a manual refresh.
+  // status column live when the Safety tab is active.
   useEffect(() => {
+    if (!active) return;
     refresh();
     const t = setInterval(refresh, 20_000);
     return () => clearInterval(t);
-  }, []);
+  }, [active, refresh]);
 
   const add = async () => {
     const name = draft.name.trim();
@@ -215,25 +205,12 @@ function McpServersCard({ perms, onServerTier }: {
               {s.status === 'connected' && s.peer?.name && (
                 <p className="text-[11px] text-faint">{s.peer.name}{s.peer.version ? ` ${s.peer.version}` : ''}</p>
               )}
-              <div className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
-                <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={`Default tier for every ${key}__* tool — per-tool rows (Coder sidebar) override`}>{key}</span>
-                {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                  <button
-                    key={v}
-                    type="button"
-                    onClick={() => onServerTier(key, v)}
-                    title={`${v} every tool on ${s.name}`}
-                    className={cn(
-                      'rounded px-2 py-0.5 text-[11px] font-medium',
-                      tier === v
-                        ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                        : 'text-faint hover:bg-panel2 hover:text-mute',
-                    )}
-                  >
-                    {v}
-                  </button>
-                ))}
-              </div>
+              <TierRow
+                label={key}
+                tier={tier}
+                onChange={(v) => onServerTier(key, v)}
+                title={`Default tier for every ${key}__* tool — per-tool rows override`}
+              />
             </div>
           );
         })}
@@ -289,7 +266,7 @@ function McpServersCard({ perms, onServerTier }: {
   );
 }
 
-export function SafetyTab() {
+export function SafetyTab({ active = true }: { active?: boolean }) {
   const { safeMode, setSafeMode, sandbox, setSandbox, sandboxAvailable, sandboxKind, commitApproval, setCommitApproval } = useCoderSafety();
   const sandboxIsWindows = sandboxKind !== 'bwrap';
   const [perms, setPermsState] = useState<PermConfig>(loadDefaultPerms);
@@ -297,6 +274,7 @@ export function SafetyTab() {
   const setPerms = (next: PermConfig) => {
     setPermsState(next);
     saveDefaultPerms(next);
+    coderPermsSet(next).catch(() => { /* best-effort sync to control plane */ });
   };
   const setToolPerm = (name: string, tier: PermTier) => {
     setPerms({ ...perms, tools: { ...perms.tools, [name]: tier } });
@@ -307,9 +285,24 @@ export function SafetyTab() {
   const [remoteBusy, setRemoteBusy] = useState(false);
   const [remoteError, setRemoteError] = useState('');
   const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    getRemoteAccessStatus().then((s) => { setRemote(s); setRemotePort(s.port); }).catch(() => {});
+
+  const fetchRemoteStatus = useCallback(() => {
+    setRemoteError('');
+    getRemoteAccessStatus()
+      .then((s) => {
+        setRemote(s);
+        setRemotePort(s.port);
+      })
+      .catch((e) => {
+        setRemote(null);
+        setRemoteError(e instanceof Error ? e.message : 'Failed to fetch remote access status');
+      });
   }, []);
+
+  useEffect(() => {
+    if (active) fetchRemoteStatus();
+  }, [active, fetchRemoteStatus]);
+
   const toggleRemote = async () => {
     setRemoteBusy(true);
     setRemoteError('');
@@ -426,6 +419,11 @@ export function SafetyTab() {
             >
               {remoteBusy ? '…' : remote?.running ? 'ON' : 'OFF'}
             </button>
+            {!remote && !remoteBusy && (
+              <Button size="sm" variant="ghost" onClick={fetchRemoteStatus}>
+                <RefreshCw size={12} /> Retry
+              </Button>
+            )}
           </div>
           {remoteError && <p className="text-[12px] text-danger">{remoteError}</p>}
           {remote?.running && (
@@ -446,36 +444,24 @@ export function SafetyTab() {
         </div>
       </SectionCard>
 
-      <McpServersCard perms={perms} onServerTier={setToolPerm} />
+      <McpServersCard perms={perms} onServerTier={setToolPerm} active={active} />
 
       <SectionCard
-        title="Default permissions template"
+        title="Default permissions template & global enforcement"
         icon={<ShieldCheck size={15} />}
-        description="Seeds a brand-new workspace's tool tiers and denied paths. Existing workspaces keep their own settings (edit those from the Coder sidebar) — changing this template never touches them."
+        description="Seeds new workspaces and pushes permissions to global control plane. (Individual workspaces can override these from the Coder sidebar)."
       >
         <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
           {TOOLS.map((t) => {
             const tier = perms.tools[t.function.name] ?? 'allow';
             return (
-              <div key={t.function.name} className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
-                <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={t.function.description}>{t.function.name}</span>
-                {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                  <button
-                    key={v}
-                    type="button"
-                    onClick={() => setToolPerm(t.function.name, v)}
-                    title={`${v} ${t.function.name}`}
-                    className={cn(
-                      'rounded px-2 py-0.5 text-[11px] font-medium',
-                      tier === v
-                        ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                        : 'text-faint hover:bg-panel2 hover:text-mute',
-                    )}
-                  >
-                    {v}
-                  </button>
-                ))}
-              </div>
+              <TierRow
+                key={t.function.name}
+                label={t.function.name}
+                tier={tier}
+                onChange={(v) => setToolPerm(t.function.name, v)}
+                title={t.function.description}
+              />
             );
           })}
         </div>
@@ -491,3 +477,4 @@ export function SafetyTab() {
     </div>
   );
 }
+
