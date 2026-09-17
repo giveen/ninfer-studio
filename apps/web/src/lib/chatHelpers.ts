@@ -462,15 +462,22 @@ export function resolveProviderConfig(
 
   if (effectiveProvider === 'cloud') {
     const roleModel = role === 'primary' ? appConfig.cloudProviderPrimaryModel : appConfig.cloudProviderSubagentModel;
+    const defaultModel = appConfig.cloudProviderDefaultModel;
     const fallbackDefault = role === 'primary'
-      ? (appConfig.cloudProviderPrimaryModel || appConfig.cloudProviderDefaultModel || 'gpt-4o')
-      : (appConfig.cloudProviderSubagentModel || appConfig.cloudProviderDefaultModel || 'gpt-4o-mini');
+      ? (roleModel || defaultModel || 'gpt-4o')
+      : (roleModel || defaultModel || 'gpt-4o-mini');
+
+    const rawParam = role === 'primary' ? (params.primaryCloudModel || params.cloudModel) : (params.subagentCloudModel || params.cloudModel);
+    const paramModel = typeof rawParam === 'string' ? rawParam.trim() : '';
+
+    const model = paramModel || roleModel || fallbackDefault;
+
     const result = {
       source: 'remote' as const,
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
       extraHeaders: appConfig.cloudProviderExtraHeaders || undefined,
-      model: params[`${role}CloudModel`] || params.cloudModel || roleModel || fallbackDefault,
+      model,
     };
     console.log('[resolveProviderConfig] Resolved cloud provider:', { role, model: result.model, baseUrl: result.baseUrl, hasApiKey: !!result.apiKey });
     return result;

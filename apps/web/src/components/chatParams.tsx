@@ -59,35 +59,34 @@ export function ParamsPopover({
                   ]}
                 />
               </div>
-              {effectivePrimaryProvider === 'cloud' && (
-                <div className={row}>
-                  <span className={lab}>Primary Model</span>
-                  <div className="flex flex-col gap-1 w-full">
+              {effectivePrimaryProvider === 'cloud' && (() => {
+                const globalPrimary = appConfig?.cloudProviderPrimaryModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o';
+                const options = [
+                  { value: '', label: `Default (${globalPrimary})` },
+                  ...Array.from(
+                    new Set([
+                      'gpt-4o',
+                      'gpt-4o-mini',
+                      'gpt-4-turbo',
+                      'o1',
+                      'o3-mini',
+                      ...(appConfig?.cloudProviderPrimaryModel ? [appConfig.cloudProviderPrimaryModel] : []),
+                      ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                      ...(params.primaryCloudModel ? [params.primaryCloudModel] : []),
+                    ].filter(Boolean))
+                  ).map((m) => ({ value: m, label: m })),
+                ];
+                return (
+                  <div className={row}>
+                    <span className={lab}>Primary Model</span>
                     <SelectField
-                      value={params.primaryCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                      onChange={(v) => set({ primaryCloudModel: v })}
-                      options={Array.from(
-                        new Set([
-                          'gpt-4o',
-                          'gpt-4o-mini',
-                          'gpt-4-turbo',
-                          'o1',
-                          'o3-mini',
-                          ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                          ...(params.primaryCloudModel ? [params.primaryCloudModel] : []),
-                        ])
-                      ).map((m) => ({ value: m, label: m }))}
-                    />
-                    <input
-                      type="text"
                       value={params.primaryCloudModel || ''}
-                      onChange={(e) => set({ primaryCloudModel: e.target.value })}
-                      placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o'}
-                      className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                      onChange={(v) => set({ primaryCloudModel: v })}
+                      options={options}
                     />
                   </div>
-                </div>
-              )}
+                );
+              })()}
               <div className={row}>
                 <span className={lab}>Subagent</span>
                 <SelectField
@@ -99,35 +98,34 @@ export function ParamsPopover({
                   ]}
                 />
               </div>
-              {effectiveSubagentProvider === 'cloud' && (
-                <div className={row}>
-                  <span className={lab}>Subagent Model</span>
-                  <div className="flex flex-col gap-1 w-full">
+              {effectiveSubagentProvider === 'cloud' && (() => {
+                const globalSubagent = appConfig?.cloudProviderSubagentModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini';
+                const options = [
+                  { value: '', label: `Default (${globalSubagent})` },
+                  ...Array.from(
+                    new Set([
+                      'gpt-4o-mini',
+                      'gpt-4o',
+                      'gpt-4-turbo',
+                      'o1-mini',
+                      'o3-mini',
+                      ...(appConfig?.cloudProviderSubagentModel ? [appConfig.cloudProviderSubagentModel] : []),
+                      ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
+                      ...(params.subagentCloudModel ? [params.subagentCloudModel] : []),
+                    ].filter(Boolean))
+                  ).map((m) => ({ value: m, label: m })),
+                ];
+                return (
+                  <div className={row}>
+                    <span className={lab}>Subagent Model</span>
                     <SelectField
-                      value={params.subagentCloudModel || appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                      onChange={(v) => set({ subagentCloudModel: v })}
-                      options={Array.from(
-                        new Set([
-                          'gpt-4o-mini',
-                          'gpt-4o',
-                          'gpt-4-turbo',
-                          'o1-mini',
-                          'o3-mini',
-                          ...(appConfig?.cloudProviderDefaultModel ? [appConfig.cloudProviderDefaultModel] : []),
-                          ...(params.subagentCloudModel ? [params.subagentCloudModel] : []),
-                        ])
-                      ).map((m) => ({ value: m, label: m }))}
-                    />
-                    <input
-                      type="text"
                       value={params.subagentCloudModel || ''}
-                      onChange={(e) => set({ subagentCloudModel: e.target.value })}
-                      placeholder={appConfig?.cloudProviderDefaultModel || 'gpt-4o-mini'}
-                      className="w-full rounded-lg border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
+                      onChange={(v) => set({ subagentCloudModel: v })}
+                      options={options}
                     />
                   </div>
-                </div>
-              )}
+                );
+              })()}
             </div>
           );
         })()}

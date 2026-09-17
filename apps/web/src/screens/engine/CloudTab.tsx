@@ -94,9 +94,20 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [customSubagentMode, setCustomSubagentMode] = useState(false);
   const [modelsSavedNotice, setModelsSavedNotice] = useState(false);
 
+  const isModelDirty = primaryDraft !== currentPrimary || subagentDraft !== currentSubagent;
+
+  const prevPrimaryRef = useRef(currentPrimary);
+  const prevSubagentRef = useRef(currentSubagent);
+
   useEffect(() => {
-    setPrimaryDraft(currentPrimary);
-    setSubagentDraft(currentSubagent);
+    if (prevPrimaryRef.current !== currentPrimary) {
+      prevPrimaryRef.current = currentPrimary;
+      setPrimaryDraft(currentPrimary);
+    }
+    if (prevSubagentRef.current !== currentSubagent) {
+      prevSubagentRef.current = currentSubagent;
+      setSubagentDraft(currentSubagent);
+    }
   }, [currentPrimary, currentSubagent]);
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);

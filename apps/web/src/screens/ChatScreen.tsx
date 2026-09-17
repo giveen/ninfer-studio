@@ -88,7 +88,20 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
   const [appConfig, setAppConfig] = useState<any>(null);
   useEffect(() => {
-    getConfig().then(setAppConfig).catch(() => {});
+    let active = true;
+    const fetchCfg = () => {
+      getConfig()
+        .then((cfg) => {
+          if (active) setAppConfig(cfg);
+        })
+        .catch(() => {});
+    };
+    fetchCfg();
+    const timer = setInterval(fetchCfg, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
   }, []);
   const [presets, setPresets] = useState<SavedChatParams[]>([]);
   const [convSearch, setConvSearch] = useState('');
