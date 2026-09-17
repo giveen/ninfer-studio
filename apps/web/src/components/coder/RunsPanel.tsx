@@ -63,7 +63,7 @@ export function RunsPanel() {
   );
 
   const statusDot = (s: RunSummary['status']) =>
-    s === 'running' || s === 'awaiting_approval' || s === 'awaiting_user' || s === 'awaiting_gate'
+    s === 'running' || s === 'awaiting_approval' || s === 'awaiting_user' || s === 'awaiting_hook' || s === 'awaiting_gate'
       ? 'animate-pulse bg-accent'
       : s === 'done'
         ? 'bg-ok'
@@ -74,8 +74,8 @@ export function RunsPanel() {
       <div className="mb-1.5 flex items-center">
         <span className="flex items-center gap-1.5 text-[10.5px] font-medium text-mute">
           <Activity size={11} />
-          {runs.filter((r) => r.status === 'running' || r.status === 'awaiting_approval').length > 0
-            ? `${runs.filter((r) => r.status === 'running' || r.status === 'awaiting_approval').length} live`
+          {runs.filter((r) => r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_hook').length > 0
+            ? `${runs.filter((r) => r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_hook').length} live`
             : 'Server runs'}
         </span>
         <button
@@ -93,7 +93,7 @@ export function RunsPanel() {
         ) : (
           <div className="max-h-64 space-y-1 overflow-auto">
             {runs.slice(0, 20).map((r) => {
-              const live = r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_user' || r.status === 'awaiting_gate';
+              const live = r.status === 'running' || r.status === 'awaiting_approval' || r.status === 'awaiting_user' || r.status === 'awaiting_hook' || r.status === 'awaiting_gate';
               const isOpen = expanded === r.id;
               return (
                 <div key={r.id} className="rounded border border-line px-2 py-1">

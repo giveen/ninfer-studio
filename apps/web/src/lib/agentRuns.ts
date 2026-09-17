@@ -32,7 +32,7 @@ import { API_BASE, getJSON, postJSON } from './api/core';
 // Wire types
 // ---------------------------------------------------------------------------
 
-export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'awaiting_gate' | 'done' | 'stopped' | 'error';
+export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'awaiting_hook' | 'awaiting_gate' | 'done' | 'stopped' | 'error';
 
 export interface PendingApprovalWire {
   id: string;
@@ -65,6 +65,12 @@ export interface RunSnapshot {
   kind: string;
   label: string;
   model: string;
+  system?: string | null;
+  maxSteps?: number;
+  createdAt?: number;
+  toolSet?: string;
+  toolNames?: string[];
+  parent?: string | null;
   status: RunStatusWire;
   messages: RunMessageWire[];
   turns: number;
@@ -77,8 +83,13 @@ export interface RunSnapshot {
   /** A pending risky/commit gate pause (the polling client's dialog). */
   pendingGate: { id: string; kind: 'risky' | 'commit'; command: string; reason: string | null } | null;
   scope: string | null;
+  todo?: unknown | null;
   usage: RunUsageWire;
   lastMeta: Record<string, unknown> | null;
+  hookMode?: string;
+  pendingHook?: string | null;
+  plan?: boolean;
+  todoRev?: number;
 }
 
 export interface RunSummary {
