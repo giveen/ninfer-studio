@@ -75,8 +75,8 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
             <TextField value={profile.apiKey || ''} onChange={(v) => setU('apiKey', v || undefined)} placeholder="unset (open)" />
           </Field>
           <Field label="Chat template" hint="Jinja chat template. Defaults to the artifact's embedded template.">
-            <Toggle checked={profile.chatTemplate !== undefined} onChange={(v) => { if (v) setU('chatTemplate', ''); else setU('chatTemplate', undefined); }} label="Custom template" />
-            {profile.chatTemplate !== undefined && (
+            <Toggle checked={Boolean(profile.chatTemplate)} onChange={(v) => { if (v) set('chatTemplate', ''); else setU('chatTemplate', undefined); }} label="Custom template" />
+            {profile.chatTemplate !== undefined && profile.chatTemplate !== null && (
               <div className="mt-2">
                 <TextField value={profile.chatTemplate || ''} onChange={(v) => setU('chatTemplate', v || undefined)} placeholder="/path/to/template.jinja" />
               </div>

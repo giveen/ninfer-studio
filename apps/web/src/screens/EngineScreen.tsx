@@ -72,7 +72,12 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
     getProfileState()
       .then((s) => {
         if (cancelled) return;
-        if (s.profile) { setProfile({ ...BLANK_PROFILE, ...s.profile }); setAppliedPresetId(null); }
+        if (s.profile) {
+          const prof = { ...BLANK_PROFILE, ...s.profile };
+          if (!prof.chatTemplate) delete prof.chatTemplate;
+          setProfile(prof);
+          setAppliedPresetId(null);
+        }
         else setProfile({ ...DEFAULT_PRESET.profile });
         // Only restore a *non-empty* artifact. A persisted "" means "no explicit
         // choice", and restoring it would clobber the auto-selected artifact if
