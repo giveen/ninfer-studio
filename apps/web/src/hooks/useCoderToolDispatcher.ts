@@ -670,7 +670,7 @@ export function useCoderToolDispatcher(opts: UseCoderToolDispatcherOptions) {
             opts.addLog({ type: 'bash', label: 'subagent', detail: `spawning worker (${task.slice(0, 60)})` });
             const wmodel = (args.model && String(args.model).trim()) || opts.modelRef.current;
             const workerTools = filterToolAllowList(args.tools, WORKER_TOOL_NAMES);
-            const subId = `subagent-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+            const subId = `subagent-${crypto.randomUUID().slice(0, 8)}`;
             opts.jobs.registerSub({ id: subId, label: 'subagent', task: task.slice(0, 100), ws: opts.activeWsDir });
             try {
               let preTree = '';

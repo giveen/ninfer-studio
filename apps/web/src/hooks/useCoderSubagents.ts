@@ -163,7 +163,7 @@ export function useCoderSubagents({
       depth = 0
     ): Promise<string> => {
       if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-      const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+      const subId = `${label}-${crypto.randomUUID().slice(0, 8)}`;
       jobs.registerSub({ id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
       try {
         return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
@@ -254,7 +254,7 @@ export function useCoderSubagents({
       depth = 0
     ): Promise<{ summary: string; diff: string; ok: boolean }> => {
       if (depth > 5) return { summary: '(worker failed: maximum depth 5 exceeded)', diff: '', ok: false };
-      const subId = `worker-${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+      const subId = `worker-${label}-${crypto.randomUUID().slice(0, 8)}`;
       jobs.registerSub({ id: subId, label: `worker:${label}`, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
       try {
         const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'edit', 'apply_patch', 'write', 'cmd']);
