@@ -7,6 +7,7 @@
 
 use crate::engine::S;
 use crate::memstore::{day_string, mem_lock};
+use crate::types::now_ms;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State as AxumState};
@@ -360,13 +361,6 @@ pub(crate) async fn usage_stats(
         "dailySeries": daily_series,
         "modelBreakdown": model_breakdown,
     }))
-}
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

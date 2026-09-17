@@ -8,6 +8,7 @@
 
 use crate::agent::engine_loop;
 use crate::engine::S;
+pub(crate) use crate::types::now_ms;
 use axum::extract::{Path, State as AxumState};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -433,13 +434,6 @@ impl std::fmt::Debug for RunShared {
 /// `State` holds the registry. A std::sync::Mutex: insert/lookup only,
 /// never held across an await.
 pub type RunRegistry = Arc<Mutex<HashMap<String, Arc<RunShared>>>>;
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn lock<'a>(m: &'a Mutex<RunLive>) -> MutexGuard<'a, RunLive> {
     m.lock().unwrap_or_else(|p| p.into_inner())

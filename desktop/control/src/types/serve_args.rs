@@ -343,7 +343,7 @@ mod args_equal_tests {
         assert_eq!(base_name("C:\\models\\folder\\"), "folder");
         assert_eq!(base_name("/a/b/c/"), "c");
         assert_eq!(base_name("model.ninfer"), "model.ninfer");
-        assert_eq!(base_name(""), "");
+        assert_eq!(base_name(""), "(root)");
     }
 }
 

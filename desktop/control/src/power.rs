@@ -120,7 +120,7 @@ pub(crate) async fn run_power_sampler(state: S) {
             continue;
         }
         let wh = watts * (SAMPLE_INTERVAL.as_secs_f64() / 3600.0);
-        let day = day_string(crate::usage::now_ms());
+        let day = day_string(crate::types::now_ms());
         *by_day.entry(day).or_insert(0.0) += wh / 1000.0;
         write_power_log(&state, &by_day).await;
     }
