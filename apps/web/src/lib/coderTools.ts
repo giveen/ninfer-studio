@@ -154,15 +154,13 @@ export const TOOLS = [
     type: "function",
     function: {
       name: "grep",
-      description: "Search for a regex pattern in files. Results are paginated — if the result's `more` is true, pass `offset` to fetch the next page (the `total` field shows the true count).",
+      description: "Search for a regex pattern in files using ripgrep. Returns matching lines and file paths up to the match limit.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
-          include: { type: "string", description: "Glob pattern to include (e.g. *.ts)" },
-          ignoreCase: { type: "boolean" },
-          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
-          limit: { type: "number", description: "Max matches to return per page (default 200, max 2000)." }
+          path: { type: "string", description: "Subdirectory path relative to workspace root to restrict the search to." },
+          ignoreCase: { type: "boolean" }
         },
         required: ["pattern"]
       }
@@ -172,13 +170,12 @@ export const TOOLS = [
     type: "function",
     function: {
       name: "glob",
-      description: "Find files matching a glob pattern. Paginated — if `more` is true, pass `offset` for the next page.",
+      description: "Find files matching a glob pattern relative to the workspace root or specified subfolder.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
-          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
-          limit: { type: "number", description: "Max files to return per page (default 200)." }
+          path: { type: "string", description: "Subdirectory path relative to workspace root to restrict the search to." }
         },
         required: ["pattern"]
       }

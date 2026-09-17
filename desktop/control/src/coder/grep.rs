@@ -25,11 +25,18 @@ pub async fn grep(
             Json(json!({"error": "pattern required"})),
         ));
     }
+    let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let search_root = if rel_root.is_empty() {
+        ws.clone()
+    } else {
+        within_ws(&ws, rel_root)?
+    };
+
     enforce_perm(
         &state,
         &perm_scope(&req),
         "grep",
-        None,
+        req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()),
         req.get("approvalToken").and_then(|v| v.as_str()),
     )
     .await?;
@@ -56,13 +63,14 @@ pub async fn grep(
     };
 
     let max_matches = req
-        .get("maxMatches")
+        .get("limit")
+        .or_else(|| req.get("maxMatches"))
         .and_then(|v| v.as_u64())
         .unwrap_or(2000) as usize;
 
     let result = tokio::task::spawn_blocking(move || {
         let mut matches = Vec::new();
-        let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
+        let walker = ignore::WalkBuilder::new(&search_root).hidden(false).build();
 
         for result in walker {
             if matches.len() >= max_matches {
