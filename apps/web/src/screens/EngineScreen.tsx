@@ -4,6 +4,7 @@ import { engineArgs, getConfig, getProfileState, saveConfig, saveProfileState, s
 import { BLANK_PROFILE, PRESETS, SPEC_BACKEND_OPTIONS } from '../lib/presets';
 import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
+import { baseName } from '../lib/coderStore';
 import {
   isLiveMetricsStale,
   useLatestRequestMetrics,
@@ -29,20 +30,7 @@ const TABS: Array<{ id: EngineTab; label: string }> = [
   { id: 'usage', label: 'Usage' },
 ];
 
-// P0-2: the in-UI launch-arg builder (buildArgs) and the restart-dirty logic
-// moved to the control plane (POST /api/engine/args) — the same builder that
-// spawns the engine computes both, so the displayed command and the dirty
-// verdict can no longer drift from what actually runs.
-
-
-function MiniStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <span className="text-[10.5px] uppercase tracking-wider text-faint">{label}</span>
-      <span className="font-mono text-sm font-medium text-main">{value}</span>
-    </div>
-  );
-}
+const DEFAULT_PRESET = PRESETS.find((p) => p.id === 'default') ?? PRESETS[0];
 
 export function EngineScreen({
   engine,
@@ -54,10 +42,10 @@ export function EngineScreen({
   onSaveConfig: (c: Partial<AppSettings>) => Promise<void>;
 }) {
   const [tab, setTab] = useState<EngineTab>('basics');
-  const [profile, setProfile] = useState<EngineProfile>({ ...PRESETS[1].profile });
+  const [profile, setProfile] = useState<EngineProfile>({ ...DEFAULT_PRESET.profile });
   const [artifact, setArtifact] = useState<string>('');
   const [saved, setSaved] = useState<SavedProfile[]>([]);
-  const [appliedPresetId, setAppliedPresetId] = useState<string | null>(PRESETS[1].id);
+  const [appliedPresetId, setAppliedPresetId] = useState<string | null>(DEFAULT_PRESET.id);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -67,7 +55,7 @@ export function EngineScreen({
       .then((s) => {
         if (cancelled) return;
         if (s.profile) { setProfile({ ...BLANK_PROFILE, ...s.profile }); setAppliedPresetId(null); }
-        else setProfile({ ...PRESETS[1].profile });
+        else setProfile({ ...DEFAULT_PRESET.profile });
         // Only restore a *non-empty* artifact. A persisted "" means "no explicit
         // choice", and restoring it would clobber the auto-selected artifact if
         // this fetch resolves after the status feed has already filled it in.
@@ -134,10 +122,14 @@ export function EngineScreen({
   // Persist the engine profile, chosen artifact, and saved named profiles to the
   // user's profile dir on the control plane. Skipped until the initial hydrate
   // completes so we never clobber disk with the first-render defaults.
+  // Debounced (500ms) to avoid atomic disk writes per keystroke.
   useEffect(() => {
     if (!loaded) return;
-    const snapshot = { profile, artifact, saved };
-    saveProfileState(snapshot).catch(() => undefined);
+    const timer = setTimeout(() => {
+      const snapshot = { profile, artifact, saved };
+      saveProfileState(snapshot).catch(() => undefined);
+    }, 500);
+    return () => clearTimeout(timer);
   }, [profile, artifact, saved, loaded]);
 
   // Pick the most recently added artifact when none is explicitly chosen. Depends
@@ -152,7 +144,7 @@ export function EngineScreen({
     // response lands (debounced, typically <300ms after the screen opens).
     const args = argsInfo?.args ?? [];
     const command = [
-      `ninfer-serve ${artifact ? artifact.split('/').pop() : '<artifact>.ninfer'}`,
+      `ninfer-serve ${artifact ? baseName(artifact) : '<artifact>.ninfer'}`,
       ...(args.length ? ['  ' + args.join(' \\\n  ')] : []),
     ].join('\n');
     return { command, argCount: args.length };
@@ -247,7 +239,7 @@ export function EngineScreen({
    *  has drifted from the preset's values (port excluded). */
   const appliedPreset = appliedPresetId ? PRESETS.find((p) => p.id === appliedPresetId) : null;
   const presetMatches = appliedPreset
-    ? Object.entries(appliedPreset.profile).every(([k, v]) => (profile as unknown as Record<string, unknown>)[k] === v)
+    ? Object.entries(appliedPreset.profile).every(([k, v]) => k === 'port' || (profile as unknown as Record<string, unknown>)[k] === v)
     : false;
 
   const saveCurrent = () => {
@@ -257,7 +249,6 @@ export function EngineScreen({
     setNotice({ tone: 'ok', text: `saved profile “${name}”` });
   };
 
-  const draftRange = profile.spec === 'mtp' ? [1, 5] : [1, 15];
   // Real per-artifact capability comes from the catalog's `spec` string
   // (e.g. "mtp (1..5) or dflash2 (1..15) or off"), not a filename heuristic.
   const specSupported = useMemo(() => {
@@ -270,6 +261,24 @@ export function EngineScreen({
       dflash2: /\bdflash2\b/.test(s),
     };
   }, [artifacts, artifact]);
+
+  // Reconcile profile.spec if current backend is unsupported by the selected artifact
+  useEffect(() => {
+    if (!specSupported || profile.spec === 'off' || !profile.spec) return;
+    const cur = profile.spec as 'mtp' | 'dflash' | 'dflash2';
+    if (specSupported[cur] === false) {
+      set('spec', 'off');
+    }
+  }, [specSupported, profile.spec]);
+
+  const draftRange = useMemo(() => {
+    const specStr = artifacts.find((x) => x.path === artifact)?.known?.spec;
+    if (specStr && profile.spec && profile.spec !== 'off') {
+      const match = new RegExp(`\\b${profile.spec}\\b\\s*\\((\\d+)\\.\\.(\\d+)\\)`, 'i').exec(specStr);
+      if (match) return [parseInt(match[1], 10), parseInt(match[2], 10)] as [number, number];
+    }
+    return profile.spec === 'mtp' ? [1, 5] : [1, 15];
+  }, [artifacts, artifact, profile.spec]);
 
   // Disable backends the selected artifact's catalog entry does not support.
   const specOptions = useMemo(
@@ -317,7 +326,7 @@ export function EngineScreen({
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Stat
             label="engine"
-            tone={engine?.state === 'running' ? 'ok' : engine?.state === 'external' ? 'accent' : engine?.state === 'starting' ? 'warn' : engine?.state === 'failed' ? 'danger' : 'neutral' as never}
+            tone={engine?.state === 'running' ? 'ok' : engine?.state === 'external' ? 'accent' : engine?.state === 'starting' ? 'warn' : engine?.state === 'failed' ? 'danger' : 'neutral'}
             value={
               <span className="flex items-center gap-2">
                 <span className={cn('h-2 w-2 rounded-full', engine?.state === 'running' ? 'bg-ok' : engine?.state === 'external' ? 'bg-info' : engine?.state === 'starting' || engine?.state === 'stopping' ? 'bg-warn pulse-dot' : engine?.state === 'failed' ? 'bg-danger' : 'bg-faint')} />
@@ -328,7 +337,7 @@ export function EngineScreen({
               engine?.state === 'external'
                 ? `external process (pid ${engine.pid || '?'}) — not spawned by Studio`
                 : engine?.artifact
-                  ? engine.artifact.split('/').pop()
+                  ? baseName(engine.artifact)
                   : 'no artifact selected'
             }
           />
@@ -422,7 +431,7 @@ export function EngineScreen({
                 <span className="min-w-0 truncate text-[12.5px] font-medium">{e.modelId || 'unknown model'}</span>
                 <span className="shrink-0 font-mono text-[11px] text-faint">:{e.port}</span>
                 {e.artifact && (
-                  <span className="hidden shrink-0 font-mono text-[11px] text-faint lg:inline">{e.artifact.split('/').pop()}</span>
+                  <span className="hidden shrink-0 font-mono text-[11px] text-faint lg:inline">{baseName(e.artifact)}</span>
                 )}
                 <span className="shrink-0 text-[10.5px] text-faint">external · pid {e.pid || '?'}</span>
                 <div className="ml-auto flex shrink-0 items-center gap-2">

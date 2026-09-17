@@ -363,8 +363,8 @@ export function SectionCard({
   );
 }
 
-export function Stat({ label, value, sub, tone }: { label: string; value: ReactNode; sub?: ReactNode; tone?: 'ok' | 'warn' | 'danger' | 'accent' }) {
-  const toneCls = { ok: 'text-ok', warn: 'text-warn', danger: 'text-danger', accent: 'text-accent' }[tone || 'accent'];
+export function Stat({ label, value, sub, tone }: { label: string; value: ReactNode; sub?: ReactNode; tone?: 'ok' | 'warn' | 'danger' | 'accent' | 'neutral' }) {
+  const toneCls = { ok: 'text-ok', warn: 'text-warn', danger: 'text-danger', accent: 'text-accent', neutral: 'text-faint' }[tone || 'accent'];
   return (
     <div className="min-w-0 rounded-lg border border-line bg-inset px-3.5 py-3">
       <div className="truncate text-[11px] font-medium uppercase tracking-wider text-faint">{label}</div>
