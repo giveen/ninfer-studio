@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Download, ExternalLink, Layers, Play, Trash2 } from 'lucide-react';
-import { convertModel, downloadModel, saveConfig } from '../lib/api';
+import { convertModel, downloadModel, saveConfig, upgradeModel } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
 import { openExternalLink } from '../lib/externalLink';
 import type { DownloadRec, StatusPayload } from '../lib/types';
@@ -262,7 +262,7 @@ export function ModelsScreen({ status }: { status: StatusPayload | null }) {
                             size="sm"
                             className="ml-auto"
                             onClick={async () => {
-                              const r = await import('../lib/api').then(m => m.upgradeModel(a.path));
+                              const r = await upgradeModel(a.path);
                               if (!r.ok) {
                                 alert(r.message || 'Upgrade failed');
                               }
