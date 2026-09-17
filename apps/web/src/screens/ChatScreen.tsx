@@ -653,7 +653,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           // Look up the engine actually serving `useModel`, not just the
           // first/primary one — matters when multiple engines with different
           // context sizes are running (same fix as ctxLimit above).
-          const limit = allEngines.find((e) => e.artifact === useModel || e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
+          const limit = allEngines.find((e) => e.artifact === useModel || e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? (baseUrl ? 200_000 : 128_000);
           const convForCompact = convsRef.current.find((c) => c.id === convId);
           const msgsForCompact = convForCompact?.messages ?? [];
           // The final reply is the last assistant message (past the original

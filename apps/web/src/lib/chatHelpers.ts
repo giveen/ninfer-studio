@@ -305,16 +305,16 @@ export function normalizeParams(raw: unknown): ChatParams {
  * while trimming bloated legacy tool results, saving up to 70% in cloud API input tokens.
  */
 export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length <= 4) return messages;
+  if (messages.length <= 2) return messages;
 
-  const cutoffIndex = messages.length - 4;
-  return messages.map((m, idx) => {
+  const cutoffIndex = Math.max(0, messages.length - 4);
+  let pruned = messages.map((m, idx) => {
     if (idx >= cutoffIndex) return m;
 
-    if (m.content && m.content.length > 1500) {
-      const head = m.content.slice(0, 750);
-      const tail = m.content.slice(-400);
-      const omittedBytes = m.content.length - 1150;
+    if (m.content && m.content.length > 1200) {
+      const head = m.content.slice(0, 600);
+      const tail = m.content.slice(-300);
+      const omittedBytes = m.content.length - 900;
       return {
         ...m,
         content: `${head}\n\n...[${omittedBytes} bytes of historical tool output pruned for cloud optimization]...\n\n${tail}`,
@@ -322,6 +322,40 @@ export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
     }
     return m;
   });
+
+  // Safeguard: if total payload exceeds ~150k tokens (approx 600,000 chars),
+  // omit older middle turns to stay safely below 200k cloud context limits.
+  const MAX_CLOUD_CHARS = 600_000;
+  const totalChars = pruned.reduce((sum, m) => sum + (typeof m.content === 'string' ? m.content.length : 0), 0);
+  if (totalChars > MAX_CLOUD_CHARS && pruned.length > 6) {
+    const keepFirst = pruned.slice(0, 2);
+    const keepLast = pruned.slice(-4);
+    const middle = pruned.slice(2, -4);
+
+    let currentChars = keepFirst.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0) +
+                        keepLast.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
+
+    const keptMiddle: ChatMessage[] = [];
+    for (let i = middle.length - 1; i >= 0; i--) {
+      const len = typeof middle[i].content === 'string' ? middle[i].content.length : 0;
+      if (currentChars + len > MAX_CLOUD_CHARS) break;
+      currentChars += len;
+      keptMiddle.unshift(middle[i]);
+    }
+
+    const omittedCount = middle.length - keptMiddle.length;
+    if (omittedCount > 0) {
+      const summaryNotice: ChatMessage = {
+        role: 'user',
+        displayName: 'Pruned Context',
+        collapsed: true,
+        content: `[System Notice: ${omittedCount} older historical turns were automatically omitted to stay within cloud context limits.]`,
+      };
+      pruned = [...keepFirst, summaryNotice, ...keptMiddle, ...keepLast];
+    }
+  }
+
+  return pruned;
 }
 
 /**

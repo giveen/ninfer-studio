@@ -264,6 +264,11 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
         /* ignore */
       }
     }
+    if (!maxContext && (primaryConfig.baseUrl || opts.appConfig?.cloudProviderEnabled)) {
+      maxContext = 200_000;
+    } else if (!maxContext) {
+      maxContext = 128_000;
+    }
     opts.setCtxLimit(maxContext > 0 ? maxContext : null);
     const COMPACT_AT = (opts.coderParams.compactAt ?? 80) / 100;
     const MAX_ATTEMPTS = 3;
