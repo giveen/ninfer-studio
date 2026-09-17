@@ -94,8 +94,6 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [customSubagentMode, setCustomSubagentMode] = useState(false);
   const [modelsSavedNotice, setModelsSavedNotice] = useState(false);
 
-  const isModelDirty = primaryDraft !== currentPrimary || subagentDraft !== currentSubagent;
-
   const prevPrimaryRef = useRef(currentPrimary);
   const prevSubagentRef = useRef(currentSubagent);
 
