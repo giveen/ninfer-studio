@@ -1516,6 +1516,7 @@ pub(crate) fn test_run(
             usage: RunUsage::default(),
             last_meta: None,
             todo_rev: 0,
+            user_todo_rev: 0,
             todo_base_rev: 0,
         }),
         tx,
@@ -1632,5 +1633,37 @@ mod tests {
         assert!(b.risky_gate && b.commit_gate);
         assert_eq!(b.approved_commands, vec!["git push".to_string()]);
         assert!(b.plan);
+    }
+
+    #[test]
+    fn sse_frame_includes_id_line() {
+        let frame = sse_frame(42, "state", "{\"hello\":\"world\"}");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.starts_with("id: 42\nevent: state\ndata: {\"hello\":\"world\"}\n\n"));
+    }
+
+    #[test]
+    fn prune_terminal_runs_evicts_oldest_completed() {
+        let state = fresh();
+        let mut runs = HashMap::new();
+        for i in 0..(MAX_STORED_RUNS + 5) {
+            let shared = test_run(&state, "chat", &[], None);
+            let mut live = shared.live.lock().unwrap();
+            live.updated_at = i as u64;
+            live.status = RunStatus::Done;
+            drop(live);
+            runs.insert(format!("run_{i}"), shared);
+        }
+        assert_eq!(runs.len(), MAX_STORED_RUNS + 5);
+        prune_terminal_runs(&mut runs);
+        assert_eq!(runs.len(), MAX_STORED_RUNS - 1);
+        // The 6 oldest runs (updated_at 0..6) should have been evicted
+        for i in 0..6 {
+            assert!(!runs.contains_key(&format!("run_{i}")));
+        }
+        for i in 6..(MAX_STORED_RUNS + 5) {
+            assert!(runs.contains_key(&format!("run_{i}")));
+        }
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
 }

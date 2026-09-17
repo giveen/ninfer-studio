@@ -1058,6 +1058,7 @@ mod tests {
             axum::extract::Path((shared.meta.id.clone(), gid)),
             axum::Json(crate::agent::run::GateDecideBody {
                 decision: "deny".into(),
+                token: None,
             }),
         )
         .await;
@@ -1108,6 +1109,7 @@ mod tests {
             axum::extract::Path((shared.meta.id.clone(), gid)),
             axum::Json(crate::agent::run::GateDecideBody {
                 decision: "once".into(),
+                token: Some("tok_test".into()),
             }),
         )
         .await;
