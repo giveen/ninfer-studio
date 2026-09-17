@@ -351,7 +351,9 @@ fn re_xml_function() -> &'static Regex {
 /// `<parameter=key>value</parameter>` inside an XML-ish `<function=...>` body.
 fn re_xml_parameter() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>").expect("static regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>").expect("static regex")
+    })
 }
 
 /// Parse the XML-ish `<function=name><parameter=k>v</parameter>...</function>`
@@ -1767,7 +1769,10 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "shell");
         let args0: Value = serde_json::from_str(&calls[0].arguments).unwrap();
-        assert_eq!(args0["command"].as_str().unwrap().trim(), "find /a -name \"*.ts\"");
+        assert_eq!(
+            args0["command"].as_str().unwrap().trim(),
+            "find /a -name \"*.ts\""
+        );
         assert_eq!(calls[1].name, "grep");
         let args1: Value = serde_json::from_str(&calls[1].arguments).unwrap();
         assert_eq!(args1["pattern"], "^export ");
