@@ -213,311 +213,35 @@ fn flatten(res: Result<Json<Value>, (axum::http::StatusCode, Json<Value>)>) -> V
 /// In-process dispatch of one tool call. Returns the JSON result value the
 /// tool message gets (an error-shaped `{error: …}` value when denied or
 /// unknown — never a panic, never a run-killing error).
+/// In-process dispatch of one tool call. Returns the JSON result value the
+/// tool message gets (an error-shaped `{error: …}` value when denied or
+/// unknown — never a panic, never a run-killing error).
 pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value) -> Value {
     if !run.meta.tool_names.iter().any(|n| n == name) {
         return json!({ "error": format!("unknown tool: {name}") });
     }
 
-    // --- control tools (no endpoint, run-local) -------------------------
-    match name {
-        "ask_user" => return ask_user(run, args).await,
-        "todo_write" => {
-            // The client's guard, ported: validate the items (the JSON schema
-            // is a model hint only — malformed items are dropped, never
-            // stringified) and discard updates the user superseded mid-run
-            // (a user edit bumps `user_todo_rev` past the rev captured at request
-            // build time — `todo_base_rev`).
-            let items =
-                crate::agent::run::clean_todo_items(args.get("todos").unwrap_or(&Value::Null));
-            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
-            if live.user_todo_rev != live.todo_base_rev {
-                let current = live.todo.clone().unwrap_or(Value::Array(vec![]));
-                return json!({
-                    "success": false,
-                    "reason": format!(
-                        "the task list was edited by the user while this response was being generated, so this update was not applied. The current list is: {current} — re-emit todo_write with the full intended list if your plan is still correct."
-                    ),
-                });
-            }
-            live.todo = Some(Value::Array(items.clone()));
-            live.todo_rev += 1;
-            drop(live);
-            let _ = run.tx.send(AgentEvent::Todo {
-                items: Value::Array(items.clone()),
-            });
-            return json!({ "success": true, "count": items.len() });
-        }
-        "set_directory" => {
-            let requested = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if requested.is_empty() {
-                return json!({ "error": "path is required" });
-            }
-            let expanded = if requested == "~" || requested.starts_with("~/") {
-                let home = std::env::var("HOME").unwrap_or_default();
-                format!("{home}{}", requested.trim_start_matches('~'))
-            } else {
-                requested.clone()
-            };
-            let Ok(canon) = std::fs::canonicalize(&expanded) else {
-                return json!({ "error": format!("{requested} does not exist") });
-            };
-            if !canon.is_dir() {
-                return json!({ "error": format!("{requested} is not a directory") });
-            }
-            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
-            live.scope = Some(canon.to_string_lossy().into_owned());
-            return json!({ "ok": true, "scope": canon.to_string_lossy().into_owned() });
-        }
-        "obs_recall" => {
-            let id = args
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let text = run
-                .recall
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&id)
-                .cloned();
-            let Some(text) = text else {
-                return json!({ "error": format!("unknown observation id: {id}") });
-            };
-            // The webview's recall page budget: ≤4000 bytes / ≤200 lines.
-            const MAX_BYTES: usize = 4000;
-            const MAX_LINES: usize = 200;
-            if offset > text.len() || !text.is_char_boundary(offset) {
-                return json!({ "error": format!("offset {offset} out of range (0-{})", text.len()) });
-            }
-            let bytes = text.as_bytes();
-            let available = bytes.len() - offset;
-            let mut end = available.min(MAX_BYTES);
-            let mut newlines = 0usize;
-            let mut i = 0usize;
-            while i < end {
-                if bytes[offset + i] == b'\n' {
-                    newlines += 1;
-                    if newlines == MAX_LINES {
-                        end = i + 1;
-                        break;
-                    }
-                }
-                i += 1;
-            }
-            let end = offset + end;
-            // `end` lands on a newline (never a UTF-8 continuation byte) or
-            // the end of the text — both char boundaries.
-            let next = if end < text.len() { Some(end) } else { None };
-            let chunk = &text[offset..end];
-            return json!({ "text": chunk, "nextOffset": next, "next_offset": next, "eof": next.is_none() });
-        }
-        "delegate" => return delegate(state, run, args).await,
-        "subagent" => return subagent(state, run, args).await,
-        "memory_update" => {
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("tip");
-            if text.is_empty() {
-                return json!({ "error": "text is required" });
-            }
-            let mut payload = json!({ "learning": { "text": text, "kind": kind } });
-            if let Some(scope) = run.scope_opt() {
-                payload["workspace"] = json!(scope);
-            }
-            return match crate::coder::memory::memory_set(
-                axum::extract::State(state.clone()),
-                Json(payload),
-            )
-            .await
-            {
-                Ok(Json(res)) => {
-                    json!({ "ok": true, "kind": kind, "learnings": res.get("learnings").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) })
-                }
-                Err((_, Json(e))) => e,
-            };
-        }
-        "memory_recall" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            let kind = args.get("kind").and_then(|v| v.as_str());
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10)
-                .clamp(1, 30) as usize;
-            let mem_res = crate::coder::memory::memory_get(
-                axum::extract::State(state.clone()),
-                axum::extract::Query(crate::coder::memory::MemQuery {
-                    workspace: run.scope_opt().map(|s| s.to_string()),
-                }),
-            )
-            .await;
-            let mem = match mem_res {
-                Ok(Json(v)) => v,
-                Err((_, Json(e))) => return e,
-            };
-            let learnings = mem
-                .get("learnings")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let mut matches: Vec<Value> = learnings
-                .into_iter()
-                .filter(|l| {
-                    let kind_ok = kind
-                        .map(|k| l.get("kind").and_then(|v| v.as_str()) == Some(k))
-                        .unwrap_or(true);
-                    let text = l
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let task = l
-                        .get("task")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    kind_ok && (text.contains(&query) || task.contains(&query))
-                })
-                .collect();
-            matches.truncate(limit);
-            matches.reverse();
-            return json!({ "matches": matches });
-        }
-        "git_commit" => {
-            // Server port of the client's git_commit: stage the named files
-            // (or -A) and commit through the same exec endpoint (sandbox,
-            // safe mode, and the git_commit permission tier all apply).
-            let files: Vec<String> = args
-                .get("files")
-                .and_then(|v| v.as_str())
-                .map(|f| f.split_whitespace().map(|s| s.to_string()).collect())
-                .unwrap_or_default();
-            let file_tokens: Vec<String> = if files.is_empty() {
-                vec!["-A".into()]
-            } else {
-                files
-            };
-            let file_args = file_tokens
-                .iter()
-                .map(|t| if t.starts_with("-") { t.clone() } else { q(t) })
-                .collect::<Vec<_>>()
-                .join(" ");
-            let message = args
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Agent commit")
-                .to_string();
-            let mut body = json!({ "command": format!("git add {file_args} && git commit -m {} && git rev-parse HEAD", q(&message)) });
-            if let Some(scope) = run.scope_opt() {
-                body["cwd"] = json!(scope);
-                body["workspace"] = json!(scope);
-            }
-            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
-        }
-        "git_branch" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
-            let branch_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let cmd = match action {
-                "list" => "git branch --list".to_string(),
-                "create" => {
-                    if branch_name.is_empty() {
-                        return json!({ "error": "branch name required for action 'create'" });
-                    }
-                    format!("git checkout -b {}", q(branch_name))
-                }
-                "switch" => {
-                    if branch_name.is_empty() {
-                        return json!({ "error": "branch name required for action 'switch'" });
-                    }
-                    format!("git switch {}", q(branch_name))
-                }
-                _ => return json!({ "error": format!("unknown action: {action} (use list, create, or switch)") }),
-            };
-            let mut body = json!({ "command": cmd });
-            if let Some(scope) = run.scope_opt() {
-                body["cwd"] = json!(scope);
-                body["workspace"] = json!(scope);
-            }
-            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
-        }
-        "git_worktree" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let cmd = match action {
-                "list" => "git worktree list".to_string(),
-                "add" => {
-                    if path.is_empty() || branch.is_empty() {
-                        return json!({ "error": "path and branch required for action 'add'" });
-                    }
-                    format!("git worktree add -B {} {} {} || git worktree add -b {} {}", q(branch), q(path), q(branch), q(branch), q(path))
-                }
-                _ => return json!({ "error": format!("unknown action: {action} (use list or add)") }),
-            };
-            let mut body = json!({ "command": cmd });
-            if let Some(scope) = run.scope_opt() {
-                body["cwd"] = json!(scope);
-                body["workspace"] = json!(scope);
-            }
-            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
-        }
-        "git_pr" => {
-            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let body_text = args.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("");
-            if title.is_empty() {
-                return json!({ "error": "title is required" });
-            }
-            let base_flag = if base.is_empty() { String::new() } else { format!("--base {}", q(base)) };
-            let cmd = format!("gh pr create --title {} --body {} {base_flag} || git push origin HEAD", q(title), q(body_text));
-            let mut body = json!({ "command": cmd });
-            if let Some(scope) = run.scope_opt() {
-                body["cwd"] = json!(scope);
-                body["workspace"] = json!(scope);
-            }
-            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
-        }
-        "ast_grep" => {
-            let sg_installed = std::process::Command::new("sg")
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if !sg_installed {
-                return json!({ "error": "ast-grep ('sg') is not installed on this system. Use 'grep' or 'glob' instead." });
-            }
-            let pattern = args
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let lang = args
-                .get("lang")
-                .and_then(|v| v.as_str())
-                .unwrap_or("rust")
-                .to_string();
-            let mut body = json!({ "command": format!("sg -p '{}' -l {lang}", pattern.replace('\'', "'\\''")) });
-            if let Some(scope) = run.scope_opt() {
-                body["cwd"] = json!(scope);
-                body["workspace"] = json!(scope);
-            }
-            return flatten(exec::exec(AxumState(state.clone()), Json(body)).await);
-        }
-        _ => {}
+    // --- family check & config flags ------------------------------------
+    let family = if run.meta.tool_set == "chat" {
+        CHAT_TOOLS
+    } else {
+        CODER_TOOLS
+    };
+
+    let (udiff_enabled, repo_map_enabled) = {
+        let config = state.config.read().await;
+        (config.coder_udiff_edit_enabled, config.coder_repo_map_enabled)
+    };
+    let mut allowed_family: Vec<&str> = family.to_vec();
+    if !udiff_enabled {
+        allowed_family.retain(|&t| t != "udiff_edit");
+    }
+    if !repo_map_enabled {
+        allowed_family.retain(|&t| t != "repo_map");
+    }
+
+    if mcp_name(name).is_none() && allowed_family.iter().all(|f| *f != name) {
+        return json!({ "error": format!("unknown tool: {name}") });
     }
 
     // --- plan mode (read-only investigation run) -------------------------
@@ -533,7 +257,10 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             "git_commit",
             "git_branch",
             "git_worktree",
+            "git_pr",
             "subagent",
+            "memory_update",
+            "set_directory",
         ];
         if name == "bash" {
             let cmd = args
@@ -545,6 +272,11 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 return json!({
                     "error": "Plan mode is read-only — bash may only run inspection commands (find, ls, cat, head, tail, wc, grep, rg, file, stat, du, tree, git log/status/diff/show, …); redirection, pipes, and chaining are rejected. Turn Plan off to execute anything that changes state."
                 });
+            }
+        } else if name == "ast_grep" {
+            let lang = args.get("lang").and_then(|v| v.as_str()).unwrap_or("");
+            if lang.contains(';') || lang.contains('|') || lang.contains('&') || lang.contains('\n') {
+                return json!({ "error": "Plan mode rejected invalid language argument for ast_grep" });
             }
         } else if MUTATING.contains(&name) {
             return json!({
@@ -561,8 +293,6 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // The same scope bucket the HTTP endpoints use (scope → workspace →
     // "default"), and the same tier table the UI pushes. Tiers default to
     // `allow`; the UI opts tools up to `ask`/`deny` per scope.
-    // Tiers are pushed per scope bucket (scope → workspace → "default"),
-    // so look this run's bucket up before asking for the tool's tier.
     let scope_val = json!({ "scope": run.scope_opt().unwrap_or_default() });
     let scope = crate::coder::common::perm_scope(&scope_val);
     let tier = {
@@ -601,12 +331,16 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // The CoderScreen HITL gates, ported: pause for a once/remember/deny
     // (risky) or approve/deny (commit) decision instead of executing. Runs
     // without the flags behave exactly as before.
-    if name == "bash" {
-        let command = body
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    if name == "bash" || name == "git_commit" {
+        let command = if name == "git_commit" {
+            let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("commit");
+            format!("git commit -m {msg}")
+        } else {
+            body.get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         let (risky_on, commit_on) = {
             let gs = run.gate_state.lock().unwrap_or_else(|p| p.into_inner());
             (gs.opts.risky, gs.opts.commit)
@@ -634,7 +368,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                 }
             }
         }
-        if commit_on && is_git_commit_command(&command) {
+        if commit_on && (name == "git_commit" || is_git_commit_command(&command)) {
             match await_gate(run, GateKind::Commit, command.clone(), None).await {
                 GateDecision::Deny => {
                     return json!({
@@ -646,33 +380,338 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
         }
     }
 
-    // --- scope injection + dispatch -------------------------------------
+    // --- scope injection -------------------------------------------------
     inject_scope(run, name, &mut body);
     if let Some(t) = token {
         body["approvalToken"] = json!(t);
     }
 
-    // endpoint-dispatchable; everything else must be in the tool-set's table.
-    let family = if run.meta.tool_set == "chat" {
-        CHAT_TOOLS
-    } else {
-        CODER_TOOLS
-    };
-
-    let config = state.config.read().await;
-    let mut allowed_family: Vec<&str> = family.to_vec();
-    if !config.coder_udiff_edit_enabled {
-        allowed_family.retain(|&t| t != "udiff_edit");
+    // --- control tools + endpoint handlers -------------------------------
+    match name {
+        "ask_user" => ask_user(run, &body).await,
+        "todo_write" => {
+            let items =
+                crate::agent::run::clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
+            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+            if live.user_todo_rev != live.todo_base_rev {
+                let current = live.todo.clone().unwrap_or(Value::Array(vec![]));
+                return json!({
+                    "success": false,
+                    "reason": format!(
+                        "the task list was edited by the user while this response was being generated, so this update was not applied. The current list is: {current} — re-emit todo_write with the full intended list if your plan is still correct."
+                    ),
+                });
+            }
+            live.todo = Some(Value::Array(items.clone()));
+            live.todo_rev += 1;
+            drop(live);
+            let _ = run.tx.send(AgentEvent::Todo {
+                items: Value::Array(items.clone()),
+            });
+            json!({ "success": true, "count": items.len() })
+        }
+        "set_directory" => {
+            let requested = body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if requested.is_empty() {
+                return json!({ "error": "path is required" });
+            }
+            let expanded = if requested == "~" || requested.starts_with("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}{}", requested.trim_start_matches('~'))
+            } else {
+                requested.clone()
+            };
+            let Ok(canon) = std::fs::canonicalize(&expanded) else {
+                return json!({ "error": format!("{requested} does not exist") });
+            };
+            if !canon.is_dir() {
+                return json!({ "error": format!("{requested} is not a directory") });
+            }
+            let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
+            live.scope = Some(canon.to_string_lossy().into_owned());
+            json!({ "ok": true, "scope": canon.to_string_lossy().into_owned() })
+        }
+        "obs_recall" => {
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let offset = body.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let text = run
+                .recall
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .cloned();
+            let Some(text) = text else {
+                return json!({ "error": format!("unknown observation id: {id}") });
+            };
+            const MAX_BYTES: usize = 4000;
+            const MAX_LINES: usize = 200;
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                return json!({ "error": format!("offset {offset} out of range (0-{})", text.len()) });
+            }
+            let bytes = text.as_bytes();
+            let available = bytes.len() - offset;
+            let mut end = available.min(MAX_BYTES);
+            let mut newlines = 0usize;
+            let mut i = 0usize;
+            while i < end {
+                if bytes[offset + i] == b'\n' {
+                    newlines += 1;
+                    if newlines == MAX_LINES {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let end = offset + end;
+            let next = if end < text.len() { Some(end) } else { None };
+            let chunk = &text[offset..end];
+            json!({ "text": chunk, "nextOffset": next, "next_offset": next, "eof": next.is_none() })
+        }
+        "delegate" => delegate(state, run, &body).await,
+        "subagent" => subagent(state, run, &body).await,
+        "memory_update" => {
+            let text = body
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("tip");
+            if text.is_empty() {
+                return json!({ "error": "text is required" });
+            }
+            let mut payload = json!({ "learning": { "text": text, "kind": kind } });
+            if let Some(scope) = run.scope_opt() {
+                payload["workspace"] = json!(scope);
+            }
+            match crate::coder::memory::memory_set(
+                axum::extract::State(state.clone()),
+                Json(payload),
+            )
+            .await
+            {
+                Ok(Json(res)) => {
+                    json!({ "ok": true, "kind": kind, "learnings": res.get("learnings").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) })
+                }
+                Err((_, Json(e))) => e,
+            }
+        }
+        "memory_recall" => {
+            let query = body
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if query.is_empty() {
+                return json!({ "error": "memory_recall requires non-empty query" });
+            }
+            let kind = body.get("kind").and_then(|v| v.as_str());
+            let limit = body
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .clamp(1, 30) as usize;
+            let mem_res = crate::coder::memory::memory_get(
+                axum::extract::State(state.clone()),
+                axum::extract::Query(crate::coder::memory::MemQuery {
+                    workspace: run.scope_opt().map(|s| s.to_string()),
+                }),
+            )
+            .await;
+            let mem = match mem_res {
+                Ok(Json(v)) => v,
+                Err((_, Json(e))) => return e,
+            };
+            let learnings = mem
+                .get("learnings")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let filtered: Vec<Value> = learnings
+                .into_iter()
+                .filter(|l| {
+                    let kind_ok = kind
+                        .map(|k| l.get("kind").and_then(|v| v.as_str()) == Some(k))
+                        .unwrap_or(true);
+                    let text = l
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let task = l
+                        .get("task")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    kind_ok && (text.contains(&query) || task.contains(&query))
+                })
+                .collect();
+            let total_matched = filtered.len();
+            let start = total_matched.saturating_sub(limit);
+            let mut matches: Vec<Value> = filtered[start..].to_vec();
+            matches.reverse();
+            json!({
+                "query": query,
+                "matched": total_matched,
+                "returned": matches.len(),
+                "learnings": matches
+            })
+        }
+        "git_commit" => {
+            let files_val = body.get("files");
+            let files: Vec<String> = match files_val {
+                None => Vec::new(),
+                Some(v) if v.is_null() => Vec::new(),
+                Some(v) if v.is_string() => v
+                    .as_str()
+                    .unwrap()
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect(),
+                Some(_) => {
+                    return json!({
+                        "error": "files argument must be a space-separated string of filenames, e.g. 'src/main.rs src/lib.rs'"
+                    });
+                }
+            };
+            let file_tokens: Vec<String> = if files.is_empty() {
+                vec!["-A".into()]
+            } else {
+                files
+            };
+            let file_args = file_tokens
+                .iter()
+                .map(|t| if t.starts_with("-") { t.clone() } else { q(t) })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let message = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Agent commit")
+                .to_string();
+            let mut req_body = json!({ "command": format!("git add {file_args} && git commit -m {} && git rev-parse HEAD", q(&message)) });
+            if let Some(scope) = run.scope_opt() {
+                req_body["cwd"] = json!(scope);
+                req_body["workspace"] = json!(scope);
+            }
+            if let Some(t) = body.get("approvalToken") {
+                req_body["approvalToken"] = t.clone();
+            }
+            flatten(exec::exec(AxumState(state.clone()), Json(req_body)).await)
+        }
+        "git_branch" => {
+            let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let branch_name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let cmd = match action {
+                "list" => "git branch --list".to_string(),
+                "create" => {
+                    if branch_name.is_empty() {
+                        return json!({ "error": "branch name required for action 'create'" });
+                    }
+                    format!("git checkout -b {}", q(branch_name))
+                }
+                "switch" => {
+                    if branch_name.is_empty() {
+                        return json!({ "error": "branch name required for action 'switch'" });
+                    }
+                    format!("git switch {}", q(branch_name))
+                }
+                _ => return json!({ "error": format!("unknown action: {action} (use list, create, or switch)") }),
+            };
+            let mut req_body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                req_body["cwd"] = json!(scope);
+                req_body["workspace"] = json!(scope);
+            }
+            if let Some(t) = body.get("approvalToken") {
+                req_body["approvalToken"] = t.clone();
+            }
+            flatten(exec::exec(AxumState(state.clone()), Json(req_body)).await)
+        }
+        "git_worktree" => {
+            let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let branch = body.get("branch").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let cmd = match action {
+                "list" => "git worktree list".to_string(),
+                "add" => {
+                    if path.is_empty() || branch.is_empty() {
+                        return json!({ "error": "path and branch required for action 'add'" });
+                    }
+                    format!("git worktree add -B {} {} {} || git worktree add -b {} {}", q(branch), q(path), q(branch), q(branch), q(path))
+                }
+                _ => return json!({ "error": format!("unknown action: {action} (use list or add)") }),
+            };
+            let mut req_body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                req_body["cwd"] = json!(scope);
+                req_body["workspace"] = json!(scope);
+            }
+            if let Some(t) = body.get("approvalToken") {
+                req_body["approvalToken"] = t.clone();
+            }
+            flatten(exec::exec(AxumState(state.clone()), Json(req_body)).await)
+        }
+        "git_pr" => {
+            let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let base = body.get("base").and_then(|v| v.as_str()).unwrap_or("");
+            if title.is_empty() {
+                return json!({ "error": "title is required" });
+            }
+            let base_flag = if base.is_empty() { String::new() } else { format!("--base {}", q(base)) };
+            let cmd = format!("gh pr create --title {} --body {} {base_flag} || git push origin HEAD", q(title), q(body_text));
+            let mut req_body = json!({ "command": cmd });
+            if let Some(scope) = run.scope_opt() {
+                req_body["cwd"] = json!(scope);
+                req_body["workspace"] = json!(scope);
+            }
+            if let Some(t) = body.get("approvalToken") {
+                req_body["approvalToken"] = t.clone();
+            }
+            flatten(exec::exec(AxumState(state.clone()), Json(req_body)).await)
+        }
+        "ast_grep" => {
+            let sg_installed = std::process::Command::new("sg")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !sg_installed {
+                return json!({ "error": "ast-grep ('sg') is not installed on this system. Use 'grep' or 'glob' instead." });
+            }
+            let pattern = body
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let lang = body
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rust")
+                .to_string();
+            let mut req_body = json!({ "command": format!("sg -p '{}' -l {lang}", pattern.replace('\'', "'\\''")) });
+            if let Some(scope) = run.scope_opt() {
+                req_body["cwd"] = json!(scope);
+                req_body["workspace"] = json!(scope);
+            }
+            if let Some(t) = body.get("approvalToken") {
+                req_body["approvalToken"] = t.clone();
+            }
+            flatten(exec::exec(AxumState(state.clone()), Json(req_body)).await)
+        }
+        _ => call(state, run, name, &body).await,
     }
-    if !config.coder_repo_map_enabled {
-        allowed_family.retain(|&t| t != "repo_map");
-    }
-
-    if mcp_name(name).is_none() && allowed_family.iter().all(|f| *f != name) {
-        return json!({ "error": format!("unknown tool: {name}") });
-    }
-
-    call(state, run, name, &body).await
 }
 
 /// `true` for namespaced MCP tool calls: `mcp__<server>__<tool>`.
@@ -1151,5 +1190,26 @@ mod tests {
         assert!(WORKER_SYSTEM.contains("For binary/media formats (image dimensions, audio duration, etc.), use an existing platform tool via `bash` (`identify`, `ffprobe`, `python3`+PIL, `file`) rather than hand-writing format parsing."));
         assert!(CRITIC_SYSTEM.contains("VERDICT: APPROVED"));
         assert!(CRITIC_SYSTEM.contains("VERDICT: CHANGES_REQUESTED"));
+    }
+
+    #[tokio::test]
+    async fn test_control_tools_respect_plan_mode_and_permissions() {
+        let state = fresh_state();
+        let tools = ["git_commit", "subagent", "memory_update", "set_directory"];
+
+        for t in tools {
+            let tool_set = if t == "set_directory" { "chat" } else { "coder" };
+            let mut shared = crate::agent::run::test_run(&state, "coder", &[t], None);
+            Arc::get_mut(&mut shared).unwrap().meta.plan = true;
+            Arc::get_mut(&mut shared).unwrap().meta.tool_set = tool_set.to_string();
+
+            let res = dispatch(&state, &shared, t, &json!({})).await;
+            let err = res.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                err.contains("Plan mode is read-only"),
+                "Control tool '{t}' bypassed plan mode guard! Error was: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
 }
