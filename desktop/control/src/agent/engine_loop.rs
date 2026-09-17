@@ -39,7 +39,7 @@ const PACK_FULL_SENDS: usize = 2;
 /// Placeholder excerpt budget, split evenly between head and tail.
 const PACK_EXCERPT_BYTES: usize = 1024;
 /// Already bounded/paged results (or the recall path itself) — never pack.
-const PACK_EXCLUDED: &[&str] = &["grep", "glob", "repo_search", "obs_recall"];
+const PACK_EXCLUDED: &[&str] = &["obs_recall"];
 /// How long a client-hook pause waits for the attached screen before the
 /// loop falls back to its default (done on a tool-less turn, continue on a
 /// tool turn) — an absent client must never wedge a run.

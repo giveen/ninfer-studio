@@ -4,7 +4,7 @@
 //! repo search over a cached symbol index, the repo map (declaration
 //! signatures per file), and the git working-tree diff.
 
-use super::common::resolve_ws;
+use super::common::{CODER_IGNORE, enforce_perm, resolve_ws};
 use crate::engine::S;
 use axum::Json;
 use axum::extract::{Query, State as AxumState};
@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -35,28 +35,40 @@ static SEARCH_SYMBOL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     .unwrap()
 });
 const SYMBOL_TTL: Duration = Duration::from_secs(15);
-const MAX_SYMBOL_FILES: usize = 20_000;
+const MAX_SYMBOL_HITS: usize = 20_000;
+const MAX_SYMBOL_FILES_SCANNED: usize = 5_000;
 const MAX_CONTENT_MATCHES: usize = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct SymHit {
-    file: String,
-    line: u64,
-    name: String,
+    pub file: String,
+    pub line: u64,
+    pub name: String,
 }
 
 /// Cache slot type for the in-memory symbol index: build time, the root it
-/// was built from, and the hits. Lives on `state.symbol_index` (see that
-/// field's doc) rather than a module-global static, keyed by root so a
-/// workspace switch within the TTL window can never serve another
-/// workspace's stale index.
-type SymbolIndexCache = Mutex<Option<(std::time::Instant, PathBuf, Vec<SymHit>)>>;
+/// was built from, and the hits wrapped in an `Arc` to avoid deep-cloning
+/// the symbol hit vector on every cache lookup.
+type SymbolIndexCache = Mutex<Option<(std::time::Instant, PathBuf, Arc<Vec<SymHit>>)>>;
 
 fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
     let mut out = Vec::new();
-    let walker = ignore::WalkBuilder::new(root).hidden(false).build();
+    let mut files_scanned = 0usize;
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .parents(false)
+        .filter_entry(|e| {
+            if let Some(name) = e.file_name().to_str() {
+                if CODER_IGNORE.contains(&name) {
+                    return false;
+                }
+            }
+            true
+        })
+        .build();
+
     for result in walker {
-        if out.len() >= MAX_SYMBOL_FILES {
+        if out.len() >= MAX_SYMBOL_HITS || files_scanned >= MAX_SYMBOL_FILES_SCANNED {
             break;
         }
         let Ok(entry) = result else { continue };
@@ -69,6 +81,11 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
         if !SEARCH_SYMBOL_EXTS.contains(&ext) {
             continue;
         }
+        if let Ok(meta) = entry.metadata() {
+            if meta.len() > 10 * 1024 * 1024 {
+                continue;
+            }
+        }
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -76,6 +93,8 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
             continue;
         };
         let rel = rel.to_string_lossy().to_string();
+        files_scanned += 1;
+
         for (i, line) in content.lines().enumerate() {
             if let Some(caps) = SEARCH_SYMBOL_RE.captures(line) {
                 out.push(SymHit {
@@ -84,7 +103,7 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
                     name: caps[1].to_string(),
                 });
             }
-            if out.len() >= MAX_SYMBOL_FILES {
+            if out.len() >= MAX_SYMBOL_HITS {
                 break;
             }
         }
@@ -92,22 +111,20 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
     out
 }
 
-fn search_symbol_index(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
-    let idx = build_symbol_index_blocking(root);
-    *cache.lock().unwrap() = Some((std::time::Instant::now(), root.to_path_buf(), idx));
-    cache.lock().unwrap().as_ref().unwrap().2.clone()
+fn search_symbol_index(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>> {
+    let hits = Arc::new(build_symbol_index_blocking(root));
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some((std::time::Instant::now(), root.to_path_buf(), Arc::clone(&hits)));
+    hits
 }
 
-fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
-    // Drop the guard before rebuilding: the rebuild locks the same mutex, so
-    // holding it across the call would self-deadlock on a cache miss.
+fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>> {
     {
-        let guard = cache.lock().unwrap();
-        if let Some((at, cached_root, idx)) = guard.as_ref()
-            && at.elapsed() < SYMBOL_TTL
-            && cached_root == root
-        {
-            return idx.clone();
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, cached_root, idx)) = guard.as_ref() {
+            if at.elapsed() < SYMBOL_TTL && cached_root == root {
+                return Arc::clone(idx);
+            }
         }
     }
     search_symbol_index(cache, root)
@@ -115,13 +132,17 @@ fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Vec<SymHit> {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
-    // pub(crate): the in-process agent dispatch (src/agent/tools.rs) builds
-    // these extractors directly instead of round-tripping through HTTP.
     pub q: Option<String>,
     #[serde(default)]
     pub limit: Option<u64>,
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub approval_token: Option<String>,
+    #[serde(default)]
+    pub ignore_case: Option<bool>,
 }
 
 pub async fn search(
@@ -133,52 +154,110 @@ pub async fn search(
         return Json(json!({"results": [], "truncated": false}));
     }
     let limit = params.limit.unwrap_or(15).clamp(1, 50) as usize;
+    let scope = params.scope.as_deref().unwrap_or("default");
+
+    if enforce_perm(
+        &state,
+        scope,
+        "repo_search",
+        None,
+        params.approval_token.as_deref(),
+    )
+    .await
+    .is_err()
+    {
+        return Json(json!({
+            "error": "permission denied",
+            "results": [],
+            "truncated": false
+        }));
+    }
+
     let Ok(root) = resolve_ws(&state, params.workspace.as_deref()).await else {
-        return Json(json!({"results": [], "truncated": false}));
+        return Json(json!({
+            "error": "workspace not found",
+            "results": [],
+            "truncated": false
+        }));
     };
-    let terms: Vec<String> = q
-        .to_lowercase()
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .take(8)
-        .map(String::from)
-        .collect();
+
+    let ignore_case = params.ignore_case.unwrap_or(true);
+    let terms: Vec<String> = if ignore_case {
+        q.to_lowercase()
+    } else {
+        q.clone()
+    }
+    .split_whitespace()
+    .filter(|t| !t.is_empty())
+    .take(8)
+    .map(String::from)
+    .collect();
+
     let root_cloned = root.clone();
     let state_cloned = state.clone();
+
     let result = tokio::task::spawn_blocking(move || {
-        let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        #[derive(Debug)]
+        struct RawHit {
+            file: String,
+            line: u64,
+            snippet: String,
+            score: u64,
+            kind: String,
+        }
+
+        let mut results: std::collections::HashMap<String, RawHit> = std::collections::HashMap::new();
+
         // Symbol-name matches (cached index, high scores).
         let idx = search_cached_symbols(&state_cloned.symbol_index, &root_cloned);
-        for s in &idx {
-            let file_low = s.file.to_lowercase();
-            let name_low = s.name.to_lowercase();
-            let mut score = 0;
+        for s in idx.iter() {
+            let file_cmp = if ignore_case { s.file.to_lowercase() } else { s.file.clone() };
+            let name_cmp = if ignore_case { s.name.to_lowercase() } else { s.name.clone() };
+            let mut score = 0u64;
             for t in &terms {
-                if name_low == *t {
+                if name_cmp == *t {
                     score += 100;
-                } else if name_low.starts_with(t.as_str()) {
+                } else if name_cmp.starts_with(t.as_str()) {
                     score += 60;
-                } else if name_low.contains(t.as_str()) {
+                } else if name_cmp.contains(t.as_str()) {
                     score += 30;
-                } else if file_low.contains(t.as_str()) {
-                    score += 10;
+                } else if file_cmp.contains(t.as_str()) {
+                    score += 5;
                 }
             }
             if score > 0 {
                 let key = format!("{}:{}", s.file, s.line);
-                let e = results
+                results
                     .entry(key)
-                    .or_insert_with(|| json!({"file": s.file, "line": s.line, "snippet": "", "score": 0, "kind": "symbol"}));
-                *e = json!({"file": s.file, "line": s.line, "snippet": e["snippet"], "score": e["score"].as_u64().unwrap_or(0) + score as u64, "kind": e["kind"]});
+                    .and_modify(|e| e.score += score)
+                    .or_insert_with(|| RawHit {
+                        file: s.file.clone(),
+                        line: s.line,
+                        snippet: String::new(),
+                        score,
+                        kind: "symbol".to_string(),
+                    });
             }
         }
-        // Content matches: case-sensitive fixed-string, gitignore-respecting
-        // (the `ignore` crate mirrors the sidecar's `rg` exclude list).
-        let q_bytes = q.as_bytes();
-        let walker = ignore::WalkBuilder::new(&root_cloned).hidden(false).build();
-        let mut content = 0usize;
+
+        // Content matches: fixed-string, gitignore-respecting
+        let q_cmp = if ignore_case { q.to_lowercase() } else { q.clone() };
+        let walker = ignore::WalkBuilder::new(&root_cloned)
+            .hidden(true)
+            .parents(false)
+            .filter_entry(|e| {
+                if let Some(name) = e.file_name().to_str() {
+                    if CODER_IGNORE.contains(&name) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .build();
+
+        let mut content_count = 0usize;
         for result in walker {
-            if content >= MAX_CONTENT_MATCHES {
+            if content_count >= MAX_CONTENT_MATCHES {
                 break;
             }
             let Ok(entry) = result else { continue };
@@ -188,35 +267,67 @@ pub async fn search(
             let Ok(rel) = entry.path().strip_prefix(&root_cloned) else {
                 continue;
             };
-            let rel = rel.to_string_lossy().to_string();
+            let rel_str = rel.to_string_lossy().to_string();
+
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() > 10 * 1024 * 1024 {
+                    continue;
+                }
+            }
+
             let Ok(content_text) = std::fs::read_to_string(entry.path()) else {
-                continue; // binary file — rg would skip it too
+                continue;
             };
+
             for (i, line) in content_text.lines().enumerate() {
-                if content >= MAX_CONTENT_MATCHES {
+                if content_count >= MAX_CONTENT_MATCHES {
                     break;
                 }
-                if line.as_bytes().windows(q_bytes.len()).any(|w| w == q_bytes) {
-                    content += 1;
-                    let key = format!("{rel}:{}", i + 1);
-                    let e = results.entry(key).or_insert_with(|| {
-                        json!({"file": rel, "line": i + 1, "snippet": "", "score": 0, "kind": "content"})
-                    });
+                let line_cmp = if ignore_case { line.to_lowercase() } else { line.to_string() };
+                if line_cmp.contains(&q_cmp) {
+                    content_count += 1;
+                    let key = format!("{rel_str}:{}", i + 1);
                     let snippet: String = line.chars().take(300).collect();
-                    *e = json!({"file": e["file"], "line": e["line"], "snippet": snippet, "score": e["score"].as_u64().unwrap_or(0) + 8, "kind": e["kind"]});
+                    results
+                        .entry(key)
+                        .and_modify(|e| {
+                            e.score += 8;
+                            if e.snippet.is_empty() {
+                                e.snippet = snippet.clone();
+                            }
+                        })
+                        .or_insert_with(|| RawHit {
+                            file: rel_str.clone(),
+                            line: (i + 1) as u64,
+                            snippet,
+                            score: 8,
+                            kind: "content".to_string(),
+                        });
                 }
             }
         }
-        let mut arr: Vec<Value> = results.into_values().collect();
-        arr.sort_by(|a, b| {
-            b["score"].as_u64().unwrap_or(0).cmp(&a["score"].as_u64().unwrap_or(0))
-        });
-        let truncated = arr.len() > limit;
-        arr.truncate(limit);
+
+        let mut hits: Vec<RawHit> = results.into_values().collect();
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.file.cmp(&b.file)).then_with(|| a.line.cmp(&b.line)));
+        let truncated = hits.len() > limit;
+        hits.truncate(limit);
+
+        let arr: Vec<Value> = hits
+            .into_iter()
+            .map(|h| json!({
+                "file": h.file,
+                "line": h.line,
+                "snippet": h.snippet,
+                "score": h.score,
+                "kind": h.kind,
+            }))
+            .collect();
+
         json!({"results": arr, "truncated": truncated})
     })
     .await
     .unwrap_or_else(|_| json!({"results": [], "truncated": false}));
+
     Json(result)
 }
 
@@ -225,6 +336,10 @@ pub async fn search(
 pub struct WsQuery {
     #[serde(default)]
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub approval_token: Option<String>,
 }
 
 pub async fn repo_map(
@@ -232,18 +347,43 @@ pub async fn repo_map(
     Query(params): Query<WsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws = resolve_ws(&state, params.workspace.as_deref()).await?;
+    let scope = params.scope.as_deref().unwrap_or("default");
+
+    enforce_perm(
+        &state,
+        scope,
+        "repo_map",
+        None,
+        params.approval_token.as_deref(),
+    )
+    .await?;
 
     let result = tokio::task::spawn_blocking(move || {
         use std::collections::{HashMap, HashSet};
         use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
         let mut parser = Parser::new();
-        let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
+        let walker = ignore::WalkBuilder::new(&ws)
+            .hidden(true)
+            .parents(false)
+            .filter_entry(|e| {
+                if let Some(name) = e.file_name().to_str() {
+                    if CODER_IGNORE.contains(&name) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .build();
 
         let mut ref_counts: HashMap<String, HashSet<String>> = HashMap::new();
         let mut file_defs: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut files_processed = 0usize;
 
         for entry in walker.flatten() {
+            if files_processed >= 1_000 {
+                break;
+            }
             if entry.file_type().is_none_or(|ft| ft.is_dir()) {
                 continue;
             }
@@ -287,7 +427,11 @@ pub async fn repo_map(
             let Ok(content) = std::fs::read_to_string(path) else {
                 continue;
             };
-            parser.set_language(&lang).unwrap();
+
+            if parser.set_language(&lang).is_err() {
+                continue;
+            }
+
             let Some(tree) = parser.parse(&content, None) else {
                 continue;
             };
@@ -295,6 +439,7 @@ pub async fn repo_map(
             let Ok(query) = Query::new(&lang, query_str) else {
                 continue;
             };
+
             let mut cursor = QueryCursor::new();
             let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
 
@@ -304,6 +449,7 @@ pub async fn repo_map(
                 .to_string_lossy()
                 .to_string();
             let mut local_defs = Vec::new();
+            files_processed += 1;
 
             while let Some(m) = matches.next() {
                 for capture in m.captures() {
@@ -314,9 +460,21 @@ pub async fn repo_map(
                             if let Some(parent) = node.parent()
                                 && let Ok(parent_text) = parent.utf8_text(content.as_bytes())
                             {
-                                let sig =
-                                    parent_text.lines().next().unwrap_or("").trim().to_string();
-                                local_defs.push((text.to_string(), sig));
+                                let sig = parent_text
+                                    .lines()
+                                    .map(|l| l.trim())
+                                    .find(|l| {
+                                        !l.is_empty()
+                                            && !l.starts_with("#[")
+                                            && !l.starts_with("//")
+                                            && !l.starts_with("/*")
+                                            && !l.starts_with("*")
+                                    })
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !sig.is_empty() {
+                                    local_defs.push((text.to_string(), sig));
+                                }
                             }
                         } else if tag_name == "ref" {
                             ref_counts
@@ -343,7 +501,8 @@ pub async fn repo_map(
             })
             .collect();
 
-        file_scores.sort_by_key(|a| std::cmp::Reverse(a.1));
+        // Deterministic sorting: descending score, ascending file path as tie breaker
+        file_scores.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut map_out = String::new();
         let mut chars_used = 0;
@@ -376,12 +535,27 @@ pub async fn repo_map(
 // ---------------------------------------------------------------------------
 // Working-tree diff (git) — mirrors the sidecar's `/api/coder/diff`.
 // ---------------------------------------------------------------------------
-async fn git_run(root: &Path, args: &[&str], secs: u64) -> Option<String> {
+async fn git_run(root: &Path, extra_args: &[&str], secs: u64) -> Option<String> {
     let out = timeout(
         Duration::from_secs(secs),
         Command::new("git")
             .arg("--no-pager")
-            .args(args)
+            .args(&[
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "diff.external=",
+                "-c",
+                "core.pager=",
+                "--no-optional-locks",
+            ])
+            .arg("diff")
+            .arg("HEAD")
+            .arg("--no-ext-diff")
+            .arg("--no-textconv")
+            .args(extra_args)
+            .env_remove("GIT_EXTERNAL_DIFF")
+            .env_remove("GIT_PAGER")
             .current_dir(root)
             .output(),
     )
@@ -396,30 +570,36 @@ pub async fn diff(
     Query(params): Query<WsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let root = resolve_ws(&state, params.workspace.as_deref()).await?;
-    let stat = git_run(&root, &["diff", "HEAD", "--stat"], 15).await;
-    let full = git_run(&root, &["diff", "HEAD"], 60).await;
+    let scope = params.scope.as_deref().unwrap_or("default");
+
+    enforce_perm(
+        &state,
+        scope,
+        "git_diff",
+        None,
+        params.approval_token.as_deref(),
+    )
+    .await?;
+
+    let stat = git_run(&root, &["--stat"], 15).await;
+    let full = git_run(&root, &[], 60).await;
     let (stat_text, diff_text) = match (stat, full) {
         (Some(s), Some(d)) => (s, d),
-        // Either git call failing (no repo, timeout, git missing) means the
-        // diff is unavailable — report it like the sidecar, don't error out.
         _ => {
             return Ok(Json(
                 json!({"files": [], "diff": "", "error": "diff failed — see server log"}),
             ));
         }
     };
-    let stat_re = regex::Regex::new(r"^(.+?)\s*\|\s*\d+\s*([+-]*)$").unwrap();
+    let stat_re = regex::Regex::new(r"^\s*(.+?)\s*\|\s*(?:\d+\s*([+-]*)|Bin\b.*)$").unwrap();
     let mut files = Vec::new();
     for l in stat_text.lines() {
         let Some(caps) = stat_re.captures(l) else {
             continue;
         };
-        // The "N files changed" summary line has no `|`; file lines start with
-        // a space — keep only genuine per-file rows.
-        if l.starts_with(' ') {
-            let bar = caps[2].to_string();
-            files.push(json!({"path": caps[1].trim(), "bar": bar}));
-        }
+        let file_path = caps[1].trim();
+        let bar = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        files.push(json!({"path": file_path, "bar": bar}));
     }
     let truncated = diff_text.len() > 60_000;
     Ok(Json(json!({
@@ -455,6 +635,9 @@ mod tests {
                 q: Some("   ".into()),
                 limit: None,
                 workspace: None,
+                scope: None,
+                approval_token: None,
+                ignore_case: None,
             }),
         )
         .await;
@@ -467,6 +650,9 @@ mod tests {
                 q: Some("SymbolIndex".into()),
                 limit: Some(50),
                 workspace: None,
+                scope: None,
+                approval_token: None,
+                ignore_case: None,
             }),
         )
         .await;
@@ -491,12 +677,18 @@ mod tests {
                 q: Some("mentions_ranking".into()),
                 limit: Some(50),
                 workspace: None,
+                scope: None,
+                approval_token: None,
+                ignore_case: None,
             }),
         )
         .await;
         let c_res = c["results"].as_array().unwrap();
-        assert!(c_res.iter().any(|x| x["file"] == "src/handler.rs"
-            && x["snippet"].as_str().unwrap().contains("mentions_ranking")));
+        assert!(
+            c_res.iter().any(|x| x["file"] == "src/handler.rs"
+                && x["snippet"].as_str().unwrap().contains("mentions_ranking")),
+            "c_res was: {c:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -523,8 +715,6 @@ mod tests {
             );
             Ok(o)
         };
-        // No git (exotic runners) → skip the assertions; the no-repo path is
-        // still exercised below and must return a soft error, not a 500.
         let have_git = git(&["init", "-q"]).is_ok();
 
         let state: S =
@@ -536,34 +726,145 @@ mod tests {
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "base"]).unwrap();
             std::fs::write(ws.join("a.txt"), "one\ntwo\n").unwrap();
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
-                .await
-                .unwrap()
-                .0;
+            let r = diff(
+                AxumState(state.clone()),
+                Query(WsQuery {
+                    workspace: None,
+                    scope: None,
+                    approval_token: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
             let files = r["files"].as_array().unwrap();
             assert!(
                 files.iter().any(|f| f["path"] == "a.txt"),
                 "changed file missing: {files:?}"
             );
             assert!(r["diff"].as_str().unwrap().contains("two"));
+
             // Clean tree → empty diff, no files.
             git(&["add", "."]).unwrap();
             git(&["commit", "-q", "-m", "b"]).unwrap();
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
-                .await
-                .unwrap()
-                .0;
+            let r = diff(
+                AxumState(state.clone()),
+                Query(WsQuery {
+                    workspace: None,
+                    scope: None,
+                    approval_token: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
             assert!(r["files"].as_array().unwrap().is_empty());
         } else {
-            let r = diff(AxumState(state.clone()), Query(WsQuery { workspace: None }))
-                .await
-                .unwrap()
-                .0;
+            let r = diff(
+                AxumState(state.clone()),
+                Query(WsQuery {
+                    workspace: None,
+                    scope: None,
+                    approval_token: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
             assert!(
                 r.get("error").is_some(),
                 "no git, no repo → soft error: {r:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn repo_map_produces_deterministic_signatures_and_skips_attributes() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-repomapws-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(
+            ws.join("src/lib.rs"),
+            "#[derive(Debug)]\npub fn calculate_map() -> usize { 42 }\n",
+        )
+        .unwrap();
+
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
+
+        let res1 = repo_map(
+            AxumState(state.clone()),
+            Query(WsQuery {
+                workspace: None,
+                scope: None,
+                approval_token: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let map_str1 = res1["map"].as_str().unwrap();
+        assert!(
+            map_str1.contains("pub fn calculate_map() -> usize"),
+            "signature should skip #[derive] attribute line: {map_str1}"
+        );
+
+        let res2 = repo_map(
+            AxumState(state.clone()),
+            Query(WsQuery {
+                workspace: None,
+                scope: None,
+                approval_token: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(res1, res2, "repo_map output must be deterministic");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn search_endpoints_enforce_permissions() {
+        use crate::coder::common::perms_set;
+
+        let tmp = std::env::temp_dir().join(format!("ninfier-searchperm-{}", std::process::id()));
+        let ws = tmp.join("ws");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&ws).unwrap();
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+        state.config.write().await.coder_workspace = ws.to_string_lossy().into_owned();
+        let ws_state = || AxumState(state.clone());
+
+        // Set repo_search to deny
+        let _ = perms_set(
+            ws_state(),
+            Json(json!({"tools": {"repo_search": "deny"}, "denyPaths": []})),
+        )
+        .await;
+
+        let r = search(
+            ws_state(),
+            Query(SearchQuery {
+                q: Some("test".into()),
+                limit: None,
+                workspace: None,
+                scope: None,
+                approval_token: None,
+                ignore_case: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(r["error"].as_str(), Some("permission denied"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

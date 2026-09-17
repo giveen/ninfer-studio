@@ -172,7 +172,7 @@ pub async fn fs_read(
         ));
     }
     use tokio::io::AsyncReadExt as _;
-    let mut file = tokio::fs::File::open(&full).await.map_err(|_| {
+    let file = tokio::fs::File::open(&full).await.map_err(|_| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("file not found: {rel}")})),

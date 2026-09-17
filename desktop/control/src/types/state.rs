@@ -187,7 +187,7 @@ pub struct State {
         Option<(
             std::time::Instant,
             std::path::PathBuf,
-            Vec<crate::coder::SymHit>,
+            std::sync::Arc<Vec<crate::coder::SymHit>>,
         )>,
     >,
     /// Optional bridge to the desktop shell. `None` when running headless.

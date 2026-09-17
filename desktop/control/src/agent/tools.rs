@@ -832,6 +832,14 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
                     .get("workspace")
                     .and_then(|v| v.as_str())
                     .map(String::from),
+                scope: body
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                approval_token: body
+                    .get("approvalToken")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             }),
         )
         .await
@@ -846,6 +854,15 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
                     .get("workspace")
                     .and_then(|v| v.as_str())
                     .map(String::from),
+                scope: body
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                approval_token: body
+                    .get("approvalToken")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                ignore_case: body.get("ignoreCase").and_then(|v| v.as_bool()),
             }),
         )
         .await
@@ -855,6 +872,14 @@ async fn call(state: &S, run: &Arc<RunShared>, name: &str, body: &Value) -> Valu
             Query(search::WsQuery {
                 workspace: body
                     .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                scope: body
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                approval_token: body
+                    .get("approvalToken")
                     .and_then(|v| v.as_str())
                     .map(String::from),
             }),
