@@ -216,6 +216,10 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
       // polls), but a relative read must never fly while the control plane still
       // points at another workspace — e.g. setActive's activation re-check.
       if (!ready()) return;
+      if (kind === 'binary') {
+        patchTab(id, (t) => ({ ...t, status: 'binary' }));
+        return;
+      }
       const gen = genRef.current;
       const seq = (readSeqRef.current.get(id) || 0) + 1;
       readSeqRef.current.set(id, seq);
@@ -524,7 +528,7 @@ export function useFileTabs(opts: FileTabsOptions): FileTabsApi {
         id, path,
         kind: fk.kind, lang: fk.lang,
         doc: '', base: '', baseBytes: null, docRev: 0,
-        dirty: false, status: 'loading',
+        dirty: false, status: fk.kind === 'binary' ? 'binary' : 'loading',
         truncated: false, diskChanged: false,
         diags: [], linting: false, image: null,
       };
