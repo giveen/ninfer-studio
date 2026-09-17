@@ -212,6 +212,30 @@ pub(crate) struct EngineArgsBody {
     artifact: Option<String>,
 }
 
+fn extract_artifact(args: &[String]) -> Option<&str> {
+    if let Some(art) = args.iter().find(|x| {
+        x.ends_with(".ninfer")
+            || x.ends_with(".gguf")
+            || x.ends_with(".safetensors")
+            || x.ends_with(".bin")
+    }) {
+        return Some(art.as_str());
+    }
+    let mut i = 0;
+    while i < args.len() {
+        if args[i].starts_with('-') {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            return Some(args[i].as_str());
+        }
+    }
+    None
+}
+
 pub(crate) async fn engine_args(
     AxumState(state): AxumState<S>,
     Json(body): Json<EngineArgsBody>,
@@ -248,10 +272,10 @@ pub(crate) async fn engine_args(
     let dirty = if running && port_match {
         match running_args {
             Some(ra) => {
-                let running_artifact = ra.iter().find(|x| !x.starts_with('-'));
+                let running_artifact = extract_artifact(ra);
                 !args_equal(ra, &form)
                     || base_name(&artifact)
-                        != base_name(running_artifact.map(|s| s.as_str()).unwrap_or(""))
+                        != base_name(running_artifact.unwrap_or(""))
             }
             None => match last.as_ref() {
                 // The UI normalizes "" to null for the artifact, so an empty
@@ -262,9 +286,8 @@ pub(crate) async fn engine_args(
                     } else {
                         Some(artifact.as_str())
                     };
-                    ls.artifact.as_deref() != art_opt
-                        || serde_json::to_string(&ls.profile).ok()
-                            != serde_json::to_string(&profile).ok()
+                    let running_form = build_serve_args(&ls.profile, ls.port);
+                    ls.artifact.as_deref() != art_opt || !args_equal(&running_form, &form)
                 }
                 None => false,
             },

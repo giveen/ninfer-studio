@@ -1,9 +1,8 @@
-//! Engine launch-arg builder + argv equality (mirrors the web UI).
+//! Engine launch-arg builder + argv equality.
 use super::settings::{EngineProfile, NumberOrAuto};
 
 /// Build the `ninfer-serve` argv (after the artifact path) from a profile.
-/// The flag is only emitted when its value is present — mirroring the web UI's
-/// generated command, so what is reviewed is what runs.
+/// The flag is only emitted when its value is present.
 pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let kv = |a: &mut Vec<String>, flag: &str, v: &str| {
@@ -143,12 +142,12 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     {
         a.push("--spec".into());
         a.push(spec.clone());
-        kv(
-            &mut a,
-            "--draft-tokens",
-            &p.draft_tokens.map(|v| v.to_string()).unwrap_or_default(),
-        );
     }
+    kv(
+        &mut a,
+        "--draft-tokens",
+        &p.draft_tokens.map(|v| v.to_string()).unwrap_or_default(),
+    );
     flag(&mut a, "--lm-head-draft", p.lm_head_draft == Some(true));
     kv(
         &mut a,
@@ -257,26 +256,32 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     a
 }
 
+fn is_flag(s: &str) -> bool {
+    s.starts_with('-') && s.parse::<f64>().is_err()
+}
+
 /// Order-insensitive flag/value equality for two argv lists (positional args
-/// are ignored — the artifact path is compared separately). Mirrors the web
-/// UI's `argsEqual`, so the server-computed restart-dirty check and the UI
-/// cannot disagree about whether settings changed.
+/// are ignored — the artifact path is compared separately).
 pub fn args_equal(a: &[String], b: &[String]) -> bool {
-    fn norm(xs: &[String]) -> std::collections::HashMap<String, String> {
-        let mut m = std::collections::HashMap::new();
+    fn norm(xs: &[String]) -> std::collections::HashMap<String, Vec<String>> {
+        let mut m: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         let mut i = 0;
         while i < xs.len() {
-            if !xs[i].starts_with('-') {
+            if !is_flag(&xs[i]) {
                 i += 1;
                 continue;
             }
-            if i + 1 < xs.len() && !xs[i + 1].starts_with('-') {
-                m.insert(xs[i].clone(), xs[i + 1].clone());
+            let flag_name = xs[i].clone();
+            if i + 1 < xs.len() && !is_flag(&xs[i + 1]) {
+                m.entry(flag_name).or_default().push(xs[i + 1].clone());
                 i += 2;
             } else {
-                m.insert(xs[i].clone(), String::new());
+                m.entry(flag_name).or_default().push(String::new());
                 i += 1;
             }
+        }
+        for vals in m.values_mut() {
+            vals.sort();
         }
         m
     }
@@ -305,14 +310,30 @@ mod args_equal_tests {
     }
 
     #[test]
-    fn flag_value_boundary_matches_javascript_semantics() {
+    fn flag_value_boundary_handles_standalone_flags() {
         // `--greedy --port`: a value flag eats the next non-flag token only,
         // so `--greedy` maps to "" and `--port` stands alone with value 8080.
-        // The JS normalization shares this rule, so both sides agree.
         let a = v(&["--greedy", "--port", "8080"]);
         let b = v(&["--port", "8080", "--greedy"]);
         assert!(args_equal(&a, &b));
         assert!(!args_equal(&a, &v(&["--port", "8080"])));
+    }
+
+    #[test]
+    fn negative_numeric_values_are_not_parsed_as_flags() {
+        let a = v(&["--presence-penalty", "-1.5", "--temperature", "-0.5"]);
+        let b = v(&["--temperature", "-0.5", "--presence-penalty", "-1.5"]);
+        assert!(args_equal(&a, &b));
+        assert!(!args_equal(&a, &v(&["--presence-penalty", "1.5"])));
+    }
+
+    #[test]
+    fn duplicate_flags_are_not_collapsed() {
+        let a = v(&["--device", "0", "--device", "1"]);
+        let b = v(&["--device", "1"]);
+        assert!(!args_equal(&a, &b));
+        let c = v(&["--device", "1", "--device", "0"]);
+        assert!(args_equal(&a, &c));
     }
 
     #[test]
@@ -331,11 +352,6 @@ mod parity {
     use super::*;
     use std::path::Path;
 
-    /// build_serve_args is the single engine launch-arg builder (dev and
-    /// packaged launches share it — the former Node sidecar copy is gone).
-    /// This test pins its argv against the fixture in tests/parity; change
-    /// the builder intentionally by updating expected-args.json alongside it
-    /// and reviewing the diff.
     #[test]
     fn serve_args_match_fixture() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/parity");
@@ -354,18 +370,23 @@ mod parity {
         let expected = expected.as_array().expect("expected array");
         assert_eq!(cases.len(), expected.len(), "parity case count drift");
 
-        for (case, want) in cases.iter().zip(expected.iter()) {
-            // Deserializing through the real EngineProfile also exercises the
-            // camelCase serde mapping the web UI depends on.
+        let expected_map: std::collections::HashMap<&str, &serde_json::Value> = expected
+            .iter()
+            .filter_map(|w| w["name"].as_str().map(|name| (name, w)))
+            .collect();
+
+        for case in cases {
+            let name = case["name"].as_str().expect("case name");
+            let want = expected_map
+                .get(name)
+                .unwrap_or_else(|| panic!("missing expected fixture for case {:?}", name));
             let profile: EngineProfile = serde_json::from_value(case["profile"].clone())
-                .unwrap_or_else(|e| {
-                    panic!("profile {:?} failed to deserialize: {e}", case["name"])
-                });
+                .unwrap_or_else(|e| panic!("profile {:?} failed to deserialize: {e}", name));
             let port = case["port"].as_u64().expect("case port") as u16;
             let got = build_serve_args(&profile, port);
-            let want: Vec<String> =
+            let want_args: Vec<String> =
                 serde_json::from_value(want["args"].clone()).expect("expected args array");
-            assert_eq!(got, want, "argv drift for parity case {:?}", case["name"]);
+            assert_eq!(got, want_args, "argv drift for parity case {:?}", name);
         }
     }
 }
