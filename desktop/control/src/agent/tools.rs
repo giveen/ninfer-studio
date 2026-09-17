@@ -1150,4 +1150,12 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
+
+    #[test]
+    fn test_worker_and_critic_prompt_parity() {
+        assert!(WORKER_SYSTEM.contains("DO NOT use `bash` for `cat`, `head`, `tail`, `less`, `grep`, `find`, `ls`, `sed`, or `awk`."));
+        assert!(WORKER_SYSTEM.contains("For binary/media formats (image dimensions, audio duration, etc.), use an existing platform tool via `bash` (`identify`, `ffprobe`, `python3`+PIL, `file`) rather than hand-writing format parsing."));
+        assert!(CRITIC_SYSTEM.contains("VERDICT: APPROVED"));
+        assert!(CRITIC_SYSTEM.contains("VERDICT: CHANGES_REQUESTED"));
+    }
 }

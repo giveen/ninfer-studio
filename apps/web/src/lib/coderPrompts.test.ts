@@ -14,13 +14,15 @@ describe('coderPrompts & coderLens', () => {
       expect(CODER_SYSTEM).toContain('Verify Everything');
       expect(CODER_SYSTEM).toContain('todo_write');
       expect(CODER_SYSTEM).toContain('memory_update');
+      expect(CODER_SYSTEM).toContain('You have a workspace memory bank that persists across sessions');
     });
   });
 
   describe('WORKER_SYSTEM', () => {
-    it('restricts worker subagents from committing or asking user', () => {
+    it('restricts worker subagents from committing or asking user and includes binary format guidance', () => {
       expect(WORKER_SYSTEM).toContain('Do NOT call: ask_user');
       expect(WORKER_SYSTEM).toContain('the supervisor owns version control');
+      expect(WORKER_SYSTEM).toContain('For binary/media formats');
     });
   });
 
