@@ -4,7 +4,7 @@ use std::fmt;
 
 /// impls to redact secrets while still showing whether one is set, without
 /// leaking the value itself into a log line or panic message.
-pub(crate) fn redacted(s: &str) -> &'static str {
+fn redacted(s: &str) -> &'static str {
     if s.is_empty() { "" } else { "***" }
 }
 
@@ -509,8 +509,7 @@ impl fmt::Debug for EngineProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NumberOrAuto {
     Number(u64),
     Auto,
