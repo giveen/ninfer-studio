@@ -349,7 +349,9 @@ pub struct RunLive {
     /// A `todo_write` whose snapshot predates the bump is stale and discarded
     /// (the client's mid-run edit guard).
     pub todo_rev: u64,
-    /// The rev captured at the start of the in-flight turn — the list the
+    /// User-initiated task-list revision: bumped ONLY by human edits via `todo_set`.
+    pub user_todo_rev: u64,
+    /// The user_todo_rev captured at the start of the in-flight turn — the list the
     /// current response was generated from.
     pub todo_base_rev: u64,
 }
@@ -796,6 +798,7 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         usage: RunUsage::default(),
         last_meta: None,
         todo_rev: 0,
+        user_todo_rev: 0,
         todo_base_rev: 0,
     };
     // Worker critic spec (subagent runs only): `{model, system?}`.
@@ -1407,6 +1410,7 @@ pub(crate) async fn todo_set(
     let items = clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
     let mut live = lock(&r.live);
     live.todo = Some(Value::Array(items.clone()));
+    live.user_todo_rev += 1;
     live.todo_rev += 1;
     let rev = live.todo_rev;
     drop(live);

@@ -1116,7 +1116,7 @@ pub async fn run(state: S, shared: Arc<RunShared>) {
         // guard: it is the list this response was generated from.
         let system = {
             let mut live = lock_live(&shared);
-            live.todo_base_rev = live.todo_rev;
+            live.todo_base_rev = live.user_todo_rev;
             let mut sys = meta.system.clone().unwrap_or_default();
             if meta.kind == "coder"
                 && let Some(t) = live.todo.as_ref().filter(|t| !t.is_null())
@@ -1888,6 +1888,7 @@ mod tests {
                 usage: Default::default(),
                 last_meta: None,
                 todo_rev: 0,
+                user_todo_rev: 0,
                 todo_base_rev: 0,
             }),
             tx,
@@ -2061,6 +2062,7 @@ mod tests {
             usage: Default::default(),
             last_meta: None,
             todo_rev: 0,
+            user_todo_rev: 0,
             todo_base_rev: 0,
         };
         let shared = Arc::new(crate::agent::run::RunShared {
@@ -2179,6 +2181,7 @@ mod tests {
                 usage: Default::default(),
                 last_meta: None,
                 todo_rev: 0,
+                user_todo_rev: 0,
                 todo_base_rev: 0,
             }),
             tx,

@@ -225,12 +225,12 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             // The client's guard, ported: validate the items (the JSON schema
             // is a model hint only — malformed items are dropped, never
             // stringified) and discard updates the user superseded mid-run
-            // (a user edit bumps `todo_rev` past the rev captured at request
+            // (a user edit bumps `user_todo_rev` past the rev captured at request
             // build time — `todo_base_rev`).
             let items =
                 crate::agent::run::clean_todo_items(args.get("todos").unwrap_or(&Value::Null));
             let mut live = run.live.lock().unwrap_or_else(|p| p.into_inner());
-            if live.todo_rev != live.todo_base_rev {
+            if live.user_todo_rev != live.todo_base_rev {
                 let current = live.todo.clone().unwrap_or(Value::Array(vec![]));
                 return json!({
                     "success": false,

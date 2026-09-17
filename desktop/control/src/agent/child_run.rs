@@ -365,6 +365,7 @@ pub(crate) async fn spawn_child(
         usage: Default::default(),
         last_meta: None,
         todo_rev: 0,
+        user_todo_rev: 0,
         todo_base_rev: 0,
     };
 

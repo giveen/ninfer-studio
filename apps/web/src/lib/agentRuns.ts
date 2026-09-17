@@ -215,6 +215,10 @@ export const agentRunsApi = {
   ): Promise<{ ok: boolean }> {
     return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/hooks/${encodeURIComponent(hookId)}`, body, 5000);
   },
+  /** Update the run's task list (user edit). Bumps `user_todo_rev` on server. */
+  setTodo(id: string, todos: unknown[]): Promise<{ ok: boolean; count: number; rev: number }> {
+    return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/todo`, { todos }, 5000);
+  },
   /** Resolve a pending risky/commit gate. Risky: once|remember|deny;
    *  commit: approve|deny. */
   decideGate(
