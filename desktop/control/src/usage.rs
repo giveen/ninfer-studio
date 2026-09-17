@@ -198,10 +198,38 @@ pub(crate) async fn usage_stats(
     // AppSettings::cloud_model_pricing / cloud_test). Computed at read time
     // (not log time) so a later price refresh re-prices old log lines too —
     // same reasoning as `display_model_name` above.
-    let pricing = state.config.read().await.cloud_model_pricing.clone();
+    let cfg = state.config.read().await;
+    let pricing = cfg.cloud_model_pricing.clone();
+    let mut cloud_models = BTreeSet::new();
+    for k in pricing.keys() {
+        cloud_models.insert(k.clone());
+    }
+    if !cfg.cloud_provider_default_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_default_model.clone());
+    }
+    if !cfg.cloud_provider_primary_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_primary_model.clone());
+    }
+    if !cfg.cloud_provider_subagent_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_subagent_model.clone());
+    }
+
     let price_event = |model: &str, prompt: u64, completion: u64| -> Option<f64> {
         let p = pricing.get(model)?;
         Some(prompt as f64 * p.prompt_per_token + completion as f64 * p.completion_per_token)
+    };
+
+    let is_remote_event = |e: &Value| -> bool {
+        let src = e.get("source").and_then(Value::as_str);
+        if src == Some("remote") {
+            return true;
+        }
+        if let Some(m) = e.get("model").and_then(Value::as_str) {
+            if m.contains('/') || cloud_models.contains(m) {
+                return true;
+            }
+        }
+        false
     };
 
     let events: Vec<Value> = read_usage_events(&state)
@@ -212,8 +240,11 @@ pub(crate) async fn usage_stats(
                 .and_then(Value::as_u64)
                 .is_some_and(|ts| ts >= cutoff_ms && ts <= now_ms)
         })
-        .filter(|e| {
-            source == "all" || e.get("source").and_then(Value::as_str) == Some(source.as_str())
+        .filter(|e| match source.as_str() {
+            "all" => true,
+            "remote" => is_remote_event(e),
+            "local" => !is_remote_event(e),
+            _ => true,
         })
         .collect();
 
