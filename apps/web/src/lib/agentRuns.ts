@@ -161,8 +161,8 @@ export interface RunEvent {
 // ---------------------------------------------------------------------------
 
 export const agentRunsApi = {
-  start(body: StartRunBody): Promise<{ id: string; status: string }> {
-    return postJSON('/api/agent/runs', body, 10_000);
+  start(body: StartRunBody, signal?: AbortSignal): Promise<{ id: string; status: string }> {
+    return postJSON('/api/agent/runs', body, 10_000, signal);
   },
   list(): Promise<RunSummary[]> {
     return getJSON<RunSummary[]>('/api/agent/runs', 4000);

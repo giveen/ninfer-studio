@@ -65,7 +65,9 @@ export function useCoderSubagents({
       const rawTools = TOOLS.filter((t) => names.includes(t.function.name));
       const tools = filterToolAllowList(filterToolsByConfig(rawTools, appConfig), allowed);
       let id: string | null = null;
+      let stream: RunStream | null = null;
       const stop = () => {
+        stream?.close();
         if (id) agentRunsApi.stop(id).catch(() => {});
       };
       try {
@@ -75,6 +77,10 @@ export function useCoderSubagents({
           taskWeight: 'light',
         }, model);
         const subProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
+        // Listen before start(): if the start POST itself is what's slow,
+        // an abort mid-flight must cancel that fetch (via the signal we now
+        // pass into agentRunsApi.start below), not just whatever comes after.
+        signal.addEventListener('abort', stop, { once: true });
         const started = await agentRunsApi.start({
           messages: [{ role: 'user', content: prompt }],
           kind: 'scout',
@@ -98,15 +104,14 @@ export function useCoderSubagents({
             maxTokens: 2048,
           },
           scope: activeWsDir,
-        });
+        }, signal);
         id = started.id;
         if (signal.aborted) {
           stop();
           return `(subagent ${label} aborted)`;
         }
-        signal.addEventListener('abort', stop, { once: true });
         try {
-          const stream = new RunStream(
+          stream = new RunStream(
             id,
             () => {},
             (ev: any) => {
@@ -283,9 +288,11 @@ export function useCoderSubagents({
             maxTokens: 4096,
           },
           scope: activeWsDir,
-        });
+        }, signal);
         const id = started.id;
+        let stream: RunStream | null = null;
         const stop = () => {
+          stream?.close();
           agentRunsApi.stop(id).catch(() => {});
         };
         if (signal.aborted) {
@@ -294,7 +301,7 @@ export function useCoderSubagents({
         }
         signal.addEventListener('abort', stop, { once: true });
         try {
-          const stream = new RunStream(
+          stream = new RunStream(
             id,
             () => {},
             (ev: any) => {

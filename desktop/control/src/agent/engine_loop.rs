@@ -342,6 +342,54 @@ fn parse_items(s: &str) -> Option<Vec<Value>> {
     }
 }
 
+/// `<function=name>` — the XML-ish attribute form some models emit instead
+/// of JSON inside `<tool_call>` (no quotes, `=` instead of a JSON key).
+fn re_xml_function() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<function=([^>]+)>(.*?)</function>").expect("static regex"))
+}
+/// `<parameter=key>value</parameter>` inside an XML-ish `<function=...>` body.
+fn re_xml_parameter() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)<parameter=([^>]+)>(.*?)</parameter>").expect("static regex")
+    })
+}
+
+/// Parse the XML-ish `<function=name><parameter=k>v</parameter>...</function>`
+/// form (no JSON at all — plain attribute-style tags) into the same
+/// `{"name", "arguments"}` shape `coerce` expects. A body may hold more than
+/// one `<function=...>` block. Returns `None` when nothing matches, so
+/// callers can fall through to other tiers.
+fn parse_xml_functions(s: &str) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    for fn_cap in re_xml_function().captures_iter(s) {
+        let name = fn_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let mut args = Map::new();
+        for p_cap in re_xml_parameter().captures_iter(body) {
+            let key = p_cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            if key.is_empty() {
+                continue;
+            }
+            // Strip only the leading/trailing newline padding models wrap
+            // multi-line values in — a trailing space can be semantically
+            // meaningful (e.g. a grep pattern like "^export "), so don't
+            // `.trim()` the whole value.
+            let val = p_cap
+                .get(2)
+                .map(|m| m.as_str().trim_matches(['\n', '\r']))
+                .unwrap_or("");
+            args.insert(key.to_string(), Value::String(val.to_string()));
+        }
+        items.push(json!({ "name": name, "arguments": Value::Object(args) }));
+    }
+    if items.is_empty() { None } else { Some(items) }
+}
+
 /// Coerce a parsed markup item into (name, args). Accepts the shapes models
 /// actually emit: `name`/`function.name`/`tool` and `arguments`/
 /// `function.arguments`/`args`/`parameters` (JSON string or object).
@@ -403,7 +451,12 @@ pub fn parse_markup_tool_calls(text: &str) -> (Vec<Tc>, Vec<String>) {
         };
 
     for cap in re_tool_call().captures_iter(text) {
-        if let Some(items) = parse_items(cap.get(1).map(|m| m.as_str()).unwrap_or("")) {
+        let inner = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        // JSON body first (the common case); fall back to the XML-ish
+        // `<function=name><parameter=k>v</parameter>` form some models emit
+        // instead — same `<tool_call>` wrapper, no JSON inside at all.
+        let items = parse_items(inner).or_else(|| parse_xml_functions(inner));
+        if let Some(items) = items {
             push_items(
                 &items,
                 cap.get(0).unwrap().as_str(),
@@ -436,6 +489,21 @@ pub fn parse_markup_tool_calls(text: &str) -> (Vec<Tc>, Vec<String>) {
         && let Some(items) = parse_items(bare)
     {
         push_items(&items, bare, &mut calls, &mut consumed);
+    }
+    if !calls.is_empty() {
+        return (calls, consumed);
+    }
+    // Last resort: bare `<function=...>` blocks with no `<tool_call>`
+    // wrapper at all (some models drop the wrapper but keep this form).
+    for cap in re_xml_function().captures_iter(text) {
+        if let Some(items) = parse_xml_functions(cap.get(0).unwrap().as_str()) {
+            push_items(
+                &items,
+                cap.get(0).unwrap().as_str(),
+                &mut calls,
+                &mut consumed,
+            );
+        }
     }
     (calls, consumed)
 }
@@ -1686,6 +1754,39 @@ mod tests {
         assert!(!stripped.contains("<tool_call>"));
         assert!(stripped.contains("Sure, I'll read it:"));
         assert!(stripped.contains("done"));
+    }
+
+    #[test]
+    fn markup_recovery_xml_function_form() {
+        // Exact shape observed live: a model emitting the XML-ish
+        // `<function=name><parameter=k>v</parameter></function>` form
+        // instead of a JSON body inside `<tool_call>` — previously matched
+        // by re_tool_call but rejected by parse_items (JSON-only), so it
+        // was silently dropped as prose and the run finished with zero
+        // tool calls despite the model clearly asking to call three.
+        let text = "<tool_call>\n<function=shell>\n<parameter=command>\nfind /a -name \"*.ts\"\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=grep>\n<parameter=pattern>^export </parameter>\n<parameter=path>src/</parameter>\n</function>\n</tool_call>";
+        let (calls, consumed) = parse_markup_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        let args0: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args0["command"].as_str().unwrap().trim(),
+            "find /a -name \"*.ts\""
+        );
+        assert_eq!(calls[1].name, "grep");
+        let args1: Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        assert_eq!(args1["pattern"], "^export ");
+        assert_eq!(args1["path"], "src/");
+        let stripped = strip_consumed(text, &consumed);
+        assert!(!stripped.contains("<tool_call>"));
+
+        // Same form, no <tool_call> wrapper at all.
+        let bare = "<function=read>\n<parameter=path>a.txt</parameter>\n</function>";
+        let (calls, _) = parse_markup_tool_calls(bare);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["path"], "a.txt");
     }
 
     #[test]
