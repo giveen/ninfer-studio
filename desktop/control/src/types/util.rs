@@ -17,9 +17,13 @@ pub fn strip_extended_prefix(p: &str) -> String {
 /// Basename of a filesystem-ish path (`/a/b/c` -> `c`); whole string when there
 /// is no separator. Mirrors the UI's `baseName` for artifact comparison.
 pub fn base_name(p: &str) -> &str {
-    match p.rsplit_once('/') {
+    let trimmed = p.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return p;
+    }
+    match trimmed.rsplit_once(|c| c == '/' || c == '\\') {
         Some((_, rest)) => rest,
-        None => p,
+        None => trimmed,
     }
 }
 

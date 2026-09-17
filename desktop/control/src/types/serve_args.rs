@@ -318,6 +318,9 @@ mod args_equal_tests {
     #[test]
     fn base_name_handles_plain_names_and_separators() {
         assert_eq!(base_name("/a/b/model.ninfer"), "model.ninfer");
+        assert_eq!(base_name("C:\\models\\x.ninfer"), "x.ninfer");
+        assert_eq!(base_name("C:\\models\\folder\\"), "folder");
+        assert_eq!(base_name("/a/b/c/"), "c");
         assert_eq!(base_name("model.ninfer"), "model.ninfer");
         assert_eq!(base_name(""), "");
     }
