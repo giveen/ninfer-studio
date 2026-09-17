@@ -105,6 +105,10 @@ fn parse_apps_csv(stdout: &str) -> Vec<GpuApp> {
 }
 
 pub async fn gpu_stats() -> GpuStats {
+    gpu_stats_for_device(None).await
+}
+
+pub async fn gpu_stats_for_device(gpu_id: Option<u32>) -> GpuStats {
     fn fallback() -> GpuStats {
         GpuStats {
             available: false,
@@ -116,7 +120,7 @@ pub async fn gpu_stats() -> GpuStats {
             apps: vec![],
         }
     }
-    let result = tokio::task::spawn_blocking(|| {
+    let result = tokio::task::spawn_blocking(move || {
         let fallback = fallback();
         // nvidia-smi accepts only ONE `--query-*` switch per invocation
         // ("Only one --query-* switch can be used at a time"), so GPU
@@ -127,27 +131,34 @@ pub async fn gpu_stats() -> GpuStats {
         // Stdio must be piped (not inherited) for `wait_with_output` to
         // return the query result — inherited output would leak into this
         // process's own stdout and yield an empty `Output`.
-        let gpu_child = match std::process::Command::new("nvidia-smi")
-            .args([
-                "--query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw",
-                "--format=csv,noheader,nounits",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+        let mut gpu_cmd = std::process::Command::new("nvidia-smi");
+        if let Some(id) = gpu_id {
+            gpu_cmd.arg(format!("--id={id}"));
+        }
+        gpu_cmd.args([
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+        let gpu_child = match gpu_cmd.spawn() {
             Ok(c) => c,
             Err(_) => return fallback,
         };
-        let apps_child = std::process::Command::new("nvidia-smi")
-            .args([
-                "--query-compute-apps=pid,process_name,used_memory",
-                "--format=csv,noheader,nounits",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .ok();
+
+        let mut apps_cmd = std::process::Command::new("nvidia-smi");
+        if let Some(id) = gpu_id {
+            apps_cmd.arg(format!("--id={id}"));
+        }
+        apps_cmd.args([
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+        let apps_child = apps_cmd.spawn().ok();
 
         let gpu_deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(NVSMI_TIMEOUT_MS);
