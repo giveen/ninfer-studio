@@ -256,7 +256,7 @@ export const TOOLS = [
           id: { type: "string", description: "Observation id from the placeholder, e.g. obs_ab12cd34ef56..." },
           offset: { type: "number", description: "Byte offset to resume from — 0 for the first call, then the previous response's next_offset." }
         },
-        required: ["id", "offset"]
+        required: ["id"]
       }
     }
   },

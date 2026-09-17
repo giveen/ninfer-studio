@@ -155,6 +155,7 @@ function placeholderFor(id: string, toolName: string, text: string): string {
 export interface RecallResult {
   text?: string;
   nextOffset?: number;
+  next_offset?: number;
   eof?: boolean;
   error?: string;
 }
@@ -183,8 +184,8 @@ export async function readRecallChunk(id: string, offset: number): Promise<Recal
   // fatal:false tolerates a chunk boundary landing mid-character (rare, and
   // only ever cosmetic — one stray replacement character at a page edge).
   const text2 = new TextDecoder('utf-8', { fatal: false }).decode(chunk);
-  const nextOffset = offset + chunk.length;
-  return { text: text2, nextOffset, eof: nextOffset >= bytes.length };
+  const nextVal = offset + chunk.length < bytes.length ? offset + chunk.length : undefined;
+  return { text: text2, nextOffset: nextVal, next_offset: nextVal, eof: nextVal === undefined };
 }
 
 export interface ToolResultText {
