@@ -62,15 +62,28 @@ export function buildChatRequest(
         else if (a.kind === 'video') content.push({ type: 'video_url', video_url: { url: a.dataUrl! } });
         else if (a.kind === 'file') {
           const p = a.path ?? a.name;
-          const body = a.content ?? '';
-          const longestRun = (body.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
+          let fileText = a.content ?? '';
+          const MAX_ATTACHMENT_CHARS = 30_000;
+          if (fileText.length > MAX_ATTACHMENT_CHARS) {
+            fileText = fileText.slice(0, MAX_ATTACHMENT_CHARS) + `\n... [truncated ${fileText.length - MAX_ATTACHMENT_CHARS} bytes]`;
+          }
+          const longestRun = (fileText.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
           const fence = '`'.repeat(Math.max(3, longestRun + 1));
-          const fileBlock: Record<string, unknown> = { type: 'text', text: `\n\n[Attached file: ${p}]\n${fence}\n${body}\n${fence}\n` };
+          const fileBlock: Record<string, unknown> = { type: 'text', text: `\n\n[Attached file: ${p}]\n${fence}\n${fileText}\n${fence}\n` };
           if (cacheThisMsg && content.length === 0) fileBlock.cache_control = { type: 'ephemeral' };
           content.push(fileBlock);
         }
       }
-      messages.push({ role: 'user', content });
+      const msg: Record<string, unknown> = { role: m.role, content };
+      if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
+      if (m.tool_calls) msg.tool_calls = m.tool_calls.map(tc => ({
+        id: tc.id,
+        type: 'function',
+        function: { name: tc.name, arguments: tc.arguments }
+      }));
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+      if (m.name) msg.name = m.name;
+      messages.push(msg);
     } else {
       let content: unknown = m.content;
       if (cacheThisMsg && typeof m.content === 'string' && m.content.trim()) {
@@ -108,19 +121,22 @@ export function buildChatRequest(
     stream_options: { include_usage: true },
     enable_thinking: enableThinking,
   };
-  // The engine only accepts `enable_thinking`/`preserve_thinking` inside
-  // chat_template_kwargs; any other key there (including reasoning_effort)
-  // is rejected outright. reasoning_effort must be a top-level field.
   if (effort) body.reasoning_effort = effort;
   if (params.preserveThinking !== undefined) body.preserve_thinking = params.preserveThinking;
   if (params.maxTokens) body.max_completion_tokens = params.maxTokens;
   // Order matters: greedy must win over a lingering temperature value, not
   // the other way round, or "deterministic" silently turns into "sampled".
   if (params.temperature !== undefined) body.temperature = params.temperature;
-  if (params.greedy) body.temperature = 0;
-  if (params.topP !== undefined) body.top_p = params.topP;
-  if (params.topK !== undefined) body.top_k = params.topK;
-  if (params.minP !== undefined) body.min_p = params.minP;
+  if (params.greedy) {
+    body.temperature = 0;
+    body.top_p = 1;
+    delete body.top_k;
+    delete body.min_p;
+  } else {
+    if (params.topP !== undefined) body.top_p = params.topP;
+    if (params.topK !== undefined) body.top_k = params.topK;
+    if (params.minP !== undefined) body.min_p = params.minP;
+  }
   if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
   if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
   if (params.seed !== undefined) body.seed = params.seed;
@@ -140,8 +156,9 @@ export async function streamChat(
   // Accumulate streamed tool calls (native OpenAI function calling).
   const toolAcc: Array<{ id: string; type: string; name: string; arguments: string }> = [];
 
-  const THINK_CLOSE = '</think>';
-  const TAG_HOLDBACK = THINK_CLOSE.length - 1;
+  const THINK_TAGS = ['</think>', '</thinking>'];
+  const MAX_TAG_LEN = Math.max(...THINK_TAGS.map((t) => t.length));
+  const TAG_HOLDBACK = MAX_TAG_LEN - 1; // 9
   let contentBuf = '';
   const flushContent = (text: string) => {
     if (!text) return;
@@ -150,10 +167,18 @@ export async function streamChat(
   const pushContent = (text: string) => {
     if (firstContentAt === null) firstContentAt = performance.now();
     contentBuf += text;
-    const closeIdx = contentBuf.lastIndexOf(THINK_CLOSE);
+    let closeIdx = -1;
+    let tagLen = 0;
+    for (const tag of THINK_TAGS) {
+      const idx = contentBuf.lastIndexOf(tag);
+      if (idx > closeIdx) {
+        closeIdx = idx;
+        tagLen = tag.length;
+      }
+    }
     if (closeIdx !== -1) {
-      const leaked = contentBuf.slice(0, closeIdx + THINK_CLOSE.length);
-      contentBuf = contentBuf.slice(closeIdx + THINK_CLOSE.length);
+      const leaked = contentBuf.slice(0, closeIdx + tagLen);
+      contentBuf = contentBuf.slice(closeIdx + tagLen);
       cb.onReasoningDelta?.(leaked);
     }
     if (contentBuf.length > TAG_HOLDBACK) {
@@ -236,7 +261,7 @@ export async function streamChat(
         meta.promptTokPerSec = t.prompt_per_second;
         meta.decodeTokPerSec = t.predicted_per_second;
         meta.cachedTokens = t.cache_n;
-        meta.promptTokens = t.cache_n + t.prompt_n;
+        meta.promptTokens = (t.cache_n ?? 0) + (t.prompt_n ?? 0);
         meta.completionTokens = t.predicted_n;
         if (t.draft_n !== undefined) meta.draftN = t.draft_n;
         if (t.draft_n_accepted !== undefined) meta.draftNAccepted = t.draft_n_accepted;
@@ -280,6 +305,7 @@ export async function streamChat(
         buf = buf.slice(idx + 1);
         if (handleLine(line)) {
           finish();
+          reader.cancel().catch(() => undefined);
           return;
         }
       }
@@ -293,6 +319,7 @@ export async function streamChat(
       buf = '';
       if (handleLine(tail)) {
         finish();
+        reader.cancel().catch(() => undefined);
         return;
       }
     }
@@ -312,6 +339,42 @@ export async function streamChat(
     }
     cb.onError?.(e instanceof Error ? e.message : String(e));
   }
+}
+
+export interface StreamToStringOpts {
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
+  onDelta?: (text: string) => void;
+}
+
+export function streamToString(
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+  opts?: StreamToStringOpts
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let acc = '';
+    streamChat(
+      body,
+      signal,
+      {
+        onContentDelta: (d) => {
+          acc += d;
+          opts?.onDelta?.(d);
+        },
+        onDone: () => {
+          if (signal.aborted) {
+            reject(new DOMException('Stream aborted', 'AbortError'));
+          } else {
+            resolve(acc.trim());
+          }
+        },
+        onError: (m) => reject(new Error(m)),
+      },
+      { baseUrl: opts?.baseUrl, apiKey: opts?.apiKey, extraHeaders: opts?.extraHeaders }
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +445,11 @@ export function summarizeConversation(opts: {
   signal?: AbortSignal;
   maxTokens?: number;
   useLocalCompactor?: boolean;
+  localMaxContext?: number;
 }): Promise<string> {
   const instruction: ChatMessage = { role: 'user', content: COMPACTION_INSTRUCTION };
   const summaryParams: ChatParams = {
     thinking: false,
-    reasoningEffort: '',
     preserveThinking: false,
     maxTokens: opts.maxTokens ?? 2048,
   };
@@ -400,26 +463,16 @@ export function summarizeConversation(opts: {
     sanitizedHistory = firstUser && !recent.includes(firstUser) ? [firstUser, ...recent] : recent;
   }
 
+  const estTokens = sanitizedHistory.reduce((acc, m) => acc + Math.ceil(m.content.length / 3.5), 0);
+
   const runPass = (model: string, baseUrl?: string, apiKey?: string, extraHeaders?: string) => {
     const body = buildChatRequest(model, opts.systemPrompt, [...sanitizedHistory, instruction], summaryParams);
     const signal = opts.signal ?? AbortSignal.timeout(180_000);
-    return new Promise<string>((resolve, reject) => {
-      let acc = '';
-      streamChat(body, signal, {
-        onContentDelta: (d) => {
-          acc += d;
-          opts.onDelta?.(d);
-        },
-        onDone: () => {
-          if (signal.aborted) { reject(new DOMException('Compaction aborted', 'AbortError')); return; }
-          resolve(acc.trim());
-        },
-        onError: (m) => reject(new Error(m)),
-      }, { baseUrl, apiKey, extraHeaders });
-    });
+    return streamToString(body, signal, { baseUrl, apiKey, extraHeaders, onDelta: opts.onDelta });
   };
 
-  const useLocal = opts.useLocalCompactor !== false && !!opts.baseUrl;
+  const localMax = opts.localMaxContext ?? 8192;
+  const useLocal = opts.useLocalCompactor !== false && !!opts.baseUrl && estTokens <= localMax;
   if (useLocal) {
     // Try local NInfer compactor first; fallback to cloud if local is unreachable.
     return runPass('ninfer', undefined, undefined, undefined).catch(() =>
@@ -465,9 +518,6 @@ function formatReflectionHistory(history: ChatMessage[]): string {
     .join('\n\n');
 }
 
-/** One critique pass over a draft reply. Resolves `null` when approved (or
- *  on any failure — best-effort, never blocks the turn), otherwise the
- *  specific issue to fix. */
 /** Pure parse of a critique model's raw output into a verdict — extracted so
  *  the regex-based verdict/critique-text split is directly unit-testable
  *  without a network round-trip. `null` = approved (or the raw text simply
@@ -482,13 +532,16 @@ export function parseReflectionVerdict(raw: string): string | null {
   if (!critique) return null;
 
   // Ignore spurious critiques about date/time system context, system clock, or tool fabrications
-  if (/\b(?:system context|system clock|time|timezone|clock|tool|web_fetch|web_search|live source|fabricated)\b/i.test(critique)) {
+  if (/\b(?:system (?:clock|context|time|timezone)|current (?:date|time|year|clock|timezone)|live source|fabricat(?:ed|ion|ing) (?:tool|search|fetch|source|context|data|result))\b/i.test(critique)) {
     return null;
   }
 
   return critique;
 }
 
+/** One critique pass over a draft reply. Resolves `null` when approved (or
+ *  on any failure — best-effort, never blocks the turn), otherwise the
+ *  specific issue to fix. */
 export function critiqueChatReply(opts: {
   model: string;
   baseUrl?: string;
@@ -500,16 +553,12 @@ export function critiqueChatReply(opts: {
   signal?: AbortSignal;
 }): Promise<string | null> {
   const prompt = `CONVERSATION (most recent messages):\n${formatReflectionHistory(opts.history)}\n\nDRAFT REPLY:\n${opts.reply.slice(0, 4000)}\n\nReview the draft reply against the conversation.`;
-  const critiqueParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: opts.maxTokens ?? 400 };
+  const critiqueParams: ChatParams = { thinking: false, preserveThinking: false, maxTokens: opts.maxTokens ?? 400 };
   const body = buildChatRequest(opts.model, CHAT_REFLECTION_SYSTEM, [{ role: 'user', content: prompt }], critiqueParams);
   const signal = opts.signal ?? AbortSignal.timeout(60_000);
-  return new Promise<string | null>((resolve) => {
-    let acc = '';
-    streamChat(body, signal, {
-      onContentDelta: (d) => { acc += d; },
-      onDone: () => resolve(signal.aborted ? null : parseReflectionVerdict(acc)),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
-  });
+  return streamToString(body, signal, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders })
+    .then((raw) => parseReflectionVerdict(raw))
+    .catch(() => null);
 }
 
 /** Regenerate a reply once, given a critique — appended as a hidden user-role
@@ -535,13 +584,9 @@ export function regenerateChatReply(opts: {
   const messages: ChatMessage[] = [...opts.history, { role: 'assistant', content: opts.originalReply }, nudge];
   const body = buildChatRequest(opts.model, opts.system, messages, opts.params);
   const signal = opts.signal ?? AbortSignal.timeout(120_000);
-  return new Promise<string | null>((resolve) => {
-    let acc = '';
-    streamChat(body, signal, {
-      onContentDelta: (d) => { acc += d; },
-      onDone: () => resolve(signal.aborted ? null : (acc.trim() || null)),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
-  });
+  return streamToString(body, signal, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders })
+    .then((res) => res.trim() || null)
+    .catch(() => null);
 }
 
 // ---------------------------------------------------------------------------
@@ -594,7 +639,7 @@ const OUTPUT_REDUCER_INSTRUCTION = [
  *  contains an unverifiable (hallucinated/paraphrased) quote, or — when
  *  `isError` is known — disagrees with the actual outcome. Exported for
  *  unit testing. */
-function validateOutputReceipt(raw: string, sourceText: string, isError?: boolean): OutputReceipt | null {
+export function validateOutputReceipt(raw: string, sourceText: string, isError?: boolean): OutputReceipt | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -651,6 +696,11 @@ export function renderOutputReceipt(receipt: OutputReceipt): string {
   return lines.join('\n');
 }
 
+/** Render full AI-summarized output payload with evidence and raw tail. */
+export function formatSummarizedOutput(textLength: number, receipt: OutputReceipt, tail: string): string {
+  return `[AI-summarized output — ${textLength} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${tail.length} chars) ---\n${tail}`;
+}
+
 /** Stream a structured, evidence-verified reduction of a tool output.
  *  Returns null (never throws) on any failure — malformed JSON, an
  *  unverifiable quote, or a status/evidence mismatch with `isError` —
@@ -665,28 +715,16 @@ export async function summarizeOutputVerified(opts: {
   signal?: AbortSignal;
   maxTokens?: number;
 }): Promise<OutputReceipt | null> {
-  const instruction: ChatMessage = { role: 'user', content: OUTPUT_REDUCER_INSTRUCTION };
   const params: ChatParams = {
     thinking: false,
-    reasoningEffort: '',
     preserveThinking: false,
     maxTokens: opts.maxTokens ?? 1024,
   };
-  const body = buildChatRequest(opts.model, undefined, [{ role: 'user', content: opts.output }, instruction], params);
-  let raw: string;
-  try {
-    raw = await new Promise<string>((resolve, reject) => {
-      let acc = '';
-      streamChat(body, opts.signal ?? AbortSignal.timeout(180_000), {
-        onContentDelta: (d) => { acc += d; },
-        onDone: () => resolve(acc.trim()),
-        onError: (m) => reject(new Error(m)),
-      }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
-    });
-  } catch {
-    return null;
-  }
-  return validateOutputReceipt(raw, opts.output, opts.isError);
+  const body = buildChatRequest(opts.model, OUTPUT_REDUCER_INSTRUCTION, [{ role: 'user', content: opts.output }], params);
+  const signal = opts.signal ?? AbortSignal.timeout(180_000);
+  return streamToString(body, signal, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders })
+    .then((raw) => validateOutputReceipt(raw, opts.output, opts.isError))
+    .catch(() => null);
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +739,7 @@ const FOLLOWUP_INSTRUCTION = [
   'Output ONLY a JSON array of exactly 3 strings, e.g. ["...", "...", "..."]. No preamble, no markdown, no other text.',
 ].join('\n');
 
-function parseFollowUps(raw: string): string[] {
+export function parseFollowUps(raw: string): string[] {
   const text = raw.trim();
   // Also matches an OPENED-but-never-closed fence (maxTokens can cut the
   // response off mid-block) — `(?:```|$)` accepts end-of-string as the close.
@@ -732,18 +770,12 @@ function parseFollowUps(raw: string): string[] {
  *  should already end in the assistant's just-completed reply). */
 export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey?: string; extraHeaders?: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
   const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
-  const params: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 200 };
+  const params: ChatParams = { thinking: false, preserveThinking: false, maxTokens: 200 };
   const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
-  return new Promise<string[]>((resolve, reject) => {
-    let acc = '';
-    streamChat(body, opts.signal ?? AbortSignal.timeout(30_000), {
-      onContentDelta: (d) => {
-        acc += d;
-      },
-      onDone: () => resolve(parseFollowUps(acc)),
-      onError: (m) => reject(new Error(m)),
-    }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
-  });
+  const signal = opts.signal ?? AbortSignal.timeout(30_000);
+  return streamToString(body, signal, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders })
+    .then((raw) => parseFollowUps(raw))
+    .catch(() => []);
 }
 
 export type { ChatAttachment };
