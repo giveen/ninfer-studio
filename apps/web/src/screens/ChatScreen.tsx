@@ -151,11 +151,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const engineUp = upEngines.length > 0;
   const runningModel = upEngines[0]?.modelId || '';
 
-  const primaryProviderConfig = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+  const effectiveAppConfig = appConfig || status?.config || null;
+  const primaryProviderConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
   const isCloudPrimary = !!(
-    appConfig?.cloudProviderEnabled &&
+    effectiveAppConfig?.cloudProviderEnabled &&
     (params.primaryProvider === 'cloud' ||
-      (appConfig.cloudUseForPrimary && params.primaryProvider !== 'ninfer'))
+      (effectiveAppConfig.cloudUseForPrimary && params.primaryProvider !== 'ninfer'))
   );
   const engineUpOrCloud = engineUp || isCloudPrimary;
   const effectiveRunningModel = runningModel || (isCloudPrimary ? primaryProviderConfig.model : '');
@@ -266,7 +267,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
       return;
     }
-    const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+    const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     if (!useModel) return;
 
     setCompacting(true);
@@ -288,7 +289,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         systemPrompt: params.systemPrompt,
         history: [...prior, ...conv.messages],
         signal: ac.signal,
-        useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
+        useLocalCompactor: effectiveAppConfig?.cloudUseLocalCompactor !== false,
       });
       if (!summary) throw new Error('compaction produced no summary');
       const compacted: Conversation = { ...conv, compactedSummary: summary, compactedCount: conv.messages.length };
@@ -317,8 +318,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
-      const runAllowFallback = appConfig?.cloudFallbackToLocal !== false;
+      const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+      const runAllowFallback = effectiveAppConfig?.cloudFallbackToLocal !== false;
       setStreaming(true);
       setStreamingConvId(convId);
       const ac = new AbortController();
@@ -406,7 +407,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         ...CHAT_TOOLS,
         ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
         ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
-        ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, appConfig) : []),
+        ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, effectiveAppConfig) : []),
         // MCP tools ride on Computer Use — they're external, potentially
         // mutating actions, so they never ship without its permission gate.
         ...(computerUseOn
@@ -420,7 +421,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // registry called, with tiers enforced from the mirrored perms). This
       // client starts the run and attaches over SSE — closing the window no
       const cloudRun = !!baseUrl;
-      const seedMessages: ChatMessage[] = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
+      const seedMessages: ChatMessage[] = cloudRun && effectiveAppConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
 
       const registry: ToolRegistry = {
         web_search: async (args, sig) => {
@@ -481,7 +482,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           params,
           tools,
           registry,
-          maxSteps: (appConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
+          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
           // The system prompt (capabilities block + memory + tool list) is
           // resent verbatim every turn — cheap to try caching it whenever
           // the turn is cloud-routed (baseUrl set); a provider that doesn't
@@ -531,7 +532,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               if (reflectionEnabled && !toolsActive && content.trim()) {
                 setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
                 try {
-                  const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
+                  const critiqueHistory = baseUrl && effectiveAppConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
                   const critique = await critiqueChatReply({
                     model: reflectionModel.trim() || useModel,
                     baseUrl,
@@ -668,7 +669,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               systemPrompt: params.systemPrompt,
               history: [...prior, ...convForCompact.messages],
               signal: ac.signal,
-              useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
+              useLocalCompactor: effectiveAppConfig?.cloudUseLocalCompactor !== false,
             });
             if (summary) {
               const compacted: Conversation = { ...convForCompact, compactedSummary: summary, compactedCount: convForCompact.messages.length };
@@ -767,7 +768,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       onNavigate('engine');
       return;
     }
-    const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+    const { model: useModel } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     if (!useModel) return;
 
     let conv = convs.find((c) => c.id === activeId);
@@ -798,7 +799,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, attachments, engineUpOrCloud, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting, appConfig]);
+  }, [text, attachments, engineUpOrCloud, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting, effectiveAppConfig]);
 
   // Send a suggested follow-up question straight away (bypassing the composer) —
   // always appends to the active conversation, which is the only one a
@@ -811,7 +812,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         onNavigate('engine');
         return;
       }
-      const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+      const { model: useModel } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
       if (!useModel) return;
       const conv = convs.find((c) => c.id === activeId);
       if (!conv) return;
@@ -824,7 +825,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const history: ChatMessage[] = modelHistory(base);
       await runStream(conv.id, history, 0, asstMsg.id);
     },
-    [streaming, compacting, engineUpOrCloud, model, runningModel, convs, activeId, runStream, onNavigate, appConfig, params],
+    [streaming, compacting, engineUpOrCloud, model, runningModel, convs, activeId, runStream, onNavigate, effectiveAppConfig, params],
   );
 
   // --- message-level actions (hover toolbar) ---
