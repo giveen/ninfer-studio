@@ -226,6 +226,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
   };
 
+  useEffect(() => {
+    autoGrow();
+  }, [text]);
+
   // Driven by a ResizeObserver on the actual content (not a [messages]
   // dependency) so it re-sticks to the bottom no matter WHY the content grew —
   // a new token, a message added, or the lazy-loaded Markdown chunk's Suspense

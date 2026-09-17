@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useEffect } from 'react';
 import {
   BrainCircuit,
   Image,
@@ -109,6 +109,18 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
   store,
   defaultMaxAgentSteps,
 }) => {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const autoGrow = () => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+  };
+
+  useEffect(() => {
+    autoGrow();
+  }, [input]);
+
   return (
     <div className="border-t border-line bg-panel p-3">
       {llmPhase && (
@@ -312,31 +324,43 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
           </div>
         </div>
       )}
-      <div className="flex gap-2">
-        <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files">
+      <div className="flex items-end gap-2">
+        <Button variant="ghost" onClick={openPicker} disabled={running || !activeWs} title="Attach workspace files" className="mb-0.5">
           <Paperclip size={14} />
         </Button>
-        <Button variant="ghost" onClick={() => setShowCoderParams((v) => !v)} disabled={!activeWs} title="Sampling params (thinking, temperature, top_p, top_k, seed)">
+        <Button variant="ghost" onClick={() => setShowCoderParams((v) => !v)} disabled={!activeWs} title="Sampling params (thinking, temperature, top_p, top_k, seed)" className="mb-0.5">
           <SlidersHorizontal size={14} />
         </Button>
-        <input
-          className="flex-1 bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50"
+        <textarea
+          ref={textareaRef}
+          rows={1}
+          className="flex-1 max-h-[220px] resize-none bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50 leading-relaxed"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && onSubmit()}
-          placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent..."}
+          onChange={(e) => {
+            setInput(e.target.value);
+            autoGrow();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              if ((input.trim() || attachments.length > 0) && activeWs && pendingQuestion === null) {
+                onSubmit();
+              }
+            }
+          }}
+          placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent… (Enter to send, Shift+Enter for newline)"}
           disabled={!activeWs || pendingQuestion !== null}
         />
         {running ? (
-          <>
+          <div className="flex items-center gap-1.5 mb-0.5">
             <Button variant="ghost" onClick={onSubmit} disabled={!input.trim() && attachments.length === 0} title="Queue this for when the current run finishes"><Plus size={14} /> Queue</Button>
             <Button variant="danger" onClick={stop} disabled={runElsewhere}
               title={runElsewhere && runConv
                 ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
                 : 'Stop the running agent'}><Square size={14} /> Stop</Button>
-          </>
+          </div>
         ) : (
-          <Button variant="primary" onClick={onSubmit} disabled={(!activeWs && attachments.length === 0) || pendingQuestion !== null}><Play size={14} /> Run</Button>
+          <Button variant="primary" onClick={onSubmit} disabled={(!activeWs && attachments.length === 0) || pendingQuestion !== null} className="mb-0.5"><Play size={14} /> Run</Button>
         )}
       </div>
       {activeConv && (queued[activeConv]?.length ?? 0) > 0 && (
