@@ -4,7 +4,7 @@
 //! repo search over a cached symbol index, the repo map (declaration
 //! signatures per file), and the git working-tree diff.
 
-use super::common::{CODER_IGNORE, enforce_perm, resolve_ws};
+use super::common::{CODER_IGNORE, denied_path_prefixes, enforce_perm, path_is_denied, perm_scope, resolve_ws};
 use crate::engine::S;
 use axum::Json;
 use axum::extract::{Query, State as AxumState};
@@ -150,11 +150,11 @@ pub async fn search(
         return Json(json!({"results": [], "truncated": false}));
     }
     let limit = params.limit.unwrap_or(15).clamp(1, 50) as usize;
-    let scope = params.scope.as_deref().unwrap_or("default");
+    let scope = perm_scope(&json!({ "scope": params.scope, "workspace": params.workspace }));
 
     if enforce_perm(
         &state,
-        scope,
+        &scope,
         "repo_search",
         None,
         params.approval_token.as_deref(),
@@ -176,6 +176,8 @@ pub async fn search(
             "truncated": false
         }));
     };
+
+    let deny_prefixes = denied_path_prefixes(&state, &scope).await;
 
     let ignore_case = params.ignore_case.unwrap_or(true);
     let terms: Vec<String> = if ignore_case {
@@ -207,6 +209,9 @@ pub async fn search(
         // Symbol-name matches (cached index, high scores).
         let idx = search_cached_symbols(&state_cloned.symbol_index, &root_cloned);
         for s in idx.iter() {
+            if path_is_denied(&deny_prefixes, &s.file) {
+                continue;
+            }
             let file_cmp = if ignore_case { s.file.to_lowercase() } else { s.file.clone() };
             let name_cmp = if ignore_case { s.name.to_lowercase() } else { s.name.clone() };
             let mut score = 0u64;
@@ -264,6 +269,10 @@ pub async fn search(
                 continue;
             };
             let rel_str = rel.to_string_lossy().to_string();
+
+            if path_is_denied(&deny_prefixes, &rel_str) {
+                continue;
+            }
 
             if let Ok(meta) = entry.metadata() {
                 if meta.len() > 10 * 1024 * 1024 {
@@ -343,16 +352,18 @@ pub async fn repo_map(
     Query(params): Query<WsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ws = resolve_ws(&state, params.workspace.as_deref()).await?;
-    let scope = params.scope.as_deref().unwrap_or("default");
+    let scope = perm_scope(&json!({ "scope": params.scope, "workspace": params.workspace }));
 
     enforce_perm(
         &state,
-        scope,
+        &scope,
         "repo_map",
         None,
         params.approval_token.as_deref(),
     )
     .await?;
+
+    let deny_prefixes = denied_path_prefixes(&state, &scope).await;
 
     let result = tokio::task::spawn_blocking(move || {
         use std::collections::{HashMap, HashSet};
@@ -384,6 +395,11 @@ pub async fn repo_map(
                 continue;
             }
             let path = entry.path();
+            if let Ok(rel) = path.strip_prefix(&ws) {
+                if path_is_denied(&deny_prefixes, &rel.to_string_lossy()) {
+                    continue;
+                }
+            }
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             let lang = match ext {
@@ -561,21 +577,60 @@ async fn git_run(root: &Path, extra_args: &[&str], secs: u64) -> Option<String> 
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Drop `diff --git a/<path> b/<path>` sections whose path sits under a
+/// denied prefix, so `denyPaths` actually keeps fenced-off content out of a
+/// working-tree diff instead of only gating the endpoint as a whole.
+fn filter_diff_text(diff_text: &str, deny_prefixes: &[String]) -> String {
+    if deny_prefixes.is_empty() || diff_text.is_empty() {
+        return diff_text.to_string();
+    }
+    let mut out = String::new();
+    let mut current: Option<(bool, String)> = None;
+    for line in diff_text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some((denied, buf)) = current.take() {
+                if !denied {
+                    out.push_str(&buf);
+                }
+            }
+            let path_a = rest
+                .split(" b/")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("a/");
+            current = Some((path_is_denied(deny_prefixes, path_a), line.to_string()));
+        } else if let Some((_, buf)) = current.as_mut() {
+            buf.push_str(line);
+        } else {
+            out.push_str(line);
+        }
+    }
+    if let Some((denied, buf)) = current {
+        if !denied {
+            out.push_str(&buf);
+        }
+    }
+    out
+}
+
 pub async fn diff(
     AxumState(state): AxumState<S>,
     Query(params): Query<WsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let root = resolve_ws(&state, params.workspace.as_deref()).await?;
-    let scope = params.scope.as_deref().unwrap_or("default");
+    let scope = perm_scope(&json!({ "scope": params.scope, "workspace": params.workspace }));
 
     enforce_perm(
         &state,
-        scope,
+        &scope,
         "git_diff",
         None,
         params.approval_token.as_deref(),
     )
     .await?;
+
+    let deny_prefixes = denied_path_prefixes(&state, &scope).await;
 
     let stat = git_run(&root, &["--stat"], 15).await;
     let full = git_run(&root, &[], 60).await;
@@ -587,6 +642,7 @@ pub async fn diff(
             ));
         }
     };
+    let diff_text = filter_diff_text(&diff_text, &deny_prefixes);
     let stat_re = regex::Regex::new(r"^\s*(.+?)\s*\|\s*(?:\d+\s*([+-]*)|Bin\b.*)$").unwrap();
     let mut files = Vec::new();
     for l in stat_text.lines() {
@@ -594,6 +650,9 @@ pub async fn diff(
             continue;
         };
         let file_path = caps[1].trim();
+        if path_is_denied(&deny_prefixes, file_path) {
+            continue;
+        }
         let bar = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         files.push(json!({"path": file_path, "bar": bar}));
     }

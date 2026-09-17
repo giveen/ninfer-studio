@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Box, ChevronDown, Rocket } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Box, ChevronDown, Sparkles } from 'lucide-react';
 import { Field, NumberField, SectionCard, SelectField, TextField, Toggle, cn } from '../../components/ui';
 import { PRESETS } from '../../lib/presets';
 import type { EngineProfile, ModelArtifact } from '../../lib/types';
@@ -42,7 +42,7 @@ interface BasicsTabProps {
 
 export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact, modelsDir, applyPreset }: BasicsTabProps) {
   const grid3 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-3';
-  const selectedArtifact = artifacts.find((a) => a.path === artifact);
+  const selectedArtifact = useMemo(() => artifacts.find((a) => a.path === artifact), [artifacts, artifact]);
 
   return (
     <div className="space-y-4">

@@ -23,7 +23,14 @@
 // The runner is UI-agnostic: screens mirror progress into their own stores
 // through the onDelta / onTurnStart / onAppended events.
 
-import { buildChatRequest, streamChat, type ChatStreamCallbacks } from './api';
+import {
+  buildChatRequest,
+  streamChat,
+  streamResponses,
+  knownResponsesSupport,
+  paramsSupportedByResponses,
+  type ChatStreamCallbacks,
+} from './api';
 import { localDateTimeBlock } from './chatHelpers';
 import { evaluate, needsHumanize, HUMANIZE_MAX_DEPTH, type VoiceProfile } from './notai';
 import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './types';
@@ -196,6 +203,14 @@ export type StreamFn = (
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
 ) => Promise<void>;
+
+/** Picks the transport for a turn that didn't request one explicitly: the
+ *  Responses API when the engine build is known to support it and `params`
+ *  doesn't use a sampling knob Responses can't express, falling back to the
+ *  proven Chat Completions path otherwise. */
+function resolveDefaultStreamFn(params: ChatParams): StreamFn {
+  return knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : streamChat;
+}
 
 export interface TurnResult {
   content: string;

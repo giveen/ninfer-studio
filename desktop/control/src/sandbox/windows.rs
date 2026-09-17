@@ -60,8 +60,9 @@ use windows_sys::core::PCWSTR;
 /// `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL` — winnt.h value `0x00020012`,
 /// which windows-sys 0.59 does not export as a named constant.
 const PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL: usize = 0x0002_0012;
-/// Mandatory Integrity Control attribute flag (`SE_GROUP_INTEGRITY` = 0x00020000).
-const SE_GROUP_INTEGRITY: u32 = 0x0002_0000;
+/// Mandatory Integrity Control attribute flag (`SE_GROUP_INTEGRITY` = 0x20, per
+/// winnt.h / windows-sys's `SystemServices::SE_GROUP_INTEGRITY`).
+const SE_GROUP_INTEGRITY: u32 = 0x20;
 /// Low mandatory integrity level SID (`SEC_MANDATORY_LABEL` low level).
 const LOW_INTEGRITY_SID: &str = "S-1-16-4";
 /// `EXPLICIT_ACCESS_W.grfAccessMode` value that REMOVES a matching ACE

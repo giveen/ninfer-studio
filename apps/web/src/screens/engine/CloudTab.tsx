@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles } from 'lucide-react';
 import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
@@ -86,19 +86,26 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [showHeaders, setShowHeaders] = useState(false);
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const debouncedOnUpdate = useCallback(
-    (patch: Partial<AppSettings>) => {
-      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = setTimeout(() => {
-        onUpdate(patch);
-      }, 500);
-    },
-    [onUpdate],
-  );
+  const pendingPatchRef = useRef<Partial<AppSettings> | null>(null);
+  const onUpdateRef = useRef(onUpdate);
+  onUpdateRef.current = onUpdate;
+  const debouncedOnUpdate = useCallback((patch: Partial<AppSettings>) => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    pendingPatchRef.current = patch;
+    debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = null;
+      pendingPatchRef.current = null;
+      onUpdateRef.current(patch);
+    }, 500);
+  }, []);
 
   useEffect(() => {
     return () => {
-      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+        if (pendingPatchRef.current) onUpdateRef.current(pendingPatchRef.current);
+      }
     };
   }, []);
 
@@ -107,6 +114,30 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
       setShowHeaders(true);
     }
   }, [settings?.cloudProviderExtraHeaders]);
+
+  /** Compact "128K ctx · $3.00/$15.00 per M" caption for a model the
+   *  provider reported pricing/context for — omitted entirely (not "—")
+   *  when nothing is known, matching how the rest of this tab treats
+   *  provider-reported optional metadata.
+   *
+   *  Declared before the `!settings` early return below: every hook in this
+   *  component must run on every render regardless of `settings`, or a
+   *  render where it's null (skipping this hook) followed by one where it
+   *  isn't (calling it) throws "Rendered more hooks than during the
+   *  previous render." */
+  const modelInfoCaption = useCallback((modelId: string): string | null => {
+    const info = modelInfo[modelId];
+    if (!info) return null;
+    const parts: string[] = [];
+    if (info.contextLength) {
+      parts.push(`${info.contextLength >= 1000 ? `${Math.round(info.contextLength / 1000)}K` : info.contextLength} ctx`);
+    }
+    if (info.pricePromptPerM != null || info.priceCompletionPerM != null) {
+      const fmt = (n: number | undefined) => (n != null ? `$${n.toFixed(2)}` : '?');
+      parts.push(`${fmt(info.pricePromptPerM)}/${fmt(info.priceCompletionPerM)} per M`);
+    }
+    return parts.length ? parts.join(' · ') : null;
+  }, [modelInfo]);
 
   if (!settings) return null;
 
@@ -182,26 +213,6 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
       setTesting(false);
     }
   };
-
-  /** Compact "128K ctx · $3.00/$15.00 per M" caption for a model the
-   *  provider reported pricing/context for — omitted entirely (not "—")
-   *  when nothing is known, matching how the rest of this tab treats
-   *  provider-reported optional metadata. */
-  const modelInfoCaption = useCallback((modelId: string): string | null => {
-    const info = modelInfo[modelId];
-    if (!info) return null;
-    const parts: string[] = [];
-    if (info.contextLength) {
-      parts.push(`${info.contextLength >= 1000 ? `${Math.round(info.contextLength / 1000)}K` : info.contextLength} ctx`);
-    }
-    if (info.pricePromptPerM != null || info.priceCompletionPerM != null) {
-      const fmt = (n: number | undefined) => (n != null ? `$${n.toFixed(2)}` : '?');
-      parts.push(`${fmt(info.pricePromptPerM)}/${fmt(info.priceCompletionPerM)} per M`);
-    }
-    return parts.length ? parts.join(' · ') : null;
-  }, [modelInfo]);
-
-
 
   const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
   const subagentModel = settings.cloudProviderSubagentModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';

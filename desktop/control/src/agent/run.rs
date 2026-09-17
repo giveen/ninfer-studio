@@ -1050,9 +1050,17 @@ pub(crate) struct ApproveBody {
 /// `POST /api/agent/runs/{id}/gates/{gid}` — resolve a pending risky/commit
 /// gate. Body: `{decision: "once"|"remember"|"deny"}` for a risky gate
 /// (`remember` runs it and records the normalized command for the rest of
-/// the run), `{decision: "approve"|"deny"}` for a commit gate. Unlike
-/// approvals, no one-shot token is involved — the dialog itself is the
-/// human gesture, and the command never leaves this machine.
+/// the run), `{decision: "approve"|"deny"}` for a commit gate.
+///
+/// Unlike `approve()` (ask-tier tool approvals), no token is required or
+/// consulted here: a gate's `GateDecision` carries no token downstream (it
+/// never reaches `enforce_perm` or any other real check — `bash`/`git_commit`
+/// aren't necessarily "ask" tier, since the risky/commit gates are a
+/// tier-independent safety net), so requiring one here would only be a
+/// non-functional formality. The actual authorization boundary is knowing
+/// this run's `id` and this gate's `gid`, both server-generated and
+/// delivered only to whoever is watching this specific run's events/snapshot
+/// — the same boundary `answer()` (ask_user) already relies on.
 pub(crate) async fn gate_decide(
     AxumState(state): AxumState<S>,
     Path((id, gid)): Path<(String, String)>,
@@ -1086,22 +1094,6 @@ pub(crate) async fn gate_decide(
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "no pending gate with that id"})),
-        )
-            .into_response();
-    }
-    let approving = matches!(body.decision.as_str(), "once" | "remember" | "approve");
-    if approving
-        && body
-            .token
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-    {
-        gs.slot = Some(slot);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "approving a gate requires a one-shot approvalToken from /api/coder/perms/approve"})),
         )
             .into_response();
     }

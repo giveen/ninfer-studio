@@ -455,7 +455,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               tools: activeTools,
               cacheSystem: opts.coderParams.promptCache,
               signal: opts.abortRef.current.signal,
-              stream: (r, sig, cb) => {
+              stream: async (r, sig, cb) => {
                 const primaryConfig = resolveProviderConfig('primary', opts.appConfig, {
                   primaryProvider: opts.coderParams.primaryProvider,
                   primaryCloudModel: opts.coderParams.primaryCloudModel,
@@ -467,9 +467,10 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
                   allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
                 };
                 if (opts.stream) {
-                  return opts.stream(r, sig, 'coder', cb, streamOpts);
+                  await opts.stream(r, sig, 'coder', cb, streamOpts);
+                  return;
                 }
-                return streamChat(r, sig, cb, streamOpts);
+                await streamChat(r, sig, cb, streamOpts);
               },
               onStreamError: (msg) => {
                 streamErrorMsg = msg;

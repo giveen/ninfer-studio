@@ -460,7 +460,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               const scope = computerUseDirRef.current || undefined;
               let approvalToken: string | undefined;
               if (tier === 'ask' && scope) {
-                const app = await coderPermsApprove(scope).catch(() => null);
+                const app = await coderPermsApprove(`mcp__${t.name}`, undefined, scope).catch(() => null);
                 if (app?.token) approvalToken = app.token;
               }
               const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope, approvalToken }, sig);

@@ -198,7 +198,13 @@ pub struct ApprovalTicket {
 }
 
 /// The perms bucket key a caller supplies via an optional `scope` or `workspace`
-/// request field (falls back to "default").
+/// request field (falls back to "default"). Both fields are canonicalized the
+/// same way: in every real caller (UI, agent loop, MCP dispatch) either one is
+/// a filesystem workspace path, never an opaque identifier, so an explicit
+/// `scope` must resolve to the exact same bucket key a `workspace` value for
+/// the same directory would — otherwise a value minted against one field
+/// (e.g. an approval token scoped to a canonicalized `workspace`) silently
+/// fails to match a request that instead supplied the raw path as `scope`.
 pub(crate) fn perm_scope(req: &Value) -> String {
     if let Some(s) = req
         .get("scope")
@@ -206,7 +212,8 @@ pub(crate) fn perm_scope(req: &Value) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return s.to_string();
+        let norm = canonicalize_ws_path(s);
+        return if norm.is_empty() { s.to_string() } else { norm };
     }
     if let Some(ws) = req
         .get("workspace")
@@ -388,19 +395,46 @@ pub(crate) async fn enforce_perm(
     Ok(())
 }
 
+/// Merged, normalized `denyPaths` prefixes for `scope` (plus `"default"`,
+/// same strictest-wins merge as `enforce_perm`). For endpoints that enumerate
+/// many files in one call (`repo_search`, `repo_map`, `diff`) rather than
+/// checking a single `rel` — `enforce_perm`'s own `rel` gate only covers a
+/// single-path call, so a `search`/`repo_map`/`diff` result set must be
+/// filtered against these prefixes per-file instead.
+pub(crate) async fn denied_path_prefixes(state: &S, scope: &str) -> Vec<String> {
+    let all_perms = state.coder_perms.read().await;
+    let mut out = Vec::new();
+    if let Some(p) = all_perms.get(scope) {
+        out.extend(p.deny_paths.iter().map(|d| normalize_rel_path(d)).filter(|s| !s.is_empty()));
+    }
+    if scope != "default" {
+        if let Some(p) = all_perms.get("default") {
+            out.extend(p.deny_paths.iter().map(|d| normalize_rel_path(d)).filter(|s| !s.is_empty()));
+        }
+    }
+    out
+}
+
+/// Whether workspace-relative `rel` sits under any of `prefixes` (same match
+/// rule as `enforce_perm`'s single-path check: exact or `<prefix>/...`).
+pub(crate) fn path_is_denied(prefixes: &[String], rel: &str) -> bool {
+    let norm = normalize_rel_path(rel);
+    if norm.is_empty() {
+        return false;
+    }
+    prefixes
+        .iter()
+        .any(|clean| norm == *clean || norm.starts_with(&format!("{clean}/")))
+}
+
 pub async fn perms_get(
     AxumState(state): AxumState<S>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let scope = q
-        .get("scope")
-        .or_else(|| q.get("workspace"))
-        .map(String::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("default");
+    let scope = perm_scope(&json!({ "scope": q.get("scope"), "workspace": q.get("workspace") }));
     let all_perms = state.coder_perms.read().await;
     Json(
-        serde_json::to_value(all_perms.get(scope).cloned().unwrap_or_default())
+        serde_json::to_value(all_perms.get(&scope).cloned().unwrap_or_default())
             .unwrap_or_else(|_| json!({"tools": {}, "denyPaths": []})),
     )
 }

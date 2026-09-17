@@ -37,8 +37,8 @@ export function AgentTab({ status, active = true }: { status: StatusPayload | nu
 
   const commitDenyPaths = useCallback((val: string) => {
     const paths = val.split(/\s+/).map((s) => s.trim()).filter(Boolean);
-    setComputerUsePerms((prev) => ({ ...prev, denyPaths: paths }));
-  }, [setComputerUsePerms]);
+    setComputerUsePerms({ ...computerUsePerms, denyPaths: paths });
+  }, [computerUsePerms, setComputerUsePerms]);
 
   useEffect(() => {
     return () => {

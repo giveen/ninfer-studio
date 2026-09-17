@@ -331,10 +331,17 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
     // The CoderScreen HITL gates, ported: pause for a once/remember/deny
     // (risky) or approve/deny (commit) decision instead of executing. Runs
     // without the flags behave exactly as before.
-    if name == "bash" || name == "git_commit" {
+    if name == "bash" || name == "git_commit" || name == "git_pr" {
         let command = if name == "git_commit" {
             let msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("commit");
             format!("git commit -m {msg}")
+        } else if name == "git_pr" {
+            // Mirrors the command git_pr's handler actually executes below
+            // (gh pr create ... || git push origin HEAD) — it runs `gh`/`git
+            // push` via `exec::exec` just like `bash` would, so it must pass
+            // through the same risky/commit human gates rather than
+            // bypassing them by routing through a different tool name.
+            "gh pr create || git push origin HEAD".to_string()
         } else {
             body.get("command")
                 .and_then(|v| v.as_str())
@@ -726,6 +733,22 @@ fn inject_scope(run: &Arc<RunShared>, name: &str, body: &mut Value) {
     let Some(scope) = run.scope_opt() else {
         return;
     };
+    let is_scoped_tool = matches!(
+        name,
+        "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree"
+            | "memory" | "bash" | "repo_search" | "repo_map" | "git_diff" | "web_fetch"
+            | "web_search" | "browser"
+    );
+    if is_scoped_tool {
+        // `body` starts as the model's own tool-call arguments (`args.clone()`),
+        // so a model-supplied `"scope"` field must never survive here: `perm_scope`
+        // prefers an explicit `"scope"` over `"workspace"`, and it would otherwise
+        // let a prompt-injected tool call point permission checks at a different
+        // (likely more permissive) bucket than the workspace it actually touches.
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("scope");
+        }
+    }
     match name {
         "read" | "write" | "edit" | "apply_patch" | "udiff_edit" | "grep" | "glob" | "tree"
         | "memory" => {

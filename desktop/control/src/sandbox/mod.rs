@@ -74,6 +74,13 @@ pub(crate) fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
     const DANGER_ROOTS_UNIX: &[&str] = &[
         "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
         "/root", "/run", "/sbin", "/sys", "/usr", "/var",
+        // On usr-merged distros (Debian/Ubuntu since ~2019, Fedora, Arch,
+        // RHEL 9+ — the current majority of Linux systems) `/bin`, `/sbin`,
+        // `/lib`, and `/lib64` are themselves symlinks into these, so
+        // `canonicalize()` above resolves a request for e.g. `/bin` to
+        // `/usr/bin` — which isn't literally any of the names above and
+        // would otherwise sail through this exact-match check.
+        "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
     ];
 
     for &danger in DANGER_ROOTS_UNIX {

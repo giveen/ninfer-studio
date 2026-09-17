@@ -109,7 +109,7 @@ pub(crate) fn rel_detail(name: &str, args: &Value) -> Option<String> {
             .or_else(|| get("branch"))
             .or_else(|| get("path")),
         "todo_write" => get("task").or_else(|| get("title")),
-        "memory_update" => get("content").or_else(|| get("key")),
+        "memory_update" => get("text").or_else(|| get("kind")),
         _ => get("path")
             .or_else(|| get("url"))
             .or_else(|| get("query"))
@@ -227,6 +227,7 @@ static RISKY_PATTERNS_SRC: &[(&str, &str)] = &[
         r"(?i)\brm\s+-[rRf]*[rf][rRf]*\b",
         "recursively deletes directories or files",
     ),
+    (r"(?i)\brmdir\b", "removes a directory"),
     (
         r"(?i)\b(mkfs|fdisk|parted|dd\s+if=)\b",
         "formats or overwrites disk partitions",

@@ -53,8 +53,6 @@ export function useCoderCheckpoints({
       } catch {
         /* not a git repo — transcript-only checkpoint */
       }
-      const msgCount = cp.messageCount ?? cp.messages ?? 0;
-      const ledgCount = cp.ledgerCount ?? cp.ledger ?? 0;
       const auto = opts?.auto ?? false;
       const cp: Checkpoint = {
         id: 'cp-' + crypto.randomUUID(),

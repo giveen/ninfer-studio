@@ -156,6 +156,25 @@ mod bwrap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn validate_writable_root_rejects_usr_merge_symlinks() {
+        // On a usr-merged system (the current majority — Debian/Ubuntu,
+        // Fedora, Arch, RHEL 9+) `/bin`, `/sbin`, `/lib`, `/lib64` are
+        // symlinks that canonicalize into `/usr/...`; only run the
+        // symlink-specific assertions where that's actually true on this
+        // host, since a legacy non-merged layout has real directories there
+        // that the pre-existing exact-name entries already reject.
+        for candidate in ["/bin", "/sbin", "/lib", "/lib64"] {
+            if std::fs::canonicalize(candidate).is_ok() {
+                assert!(
+                    validate_writable_root(candidate).is_none(),
+                    "{candidate} should be rejected as a writable root"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bwrap_argv_structure_and_namespaces() {
         let req = SpawnReq {
             command: "echo test".to_string(),

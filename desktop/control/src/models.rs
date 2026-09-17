@@ -20,19 +20,42 @@ fn safe_model_path(base_dir: &Path, user_input: &str) -> Option<PathBuf> {
         return None;
     }
     let joined = base_dir.join(p);
-    let norm_base = base_dir
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| base_dir.to_path_buf());
-    let norm_joined = joined
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| joined.clone());
-    if norm_joined.starts_with(&norm_base) || joined.starts_with(base_dir) {
-        Some(joined)
-    } else {
-        None
+    let Ok(norm_base) = base_dir.canonicalize() else {
+        // `base_dir` itself doesn't exist on disk yet — there's no real
+        // filesystem entity `joined` could alias via a symlink, so the
+        // lexical join (already verified `..`/absolute-free above) is safe.
+        return Some(joined);
+    };
+    // Once the base is real, containment must be verified against the
+    // canonicalized (symlink-resolved) path. A lexical `starts_with` check
+    // here would be a tautology — `joined` always starts with `base_dir`
+    // lexically for a relative, `..`-free `p` — and would accept a request
+    // through a symlink planted anywhere under `base_dir` that points
+    // outside it.
+    if let Ok(real) = joined.canonicalize() {
+        return if real.starts_with(&norm_base) {
+            Some(joined)
+        } else {
+            None
+        };
     }
+    // The leaf doesn't exist yet (a fresh download/convert/upgrade output
+    // path) — walk up to the nearest existing ancestor and verify that
+    // instead, so a symlinked ancestor directory is still caught. This
+    // always terminates: `base_dir` (already confirmed to exist above) is
+    // itself an ancestor of `joined` for any relative, `..`-free `p`.
+    let mut dir = joined.parent();
+    while let Some(d) = dir {
+        if let Ok(real_dir) = d.canonicalize() {
+            return if real_dir.starts_with(&norm_base) {
+                Some(joined)
+            } else {
+                None
+            };
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 pub async fn list_models(state: &State) -> Value {
@@ -564,9 +587,16 @@ pub async fn start_conversion(state: &Arc<State>, body: Value) -> Value {
         None => {
             let p = Path::new(model_path_input);
             if p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir)) {
-                let norm_m = models_dir.canonicalize().ok().unwrap_or_else(|| models_dir.clone());
-                let norm_p = p.canonicalize().ok().unwrap_or_else(|| p.to_path_buf());
-                if norm_p.starts_with(&norm_m) || p.starts_with(&models_dir) {
+                // Canonicalize-only containment check: `p.starts_with(&models_dir)`
+                // on the raw paths would be a lexical-prefix tautology a symlink
+                // planted under `models_dir` (e.g. `models_dir/evil -> /etc`)
+                // trivially satisfies without ever resolving inside it for real.
+                let real_check = p
+                    .canonicalize()
+                    .ok()
+                    .zip(models_dir.canonicalize().ok())
+                    .is_some_and(|(real_p, real_m)| real_p.starts_with(&real_m));
+                if real_check {
                     p.to_path_buf()
                 } else {
                     return json!({ "ok": false, "message": "invalid or unsafe modelPath" });
@@ -746,5 +776,45 @@ mod tests {
         assert_eq!(safe_model_path(base, "../etc/passwd"), None);
         assert_eq!(safe_model_path(base, "/etc/passwd"), None);
         assert_eq!(safe_model_path(base, "  "), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn safe_model_path_rejects_symlink_escape() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-safepath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let models_dir = tmp.join("models");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"top secret").unwrap();
+
+        // A symlink planted *inside* models_dir pointing outside it — the
+        // lexical join always starts with `models_dir`, so only a real
+        // canonicalize-based check catches this.
+        std::os::unix::fs::symlink(&outside, models_dir.join("escape")).unwrap();
+        assert_eq!(safe_model_path(&models_dir, "escape/secret.txt"), None);
+
+        // A file genuinely inside models_dir is still accepted.
+        std::fs::write(models_dir.join("real.ninfer"), b"model bytes").unwrap();
+        assert_eq!(
+            safe_model_path(&models_dir, "real.ninfer"),
+            Some(models_dir.join("real.ninfer"))
+        );
+
+        // A not-yet-created output path (download/convert destination) is
+        // still accepted when its existing ancestor is genuinely contained.
+        assert_eq!(
+            safe_model_path(&models_dir, "fresh/new-model.ninfer"),
+            Some(models_dir.join("fresh/new-model.ninfer"))
+        );
+
+        // ...but not when that ancestor is itself the symlinked escape.
+        assert_eq!(
+            safe_model_path(&models_dir, "escape/nested/new-model.ninfer"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

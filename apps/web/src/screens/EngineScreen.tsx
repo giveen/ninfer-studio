@@ -32,22 +32,41 @@ const TABS: Array<{ id: EngineTab; label: string }> = [
 
 const DEFAULT_PRESET = PRESETS.find((p) => p.id === 'default') ?? PRESETS[0];
 
-export function EngineScreen({
-  engine,
-  settings: _settings,
-  onSaveConfig: _onSaveConfig,
-}: {
-  engine: StatusPayload | null;
-  settings: AppSettings;
-  onSaveConfig: (c: Partial<AppSettings>) => Promise<void>;
-}) {
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10.5px] uppercase tracking-wider text-faint">{label}</span>
+      <span className="font-mono text-sm font-medium text-main">{value}</span>
+    </div>
+  );
+}
+
+export function EngineScreen({ status }: { status: StatusPayload | null }) {
+  const engine = status?.engine;
+  const gpu = status?.gpu;
+  const artifacts = status?.artifacts || [];
   const [tab, setTab] = useState<EngineTab>('basics');
   const [profile, setProfile] = useState<EngineProfile>({ ...DEFAULT_PRESET.profile });
   const [artifact, setArtifact] = useState<string>('');
   const [saved, setSaved] = useState<SavedProfile[]>([]);
   const [appliedPresetId, setAppliedPresetId] = useState<string | null>(DEFAULT_PRESET.id);
   const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [busy, setBusy] = useState<'' | 'start' | 'stop' | 'restart' | 'pull' | 'build'>('');
+  const [notice, setNotice] = useState<EngineNotice | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  // Global request-default settings (reasoning effort). The Engine screen is
+  // where the user picks thinking levels, but the value is applied by the proxy
+  // to every request as a chat_template_kwargs default.
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  useEffect(() => {
+    getConfig().then(setSettings).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,8 +93,8 @@ export function EngineScreen({
   const liveMetrics = useLatestRequestMetrics();
   const isStale = isLiveMetricsStale(liveMetrics);
 
-  const running = engine?.engine?.state === 'running' || engine?.engine?.state === 'external';
-  const starting = engine?.engine?.state === 'starting' || engine?.engine?.state === 'stopping';
+  const running = engine?.state === 'running' || engine?.state === 'external';
+  const starting = engine?.state === 'starting' || engine?.state === 'stopping';
 
   // The restart-dirty verdict is computed by the control plane (single source
   // of truth; debounced + sequenced so a stale response can't answer a newer
@@ -159,7 +178,15 @@ export function EngineScreen({
       // discovered on the default port at boot) keeps serving while a second
       // engine is spawned elsewhere — which looks exactly like "the settings
       // were ignored" because the stale process is the one actually answering.
-      await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
+      // Best-effort: the common case is nothing was running, which the server
+      // now reports as an HTTP 400 (not a 200 `{ok:false}`), and `stopEngine`
+      // throws on that — swallow it here instead of letting it abort the
+      // start below.
+      try {
+        await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
+      } catch {
+        /* nothing was running to stop — proceed to start regardless */
+      }
       await new Promise((res) => setTimeout(res, 800));
       const r = await startEngine(profile, artifact || null);
       if (r.profileParseError) setNotice({ tone: 'warn', text: r.profileParseError });
@@ -206,10 +233,14 @@ export function EngineScreen({
     setBusy('restart');
     setNotice(null);
     try {
-      const s = await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
-      if (!s.ok) {
-        setNotice({ tone: 'danger', text: s.message || 'stop failed — engine not restarted' });
-        return;
+      // Best-effort, matching doStart: a stop failure here doesn't need to
+      // block the restart attempt below — if the old process is genuinely
+      // still holding the port, `startEngine` reports `already_serving` and
+      // the retry loop below handles it explicitly.
+      try {
+        await stopEngine(engine?.adopted && engine.pid ? engine.pid : undefined);
+      } catch {
+        /* nothing was running to stop, or it already exited */
       }
       let r = await startEngine(profile, artifact || null);
       let tries = 0;
@@ -264,16 +295,16 @@ export function EngineScreen({
 
   // Reconcile profile.spec if current backend is unsupported by the selected artifact
   useEffect(() => {
-    if (!specSupported || profile.spec === 'off' || !profile.spec) return;
+    if (!specSupported || !profile.spec) return;
     const cur = profile.spec as 'mtp' | 'dflash' | 'dflash2';
     if (specSupported[cur] === false) {
-      set('spec', 'off');
+      set('spec', '');
     }
   }, [specSupported, profile.spec]);
 
   const draftRange = useMemo(() => {
     const specStr = artifacts.find((x) => x.path === artifact)?.known?.spec;
-    if (specStr && profile.spec && profile.spec !== 'off') {
+    if (specStr && profile.spec) {
       const match = new RegExp(`\\b${profile.spec}\\b\\s*\\((\\d+)\\.\\.(\\d+)\\)`, 'i').exec(specStr);
       if (match) return [parseInt(match[1], 10), parseInt(match[2], 10)] as [number, number];
     }

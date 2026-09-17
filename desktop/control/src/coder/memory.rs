@@ -130,8 +130,8 @@ pub async fn memory_get(
     AxumState(state): AxumState<S>,
     Query(params): Query<MemQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let scope = params.workspace.as_deref().unwrap_or("default");
-    enforce_perm(&state, scope, "read", None, None).await?;
+    let scope = perm_scope(&json!({ "workspace": params.workspace }));
+    enforce_perm(&state, &scope, "read", None, None).await?;
     let dir = match resolve_mem_dir(&state, params.workspace.as_deref()).await {
         Ok(dir) => dir,
         Err(e) => return Err(e),

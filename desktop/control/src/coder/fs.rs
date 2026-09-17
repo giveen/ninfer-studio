@@ -38,14 +38,13 @@ pub async fn tree(
         .unwrap_or(3)
         .clamp(1, 6);
     let rel = params.get("root").map(|s| s.as_str()).unwrap_or(".");
-    let scope = params
-        .get("scope")
-        .or_else(|| params.get("workspace"))
-        .map(String::as_str)
-        .unwrap_or("default");
+    let scope = perm_scope(&json!({
+        "scope": params.get("scope"),
+        "workspace": params.get("workspace"),
+    }));
     enforce_perm(
         &state,
-        scope,
+        &scope,
         "read",
         Some(rel),
         params.get("approvalToken").map(String::as_str),

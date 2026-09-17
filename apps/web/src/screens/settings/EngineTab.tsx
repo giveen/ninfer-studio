@@ -85,8 +85,12 @@ export function EngineTab({ status, active = true }: { status: StatusPayload | n
       });
       setForm(c);
       setApiKeyDraft('');
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+      if (c.rejected?.length) {
+        setError(`Not applied (invalid or conflicting value): ${c.rejected.join(', ')}`);
+      } else {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1500);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -104,7 +108,7 @@ export function EngineTab({ status, active = true }: { status: StatusPayload | n
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
+    <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
       <SectionCard title="Engine paths" description="Studio spawns the compiled engine binary and scans the models directory. Both must exist on this machine." icon={<FolderCog size={15} />}>
         <div className="space-y-4">
           <Field label="Ninfer path" hint="Root of your NInfer checkout/build. Studio derives the ninfer-serve binary (build/apps/ninfer-serve), the ninfer CLI, and the git source for pull/build automatically.">

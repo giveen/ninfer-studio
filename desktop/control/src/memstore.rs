@@ -130,7 +130,10 @@ pub async fn write_mem_file(
             Json(json!({"error": format!("mkdir failed: {e}")})),
         )
     })?;
-    crate::atomic_write(&dir.join(name), content)
+    // 0600 (not the plain `atomic_write`'s umask-dependent default): bank.md
+    // and learnings.jsonl accumulate project-sensitive text the memory bank
+    // was built to remember, same class of content as config.json's secrets.
+    crate::atomic_write_secret(&dir.join(name), content)
         .await
         .map_err(|e| {
             (
@@ -301,17 +304,26 @@ pub async fn apply_memory_update(
             )
         })?;
         use tokio::io::AsyncWriteExt as _;
-        let mut f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("learnings.jsonl"))
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("append failed: {e}")})),
-                )
-            })?;
+        let learnings_path = dir.join("learnings.jsonl");
+        let mut open_opts = tokio::fs::OpenOptions::new();
+        open_opts.create(true).append(true);
+        // 0600 on creation (same rationale as `write_mem_file`'s
+        // `atomic_write_secret`); this only takes effect for a *new* file, so
+        // also re-assert it below for one already on disk from before this
+        // fix, since `.append()` reopens an existing file as-is otherwise.
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        let mut f = open_opts.open(&learnings_path).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("append failed: {e}")})),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(&learnings_path, std::fs::Permissions::from_mode(0o600)).await;
+        }
         let line = format!("{}\n", serde_json::to_string(&entry).unwrap_or_default());
         f.write_all(line.as_bytes()).await.map_err(|e| {
             (
@@ -506,6 +518,28 @@ mod tests {
         drop(lock2);
         let _lock3 = mem_lock(&state, &tmp);
         assert_eq!(state.memory_locks.lock().len(), 1, "Unused lock entries should be evicted");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn memory_bank_files_are_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("ninfier-memstore-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state: S = Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        write_mem_file(&tmp, "bank.md", "# notes").await.unwrap();
+        apply_memory_update(&state, &tmp, &json!({"learning": {"text": "remember this"}}))
+            .await
+            .unwrap();
+
+        for name in ["bank.md", "learnings.jsonl"] {
+            let mode = std::fs::metadata(tmp.join(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} should be owner-only (0600), got {mode:o}");
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

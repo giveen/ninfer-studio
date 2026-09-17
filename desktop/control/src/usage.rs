@@ -392,11 +392,23 @@ impl UsageAccumulator {
             self.line_buf.drain(..pos + 1);
             self.process_line(&line_bytes);
         }
-        if self.line_buf.len() > 1024 * 1024 {
+        // Safety valve against a stream that never terminates a line (bug or
+        // hostile upstream), not a limit meant to engage in normal operation:
+        // the `usage`/`timings` object we actually care about always arrives
+        // in one small, final SSE `data:` line, so tripping this and
+        // force-processing + discarding the still-incomplete buffer would
+        // silently lose that object if it legitimately ever grew this large
+        // before its `\n`. 32MB (this app's other generous-but-bounded caps,
+        // e.g. `MAX_REQUEST_BODY_BYTES`, use the same order of magnitude)
+        // keeps this a genuine safety net rather than a likely-to-fire trim,
+        // and a 1MB retained tail comfortably covers a final metadata object
+        // appended after an oversized preceding field.
+        const MAX_UNTERMINATED_LINE_BYTES: usize = 32 * 1024 * 1024;
+        const RETAINED_TAIL_BYTES: usize = 1024 * 1024;
+        if self.line_buf.len() > MAX_UNTERMINATED_LINE_BYTES {
             let chunk = self.line_buf.clone();
             self.process_line(&chunk);
-            let keep_len = 64 * 1024;
-            let drain_len = self.line_buf.len().saturating_sub(keep_len);
+            let drain_len = self.line_buf.len().saturating_sub(RETAINED_TAIL_BYTES);
             self.line_buf.drain(..drain_len);
         }
     }
@@ -1008,6 +1020,31 @@ mod tests {
         assert_eq!(events[0]["promptTokens"], 100);
         assert_eq!(events[0]["completionTokens"], 50);
         assert_eq!(events[0]["model"], "qwen3_nvfp4.ninfer");
+    }
+
+    #[test]
+    fn usage_accumulator_survives_oversized_unterminated_line() {
+        // A single SSE "line" (no embedded '\n') larger than the *old* 1MB
+        // force-process-and-trim threshold, but still comfortably under the
+        // current 32MB safety valve, so the whole line stays buffered intact
+        // until its real trailing '\n' arrives instead of being prematurely
+        // force-processed (as invalid, incomplete JSON) and truncated to a
+        // 64KB tail that no longer starts with `{` — which is exactly the
+        // scenario that used to silently discard the usage/timings object.
+        let mut acc = UsageAccumulator::default();
+        let padding = "x".repeat(5 * 1024 * 1024);
+        let head = format!("data: {{\"content\":\"{padding}\",");
+        let tail = "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3},\"timings\":{\"prompt_ms\":1.0}}\n";
+
+        for piece in [head.as_bytes(), tail.as_bytes()] {
+            for window in piece.chunks(64 * 1024) {
+                acc.feed(window);
+            }
+        }
+        acc.finish();
+
+        assert_eq!(acc.usage_obj, Some(json!({"prompt_tokens": 7, "completion_tokens": 3})));
+        assert_eq!(acc.timings_obj, Some(json!({"prompt_ms": 1.0})));
     }
 
     #[tokio::test]

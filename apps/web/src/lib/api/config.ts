@@ -31,8 +31,11 @@ export async function getEngineContextSize(model = 'qwen-coder'): Promise<number
   }
 }
 
-export function saveConfig(patch: Partial<AppSettings>): Promise<AppSettings> {
-  return postJSON<AppSettings>('/api/config', patch, 5000);
+/** `rejected` lists field names the server left at their previous value —
+ *  an out-of-range `enginePort`/`costPerKwh`, or a port colliding with the
+ *  other configured port — instead of silently applying nothing for them. */
+export function saveConfig(patch: Partial<AppSettings>): Promise<AppSettings & { rejected?: string[] }> {
+  return postJSON<AppSettings & { rejected?: string[] }>('/api/config', patch, 5000);
 }
 
 // ---------------------------------------------------------------------------

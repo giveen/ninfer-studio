@@ -6,6 +6,7 @@ import {
   parseFollowUps,
   formatSummarizedOutput,
 } from './chat';
+import type { ChatParams } from '../types';
 
 describe('parseReflectionVerdict', () => {
   it('returns null for an approved verdict', () => {
@@ -45,7 +46,7 @@ describe('buildChatRequest', () => {
         { role: 'system', content: 'Mid-history system note' },
         { role: 'user', content: 'Turn 2' },
       ],
-      {},
+      { thinking: false },
       {},
       true,
     );
@@ -65,7 +66,7 @@ describe('buildChatRequest', () => {
       'mock-model',
       'sys',
       [{ role: 'user', content: 'hi' }],
-      {},
+      {} as ChatParams,
       { temperature: 0.9, enable_thinking: false },
     );
     expect(req.temperature).toBe(0.9);
@@ -80,10 +81,10 @@ describe('buildChatRequest', () => {
         {
           role: 'user',
           content: 'Here is code:',
-          attachments: [{ kind: 'file', path: 'main.py', content: 'print("hello")' }],
+          attachments: [{ kind: 'file', name: 'main.py', path: 'main.py', content: 'print("hello")' }],
         },
       ],
-      {},
+      { thinking: false },
     );
     const msgs = req.messages as Array<{ role: string; content: Array<{ type: string; text: string }> }>;
     expect(msgs[0].role).toBe('user');

@@ -120,17 +120,37 @@ pub(crate) async fn set_config(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body: Value = read_json(req).await?;
     let mut merged: AppSettings = state.config.read().await.clone();
+    // Snapshot the pre-request port values: `enginePort`/`remoteAccessPort`
+    // are validated against *each other* below, and doing that against the
+    // in-flight `merged` fields (mutated as this function runs) means a
+    // same-request swap (e.g. 8080<->1337) reads the *other* field's
+    // already-updated new value on one side and its stale old value on the
+    // other, so each side's collision check spuriously fires against the
+    // other and the whole swap is silently dropped.
+    let orig_engine_port = merged.engine_port;
+    let orig_remote_access_port = merged.remote_access_port;
+    // Fields whose new value failed validation (out of range, or colliding
+    // with the other port) and were left at their previous stored value —
+    // surfaced to the caller instead of only silently keeping the old value,
+    // since a caller has no other way to tell "ignored" apart from "applied".
+    let mut rejected: Vec<&'static str> = Vec::new();
     if let Some(v) = body.get("ninferPath").and_then(|v| v.as_str()) {
         merged.ninfer_path = crate::strip_extended_prefix(v).into();
     }
     if let Some(v) = body.get("modelsDir").and_then(|v| v.as_str()) {
         merged.models_dir = crate::strip_extended_prefix(v).into();
     }
-    if let Some(v) = body.get("enginePort").and_then(|v| v.as_u64())
-        && (1024..=65535).contains(&v)
-        && (v as u16) != merged.remote_access_port
-    {
-        merged.engine_port = v as u16;
+    // Range-checked only here; the cross-field collision check (each new
+    // port against the *other* port's final value) happens once both sides
+    // have been parsed, alongside `remoteAccessPort` below — see the note
+    // above `orig_engine_port`.
+    let mut new_engine_port: Option<u16> = None;
+    if let Some(v) = body.get("enginePort").and_then(|v| v.as_u64()) {
+        if (1024..=65535).contains(&v) {
+            new_engine_port = Some(v as u16);
+        } else {
+            rejected.push("enginePort");
+        }
     }
     if let Some(v) = body.get("apiKey").and_then(|v| v.as_str()) {
         // "********" = untouched field (the UI only ever has the mask) — keep
@@ -237,11 +257,35 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("remoteAccessEnabled").and_then(|v| v.as_bool()) {
         merged.remote_access_enabled = v;
     }
-    if let Some(v) = body.get("remoteAccessPort").and_then(|v| v.as_u64())
-        && (1024..=65535).contains(&v)
-        && (v as u16) != merged.engine_port
-    {
-        merged.remote_access_port = v as u16;
+    let mut new_remote_access_port: Option<u16> = None;
+    if let Some(v) = body.get("remoteAccessPort").and_then(|v| v.as_u64()) {
+        if (1024..=65535).contains(&v) {
+            new_remote_access_port = Some(v as u16);
+        } else {
+            rejected.push("remoteAccessPort");
+        }
+    }
+    // Resolve both ports' *final* values together (a value the caller isn't
+    // touching keeps its original) before checking them against each other,
+    // so a same-request swap (e.g. 8080<->1337) is recognized as collision-
+    // free instead of each side spuriously colliding with the other's
+    // not-yet-applied old or new value.
+    let final_engine_port = new_engine_port.unwrap_or(orig_engine_port);
+    let final_remote_access_port = new_remote_access_port.unwrap_or(orig_remote_access_port);
+    if final_engine_port == final_remote_access_port {
+        if new_engine_port.is_some() {
+            rejected.push("enginePort");
+        }
+        if new_remote_access_port.is_some() {
+            rejected.push("remoteAccessPort");
+        }
+    } else {
+        if let Some(p) = new_engine_port {
+            merged.engine_port = p;
+        }
+        if let Some(p) = new_remote_access_port {
+            merged.remote_access_port = p;
+        }
     }
     if let Some(v) = body.get("chatComputerUseEnabled").and_then(|v| v.as_bool()) {
         merged.chat_computer_use_enabled = v;
@@ -257,11 +301,12 @@ pub(crate) async fn set_config(
     if let Some(v) = body.get("currencySymbol").and_then(|v| v.as_str()) {
         merged.currency_symbol = v.into();
     }
-    if let Some(v) = body.get("costPerKwh").and_then(|v| v.as_f64())
-        && v.is_finite()
-        && (0.0..=1000.0).contains(&v)
-    {
-        merged.cost_per_kwh = v;
+    if let Some(v) = body.get("costPerKwh").and_then(|v| v.as_f64()) {
+        if v.is_finite() && (0.0..=1000.0).contains(&v) {
+            merged.cost_per_kwh = v;
+        } else {
+            rejected.push("costPerKwh");
+        }
     }
     if let Some(mcp_val) = body.get("mcpServers").and_then(|v| v.as_array()) {
         let mut new_specs = Vec::new();
@@ -346,7 +391,18 @@ pub(crate) async fn set_config(
         merged.cloud_use_for_subagent = v;
     }
     persist_config(&state, &merged).await?;
-    Ok(Json(redact_config(serde_json::to_value(&merged).unwrap())))
+    let mut out = redact_config(serde_json::to_value(&merged).unwrap());
+    if !rejected.is_empty() {
+        // Additive, backward-compatible: existing callers ignoring unknown
+        // response fields are unaffected. Without this, a caller has no way
+        // to tell "the value you sent was applied" apart from "it was
+        // silently kept at its old value because it failed validation" —
+        // e.g. an out-of-range `enginePort`/`costPerKwh` or a port collision.
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("rejected".into(), json!(rejected));
+        }
+    }
+    Ok(Json(out))
 }
 
 pub(crate) async fn cloud_test(
@@ -829,6 +885,43 @@ mod tests {
         let get_err = profile_state_get(AxumState(state.clone())).await;
         assert!(get_err.is_err());
         assert_eq!(get_err.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_set_config_port_swap_and_rejection_reporting() {
+        let state = test_state();
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        // Defaults: engine_port=8080, remote_access_port=1337.
+        assert_eq!(state.config.read().await.engine_port, 8080);
+        assert_eq!(state.config.read().await.remote_access_port, 1337);
+
+        // Swapping both ports in one request must succeed: neither side's
+        // collision check should fire against the other's stale/in-flight
+        // value mid-request.
+        let req = Request::builder()
+            .body(Body::from(json!({ "enginePort": 1337, "remoteAccessPort": 8080 }).to_string()))
+            .unwrap();
+        let res = set_config(AxumState(state.clone()), req).await.unwrap();
+        assert!(res.0.get("rejected").is_none(), "a real swap must not be rejected: {:?}", res.0.get("rejected"));
+        assert_eq!(state.config.read().await.engine_port, 1337);
+        assert_eq!(state.config.read().await.remote_access_port, 8080);
+
+        // A genuine collision (engine_port set to the *unchanged* remote
+        // access port) is rejected, reported, and leaves the stored value
+        // untouched — not just silently kept with no way to tell.
+        let req = Request::builder()
+            .body(Body::from(json!({ "enginePort": 8080 }).to_string()))
+            .unwrap();
+        let res = set_config(AxumState(state.clone()), req).await.unwrap();
+        assert_eq!(res.0["rejected"], json!(["enginePort"]));
+        assert_eq!(state.config.read().await.engine_port, 1337, "colliding value must not be applied");
+
+        // Out-of-range costPerKwh is likewise reported, not silently dropped.
+        let req = Request::builder()
+            .body(Body::from(json!({ "costPerKwh": -5.0 }).to_string()))
+            .unwrap();
+        let res = set_config(AxumState(state.clone()), req).await.unwrap();
+        assert_eq!(res.0["rejected"], json!(["costPerKwh"]));
     }
 }
 

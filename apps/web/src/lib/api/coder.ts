@@ -159,16 +159,21 @@ export const coderCommitApprovalSet = commitApproval.set;
  *  `coderPermsApprove`, `ask`) are enforced at the endpoint itself — not only
  *  by this client's own dispatcher, which an agent could otherwise route
  *  around (e.g. `bash` curling straight at an endpoint). */
-export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }, scope?: string): Promise<unknown> {
-  return postJSON<unknown>('/api/coder/perms', { ...perms, scope }, 5000);
+export function coderPermsSet(perms: { tools: Record<string, string>; denyPaths: string[] }, workspace?: string): Promise<unknown> {
+  // Sent as `workspace`, not `scope`: the server canonicalizes a `workspace`
+  // field into the bucket key (matching how the agent loop and every other
+  // coder endpoint derive it) but takes an explicit `scope` verbatim — a raw
+  // directory string here would otherwise land in a differently-keyed bucket
+  // than the one path normalization elsewhere resolves to.
+  return postJSON<unknown>('/api/coder/perms', { ...perms, workspace }, 5000);
 }
 /** Called the moment a human approves an `ask`-tiered tool call in the UI's
  *  own dialog. Mints a short-lived, single-use token the client then attaches
  *  to the actual tool-call request as `approvalToken` — without this, the
  *  endpoint has no way to tell an approved call apart from one that skipped
- *  the dialog entirely. `scope` must match the tool call's target workspace/scope. */
-export function coderPermsApprove(tool: string, path?: string, scope?: string): Promise<{ token: string }> {
-  return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path, scope }, 5000);
+ *  the dialog entirely. `workspace` must match the tool call's target workspace. */
+export function coderPermsApprove(tool: string, path?: string, workspace?: string): Promise<{ token: string }> {
+  return postJSON<{ token: string }>('/api/coder/perms/approve', { tool, path, workspace }, 5000);
 }
 export interface SandboxStatus {
   enabled: boolean;

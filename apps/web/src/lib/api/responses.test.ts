@@ -115,7 +115,7 @@ describe('buildResponsesBody', () => {
       'model-a',
       'sys prompt',
       [{ role: 'user', content: 'user msg' }],
-      { maxTokens: 1024, temperature: 0.7, topP: 0.8, reasoningEffort: 'high' },
+      { thinking: false, maxTokens: 1024, temperature: 0.7, topP: 0.8, reasoningEffort: 'xhigh' },
       { tools: [{ type: 'function', function: { name: 't1', parameters: {} } }] },
     );
     const responsesBody = buildResponsesBody(ccReq);
@@ -129,7 +129,7 @@ describe('buildResponsesBody', () => {
       max_output_tokens: 1024,
       temperature: 0.7,
       top_p: 0.8,
-      reasoning: { effort: 'high' },
+      reasoning: { effort: 'xhigh' },
       tools: [{ type: 'function', name: 't1', description: undefined, parameters: {} }],
       tool_choice: 'auto',
     });
