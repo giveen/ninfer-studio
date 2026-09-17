@@ -31,7 +31,21 @@ use std::path::PathBuf;
 /// own environment must not be handed to it wholesale, or a var like
 /// `GITHUB_TOKEN` already exported in the user's own shell before launch
 /// becomes readable/leakable by an agent-run command.
-pub(crate) const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
+pub(crate) const SECRET_ENV_PATTERNS: &[&str] = &[
+    "KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+    "CREDENTIALS",
+    "COOKIE",
+    "SESSION",
+    "GIT_ASKPASS",
+];
 
 pub(crate) fn is_secret_env_var(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
