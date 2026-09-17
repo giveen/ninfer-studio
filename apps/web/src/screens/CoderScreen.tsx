@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspens
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare, Activity } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
-import { loadStore, baseName, relTime, CoderStore, ConvMeta, LogEntry, TodoItem, newConvId, emptyConv, WsData, loadDefaultPerms, detectCommands, todoSystemBlock, CONV_KEY } from '../lib/coderStore';
+import { loadStore, baseName, relTime, CoderStore, ConvMeta, LogEntry, TodoItem, newConvId, emptyConv, WsData, loadDefaultPerms, detectCommands, todoSystemBlock, CONV_KEY, saveStoreDebounced } from '../lib/coderStore';
 
 import { DirBrowser } from '../components/DirBrowser';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
@@ -1542,12 +1542,12 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     commitResolveRef.current?.(false);
   };
 
-  // Persist conversations + per-workspace permissions across reloads.
+  // Persist conversations + per-workspace permissions across reloads (debounced).
   useEffect(() => {
-    try {
-      localStorage.setItem(CONV_KEY, JSON.stringify(store));
-    } catch { /* quota or privacy mode — session still works in memory */ }
-  }, [store]);
+    saveStoreDebounced(store, 500, () => {
+      addLog({ type: 'error', label: 'storage', detail: 'Failed to persist conversation store to localStorage (quota exceeded or private mode)' });
+    });
+  }, [store, addLog]);
   // Persist sampling params across reloads.
   useEffect(() => {
     try {
