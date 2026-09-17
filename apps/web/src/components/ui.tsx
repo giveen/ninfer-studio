@@ -446,7 +446,7 @@ export function LogPane({ lines, autoScroll = true }: { lines: string[]; autoScr
       {lines.length === 0 && <span className="text-faint">no output yet</span>}
       {lines.map((l, i) => (
         <div
-          key={i}
+          key={`${i}-${l.slice(0, 32)}`}
           className={cn(
             'whitespace-pre-wrap break-all',
             /ERROR|FATAL/i.test(l) && 'text-danger',

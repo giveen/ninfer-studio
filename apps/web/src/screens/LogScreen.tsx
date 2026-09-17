@@ -1,12 +1,10 @@
-import { Terminal } from 'lucide-react';
+import { Terminal, AlertTriangle } from 'lucide-react';
 import type { StatusPayload } from '../lib/types';
-import { useEngineLogs } from '../lib/liveLogs';
+import { useEngineLogs, LOG_TAIL_LINES } from '../lib/liveLogs';
 import { LogPane } from '../components/ui';
 
-// Full-screen engine log: the same tail the Engine screen shows at the bottom,
-// promoted to its own tab so it can be watched without scrolling settings.
-// The tail itself comes from the shared useEngineLogs store, so this pane and
-// the Engine screen's pane run ONE /api/logs poll together.
+// Dedicated Engine log tab: displays the shared engine-log tail with live polling
+// and staleness feedback when the control plane or log file is unreadable.
 export function LogScreen({ status }: { status: StatusPayload | null }) {
   const engine = status?.engine;
   const logPath = engine?.logPath;
@@ -24,7 +22,15 @@ export function LogScreen({ status }: { status: StatusPayload | null }) {
         ) : (
           <span className="text-[11.5px] text-faint">log appears when the engine starts</span>
         )}
-        <span className="ml-auto font-mono text-[11px] text-faint">{logs.length ? `${logs.length} lines (last 1000)` : ''}</span>
+        {logs.isStale && (
+          <span className="flex items-center gap-1 rounded bg-warn/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warn" title={logs.error ?? 'Polling paused or delayed'}>
+            <AlertTriangle size={11} />
+            stale
+          </span>
+        )}
+        <span className="ml-auto font-mono text-[11px] text-faint">
+          {logs.length ? `${logs.length} lines (last ${LOG_TAIL_LINES})` : ''}
+        </span>
       </div>
       <div className="min-h-0 flex-1 p-3">
         <LogPane lines={logs} />
