@@ -45,28 +45,38 @@ export function buildChatRequest(
       : text;
     messages.push({ role: 'system', content });
   }
-  for (const m of history) {
+  const lastUserIdx = history.findLastIndex((m) => m.role === 'user' && (m.content.trim() || (m.attachments && m.attachments.length)));
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
     if (m.role === 'system') continue;
+    const cacheThisMsg = cacheSystem && i === lastUserIdx;
     if (m.attachments && m.attachments.length) {
       const content: Array<Record<string, unknown>> = [];
-      if (m.content.trim()) content.push({ type: 'text', text: m.content });
+      if (m.content.trim()) {
+        const textBlock: Record<string, unknown> = { type: 'text', text: m.content };
+        if (cacheThisMsg) textBlock.cache_control = { type: 'ephemeral' };
+        content.push(textBlock);
+      }
       for (const a of m.attachments) {
         if (a.kind === 'image') content.push({ type: 'image_url', image_url: { url: a.dataUrl! } });
         else if (a.kind === 'video') content.push({ type: 'video_url', video_url: { url: a.dataUrl! } });
         else if (a.kind === 'file') {
           const p = a.path ?? a.name;
           const body = a.content ?? '';
-          // Fence longer than the longest backtick run already in the file,
-          // so content containing its own ``` (e.g. a Markdown file with an
-          // embedded code block) can't prematurely close our fence.
           const longestRun = (body.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 0);
           const fence = '`'.repeat(Math.max(3, longestRun + 1));
-          content.push({ type: 'text', text: `\n\n[Attached file: ${p}]\n${fence}\n${body}\n${fence}\n` });
+          const fileBlock: Record<string, unknown> = { type: 'text', text: `\n\n[Attached file: ${p}]\n${fence}\n${body}\n${fence}\n` };
+          if (cacheThisMsg && content.length === 0) fileBlock.cache_control = { type: 'ephemeral' };
+          content.push(fileBlock);
         }
       }
       messages.push({ role: 'user', content });
     } else {
-      const msg: Record<string, unknown> = { role: m.role, content: m.content };
+      let content: unknown = m.content;
+      if (cacheThisMsg && typeof m.content === 'string' && m.content.trim()) {
+        content = [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }];
+      }
+      const msg: Record<string, unknown> = { role: m.role, content };
       if (m.role === 'assistant' && m.reasoning) msg.reasoning_content = m.reasoning;
       if (m.tool_calls) msg.tool_calls = m.tool_calls.map(tc => ({
         id: tc.id,
@@ -91,6 +101,7 @@ export function buildChatRequest(
   }
 
   const body: Record<string, unknown> = {
+    ...(extra ?? {}),
     model,
     messages,
     stream: true,
@@ -113,7 +124,6 @@ export function buildChatRequest(
   if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
   if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
   if (params.seed !== undefined) body.seed = params.seed;
-  Object.assign(body, extra ?? {});
   return body;
 }
 
