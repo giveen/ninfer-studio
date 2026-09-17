@@ -472,7 +472,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           params,
           tools,
           registry,
-          maxSteps: 12,
+          maxSteps: (appConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
           // The system prompt (capabilities block + memory + tool list) is
           // resent verbatim every turn — cheap to try caching it whenever
           // the turn is cloud-routed (baseUrl set); a provider that doesn't
