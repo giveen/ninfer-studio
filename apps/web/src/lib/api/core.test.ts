@@ -124,5 +124,28 @@ describe('core.ts API infrastructure module', () => {
       expect(idle.signal.aborted).toBe(false);
       idle.dispose();
     });
+
+    it('does not abort the fetch signal after headers arrive, even past connectTimeoutMs', async () => {
+      // The signal passed to fetch() also governs the response body read —
+      // if the connect-timeout timer is still armed after headers arrive, a
+      // slow-but-successful long-running stream (e.g. a big prompt still
+      // prefilling) gets killed mid-flight even though nothing is actually
+      // stuck. Real timers: AbortSignal.timeout() runs on the platform clock
+      // and isn't reliably controlled by vi.useFakeTimers.
+      let capturedSignal: AbortSignal | undefined;
+      vi.spyOn(globalThis, 'fetch').mockImplementationOnce(((_url: string, init?: RequestInit) => {
+        capturedSignal = init?.signal ?? undefined;
+        return Promise.resolve({ ok: true, body: {} as ReadableStream } as Response);
+      }) as typeof fetch);
+
+      const { response, idle } = await fetchStream('/v1/chat/completions', { method: 'POST' }, { connectTimeoutMs: 40 });
+      expect(response.ok).toBe(true);
+      expect(capturedSignal?.aborted).toBe(false);
+
+      // Well past connectTimeoutMs — the request must still be alive.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(capturedSignal?.aborted).toBe(false);
+      idle.dispose();
+    });
   });
 });

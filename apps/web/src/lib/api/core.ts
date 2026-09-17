@@ -97,22 +97,31 @@ export async function fetchStream(
 ): Promise<{ response: Response; idle: StreamIdleController }> {
   const idle = new StreamIdleController(options.idleTimeoutMs ?? 30_000, options.signal);
   const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
-  const connectSignal = AbortSignal.timeout(connectTimeoutMs);
-  const combined = AbortSignal.any([idle.signal, connectSignal]);
+  // Bounds only the wait for response headers — a long-running body (e.g. a
+  // large prompt still prefilling) must not be killed by it, so the timer is
+  // cleared as soon as fetch() resolves; AbortSignal.timeout() can't be
+  // cancelled, hence the manual AbortController instead.
+  const connectController = new AbortController();
+  const connectTimer = setTimeout(() => {
+    const err = new Error(`${path} → connection timed out after ${connectTimeoutMs}ms`);
+    err.name = 'TimeoutError';
+    connectController.abort(err);
+  }, connectTimeoutMs);
+  const combined = AbortSignal.any([idle.signal, connectController.signal]);
 
   try {
     const response = await fetch(API_BASE + path, { ...init, signal: combined });
+    clearTimeout(connectTimer);
     idle.touch();
     return { response, idle };
   } catch (e) {
+    clearTimeout(connectTimer);
     idle.dispose();
     if (options.signal?.aborted) {
       throw e;
     }
-    if (connectSignal.aborted) {
-      const err = new Error(`${path} → connection timed out after ${connectTimeoutMs}ms`);
-      err.name = 'TimeoutError';
-      throw err;
+    if (connectController.signal.aborted) {
+      throw connectController.signal.reason;
     }
     if (idle.signal.aborted) {
       throw idle.signal.reason;

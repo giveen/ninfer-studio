@@ -5,6 +5,7 @@
 import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
 import { API_BASE, getJSON, postJSON, fetchStream, isAbortError } from './core';
 import type { CoderMemory, CoderLearningKind } from './coder';
+import { setLatestRequestMetrics } from '../liveMetrics';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -119,6 +120,12 @@ export function buildChatRequest(
     messages,
     stream: true,
     stream_options: { include_usage: true },
+    // llama.cpp-server-compatible engines only emit a per-chunk `timings`
+    // object (prompt/decode tok/s, draft accept rate — see handleLine below)
+    // when explicitly asked for it; without this, those fields silently stay
+    // undefined forever, not just when the UI's "last request metrics" box
+    // is stale.
+    timings_per_token: true,
     enable_thinking: enableThinking,
   };
   if (effort) body.reasoning_effort = effort;
@@ -193,11 +200,26 @@ export async function streamChat(
       flushContent(contentBuf);
       contentBuf = '';
     }
-    if (firstContentAt !== null) meta.ttftMs = firstContentAt - t0;
+    const tFinish = performance.now();
+    if (firstContentAt !== null) {
+      meta.ttftMs = firstContentAt - t0;
+      const prefillSec = (firstContentAt - t0) / 1000;
+      const uncachedPrompt = Math.max(0, (meta.promptTokens ?? 0) - (meta.cachedTokens ?? 0));
+      if (meta.promptTokPerSec === undefined && prefillSec > 0 && uncachedPrompt > 0) {
+        meta.promptTokPerSec = uncachedPrompt / prefillSec;
+      }
+      const decodeSec = (tFinish - firstContentAt) / 1000;
+      const completionTok = meta.completionTokens ?? 0;
+      if (meta.decodeTokPerSec === undefined && decodeSec > 0 && completionTok > 0) {
+        meta.decodeTokPerSec = completionTok / decodeSec;
+      }
+    }
     const calls = toolAcc
       .filter(Boolean)
       .map((t, i) => ({ id: t.id || `call_${i}`, name: t.name, arguments: t.arguments }));
     if (calls.length) cb.onToolCalls?.(calls);
+    const modelName = typeof body.model === 'string' ? body.model : 'unknown';
+    setLatestRequestMetrics(meta, modelName);
     cb.onDone?.(meta);
   };
 

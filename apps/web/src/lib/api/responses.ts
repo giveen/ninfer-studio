@@ -20,6 +20,7 @@
 import type { ChatParams, MessageMeta } from '../types';
 import type { ChatStreamCallbacks } from './chat';
 import { API_BASE, fetchStream, isAbortError } from './core';
+import { setLatestRequestMetrics } from '../liveMetrics';
 
 /** Sampling fields this engine's /v1/responses build actually accepts.
  *  Anything else set to a non-default value must keep using Chat Completions
@@ -377,7 +378,20 @@ export async function streamResponses(
       try { await reader?.cancel(); } catch {}
     }
 
-    if (firstContentAt !== null) state.meta.ttftMs = firstContentAt - t0;
+    const tFinish = performance.now();
+    if (firstContentAt !== null) {
+      state.meta.ttftMs = firstContentAt - t0;
+      const prefillSec = (firstContentAt - t0) / 1000;
+      const uncachedPrompt = Math.max(0, (state.meta.promptTokens ?? 0) - (state.meta.cachedTokens ?? 0));
+      if (state.meta.promptTokPerSec === undefined && prefillSec > 0 && uncachedPrompt > 0) {
+        state.meta.promptTokPerSec = uncachedPrompt / prefillSec;
+      }
+      const decodeSec = (tFinish - firstContentAt) / 1000;
+      const completionTok = state.meta.completionTokens ?? 0;
+      if (state.meta.decodeTokPerSec === undefined && decodeSec > 0 && completionTok > 0) {
+        state.meta.decodeTokPerSec = completionTok / decodeSec;
+      }
+    }
     if (state.calls.size) {
       cb.onToolCalls?.([...state.calls.entries()].map(([id, c]) => ({ id, name: c.name, arguments: c.arguments })));
     }
@@ -385,12 +399,16 @@ export async function streamResponses(
       cb.onError?.('The response stream ended before completion — the connection may have dropped.');
       return;
     }
+    const modelName = typeof ccReq.model === 'string' ? ccReq.model : 'unknown';
     if (state.completed) {
+      setLatestRequestMetrics(state.meta, modelName);
       cb.onDone?.(state.meta);
     }
   } catch (e) {
     if (isAbortError(e, signal)) {
       state.meta.finishReason = state.meta.finishReason || 'cancelled';
+      const modelName = typeof ccReq.model === 'string' ? ccReq.model : 'unknown';
+      setLatestRequestMetrics(state.meta, modelName);
       cb.onDone?.(state.meta);
       return;
     }

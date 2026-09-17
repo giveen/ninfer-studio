@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   paramsSupportedByResponses,
   toResponsesItems,
@@ -7,9 +7,11 @@ import {
   buildResponsesBody,
   applyResponsesEvent,
   initResponsesState,
+  streamResponses,
 } from './responses';
 import { buildChatRequest } from './chat';
 import type { ChatParams } from '../types';
+import { getLatestRequestMetrics, clearLatestRequestMetrics } from '../liveMetrics';
 
 const BASE_PARAMS: ChatParams = { thinking: true };
 
@@ -238,4 +240,54 @@ describe('applyResponsesEvent', () => {
     expect(applyResponsesEvent('{not json', state)).toEqual({});
   });
 });
+
+describe('streamResponses metrics publishing', () => {
+  it('computes fallback prompt and decode rates and publishes live metrics', async () => {
+    clearLatestRequestMetrics();
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        controller.enqueue(encoder.encode('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n'));
+        await new Promise((r) => setTimeout(r, 50));
+        controller.enqueue(
+          encoder.encode(
+            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":0},"output_tokens":20}}}\n\n',
+          ),
+        );
+        controller.close();
+      },
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+
+    try {
+      let metaResult: any;
+      await streamResponses(
+        { model: 'test-model' },
+        new AbortController().signal,
+        {
+          onDone: (m) => {
+            metaResult = m;
+          },
+        },
+      );
+
+      expect(metaResult).toBeDefined();
+      expect(metaResult.promptTokens).toBe(100);
+      expect(metaResult.completionTokens).toBe(20);
+      expect(metaResult.ttftMs).toBeGreaterThan(0);
+      expect(metaResult.promptTokPerSec).toBeGreaterThan(0);
+      expect(metaResult.decodeTokPerSec).toBeGreaterThan(0);
+
+      const latest = getLatestRequestMetrics();
+      expect(latest).not.toBeNull();
+      expect(latest?.model).toBe('test-model');
+      expect(latest?.meta.promptTokPerSec).toBe(metaResult.promptTokPerSec);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
 
