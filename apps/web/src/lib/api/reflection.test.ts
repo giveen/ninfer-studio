@@ -152,6 +152,11 @@ describe('parseFollowUps', () => {
     const raw = '["How do I fix this?", "Where is the file?", "What';
     expect(parseFollowUps(raw)).toEqual(['How do I fix this?', 'Where is the file?']);
   });
+
+  it('strips <think> blocks before parsing JSON array', () => {
+    const raw = '<think>\nLet me think about natural follow ups.\n</think>\n["Option A?", "Option B?", "Option C?"]';
+    expect(parseFollowUps(raw)).toEqual(['Option A?', 'Option B?', 'Option C?']);
+  });
 });
 
 describe('formatSummarizedOutput', () => {

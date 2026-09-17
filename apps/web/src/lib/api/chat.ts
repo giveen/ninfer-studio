@@ -391,6 +391,9 @@ export function streamToString(
       body,
       signal,
       {
+        onReasoningDelta: (d) => {
+          acc += d;
+        },
         onContentDelta: (d) => {
           acc += d;
           opts?.onDelta?.(d);
@@ -772,7 +775,10 @@ const FOLLOWUP_INSTRUCTION = [
 ].join('\n');
 
 export function parseFollowUps(raw: string): string[] {
-  const text = raw.trim();
+  let text = raw.trim();
+  text = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
+  text = text.replace(/^<think(?:ing)?>[\s\S]*/gi, '').trim();
+
   // Also matches an OPENED-but-never-closed fence (maxTokens can cut the
   // response off mid-block) — `(?:```|$)` accepts end-of-string as the close.
   const fenced = /```(?:json)?\s*([\s\S]*?)(?:```|$)/.exec(text);
@@ -786,15 +792,33 @@ export function parseFollowUps(raw: string): string[] {
   } catch {
     /* fall through below */
   }
+
+  // Attempt extracting JSON array substring [...] from text
+  const arrayMatch = /\[\s*".*?"[\s\S]*?\]/.exec(jsonText);
+  if (arrayMatch) {
+    try {
+      const arr = JSON.parse(arrayMatch[0]);
+      if (Array.isArray(arr)) {
+        const strs = arr.filter((x): x is string => typeof x === 'string' && !!x.trim());
+        if (strs.length) return strs.slice(0, 3);
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
   // The array may be truncated/malformed (tight maxTokens) — recover whole
   // quoted strings directly rather than requiring the full array to parse.
-  const quoted = [...jsonText.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1].trim()).filter(Boolean);
+  const quoted = [...jsonText.matchAll(/"((?:[^"\\]|\\.)*)"/g)]
+    .map((m) => m[1].trim())
+    .filter((s) => Boolean(s) && !/^(?:think|json)$/i.test(s));
   if (quoted.length) return quoted.slice(0, 3);
+
   // Last resort: the model ignored the JSON instruction and just listed lines.
   return jsonText
     .split('\n')
     .map((l) => l.replace(/^[\s\-*\d.)\]\[`"']+/, '').replace(/["'`]+$/, '').trim())
-    .filter(Boolean)
+    .filter((s) => Boolean(s) && !/^(?:think|json)$/i.test(s))
     .slice(0, 3);
 }
 
@@ -802,7 +826,7 @@ export function parseFollowUps(raw: string): string[] {
  *  should already end in the assistant's just-completed reply). */
 export function suggestFollowUps(opts: { model: string; baseUrl?: string; apiKey?: string; extraHeaders?: string; history: ChatMessage[]; signal?: AbortSignal }): Promise<string[]> {
   const instruction: ChatMessage = { role: 'user', content: FOLLOWUP_INSTRUCTION };
-  const params: ChatParams = { thinking: false, preserveThinking: false, maxTokens: 200 };
+  const params: ChatParams = { thinking: false, preserveThinking: false, maxTokens: 512 };
   const body = buildChatRequest(opts.model, undefined, [...opts.history, instruction], params);
   const signal = opts.signal ?? AbortSignal.timeout(30_000);
   return streamToString(body, signal, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders })
