@@ -454,9 +454,16 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
       if (computerUseOn && mcpToolsRef.current.length > 0) {
         for (const t of mcpToolsRef.current) {
-          if (mcpToolTier(computerUsePerms, t.name) !== 'deny') {
+          const tier = mcpToolTier(computerUsePerms, t.name);
+          if (tier !== 'deny') {
             registry[`mcp__${t.name}`] = async (args, sig) => {
-              const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope: computerUseDirRef.current ?? undefined }, sig);
+              const scope = computerUseDirRef.current || undefined;
+              let approvalToken: string | undefined;
+              if (tier === 'ask' && scope) {
+                const app = await coderPermsApprove(scope).catch(() => null);
+                if (app?.token) approvalToken = app.token;
+              }
+              const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope, approvalToken }, sig);
               return JSON.stringify(res);
             };
           }

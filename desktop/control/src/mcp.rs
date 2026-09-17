@@ -911,7 +911,7 @@ pub(crate) async fn connect_all(state: S) {
 }
 
 /// The JSON view of one configured server for `GET /api/mcp/servers`.
-/// `authorization` never leaves the control plane — the UI sees a mask.
+/// Credentials (`authorization`, `env` values, `headers` values) never leave the control plane — the UI sees a mask.
 fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
     let status: String = match meta {
         Some(m) if m.alive && m.error.is_none() => "connected".to_string(),
@@ -923,15 +923,33 @@ fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
         ),
         None => "disconnected".to_string(),
     };
+    let env_masked = if spec.env.is_empty() {
+        Value::Null
+    } else {
+        json!(spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), if v.is_empty() { String::new() } else { "***".to_string() }))
+            .collect::<std::collections::BTreeMap<_, _>>())
+    };
+    let headers_masked = if spec.headers.is_empty() {
+        Value::Null
+    } else {
+        json!(spec
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), if v.is_empty() { String::new() } else { "***".to_string() }))
+            .collect::<std::collections::BTreeMap<_, _>>())
+    };
     json!({
         "name": spec.name,
         "transport": spec.transport().unwrap_or("none"),
         "command": spec.command,
         "args": spec.args,
-        "env": spec.env,
+        "env": env_masked,
         "cwd": spec.cwd,
         "url": spec.url,
-        "headers": spec.headers,
+        "headers": headers_masked,
         // Secret: the UI only ever sees the mask.
         "authorization": spec.authorization.as_ref().map(|_| "***").unwrap_or_default(),
         "status": status,
@@ -948,16 +966,19 @@ fn server_value(spec: &McpServerSpec, meta: Option<&ConnMeta>) -> Value {
 /// Implicit reconnects are skipped for this long after a failed attempt — a
 /// broken server (bad binary, hanging install) must not stall every catalog
 /// fetch or tool call with the full init timeout. Explicit connects
-/// (upsert, restart) bypass the backoff.
+/// (`/api/mcp/servers/{name}/restart`) bypass this filter.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// `meta` is dead and its last failure is still inside the backoff window.
 fn failed_recently(meta: &ConnMeta) -> bool {
-    meta.error.is_some()
-        && meta
-            .error_at
-            .map(|t| t.elapsed() < RETRY_BACKOFF)
-            .unwrap_or(false)
+    meta.error
+        .as_ref()
+        .map(|_| {
+            meta.tools_at
+                .map(|t| t.elapsed() < RETRY_BACKOFF)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 /// Write the (already updated) in-memory config back to disk. Best effort —
@@ -1017,17 +1038,33 @@ pub async fn servers_upsert(
     // sanitized form (no `_` — it would break the `mcp__<server>__<tool>`
     // grammar).
     spec.name = sanitize_server_name(&name);
-    // `***` is the mask the list endpoint returns; keep the stored secret
-    // instead of persisting the mask over it.
-    if spec.authorization.as_deref() == Some("***") {
-        let existing = {
-            let cfg = state.config.read().await;
-            cfg.mcp_servers
-                .iter()
-                .find(|s| s.name == spec.name)
-                .and_then(|s| s.authorization.clone())
-        };
-        spec.authorization = existing;
+    // `***` is the mask the list endpoint returns; keep stored secrets
+    // instead of persisting the mask over them.
+    let existing = {
+        let cfg = state.config.read().await;
+        cfg.mcp_servers
+            .iter()
+            .find(|s| s.name == spec.name)
+            .cloned()
+    };
+    if let Some(existing) = &existing {
+        if spec.authorization.as_deref() == Some("***") {
+            spec.authorization = existing.authorization.clone();
+        }
+        for (k, v) in &mut spec.env {
+            if v == "***" {
+                if let Some(old_v) = existing.env.get(k) {
+                    *v = old_v.clone();
+                }
+            }
+        }
+        for (k, v) in &mut spec.headers {
+            if v == "***" {
+                if let Some(old_v) = existing.headers.get(k) {
+                    *v = old_v.clone();
+                }
+            }
+        }
     }
     validate_spec(&spec)?;
     // `validate_spec` is deliberately lenient (hand-edited configs without a
