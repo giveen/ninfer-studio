@@ -204,7 +204,7 @@ pub fn mem_rand_suffix() -> String {
 /// or a stale rewrite can clobber a newer append. Keyed by store dir so
 /// distinct stores (different workspaces, or Coder vs Chat) never contend.
 pub fn mem_lock(state: &S, store: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut map = state.memory_locks.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = state.memory_locks.lock();
     map.entry(store.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()

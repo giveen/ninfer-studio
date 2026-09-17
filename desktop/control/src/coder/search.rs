@@ -9,10 +9,11 @@ use crate::engine::S;
 use axum::Json;
 use axum::extract::{Query, State as AxumState};
 use axum::http::StatusCode;
+use parking_lot::Mutex as ParkingMutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -49,7 +50,7 @@ pub struct SymHit {
 /// Cache slot type for the in-memory symbol index: build time, the root it
 /// was built from, and the hits wrapped in an `Arc` to avoid deep-cloning
 /// the symbol hit vector on every cache lookup.
-type SymbolIndexCache = Mutex<Option<(std::time::Instant, PathBuf, Arc<Vec<SymHit>>)>>;
+type SymbolIndexCache = ParkingMutex<Option<(std::time::Instant, PathBuf, Arc<Vec<SymHit>>)>>;
 
 fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
     let mut out = Vec::new();
@@ -66,35 +67,30 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
             true
         })
         .build();
-
-    for result in walker {
-        if out.len() >= MAX_SYMBOL_HITS || files_scanned >= MAX_SYMBOL_FILES_SCANNED {
+    for entry in walker.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let p = entry.path();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !SEARCH_SYMBOL_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        files_scanned += 1;
+        if files_scanned > MAX_SYMBOL_FILES_SCANNED {
             break;
         }
-        let Ok(entry) = result else { continue };
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) else {
+        let Ok(rel) = p.strip_prefix(root) else {
             continue;
         };
-        if !SEARCH_SYMBOL_EXTS.contains(&ext) {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if meta.len() > 10 * 1024 * 1024 {
-                continue;
-            }
-        }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let Ok(content) = std::fs::read_to_string(p) else {
             continue;
         };
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let rel = rel.to_string_lossy().to_string();
-        files_scanned += 1;
-
         for (i, line) in content.lines().enumerate() {
             if let Some(caps) = SEARCH_SYMBOL_RE.captures(line) {
                 out.push(SymHit {
@@ -113,14 +109,14 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
 
 fn search_symbol_index(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>> {
     let hits = Arc::new(build_symbol_index_blocking(root));
-    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = cache.lock();
     *guard = Some((std::time::Instant::now(), root.to_path_buf(), Arc::clone(&hits)));
     hits
 }
 
 fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>> {
     {
-        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = cache.lock();
         if let Some((at, cached_root, idx)) = guard.as_ref() {
             if at.elapsed() < SYMBOL_TTL && cached_root == root {
                 return Arc::clone(idx);

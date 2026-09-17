@@ -1,6 +1,7 @@
 //! Control-plane runtime state + desktop-shell events.
 use super::domain::{EngineState, JobRec};
 use super::settings::{AppSettings, EngineProfile};
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,21 +25,6 @@ pub enum AppEvent {
     /// A repo pull/build job finished.
     BuildFinished { action: String, ok: bool },
 }
-
-// ---------------------------------------------------------------------------
-// App settings (persisted to <data>/config.json)
-// ---------------------------------------------------------------------------
-
-/// Strip the Windows extended-length prefix (`\\?\` or `//?/`) that
-/// `std::fs::canonicalize` adds to most absolute paths on Windows, so the
-/// stored workspace string matches the plain form the UI's directory picker
-/// produces (`C:\tmp`, not `\\?\C:\tmp`) — otherwise the web store (keyed
-/// by the plain path) can't find the persisted workspace on the next start
-/// and spawns a duplicate entry with a fresh conversation.
-///
-/// UNC paths need care: canonicalize yields `\\?\UNC\server\share`, and a
-/// bare `UNC\server\share` would be a *relative* path — so the leading UNC
-/// separators are restored and the tail is normalized to backslashes,
 
 // ---------------------------------------------------------------------------
 // In-memory engine state
@@ -65,19 +51,22 @@ pub struct EngineInner {
 
 impl EngineInner {
     /// Common tail of every stop path: no process is running and Studio owns
-    /// nothing. (The external-watch branch additionally clears `argv`, which
-    /// described a foreign process that is now gone.)
+    /// nothing. Clears state, pid, adopted status, fail_reason, deadline, and argv.
     pub fn reset_stopped(&mut self) {
         self.state = EngineState::Stopped;
         self.adopted = false;
         self.pid = None;
+        self.fail_reason = None;
+        self.deadline = None;
+        self.argv = None;
     }
 
-    /// Record a failure with its reason. Callers that also notify the desktop
-    /// shell use `engine::fail_and_emit` instead.
+    /// Record a failure with its reason and clear PID so stale process IDs are not signaled.
+    /// Callers that also notify the desktop shell use `engine::fail_and_emit` instead.
     pub fn mark_failed(&mut self, reason: impl Into<String>) {
         self.state = EngineState::Failed;
         self.fail_reason = Some(reason.into());
+        self.pid = None;
     }
 
     /// The reaper's transition: the spawned child exited on its own.
@@ -116,8 +105,8 @@ pub struct LastStart {
 // named saved profiles. Persisted to <data>/profile.json (mirrors the web app's
 // former browser-localStorage blob) so the settings survive a restart.
 // ---------------------------------------------------------------------------
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SavedProfile {
     pub name: String,
     pub profile: EngineProfile,
@@ -179,12 +168,14 @@ pub struct State {
     pub bg_job_counter: AtomicU64,
     /// Per-memory-store mutation locks (`coder::memory`), keyed by store
     /// directory so unrelated workspaces never contend. See `bg_jobs` for why
-    /// this lives on `State` instead of a global static.
-    pub memory_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// this lives on `State` instead of a global static. Uses `parking_lot::Mutex`
+    /// to avoid mutex poisoning.
+    pub memory_locks: ParkingMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Cached repo symbol index for `coder::search` (TTL'd, keyed by the root
     /// it was built from so a workspace switch can't serve another
     /// workspace's stale index). See `bg_jobs` for why this lives on `State`.
-    pub symbol_index: std::sync::Mutex<
+    /// Uses `parking_lot::Mutex` to avoid mutex poisoning.
+    pub symbol_index: ParkingMutex<
         Option<(
             std::time::Instant,
             std::path::PathBuf,
@@ -215,10 +206,7 @@ impl State {
     ) -> Self {
         Self {
             config: tokio::sync::RwLock::new(AppSettings::default()),
-            engine: tokio::sync::RwLock::new(EngineInner {
-                state: EngineState::Stopped,
-                ..Default::default()
-            }),
+            engine: tokio::sync::RwLock::new(EngineInner::default()),
             last_start: tokio::sync::RwLock::new(None),
             child: tokio::sync::Mutex::new(None),
             log_file: tokio::sync::Mutex::new(None),
@@ -232,8 +220,8 @@ impl State {
             browser: tokio::sync::Mutex::new(crate::coder::BrowserSlot::new()),
             bg_jobs: tokio::sync::Mutex::new(HashMap::new()),
             bg_job_counter: AtomicU64::new(0),
-            memory_locks: std::sync::Mutex::new(HashMap::new()),
-            symbol_index: std::sync::Mutex::new(None),
+            memory_locks: ParkingMutex::new(HashMap::new()),
+            symbol_index: ParkingMutex::new(None),
             event_tx,
             data_dir,
             dist_dir,
@@ -249,3 +237,49 @@ impl State {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_failed_clears_pid_and_sets_reason() {
+        let mut eng = EngineInner {
+            pid: Some(1234),
+            state: EngineState::Running,
+            ..EngineInner::default()
+        };
+        eng.mark_failed("oom error");
+        assert_eq!(eng.state, EngineState::Failed);
+        assert_eq!(eng.pid, None);
+        assert_eq!(eng.fail_reason.as_deref(), Some("oom error"));
+    }
+
+    #[test]
+    fn reset_stopped_clears_transient_fields() {
+        let mut eng = EngineInner {
+            state: EngineState::Failed,
+            pid: Some(5678),
+            adopted: true,
+            fail_reason: Some("bad state".into()),
+            deadline: Some(999999),
+            argv: Some(vec!["ninfer-serve".into()]),
+            ..EngineInner::default()
+        };
+        eng.reset_stopped();
+        assert_eq!(eng.state, EngineState::Stopped);
+        assert_eq!(eng.pid, None);
+        assert!(!eng.adopted);
+        assert_eq!(eng.fail_reason, None);
+        assert_eq!(eng.deadline, None);
+        assert_eq!(eng.argv, None);
+    }
+
+    #[test]
+    fn saved_profile_deserialization_defaults() {
+        let json = r#"{"name": "test"}"#;
+        let profile: SavedProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.name, "test");
+    }
+}
+
