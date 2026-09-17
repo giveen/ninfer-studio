@@ -6,7 +6,6 @@ import type { AppSettings, EngineProfile, SavedProfile, StatusPayload } from '..
 import { formatBytes, formatMs, formatRate, formatTime, formatUptime } from '../lib/format';
 import { baseName } from '../lib/coderStore';
 import {
-  isLiveMetricsStale,
   useLatestRequestMetrics,
 } from '../lib/liveMetrics';
 import { Badge, Button, CodeBlock, SectionCard, Stat, TabNav, cn } from '../components/ui';
@@ -91,7 +90,6 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
   // Live token metrics from the most recent chat request (lifted from the SSE
   // `timings`/`usage` so they show here, not just in the chat footer).
   const liveMetrics = useLatestRequestMetrics();
-  const isStale = isLiveMetricsStale(liveMetrics);
 
   const running = engine?.state === 'running' || engine?.state === 'external';
   const starting = engine?.state === 'starting' || engine?.state === 'stopping';
@@ -415,10 +413,10 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
 
         {/* live token metrics from the most recent chat request */}
         {liveMetrics?.meta && (
-          <div className={cn("rounded-lg border border-line bg-inset px-3.5 py-3 transition-opacity", isStale && "opacity-60")}>
+          <div className="rounded-lg border border-line bg-inset px-3.5 py-3">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-[11px] font-medium uppercase tracking-wider text-faint">
-                last request metrics {isStale && <span className="normal-case font-normal text-warn/80 ml-1">(stale)</span>}
+                last request metrics
               </span>
               <span className="font-mono text-[10.5px] text-faint">{liveMetrics.model} · {formatTime(liveMetrics.at)}</span>
             </div>
