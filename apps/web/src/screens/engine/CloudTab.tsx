@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles } from 'lucide-react';
-import { Button, Field, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
+import { Cloud, RefreshCw, Zap, CheckCircle2, XCircle, Sliders, ShieldAlert, Sparkles, Check } from 'lucide-react';
+import { Button, Field, SectionCard, TextField, Toggle } from '../../components/ui';
 import type { AppSettings } from '../../lib/types';
 import { testCloudConnection, type CloudTestResult, type CloudModelInfo } from '../../lib/api';
 
@@ -84,6 +84,18 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
   const [retrieveNotice, setRetrieveNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [testResult, setTestResult] = useState<CloudTestResult | null>(null);
   const [showHeaders, setShowHeaders] = useState(false);
+
+  const currentPrimary = settings?.cloudProviderPrimaryModel || settings?.cloudProviderDefaultModel || 'gpt-4o';
+  const currentSubagent = settings?.cloudProviderSubagentModel || settings?.cloudProviderDefaultModel || 'gpt-4o-mini';
+
+  const [primaryDraft, setPrimaryDraft] = useState(currentPrimary);
+  const [subagentDraft, setSubagentDraft] = useState(currentSubagent);
+  const [modelsSavedNotice, setModelsSavedNotice] = useState(false);
+
+  useEffect(() => {
+    setPrimaryDraft(currentPrimary);
+    setSubagentDraft(currentSubagent);
+  }, [currentPrimary, currentSubagent]);
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPatchRef = useRef<Partial<AppSettings> | null>(null);
@@ -214,11 +226,19 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
     }
   };
 
-  const primaryModel = settings.cloudProviderPrimaryModel || settings.cloudProviderDefaultModel || 'gpt-4o';
-  const subagentModel = settings.cloudProviderSubagentModel || settings.cloudProviderDefaultModel || 'gpt-4o-mini';
+  const isModelDirty = primaryDraft !== currentPrimary || subagentDraft !== currentSubagent;
 
-  const combinedList = Array.from(new Set([...models, primaryModel, subagentModel, ...COMMON_MODEL_FALLBACK].filter(Boolean)));
-  const modelOptions = combinedList.map((m) => ({ value: m, label: m }));
+  const handleSaveModels = () => {
+    onUpdate({
+      cloudProviderPrimaryModel: primaryDraft,
+      cloudProviderSubagentModel: subagentDraft,
+      cloudProviderDefaultModel: primaryDraft,
+    });
+    setModelsSavedNotice(true);
+    setTimeout(() => setModelsSavedNotice(false), 2000);
+  };
+
+  const combinedList = Array.from(new Set([...models, primaryDraft, subagentDraft, currentPrimary, currentSubagent, ...COMMON_MODEL_FALLBACK].filter(Boolean)));
 
   return (
     <div className="space-y-4">
@@ -345,16 +365,28 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                       Assign distinct models for your Main Agent (reasoning/coding) vs. Subagent Workers (speed/cost).
                     </p>
                   </div>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={handleRetrieveModels}
-                    disabled={retrieving}
-                    className="border border-line/60 self-start sm:self-auto shrink-0"
-                  >
-                    <RefreshCw size={13} className={retrieving ? 'animate-spin' : ''} />
-                    {retrieving ? 'Retrieving…' : 'Retrieve Models'}
-                  </Button>
+                  <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                    <Button
+                      size="sm"
+                      variant={isModelDirty ? 'primary' : 'ghost'}
+                      onClick={handleSaveModels}
+                      disabled={!isModelDirty && !modelsSavedNotice}
+                      className="border border-line/60"
+                    >
+                      <Check size={13} className={modelsSavedNotice ? 'text-ok' : ''} />
+                      {modelsSavedNotice ? 'Saved!' : 'Save Models'}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleRetrieveModels}
+                      disabled={retrieving}
+                      className="border border-line/60"
+                    >
+                      <RefreshCw size={13} className={retrieving ? 'animate-spin' : ''} />
+                      {retrieving ? 'Retrieving…' : 'Retrieve Models'}
+                    </Button>
+                  </div>
                 </div>
 
                 {retrieveNotice && (
@@ -368,41 +400,42 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 )}
 
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                  <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active.">
+                  <Field label="Main Agent Cloud Model" hint="Used for primary agent turns when cloud is active. Select from dropdown or type a custom model identifier.">
                     <div className="space-y-1.5">
-                      <SelectField
-                        value={primaryModel}
-                        onChange={(v) => onUpdate({ cloudProviderPrimaryModel: v, cloudProviderDefaultModel: v })}
-                        options={modelOptions}
+                      <input
+                        list="main-agent-cloud-models"
+                        value={primaryDraft}
+                        onChange={(e) => setPrimaryDraft(e.target.value)}
+                        placeholder="Select or type model identifier..."
+                        className="h-8.5 w-full rounded-lg border border-line bg-inset px-2.5 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
                       />
-                      <TextField
-                        value={settings.cloudProviderPrimaryModel || ''}
-                        onChange={(v) => debouncedOnUpdate({ cloudProviderPrimaryModel: v })}
-                        placeholder="Custom model name..."
-                        className="text-[12px]"
-                      />
-                      {modelInfoCaption(primaryModel) && (
-                        <p className="text-[11px] text-faint">{modelInfoCaption(primaryModel)}</p>
+                      <datalist id="main-agent-cloud-models">
+                        {combinedList.map((m) => (
+                          <option key={m} value={m} />
+                        ))}
+                      </datalist>
+                      {modelInfoCaption(primaryDraft) && (
+                        <p className="text-[11px] text-faint">{modelInfoCaption(primaryDraft)}</p>
                       )}
                     </div>
                   </Field>
 
-                  <Field label="Subagent Cloud Model" hint="Used for Scout probes, background workers, and Critic passes.">
+                  <Field label="Subagent Cloud Model" hint="Used for Scout probes, background workers, and Critic passes. Select from dropdown or type a custom model identifier.">
                     <div className="space-y-1.5">
-                      <SelectField
-                        value={subagentModel}
-                        onChange={(v) => onUpdate({ cloudProviderSubagentModel: v })}
-                        options={modelOptions}
+                      <input
+                        list="subagent-cloud-models"
+                        value={subagentDraft}
+                        onChange={(e) => setSubagentDraft(e.target.value)}
+                        placeholder="Select or type model identifier..."
+                        className="h-8.5 w-full rounded-lg border border-line bg-inset px-2.5 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
                       />
-                      <TextField
-                        value={settings.cloudProviderSubagentModel || ''}
-                        onChange={(v) => debouncedOnUpdate({ cloudProviderSubagentModel: v })}
-                        placeholder="Custom model name..."
-                        className="text-[12px]"
-                      />
-
-                      {modelInfoCaption(subagentModel) && (
-                        <p className="text-[11px] text-faint">{modelInfoCaption(subagentModel)}</p>
+                      <datalist id="subagent-cloud-models">
+                        {combinedList.map((m) => (
+                          <option key={m} value={m} />
+                        ))}
+                      </datalist>
+                      {modelInfoCaption(subagentDraft) && (
+                        <p className="text-[11px] text-faint">{modelInfoCaption(subagentDraft)}</p>
                       )}
                     </div>
                   </Field>
