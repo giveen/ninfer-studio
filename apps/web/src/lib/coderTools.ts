@@ -412,7 +412,7 @@ export const TOOLS = [
           text: { type: "string", description: "One concise, self-contained learning (imperative, e.g. 'Run `pnpm test` (not npm) — this repo uses pnpm.')." },
           kind: { type: "string", enum: ["success", "tip", "avoid"], description: "success = a working approach/fix; tip = a convention/fact/command; avoid = a mistake or anti-pattern." }
         },
-        required: ["component", "scope", "target_key", "value", "text", "kind"]
+        required: ["text"]
       }
     }
   },
@@ -438,7 +438,7 @@ export type PermTier = 'allow' | 'ask' | 'deny';
 export interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; approvedCommands?: string[]; }
 export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
-export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
+export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'git_pr', 'memory_update', 'subagent']);
 
 import type { AppSettings } from './types';
 export function filterToolsByConfig(tools: any[], config: any): any[] {

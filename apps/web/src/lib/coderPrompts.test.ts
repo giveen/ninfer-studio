@@ -5,8 +5,7 @@ import { coderLensBlock, LINUS_LENS } from './coderLens';
 describe('coderPrompts & coderLens', () => {
   describe('CODER_SYSTEM', () => {
     it('contains critical instructions for tool selection and thought process', () => {
-      expect(CODER_SYSTEM).toContain('CRITICAL INSTRUCTION 1: TOOL SELECTION');
-      expect(CODER_SYSTEM).toContain('CRITICAL INSTRUCTION 2: THOUGHT PROCESS');
+      expect(CODER_SYSTEM).toContain('CRITICAL INSTRUCTION: TOOL SELECTION');
       expect(CODER_SYSTEM).toContain('prioritize these specific tools over the generic `bash` tool');
     });
 

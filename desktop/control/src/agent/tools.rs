@@ -56,6 +56,8 @@ const CODER_TOOLS: &[&str] = &[
     "obs_recall",
     "delegate",
     "subagent",
+    "ask_user",
+    "todo_write",
 ];
 const CHAT_TOOLS: &[&str] = &[
     "read",
@@ -313,7 +315,7 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
             // the end of the text — both char boundaries.
             let next = if end < text.len() { Some(end) } else { None };
             let chunk = &text[offset..end];
-            return json!({ "text": chunk, "nextOffset": next, "eof": next.is_none() });
+            return json!({ "text": chunk, "nextOffset": next, "next_offset": next, "eof": next.is_none() });
         }
         "delegate" => return delegate(state, run, args).await,
         "subagent" => return subagent(state, run, args).await,
@@ -392,7 +394,6 @@ pub async fn dispatch(state: &S, run: &Arc<RunShared>, name: &str, args: &Value)
                     kind_ok && (text.contains(&query) || task.contains(&query))
                 })
                 .collect();
-            // Most recent last (the client reverses the tail slice).
             matches.truncate(limit);
             matches.reverse();
             return json!({ "matches": matches });
