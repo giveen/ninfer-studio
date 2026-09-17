@@ -5,28 +5,77 @@ use super::launch::{ENGINE_START_TIMEOUT_MS, start_timeout_message};
 use super::log::log_path_for;
 use crate::types::{AppEvent, EngineInner, EngineState, State, now_ms};
 
+/// Emit desktop shell events (tray state + OS notifications) when state changes.
+pub fn update_engine_state_and_emit(eng: &mut EngineInner, state: &State, new_state: EngineState) {
+    let prev = eng.state;
+    eng.state = new_state;
+    if prev != new_state {
+        match new_state {
+            EngineState::Running => {
+                let model = eng.model_id.clone();
+                let port = eng.port.unwrap_or(8080);
+                state.emit(AppEvent::EngineReady { model, port });
+            }
+            EngineState::Failed => {
+                let reason = eng.fail_reason.clone();
+                state.emit(AppEvent::EngineFailed { reason });
+            }
+            EngineState::Stopped => {
+                state.emit(AppEvent::EngineStopped);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Reconcile in-memory state with reality (health, child liveness, external adoption).
+/// Gathers health and process discovery facts outside of the engine write lock.
 pub async fn refresh_engine_status(state: &State) {
-    // Liveness of a Studio-spawned child: the slot is occupied while the process
-    // is alive (the reaper only clears it on actual exit). Treat a briefly-busy
-    // lock as "alive" so a refresh racing the reaper's poll never flips the
-    // engine to failed/external.
     let has_child = match state.child.try_lock() {
         Ok(g) => g.is_some(),
         Err(_) => true,
     };
+
+    let (prev_state, port_opt, has_model) = {
+        let eng = state.engine.read().await;
+        (eng.state, eng.port, eng.model_id.is_some())
+    };
+
+    let cfg_port = state.config.read().await.engine_port;
+    let port = port_opt.unwrap_or(cfg_port);
+
+    // 1) Probe health outside engine write lock
+    let is_healthy = engine_health(state, port).await;
+    let is_cfg_healthy = if port != cfg_port {
+        engine_health(state, cfg_port).await
+    } else {
+        is_healthy
+    };
+
+    // 2) Gather discovery & model info outside engine write lock if healthy
+    let (disc_engines, model_info) = if is_healthy || is_cfg_healthy {
+        let all = discover_engines().await;
+        let info = if !has_model {
+            engine_model_info(state, if is_healthy { port } else { cfg_port }).await
+        } else {
+            (None, None)
+        };
+        (Some(all), info)
+    } else {
+        (None, (None, None))
+    };
+
+    // 3) Apply state transitions atomically under lock (< 1ms lock duration)
     let mut eng = state.engine.write().await;
-    let prev_state = eng.state;
 
     if has_child {
-        if let Some(port) = eng.port {
-            if engine_health(state, port).await {
+        if let Some(_port) = eng.port {
+            if is_healthy {
                 if eng.state != EngineState::Running {
-                    eng.state = EngineState::Running;
-                    if eng.model_id.is_none() {
-                        let (mid, mctx) = engine_model_info(state, port).await;
-                        eng.assign_model_info(mid, mctx);
-                    }
+                    update_engine_state_and_emit(&mut eng, state, EngineState::Running);
+                }
+                if eng.model_id.is_none() {
+                    eng.assign_model_info(model_info.0.clone(), model_info.1);
                 }
             } else if eng.state == EngineState::Starting && eng.deadline.is_none() {
                 eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
@@ -34,68 +83,66 @@ pub async fn refresh_engine_status(state: &State) {
         }
     } else if eng.state == EngineState::Starting || eng.state == EngineState::Running {
         eng.mark_exited();
+        state.emit(AppEvent::EngineStopped);
     }
 
     if eng.state == EngineState::Starting
         && let Some(deadline) = eng.deadline
         && now_ms() > deadline
     {
-        eng.mark_failed(start_timeout_message());
+        let msg = start_timeout_message();
+        eng.mark_failed(msg.clone());
+        state.emit(AppEvent::EngineFailed { reason: Some(msg) });
     }
 
     if eng.state == EngineState::Stopped {
-        if let Some(port) = eng.port
-            && engine_health(state, port).await
-        {
-            adopt_external(&mut eng, state, port).await;
+        if let Some(port) = eng.port {
+            if is_healthy {
+                if let Some(ref all) = disc_engines {
+                    apply_adopt_external(&mut eng, &state.data_dir, port, all, cfg_port, model_info.clone());
+                    update_engine_state_and_emit(&mut eng, state, EngineState::Running);
+                }
+            }
         }
     } else if eng.state == EngineState::Failed && !has_child {
-        // a failed spawn must not mask a live engine: if the spawn targeted a
-        // non-configured port and the configured port serves, restore its view
-        let cfg_port = state.config.read().await.engine_port;
-        let port = if eng.port != Some(cfg_port) && engine_health(state, cfg_port).await {
+        let adopt_port = if port != cfg_port && is_cfg_healthy {
             Some(cfg_port)
+        } else if is_healthy {
+            Some(port)
         } else {
-            eng.port
+            None
         };
-        if let Some(port) = port
-            && engine_health(state, port).await
-        {
-            adopt_external(&mut eng, state, port).await;
+        if let Some(ap) = adopt_port {
+            if let Some(ref all) = disc_engines {
+                apply_adopt_external(&mut eng, &state.data_dir, ap, all, cfg_port, model_info.clone());
+                update_engine_state_and_emit(&mut eng, state, EngineState::Running);
+            }
         }
-    } else if eng.state == EngineState::External
-        && let Some(port) = eng.port
-    {
-        if engine_health(state, port).await {
-            // keep pid fresh (the external process may restart) — same-port
-            // policy as adoption, never a cross-port pid.
-            let all = discover_engines().await;
-            let cfg_port = state.config.read().await.engine_port;
-            if let Some(p) = resolve_external_pid(&all, Some(port), cfg_port) {
-                eng.pid = Some(p);
+    } else if eng.state == EngineState::External && let Some(port) = eng.port {
+        if is_healthy {
+            if let Some(ref all) = disc_engines {
+                eng.pid = resolve_external_pid(all, Some(port), cfg_port);
             }
             if eng.model_id.is_none() {
-                let (mid, mctx) = engine_model_info(state, port).await;
-                eng.assign_model_info(mid, mctx);
+                eng.assign_model_info(model_info.0, model_info.1);
             }
         } else {
             eng.reset_stopped();
             eng.argv = None;
+            state.emit(AppEvent::EngineStopped);
         }
     }
 
-    // Edge-triggered desktop-shell events (tray state + OS notifications).
     let new_state = eng.state;
-    drop(eng);
     if new_state != prev_state {
         match new_state {
             EngineState::Running => {
-                let model = state.engine.read().await.model_id.clone();
-                let port = state.config.read().await.engine_port;
+                let model = eng.model_id.clone();
+                let port = eng.port.unwrap_or(8080);
                 state.emit(AppEvent::EngineReady { model, port });
             }
             EngineState::Failed => {
-                let reason = state.engine.read().await.fail_reason.clone();
+                let reason = eng.fail_reason.clone();
                 state.emit(AppEvent::EngineFailed { reason });
             }
             EngineState::Stopped => {
@@ -129,6 +176,32 @@ pub fn resolve_external_pid(
         })
 }
 
+/// Pure in-memory external engine adoption helper.
+pub fn apply_adopt_external(
+    eng: &mut EngineInner,
+    data_dir: &std::path::Path,
+    port: u16,
+    all: &[DiscoveredEngine],
+    cfg_port: u16,
+    model_info: (Option<String>, Option<u64>),
+) {
+    let disc = all.iter().find(|d| d.port == Some(port));
+    eng.state = EngineState::External;
+    eng.adopted = true;
+    eng.port = Some(port);
+    eng.pid = resolve_external_pid(all, Some(port), cfg_port);
+    eng.argv = disc.map(|d| d.argv.clone());
+    eng.artifact = disc
+        .and_then(|d| d.artifact.clone())
+        .or_else(|| eng.artifact.clone());
+    if model_info.0.is_some() || model_info.1.is_some() {
+        eng.assign_model_info(model_info.0, model_info.1);
+    }
+    eng.deadline = None;
+    eng.fail_reason = None;
+    eng.log_path = Some(log_path_for(data_dir, port));
+}
+
 /// The single adopt-external-engine path, used by boot/refresh (stopped or
 /// failed state with a live port) and by start (port already serving).
 /// Records the discovered pid/argv/artifact for `port`, probes model info,
@@ -136,25 +209,13 @@ pub fn resolve_external_pid(
 pub async fn adopt_external(eng: &mut EngineInner, state: &State, port: u16) {
     let all = discover_engines().await;
     let cfg_port = state.config.read().await.engine_port;
-    let disc = all.iter().find(|d| d.port == Some(port));
-    eng.state = EngineState::External;
-    eng.adopted = true;
-    eng.port = Some(port);
-    eng.pid = resolve_external_pid(&all, Some(port), cfg_port);
-    eng.argv = disc.map(|d| d.argv.clone());
-    eng.artifact = eng
-        .artifact
-        .clone()
-        .or_else(|| disc.and_then(|d| d.artifact.clone()));
-    let (mid, mctx) = engine_model_info(state, port).await;
-    eng.assign_model_info(mid, mctx);
-    eng.fail_reason = None;
-    eng.log_path = Some(log_path_for(&state.data_dir, port));
+    let model_info = engine_model_info(state, port).await;
+    apply_adopt_external(eng, &state.data_dir, port, &all, cfg_port, model_info);
 }
 
 #[cfg(test)]
 mod adopt_policy_tests {
-    use super::{DiscoveredEngine, resolve_external_pid};
+    use super::*;
 
     fn disc(pid: u32, port: Option<u16>) -> DiscoveredEngine {
         DiscoveredEngine {
@@ -168,30 +229,46 @@ mod adopt_policy_tests {
 
     #[test]
     fn same_port_wins_and_cross_port_is_never_picked() {
-        // Two engines on two ports: adopting/stopping 8080 must resolve 111,
-        // never 222 — the old start_engine copy fell back to first().
         let all = vec![disc(111, Some(8080)), disc(222, Some(9091))];
         assert_eq!(resolve_external_pid(&all, Some(8080), 8080), Some(111));
         assert_eq!(resolve_external_pid(&all, Some(9091), 8080), Some(222));
-        // Unknown port with a foreign engine present: no fallback.
         assert_eq!(resolve_external_pid(&all, Some(1234), 8080), None);
     }
 
     #[test]
     fn portless_fallback_only_on_the_configured_port() {
         let all = vec![disc(111, Some(9091)), disc(333, None)];
-        // Default port, listener unattributable: portless pid is usable.
         assert_eq!(resolve_external_pid(&all, Some(8080), 8080), Some(333));
-        // Non-default port: the portless process must not be claimed.
         assert_eq!(resolve_external_pid(&all, Some(1234), 8080), None);
-        // Exact match beats the portless fallback even on the default port.
         let both = vec![disc(111, Some(8080)), disc(333, None)];
         assert_eq!(resolve_external_pid(&both, Some(8080), 8080), Some(111));
     }
 
     #[test]
+    fn apply_adopt_external_updates_in_memory_state() {
+        let mut eng = EngineInner::default();
+        let data_dir = std::path::Path::new("/tmp/test-data");
+        let all = vec![disc(1234, Some(8080))];
+        apply_adopt_external(
+            &mut eng,
+            data_dir,
+            8080,
+            &all,
+            8080,
+            (Some("qwen2.5".to_string()), Some(32768)),
+        );
+        assert_eq!(eng.state, EngineState::External);
+        assert!(eng.adopted);
+        assert_eq!(eng.pid, Some(1234));
+        assert_eq!(eng.port, Some(8080));
+        assert_eq!(eng.model_id, Some("qwen2.5".to_string()));
+        assert_eq!(eng.max_context, Some(32768));
+        assert!(eng.fail_reason.is_none());
+        assert!(eng.deadline.is_none());
+    }
+
+    #[test]
     fn engine_state_wire_format_keeps_lowercase_strings() {
-        // P0-3: the enum must serialize to exactly what the web UI matches on.
         let s = serde_json::to_value(crate::types::EngineState::External).unwrap();
         assert_eq!(s, serde_json::Value::String("external".into()));
         for (state, wire) in [
