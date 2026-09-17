@@ -75,6 +75,7 @@ pub async fn start(state: S, port: u16) -> std::io::Result<()> {
 pub async fn stop(state: &S) {
     if let Some(handle) = state.remote.lock().await.take() {
         handle.abort();
+        let _ = handle.await;
         tracing::event!(name: "remote_access.stopped", tracing::Level::INFO, "remote access listener stopped");
     }
 }
@@ -107,21 +108,46 @@ pub(crate) async fn post_start(
     req: Request<axum::body::Body>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let body = crate::read_json(req).await?;
-    let port = body
+    let raw_port = body
         .get("port")
-        .and_then(|v| v.as_u64())
+        .and_then(|v| v.as_u64());
+
+    if let Some(p) = raw_port {
+        if p == 0 || p > 65535 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid port {p}: must be between 1 and 65535"),
+            ));
+        }
+    }
+
+    let port = raw_port
         .map(|v| v as u16)
         .unwrap_or(state.config.read().await.remote_access_port);
+
+    if port == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid port 0: must be between 1 and 65535".to_string(),
+        ));
+    }
+
     start(state.clone(), port).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not bind 0.0.0.0:{port}: {e}"),
         )
     })?;
+
     let mut cfg = state.config.read().await.clone();
     cfg.remote_access_enabled = true;
     cfg.remote_access_port = port;
-    persist_config(&state, &cfg).await?;
+
+    if let Err(e) = persist_config(&state, &cfg).await {
+        stop(&state).await;
+        return Err(e);
+    }
+
     Ok(Json(status_json(&state).await))
 }
 
@@ -133,4 +159,14 @@ pub(crate) async fn post_stop(
     cfg.remote_access_enabled = false;
     persist_config(&state, &cfg).await?;
     Ok(Json(status_json(&state).await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_lan_ip_does_not_panic() {
+        let _ = detect_lan_ip();
+    }
 }
