@@ -80,21 +80,43 @@ describe('coderTools', () => {
       expect(isReadOnlyCommand('git status')).toBe(true);
       expect(isReadOnlyCommand('git log -n 5')).toBe(true);
       expect(isReadOnlyCommand('git diff')).toBe(true);
+      expect(isReadOnlyCommand('/bin/ls -la')).toBe(true);
+      expect(isReadOnlyCommand('/usr/bin/cat file')).toBe(true);
     });
 
     it('rejects mutating or dangerous commands', () => {
       expect(isReadOnlyCommand('rm -rf /tmp/foo')).toBe(false);
       expect(isReadOnlyCommand('git commit -m "feat"')).toBe(false);
       expect(isReadOnlyCommand('pnpm build')).toBe(false);
+      expect(isReadOnlyCommand('git branch -D feature')).toBe(false);
+      expect(isReadOnlyCommand('git tag -a v1.0')).toBe(false);
+      expect(isReadOnlyCommand('git remote add origin url')).toBe(false);
     });
 
-    it('rejects shell chaining, piping, redirection, or subshells', () => {
+    it('rejects shell chaining, piping, redirection, subshells, or newlines', () => {
       expect(isReadOnlyCommand('cat foo > bar')).toBe(false);
       expect(isReadOnlyCommand('ls | grep ts')).toBe(false);
       expect(isReadOnlyCommand('ls; rm -rf /')).toBe(false);
       expect(isReadOnlyCommand('echo $(whoami)')).toBe(false);
       expect(isReadOnlyCommand('echo `whoami`')).toBe(false);
       expect(isReadOnlyCommand('ls && rm -rf /')).toBe(false);
+      expect(isReadOnlyCommand('ls\nrm -rf .')).toBe(false);
+      expect(isReadOnlyCommand('cat file\r\nrm -rf .')).toBe(false);
+    });
+
+    it('rejects write or exec flags on allow-listed commands', () => {
+      expect(isReadOnlyCommand('find . -delete')).toBe(false);
+      expect(isReadOnlyCommand('find . -exec rm {} +')).toBe(false);
+      expect(isReadOnlyCommand('find . -execdir rm {} ;')).toBe(false);
+      expect(isReadOnlyCommand('find . -ok rm {} ;')).toBe(false);
+      expect(isReadOnlyCommand('fd foo -x rm')).toBe(false);
+      expect(isReadOnlyCommand('fd foo --exec-batch rm')).toBe(false);
+      expect(isReadOnlyCommand('rg foo --pre ./script')).toBe(false);
+      expect(isReadOnlyCommand('sort input.txt -o output.txt')).toBe(false);
+      expect(isReadOnlyCommand('sort input.txt --output=output.txt')).toBe(false);
+      expect(isReadOnlyCommand('uniq input.txt')).toBe(true);
+      expect(isReadOnlyCommand('uniq input.txt output.txt')).toBe(false);
+      expect(isReadOnlyCommand('git diff --output=patch.diff')).toBe(false);
     });
   });
 

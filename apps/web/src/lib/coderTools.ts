@@ -476,19 +476,35 @@ export function filterToolAllowList(raw: unknown, allowed: Set<string>): string[
 
 /** Binaries bash may run in plan mode (inspection only). */
 const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
-/** Read-only git subcommands allowed in plan mode. */
-const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'tag', 'remote', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
+/** Read-only git subcommands allowed in plan mode.
+ *  Note: branch, tag, and remote are omitted because they write/mutate state
+ *  when passed flags or arguments. */
+const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
 
 /** True when a bash command is pure inspection (plan mode). Conservative:
  *  rejects shell composition (redirection, pipes, chaining, substitution)
- *  outright, then allow-lists the first word — and for git, the subcommand. */
+ *  and newlines outright, then allow-lists the first word — and for git, the subcommand. */
 export function isReadOnlyCommand(cmd: string): boolean {
   if (!cmd) return false;
-  if (/[>|;&`]|\$\(/.test(cmd)) return false;
-  const words = cmd.split(/\s+/).filter(Boolean);
-  const first = words[0].replace(/^.*\//, '');
-  if (first === 'git') return words.length >= 2 && READONLY_GIT.has(words[1]);
-  return READONLY_BASH.has(first);
+  if (/[>|;&`\(\n\r]|\$\(/.test(cmd) || cmd.includes('\n') || cmd.includes('\r')) return false;
+  const words = cmd.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const first = words[0].replace(/^.*[/\\]/, '');
+  if (first === 'git') {
+    if (words.length < 2 || !READONLY_GIT.has(words[1])) return false;
+    if (words[1] === 'diff' && words.some((w) => w.startsWith('--output'))) return false;
+    return true;
+  }
+  if (!READONLY_BASH.has(first)) return false;
+  if (first === 'find' && words.some((w) => ['-delete', '-exec', '-execdir', '-ok', '-okdir'].includes(w))) return false;
+  if (first === 'fd' && words.some((w) => ['-x', '-X', '--exec', '--exec-batch'].includes(w))) return false;
+  if (first === 'rg' && words.some((w) => w.startsWith('--pre'))) return false;
+  if (first === 'sort' && words.some((w) => w === '-o' || w.startsWith('--output'))) return false;
+  if (first === 'uniq') {
+    const nonFlags = words.slice(1).filter((w) => !w.startsWith('-'));
+    if (nonFlags.length >= 2) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
