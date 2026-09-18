@@ -571,7 +571,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           params,
           tools,
           registry,
-          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
+          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 24,
           // The system prompt (capabilities block + memory + tool list) is
           // resent verbatim every turn — cheap to try caching it whenever
           // the turn is cloud-routed (baseUrl set); a provider that doesn't
@@ -719,9 +719,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       }
 
       if (loopStop === 'steps' && !ac.signal.aborted) {
+        const runMaxSteps = (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 24;
         patchTarget((m) => ({
           ...m,
-          content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
+          content: m.content + `\n\n[System: Tool execution limit reached after ${runMaxSteps} steps — the agent could not finish. Try a more specific request.]`,
           error: true,
         }));
       }
