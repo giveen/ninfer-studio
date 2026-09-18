@@ -31,10 +31,11 @@ import type { AgentToolCall, ChatAttachment, ChatMessage, ChatParams, Conversati
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud, checkComputerUsePerm } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, type McpToolInfo } from '../lib/api';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, coderRead, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderDiff, type McpToolInfo } from '../lib/api';
+import { readRecallChunk } from '../lib/observationPack';
 import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 
@@ -418,13 +419,14 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // Use) — de-duplicated by name, first entry wins, so the dedicated
       // toggles come before Computer Use and their schema is what the model
       // actually gets when both are on.
-      const computerUseOn = computerUseEnabled && !!computerUseDirRef.current;
+      const effectiveComputerUseDir = computerUseDirRef.current || '/tmp';
+      const computerUseOn = computerUseEnabled;
       // De-duplicated by name, first entry wins — agentResearch/memoryEnabled
       // come before Computer Use.
       const tools = dedupeTools([
         ...CHAT_TOOLS,
-        ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
-        ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
+        ...(agentResearch && browserTier !== 'deny' ? [CHAT_BROWSER_TOOL] : []),
+        ...(memoryEnabled && memoryToolTier !== 'deny' ? [CHAT_MEMORY_TOOL] : []),
         ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, effectiveAppConfig) : []),
         // MCP tools ride on Computer Use — they're external, potentially
         // mutating actions, so they never ship without its permission gate.
@@ -443,19 +445,29 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
       const registry: ToolRegistry = {
         web_search: async (args, sig) => {
-          const res = await coderWebSearch(String(args.query || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderWebSearch(String(args.query || ''), sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         web_fetch: async (args, sig) => {
-          const res = await coderWebFetch(String(args.url || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderWebFetch(String(args.url || ''), sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         browser: async (args, sig) => {
+          if (browserTier === 'deny') return JSON.stringify({ error: 'Tool browser is denied by Agent Mode settings.' });
+          if (browserTier === 'ask') {
+            const ok = await requestApproval('browser', JSON.stringify(args));
+            if (!ok) return JSON.stringify({ error: 'User denied permission to run browser.' });
+          }
           const action = String(args.action || 'open');
-          const res = await coderBrowser(action, args as Record<string, string | number>, sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderBrowser(action, args as Record<string, string | number>, sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         memory_update: async (args) => {
+          if (memoryToolTier === 'deny') return JSON.stringify({ error: 'Tool memory_update is denied by settings.' });
+          if (memoryToolTier === 'ask') {
+            const ok = await requestApproval('memory_update', JSON.stringify(args));
+            if (!ok) return JSON.stringify({ error: 'User denied permission to run memory_update.' });
+          }
           const res = await coderMemoryAddLearning({ text: String(args.text || ''), kind: (String(args.kind || 'tip')) as any });
           if (memoryEnabled) await loadMemory();
           return JSON.stringify({ ok: true, learnings: res?.learnings?.length ?? 1 });
@@ -469,24 +481,77 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         set_directory: async (args) => {
           const p = String(args.path || '').trim();
           if (p) setComputerUseDir(p);
-          return JSON.stringify({ ok: true, scope: p });
+          return JSON.stringify({ ok: true, scope: p || effectiveComputerUseDir });
         },
       };
 
-      if (computerUseOn && mcpToolsRef.current.length > 0) {
-        for (const t of mcpToolsRef.current) {
-          const tier = mcpToolTier(computerUsePerms, t.name);
-          if (tier !== 'deny') {
-            registry[`mcp__${t.name}`] = async (args, sig) => {
-              const scope = computerUseDirRef.current || undefined;
-              let approvalToken: string | undefined;
-              if (tier === 'ask' && scope) {
-                const app = await coderPermsApprove(`mcp__${t.name}`, undefined, scope).catch(() => null);
-                if (app?.token) approvalToken = app.token;
-              }
-              const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope, approvalToken }, sig);
-              return JSON.stringify(res);
-            };
+      if (computerUseOn) {
+        const scope = effectiveComputerUseDir;
+
+        const execCuTool = async (name: string, args: Record<string, any>, fn: (tok?: string) => Promise<any>) => {
+          const permCheck = checkComputerUsePerm(computerUsePerms, name, args);
+          if (typeof permCheck === 'string' && permCheck !== 'ask') {
+            return JSON.stringify({ error: permCheck });
+          }
+          let approvalToken: string | undefined;
+          if (permCheck === 'ask') {
+            if (scope) {
+              const app = await coderPermsApprove(name, typeof args.path === 'string' ? args.path : undefined, scope).catch(() => null);
+              if (app?.token) approvalToken = app.token;
+            }
+            if (!approvalToken) {
+              const ok = await requestApproval(name, JSON.stringify(args));
+              if (!ok) return JSON.stringify({ error: `User denied permission to run ${name}.` });
+            }
+          }
+          try {
+            const res = await fn(approvalToken);
+            return typeof res === 'string' ? res : JSON.stringify(res);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return JSON.stringify({ error: msg });
+          }
+        };
+
+        registry.read = (args, sig) => execCuTool('read', args, (tok) => coderRead(String(args.path || ''), Number(args.offset || 0), Number(args.limit || 2000), sig, scope, tok));
+        registry.write = (args, sig) => execCuTool('write', args, (tok) => coderWrite(String(args.path || ''), String(args.content || ''), sig, scope, tok));
+        registry.edit = (args, sig) => execCuTool('edit', args, (tok) => coderEdit(String(args.path || ''), String(args.old_string || args.oldString || ''), String(args.new_string || args.newString || ''), false, sig, scope, tok));
+        registry.apply_patch = (args, sig) => execCuTool('apply_patch', args, (tok) => coderPatch(String(args.path || ''), (args.edits as any[]) || [], sig, scope, tok));
+        registry.udiff_edit = (args, sig) => execCuTool('udiff_edit', args, (tok) => coderEdit(String(args.path || ''), String(args.old_string || ''), String(args.new_string || ''), false, sig, scope, tok));
+        registry.bash = (args, sig) => execCuTool('bash', args, (tok) => coderExec(String(args.command || ''), undefined, Number(args.timeout || 30) * 1000, undefined, false, sig, scope, tok));
+        registry.bash_poll = (args, sig) => execCuTool('bash_poll', args, () => coderJob(String(args.job_id || args.jobId || ''), sig, scope));
+        registry.grep = (args, sig) => execCuTool('grep', args, (tok) => coderGrep(String(args.query || args.pattern || ''), String(args.path || ''), undefined, Boolean(args.ignore_case || args.ignoreCase), 0, Number(args.limit || 100), sig, scope, tok));
+        registry.glob = (args, sig) => execCuTool('glob', args, (tok) => coderGlob(String(args.pattern || '*'), String(args.path || ''), Number(args.offset || 0), Number(args.limit || 200), sig, scope, tok));
+        registry.ast_grep = (args, sig) => execCuTool('ast_grep', args, (tok) => coderGrep(String(args.pattern || args.query || ''), String(args.path || ''), undefined, false, 0, Number(args.limit || 100), sig, scope, tok));
+        registry.repo_search = (args, sig) => execCuTool('repo_search', args, () => coderSearch(String(args.query || ''), Number(args.limit || 15), sig, scope));
+        registry.git_diff = (args) => execCuTool('git_diff', args, () => coderDiff(scope));
+        registry.git_branch = (args, sig) => execCuTool('git_branch', args, async (tok) => {
+          const res = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 10_000, undefined, false, sig, scope, tok);
+          return { branches: parseBranchList(res.stdout || '') };
+        });
+        registry.git_commit = (args, sig) => execCuTool('git_commit', args, (tok) => coderExec(`git commit -m "${String(args.message || 'commit').replace(/"/g, '\\"')}"`, undefined, 30_000, undefined, false, sig, scope, tok));
+        registry.git_pr = (args, sig) => execCuTool('git_pr', args, (tok) => coderExec(`gh pr create --title "${String(args.title || 'PR').replace(/"/g, '\\"')}" --body "${String(args.body || '').replace(/"/g, '\\"')}"`, undefined, 30_000, undefined, false, sig, scope, tok));
+        registry.git_worktree = (args, sig) => execCuTool('git_worktree', args, (tok) => coderExec('git worktree list', undefined, 10_000, undefined, false, sig, scope, tok));
+        registry.obs_recall = (args) => execCuTool('obs_recall', args, () => readRecallChunk(String(args.chunk_id || args.chunkId || ''), Number(args.offset || 0)));
+        registry.todo_write = async () => JSON.stringify({ ok: true });
+        registry.ask_user = async () => JSON.stringify({ ok: true, note: "User received your prompt" });
+        registry.subagent = async () => JSON.stringify({ error: "Subagents are handled in the Coder harness" });
+        registry.delegate = async () => JSON.stringify({ error: "Subagents are handled in the Coder harness" });
+
+        if (mcpToolsRef.current.length > 0) {
+          for (const t of mcpToolsRef.current) {
+            const tier = mcpToolTier(computerUsePerms, t.name);
+            if (tier !== 'deny') {
+              registry[`mcp__${t.name}`] = async (args, sig) => {
+                let approvalToken: string | undefined;
+                if (tier === 'ask' && scope) {
+                  const app = await coderPermsApprove(`mcp__${t.name}`, undefined, scope).catch(() => null);
+                  if (app?.token) approvalToken = app.token;
+                }
+                const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope, approvalToken }, sig);
+                return JSON.stringify(res);
+              };
+            }
           }
         }
       }
@@ -500,7 +565,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           extraHeaders,
           source: resolvedSource,
           allowFallback: runAllowFallback,
-          system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+          system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? effectiveComputerUseDir : undefined, tools.map((t) => t.function.name)),
           messages: seedMessages,
           params,
           tools,
@@ -573,7 +638,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                       baseUrl,
                       apiKey,
                       extraHeaders,
-                      system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+                      system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? effectiveComputerUseDir : undefined, tools.map((t) => t.function.name)),
                       history,
                       originalReply: content,
                       critique,
@@ -1145,6 +1210,18 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const visibleStart = windowingActive ? messages.length - RECENT_MESSAGE_WINDOW : 0;
   const hiddenMessageCount = visibleStart;
 
+  // The agent loop persists a per-turn "Context" note (date/time) into real
+  // history right before each turn's request (see contextNoteMessage in
+  // agentLoop.ts — persisted rather than discarded so the engine's KV cache
+  // keeps matching across turns). Because the user's placeholder assistant
+  // message is inserted before that note lands, the note ends up trailing
+  // the reply it was actually generated ahead of — so "last message in the
+  // array" is that inert note, not the assistant turn a viewer would call
+  // "last" (continue / follow-ups both anchor on isLast). Skip trailing
+  // auto-notes to find the last message that actually matters.
+  let lastRelevantIndex = messages.length - 1;
+  while (lastRelevantIndex >= 0 && messages[lastRelevantIndex].displayName === 'Context') lastRelevantIndex--;
+
   // Find-in-conversation: indices of messages whose content matches the
   // query, cycled through by findIndex. Message-level, not sub-string
   // highlighting — injecting <mark> into rendered markdown isn't worth the
@@ -1517,6 +1594,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
                   const i = visibleStart + sliceI;
+                  // The per-turn date/time note (see contextNoteMessage in
+                  // agentLoop.ts) is real history the model needs, but it's
+                  // not something the user said or asked to see — keep it
+                  // out of the transcript entirely rather than a collapsed row.
+                  if (m.displayName === 'Context') return null;
                   if (isCompactedMsg(m)) {
                     return (
                       <div id={`msg-${i}`} key={i}>
@@ -1524,7 +1606,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                           m={{ ...m, displayName: m.displayName || 'Compaction Summary', collapsed: true }}
                           convId={activeId ?? ''}
                           index={i}
-                          isLast={i === messages.length - 1}
+                          isLast={i === lastRelevantIndex}
                           streaming={false}
                           locked={streaming || compacting}
                           actions={msgActions}
@@ -1542,8 +1624,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                           m={m}
                           convId={activeId ?? ''}
                           index={i}
-                          isLast={i === messages.length - 1}
-                          streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
+                          isLast={i === lastRelevantIndex}
+                          streaming={streaming && streamingConvId === activeId && i === lastRelevantIndex}
                           locked={streaming || compacting}
                           actions={msgActions}
                           workspace={computerUseDir || undefined}

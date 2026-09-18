@@ -471,15 +471,25 @@ impl UsageAccumulator {
             return;
         }
         if let Ok(v) = serde_json::from_str::<Value>(payload) {
-            if let Some(m) = v.get("model").and_then(Value::as_str) {
+            if let Some(m) = v
+                .get("model")
+                .or_else(|| v.get("response").and_then(|r| r.get("model")))
+                .and_then(Value::as_str)
+            {
                 self.resp_model = Some(m.to_string());
             }
-            if let Some(u) = v.get("usage") {
+            let usage_val = v
+                .get("usage")
+                .or_else(|| v.get("response").and_then(|r| r.get("usage")));
+            if let Some(u) = usage_val {
                 if !u.is_null() {
                     self.usage_obj = Some(u.clone());
                 }
             }
-            if let Some(t) = v.get("timings") {
+            let timings_val = v
+                .get("timings")
+                .or_else(|| v.get("response").and_then(|r| r.get("timings")));
+            if let Some(t) = timings_val {
                 if !t.is_null() {
                     self.timings_obj = Some(t.clone());
                 }
@@ -662,15 +672,25 @@ async fn log_usage_from_parsed(
     if let Some(usage) = usage_obj {
         prompt_tokens = usage
             .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         completion_tokens = usage
             .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         cached_tokens = usage
             .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|d| d.get("cached_tokens").or_else(|| d.get("cache_read_input_tokens")))
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens").or_else(|| d.get("cache_read_input_tokens")))
+            })
+            .or_else(|| usage.get("cached_tokens"))
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .or_else(|| usage.get("prompt_cache_hit_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         found = true;
@@ -1192,5 +1212,85 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err_val["ok"], false);
     }
+
+    #[tokio::test]
+    async fn responses_api_streaming_usage_parsed_correctly() {
+        let state = temp_state();
+        let sse_event = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"model\":\"qwen3.8-27b\",\"usage\":{\"input_tokens\":11458,\"output_tokens\":34,\"input_tokens_details\":{\"cached_tokens\":10573}}}}\n\n";
+
+        let chunks = vec![Ok(Bytes::from(sse_event))];
+        let inner_stream = futures_util::stream::iter(chunks).boxed();
+        let tapped = wrap_for_usage_logging(
+            state.clone(),
+            Some("qwen3.8-27b".into()),
+            RequestSource::Local,
+            true,
+            Some(std::time::Instant::now()),
+            inner_stream,
+        );
+
+        let _collected: Vec<_> = tapped.collect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["promptTokens"], 11458);
+        assert_eq!(events[0]["completionTokens"], 34);
+        assert_eq!(events[0]["cachedTokens"], 10573);
+
+        let Json(stats) = usage_stats(
+            AxumState(state),
+            Query(UsageQuery {
+                days: Some(1),
+                source: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hit_rate = stats["totals"]["avgCacheHitRate"].as_f64().unwrap();
+        assert!((hit_rate - (10573.0 / 11458.0)).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_alternative_fields_parsed_correctly() {
+        let state = temp_state();
+
+        // 1. Anthropic style
+        let body1 = br#"{"usage":{"input_tokens":1000,"output_tokens":50,"cache_read_input_tokens":800}}"#;
+        log_from_response_bytes(
+            UsageLogCtx {
+                state: state.clone(),
+                model: Some("m1".into()),
+                source: RequestSource::Local,
+                streaming: false,
+            },
+            body1,
+            None,
+            None,
+        )
+        .await;
+
+        // 2. DeepSeek / top-level cached_tokens style
+        let body2 = br#"{"usage":{"prompt_tokens":500,"completion_tokens":20,"cached_tokens":400}}"#;
+        log_from_response_bytes(
+            UsageLogCtx {
+                state: state.clone(),
+                model: Some("m2".into()),
+                source: RequestSource::Local,
+                streaming: false,
+            },
+            body2,
+            None,
+            None,
+        )
+        .await;
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["cachedTokens"], 800);
+        assert_eq!(events[1]["cachedTokens"], 400);
+    }
 }
+
 

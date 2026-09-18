@@ -7,6 +7,7 @@ import { API_BASE, getJSON, postJSON, fetchStream, isAbortError } from './core';
 import type { CoderMemory, CoderLearningKind } from './coder';
 import { setLatestRequestMetrics } from '../liveMetrics';
 import { sanitizeMessagesForApi } from '../chatHelpers';
+import { getStatus } from './config';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
@@ -281,8 +282,13 @@ export async function streamChat(
       console.error('[streamChat] Request error response:', r.status, detail, text);
       if (opts?.baseUrl && opts?.allowFallback !== false && (r.status === 429 || r.status >= 500)) {
         cb.onReasoningDelta?.(`\n⚠️ *Cloud API error (${detail}). Falling back to local engine...*\n\n`);
-        const fallbackBody = { ...body, model: 'ninfer' };
-        return streamChat(fallbackBody, signal, cb, { allowFallback: false });
+        let localModel = 'ninfer';
+        try {
+          const s = await getStatus();
+          if (s?.engine?.modelId) localModel = s.engine.modelId;
+        } catch { /* ignore */ }
+        const fallbackBody = { ...body, model: localModel };
+        return streamChat(fallbackBody, signal, cb, { allowFallback: false, source: 'local' });
       }
       cb.onError?.(`engine request failed: ${detail}`);
       return;

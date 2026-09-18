@@ -356,13 +356,33 @@ export function CloudTab({ settings, onUpdate }: CloudTabProps) {
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                   <Toggle
                     checked={!!settings.cloudUseForPrimary}
-                    onChange={(v) => onUpdate({ cloudUseForPrimary: v })}
+                    onChange={(v) => {
+                      onUpdate({ cloudUseForPrimary: v });
+                      try {
+                        const raw = localStorage.getItem('ninfier.coder.params');
+                        if (raw) {
+                          const p = JSON.parse(raw);
+                          delete p.primaryProvider;
+                          localStorage.setItem('ninfier.coder.params', JSON.stringify(p));
+                        }
+                      } catch {}
+                    }}
                     label="Cloud as Main Agent"
                     hint="Automatically use cloud provider for primary chat and code agents."
                   />
                   <Toggle
                     checked={!!settings.cloudUseForSubagent}
-                    onChange={(v) => onUpdate({ cloudUseForSubagent: v })}
+                    onChange={(v) => {
+                      onUpdate({ cloudUseForSubagent: v });
+                      try {
+                        const raw = localStorage.getItem('ninfier.coder.params');
+                        if (raw) {
+                          const p = JSON.parse(raw);
+                          delete p.subagentProvider;
+                          localStorage.setItem('ninfier.coder.params', JSON.stringify(p));
+                        }
+                      } catch {}
+                    }}
                     label="Cloud as Subagent"
                     hint="Automatically use cloud provider for background subagent workers."
                   />

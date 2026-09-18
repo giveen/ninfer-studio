@@ -209,6 +209,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         // Clear legacy default provider overrides so global routing (Cloud Tab) is respected
         delete parsed.primaryProvider;
         delete parsed.subagentProvider;
+        try { localStorage.setItem(CODER_PARAMS_KEY, JSON.stringify(parsed)); } catch {}
         return { ...DEFAULT_CODER_PARAMS, ...parsed };
       }
     } catch { /* ignore */ }
@@ -1650,6 +1651,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
+      // The per-turn date/time note (see contextNoteMessage in agentLoop.ts)
+      // is real history the model needs, but it's not something the user
+      // said or asked to see — keep it out of the transcript entirely.
+      if (m.displayName === 'Context') { flushTrajectory(); continue; }
       if (isCompactedMsg(m)) {
         flushTrajectory();
         groups.push({ type: 'compact', items: [m] });

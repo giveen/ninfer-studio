@@ -101,7 +101,7 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
             )
         {
             if let Some(ref req_m) = model {
-                if primary.model_id.as_deref() == Some(req_m.as_str()) {
+                if req_m == "ninfer" || req_m == "default" || req_m.is_empty() || primary.model_id.as_deref() == Some(req_m.as_str()) {
                     wait_for_engine_ready(state, p).await?;
                     return Ok(p);
                 }
@@ -140,7 +140,13 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
         }
     }
     let port = if let Some(m) = model {
-        if let Some((p, _)) = cands
+        if m == "ninfer" || m == "default" || m.is_empty() {
+            if let Some((p, _)) = cands.first() {
+                *p
+            } else {
+                state.config.read().await.engine_port
+            }
+        } else if let Some((p, _)) = cands
             .iter()
             .find(|(_, cm)| cm.as_deref() == Some(m.as_str()))
         {
@@ -177,47 +183,52 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
 ///
 /// Returns the re-serialized body, or `None` if neither source applies / on any
 /// parse error.
-pub(crate) fn merge_default_request_params(
+/// Merge generic request parameters and map/sanitize reasoning_effort.
+///
+/// Local engines reject the top-level `reasoning_effort` parameter with
+/// "unknown parameter: reasoning_effort", so for local requests we strip
+/// `reasoning_effort` and map it to `enable_thinking`. For remote/cloud requests,
+/// we preserve `reasoning_effort`.
+pub(crate) fn sanitize_and_merge_request_params(
     body: &[u8],
     defaults_json: &str,
     reasoning_effort: &str,
+    is_local: bool,
 ) -> Option<Vec<u8>> {
-    let defaults_trimmed = defaults_json.trim();
-    let re_trimmed = reasoning_effort.trim();
-    if defaults_trimmed.is_empty() && re_trimmed.is_empty() {
-        return None;
-    }
     let mut body_val: serde_json::Value = serde_json::from_slice(body).ok()?;
     let serde_json::Value::Object(ref mut body_map) = body_val else {
         return None;
     };
 
     let client_had_re = body_map.contains_key("reasoning_effort");
+    let client_re = body_map.remove("reasoning_effort").and_then(|v| v.as_str().map(str::to_string));
 
     // 1. generic top-level defaults (client fields win)
+    let defaults_trimmed = defaults_json.trim();
     if !defaults_trimmed.is_empty() {
-        match serde_json::from_str::<serde_json::Value>(defaults_json) {
-            Ok(serde_json::Value::Object(defaults_map)) => {
-                for (k, v) in defaults_map {
-                    body_map.entry(k).or_insert(v);
-                }
-            }
-            Ok(_) => {
-                tracing::warn!("default_request_params is not a JSON object");
-            }
-            Err(e) => {
-                tracing::warn!("invalid default_request_params JSON: {e}");
+        if let Ok(serde_json::Value::Object(defaults_map)) = serde_json::from_str::<serde_json::Value>(defaults_trimmed) {
+            for (k, v) in defaults_map {
+                body_map.entry(k).or_insert(v);
             }
         }
     }
 
-    // 2. reasoning effort → map to enable_thinking for local engine; remove top-level reasoning_effort
-    //    which local engine rejects with "unknown parameter: reasoning_effort"
-    if !re_trimmed.is_empty() && !client_had_re {
-        let enable = re_trimmed != "none";
-        body_map.entry("enable_thinking".to_string()).or_insert(serde_json::Value::Bool(enable));
+    // 2. reasoning effort handling
+    if is_local {
+        // Local engine rejects top-level reasoning_effort: map to enable_thinking boolean
+        let effort_str = client_re.as_deref().or_else(|| {
+            let re_trimmed = reasoning_effort.trim();
+            if !re_trimmed.is_empty() && !client_had_re { Some(re_trimmed) } else { None }
+        });
+        if let Some(e) = effort_str {
+            let enable = e != "none";
+            body_map.entry("enable_thinking".to_string()).or_insert(serde_json::Value::Bool(enable));
+        }
+        body_map.remove("reasoning_effort");
+    } else if let Some(e) = client_re {
+        // Cloud target: keep/restore reasoning_effort for models that support it
+        body_map.insert("reasoning_effort".to_string(), serde_json::Value::String(e));
     }
-    body_map.remove("reasoning_effort");
 
     serde_json::to_vec(&body_val).ok()
 }
@@ -259,8 +270,9 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         let c = state.config.read().await;
         (c.default_request_params.clone(), c.reasoning_effort.clone())
     };
+    let is_local_target = matches!(source, RequestSource::Local);
     let body_bytes: Bytes =
-        match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
+        match sanitize_and_merge_request_params(&body_bytes, &defaults_json, &reasoning_effort, is_local_target) {
             Some(v) => v.into(),
             None => body_bytes,
         };
@@ -457,14 +469,14 @@ mod tests {
         let body = br#"{"model":"llama3","temperature":0.7}"#;
 
         // Dedicated reasoning_effort sets enable_thinking and strips top-level reasoning_effort
-        let res = merge_default_request_params(body, "", "high").unwrap();
+        let res = sanitize_and_merge_request_params(body, "", "high", true).unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
         assert_eq!(val["enable_thinking"], true);
         assert!(val.get("reasoning_effort").is_none());
 
         // Generic default merges non-conflicting fields
         let defaults = r#"{"top_p":0.9,"reasoning_effort":"low"}"#;
-        let res2 = merge_default_request_params(body, defaults, "high").unwrap();
+        let res2 = sanitize_and_merge_request_params(body, defaults, "high", true).unwrap();
         let val2: Value = serde_json::from_slice(&res2).unwrap();
         assert_eq!(val2["top_p"], 0.9);
         assert_eq!(val2["temperature"], 0.7);
@@ -473,7 +485,7 @@ mod tests {
 
         // Client explicit body strips top-level reasoning_effort before passing to local engine
         let client_re_body = br#"{"model":"llama3","reasoning_effort":"medium"}"#;
-        let res3 = merge_default_request_params(client_re_body, defaults, "high").unwrap();
+        let res3 = sanitize_and_merge_request_params(client_re_body, defaults, "high", true).unwrap();
         let val3: Value = serde_json::from_slice(&res3).unwrap();
         assert!(val3.get("reasoning_effort").is_none());
     }
@@ -484,7 +496,7 @@ mod tests {
         let bad_defaults = "{ invalid json ";
 
         // Malformed default_request_params logs warning but doesn't abort enable_thinking injection
-        let res = merge_default_request_params(body, bad_defaults, "medium").unwrap();
+        let res = sanitize_and_merge_request_params(body, bad_defaults, "medium", true).unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
         assert_eq!(val["model"], "llama3");
         assert_eq!(val["enable_thinking"], true);
