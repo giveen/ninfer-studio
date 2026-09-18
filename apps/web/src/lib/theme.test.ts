@@ -1,5 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { applyTheme, getStoredTheme, getSystemTheme, resolveTheme, subscribeTheme, STORAGE_KEY } from './theme';
+import {
+  PRESET_STORAGE_KEY,
+  PRESET_THEMES,
+  STORAGE_KEY,
+  applyPresetTheme,
+  applyTheme,
+  exportThemeCSS,
+  getStoredCustomVars,
+  getStoredPreset,
+  getStoredTheme,
+  getSystemTheme,
+  resolveTheme,
+  subscribeTheme,
+} from './theme';
+
 
 class MockStorage implements Storage {
   private store: Record<string, string> = {};
@@ -142,4 +156,36 @@ describe('theme preferences', () => {
     expect(getStoredTheme()).toBe('system');
     expect(() => applyTheme('dark')).not.toThrow();
   });
+
+  it('manages theme presets and applies CSS variables', () => {
+    expect(getStoredPreset()).toBe('midnight-lime');
+
+    applyPresetTheme('tokyo-night');
+    expect(localStorage.getItem(PRESET_STORAGE_KEY)).toBe('tokyo-night');
+    expect(docElement.style['--color-bg']).toBe('#1a1b26');
+    expect(docElement.style['--color-accent']).toBe('#bb9af7');
+
+    const customVars = {
+      bg: '#111111',
+      panel: '#222222',
+      panel2: '#333333',
+      inset: '#000000',
+      ink: '#ffffff',
+      mute: '#888888',
+      accent: '#ff0055',
+      accentHover: '#ff3377',
+    };
+    applyPresetTheme('custom', customVars);
+    expect(localStorage.getItem(PRESET_STORAGE_KEY)).toBe('custom');
+    expect(getStoredCustomVars()).toEqual(customVars);
+    expect(docElement.style['--color-bg']).toBe('#111111');
+    expect(docElement.style['--color-accent']).toBe('#ff0055');
+  });
+
+  it('exports CSS variables formatted correctly', () => {
+    const css = exportThemeCSS(PRESET_THEMES['nordic-frost'].variables);
+    expect(css).toContain('--color-bg: #2e3440');
+    expect(css).toContain('--color-accent: #88c0d0');
+  });
 });
+
