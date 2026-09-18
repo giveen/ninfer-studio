@@ -46,7 +46,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const {
     agentResearch, memoryEnabled, memoryRef, adoptMemory, loadMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
     deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
-    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir,
+    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir, showThinkingPreview,
   } = useChatAgent();
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
   // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
@@ -1595,11 +1595,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
                   const i = visibleStart + sliceI;
-                  // The per-turn date/time note (see contextNoteMessage in
-                  // agentLoop.ts) is real history the model needs, but it's
-                  // not something the user said or asked to see — keep it
-                  // out of the transcript entirely rather than a collapsed row.
                   if (m.displayName === 'Context') return null;
+                  if (!showThinkingPreview) {
+                    if (m.role === 'tool') return null;
+                    if (m.role === 'assistant' && !m.content && !m.error && m.tool_calls && m.tool_calls.length > 0 && !(streaming && streamingConvId === activeId && i === lastRelevantIndex)) {
+                      return null;
+                    }
+                  }
                   if (isCompactedMsg(m)) {
                     return (
                       <div id={`msg-${i}`} key={i}>
