@@ -195,7 +195,7 @@ fn main() {
                     let state = init_state(Some(ev_tx)).await;
                     *control_state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
                     if let Err(e) = boot(state, port, Some(ready_tx)).await {
-                        tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {error}");
+                        tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {e}");
                     }
                 });
             });
