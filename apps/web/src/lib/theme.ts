@@ -20,6 +20,8 @@ export interface ThemeVariables {
   mute: string;
   accent: string;
   accentHover: string;
+  line?: string;
+  line2?: string;
 }
 
 export type ThemePresetId =
@@ -53,6 +55,8 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#94a3b8',
       accent: '#b7f04a',
       accentHover: '#c8f75e',
+      line: 'rgba(255, 255, 255, 0.08)',
+      line2: 'rgba(255, 255, 255, 0.16)',
     },
   },
   'tokyo-night': {
@@ -68,6 +72,8 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#7aa2f7',
       accent: '#bb9af7',
       accentHover: '#c099ff',
+      line: 'rgba(122, 162, 247, 0.15)',
+      line2: 'rgba(122, 162, 247, 0.28)',
     },
   },
   'nordic-frost': {
@@ -83,6 +89,8 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#d8dee9',
       accent: '#88c0d0',
       accentHover: '#8fbcbb',
+      line: 'rgba(216, 222, 233, 0.12)',
+      line2: 'rgba(216, 222, 233, 0.22)',
     },
   },
   'monokai-dark': {
@@ -98,6 +106,8 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#cfcfc2',
       accent: '#a6e22e',
       accentHover: '#b6f23e',
+      line: 'rgba(248, 248, 242, 0.12)',
+      line2: 'rgba(248, 248, 242, 0.22)',
     },
   },
   'win95': {
@@ -110,9 +120,11 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       panel2: '#d4d4d4',
       inset: '#ffffff',
       ink: '#000000',
-      mute: '#555555',
+      mute: '#404040',
       accent: '#000080',
       accentHover: '#0000a0',
+      line: '#808080',
+      line2: '#000000',
     },
   },
   'crisp-light': {
@@ -128,6 +140,8 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#475569',
       accent: '#5d8f16',
       accentHover: '#6ea71b',
+      line: 'rgba(15, 23, 42, 0.12)',
+      line2: 'rgba(15, 23, 42, 0.22)',
     },
   },
   'solarized-light': {
@@ -143,10 +157,11 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       mute: '#839496',
       accent: '#b58900',
       accentHover: '#cb9b00',
+      line: 'rgba(101, 123, 131, 0.18)',
+      line2: 'rgba(101, 123, 131, 0.30)',
     },
   },
 };
-
 
 export function getSystemTheme(): ResolvedTheme {
   try {
@@ -200,6 +215,8 @@ export function applyCSSVariables(vars: ThemeVariables | null): void {
     ['mute', '--color-mute'],
     ['accent', '--color-accent'],
     ['accentHover', '--color-accent-hover'],
+    ['line', '--color-line'],
+    ['line2', '--color-line2'],
   ];
 
   if (!vars) {
@@ -281,8 +298,11 @@ export function exportThemeCSS(vars: ThemeVariables): string {
   --color-mute: ${vars.mute};
   --color-accent: ${vars.accent};
   --color-accent-hover: ${vars.accentHover};
+  --color-line: ${vars.line ?? 'rgba(255, 255, 255, 0.08)'};
+  --color-line2: ${vars.line2 ?? 'rgba(255, 255, 255, 0.16)'};
 }`;
 }
+
 
 export function subscribeTheme(onChange: (resolved: ResolvedTheme) => void): () => void {
   if (typeof window === 'undefined' || !window.matchMedia) {

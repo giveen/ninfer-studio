@@ -199,9 +199,12 @@ export function ThemesTab() {
                 { key: 'mute', label: 'Muted Text', varName: '--color-mute' },
                 { key: 'accent', label: 'Primary Accent', varName: '--color-accent' },
                 { key: 'accentHover', label: 'Accent Hover', varName: '--color-accent-hover' },
+                { key: 'line', label: 'Border Subdued', varName: '--color-line' },
+                { key: 'line2', label: 'Border Distinct', varName: '--color-line2' },
               ].map((colorItem) => {
                 const k = colorItem.key as keyof ThemeVariables;
-                const val = currentVars[k];
+                const val = currentVars[k] ?? '';
+
                 return (
                   <div key={colorItem.key} className="flex flex-col gap-1 rounded-md border border-line bg-inset p-2">
                     <div className="flex items-center justify-between text-[11px]">
