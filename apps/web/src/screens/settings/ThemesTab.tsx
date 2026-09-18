@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Palette, Check, Copy, RotateCcw, Sparkles, Sun, Moon, Laptop, Code, Type } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Palette, Check, Copy, RotateCcw, Sparkles, Sun, Moon, Laptop, Code, Type, Trash2, Download, Upload, Save } from 'lucide-react';
 import { Button, SectionCard, cn } from '../../components/ui';
 import {
   FONT_MONO_PRESETS,
@@ -8,7 +8,9 @@ import {
   applyFontFamily,
   applyPresetTheme,
   applyUIScale,
+  deleteUserThemePreset,
   exportThemeCSS,
+  exportThemeJSON,
   getPresetVariables,
   getStoredCustomVars,
   getStoredFontMono,
@@ -16,24 +18,32 @@ import {
   getStoredPreset,
   getStoredTheme,
   getStoredUIScale,
+  getUserThemePresets,
+  parseAndValidateThemeJSON,
+  saveUserThemePreset,
   type ThemeMode,
   type ThemePresetId,
   type ThemeVariables,
+  type UserThemePreset,
 } from '../../lib/theme';
 
 export function ThemesTab() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => getStoredTheme());
   const [activePreset, setActivePreset] = useState<ThemePresetId>(() => getStoredPreset());
+  const [userPresets, setUserPresets] = useState<UserThemePreset[]>(() => getUserThemePresets());
   const [sansFont, setSansFont] = useState<string>(() => getStoredFontSans());
   const [monoFont, setMonoFont] = useState<string>(() => getStoredFontMono());
   const [uiScale, setUiScale] = useState<string>(() => getStoredUIScale());
+  const [savePresetName, setSavePresetName] = useState<string>('');
+  const [importError, setImportError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const [customVars, setCustomVars] = useState<ThemeVariables>(() => {
     const stored = getStoredCustomVars();
     if (stored) return stored;
     const initialPreset = getStoredPreset();
-    if (initialPreset in PRESET_THEMES) {
-      return getPresetVariables(initialPreset, getStoredTheme())!;
-    }
+    const vars = getPresetVariables(initialPreset, getStoredTheme());
+    if (vars) return vars;
     return PRESET_THEMES['midnight-lime'].darkVariables;
   });
   const [copiedCSS, setCopiedCSS] = useState(false);
@@ -43,7 +53,7 @@ export function ThemesTab() {
   useEffect(() => {
     if (activePreset === 'custom') {
       applyPresetTheme('custom', customVars, themeMode);
-    } else if (activePreset in PRESET_THEMES) {
+    } else {
       applyPresetTheme(activePreset, null, themeMode);
       const vars = getPresetVariables(activePreset, themeMode);
       if (vars) setCustomVars(vars);
@@ -54,24 +64,100 @@ export function ThemesTab() {
 
   const handleSelectMode = (mode: ThemeMode) => {
     setThemeMode(mode);
-    if (activePreset in PRESET_THEMES) {
+    if (activePreset === 'custom') {
+      applyPresetTheme('custom', customVars, mode);
+    } else {
       applyPresetTheme(activePreset, null, mode);
       const vars = getPresetVariables(activePreset, mode);
       if (vars) setCustomVars(vars);
-    } else {
-      applyPresetTheme('custom', customVars, mode);
     }
   };
 
   const handleSelectPreset = (presetId: ThemePresetId) => {
     setActivePreset(presetId);
-    if (presetId in PRESET_THEMES) {
+    if (presetId === 'custom') {
+      applyPresetTheme('custom', customVars, themeMode);
+    } else {
       const vars = getPresetVariables(presetId, themeMode);
       if (vars) setCustomVars(vars);
       applyPresetTheme(presetId, null, themeMode);
-    } else {
-      applyPresetTheme('custom', customVars, themeMode);
     }
+  };
+
+  const handleSavePreset = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!savePresetName.trim()) return;
+    const newPreset = saveUserThemePreset(savePresetName, customVars, customVars);
+    const updated = getUserThemePresets();
+    setUserPresets(updated);
+    setSavePresetName('');
+    setActivePreset(newPreset.id);
+    applyPresetTheme(newPreset.id, null, themeMode);
+  };
+
+  const handleDeleteUserPreset = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    deleteUserThemePreset(id);
+    const updated = getUserThemePresets();
+    setUserPresets(updated);
+    if (activePreset === id) {
+      setActivePreset('midnight-lime');
+      applyPresetTheme('midnight-lime', null, themeMode);
+      const vars = getPresetVariables('midnight-lime', themeMode);
+      if (vars) setCustomVars(vars);
+    }
+  };
+
+  const handleImportClick = () => {
+    setImportError(null);
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target?.result as string;
+        const parsed = parseAndValidateThemeJSON(text);
+        const newPreset = saveUserThemePreset(parsed.name, parsed.darkVariables, parsed.lightVariables);
+        const updated = getUserThemePresets();
+        setUserPresets(updated);
+        setActivePreset(newPreset.id);
+        const vars = getPresetVariables(newPreset.id, themeMode);
+        if (vars) setCustomVars(vars);
+        applyPresetTheme(newPreset.id, null, themeMode);
+        setImportError(null);
+      } catch (err: any) {
+        setImportError(err.message || 'Failed to import theme JSON file.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleExportJSONFile = () => {
+    const presetName =
+      activePreset === 'custom'
+        ? 'Custom Theme'
+        : userPresets.find((p) => p.id === activePreset)?.name ||
+          PRESET_THEMES[activePreset as keyof typeof PRESET_THEMES]?.name ||
+          'Custom Theme';
+
+    const presetData = {
+      name: presetName,
+      darkVariables: customVars,
+      lightVariables: customVars,
+    };
+    const jsonStr = exportThemeJSON(presetData);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${presetName.toLowerCase().replace(/\s+/g, '-')}-theme.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleSelectSansFont = (val: string) => {
@@ -118,7 +204,8 @@ export function ThemesTab() {
     setTimeout(() => setCopiedJSON(false), 2000);
   };
 
-  const currentVars = activePreset === 'custom' ? customVars : getPresetVariables(activePreset, themeMode) ?? customVars;
+  const currentVars =
+    activePreset === 'custom' ? customVars : getPresetVariables(activePreset, themeMode) ?? customVars;
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
@@ -173,7 +260,9 @@ export function ThemesTab() {
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           {/* UI Scale Selector */}
           <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
-            <label htmlFor="select-ui-scale" className="font-semibold text-[12.5px] text-ink">Interface Text Scale</label>
+            <label htmlFor="select-ui-scale" className="font-semibold text-[12.5px] text-ink">
+              Interface Text Scale
+            </label>
             <p className="text-[11px] text-faint">Adjust base text size for comfortable viewing.</p>
             <select
               id="select-ui-scale"
@@ -189,7 +278,9 @@ export function ThemesTab() {
 
           {/* UI Sans Font Selector */}
           <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
-            <label htmlFor="select-sans-font" className="font-semibold text-[12.5px] text-ink">Interface Font (Sans-Serif)</label>
+            <label htmlFor="select-sans-font" className="font-semibold text-[12.5px] text-ink">
+              Interface Font (Sans-Serif)
+            </label>
             <p className="text-[11px] text-faint">Applied across navigation, buttons, and conversation chat bubbles.</p>
             <select
               id="select-sans-font"
@@ -207,7 +298,9 @@ export function ThemesTab() {
 
           {/* Code Mono Font Selector */}
           <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
-            <label htmlFor="select-mono-font" className="font-semibold text-[12.5px] text-ink">Code & Editor Font (Monospace)</label>
+            <label htmlFor="select-mono-font" className="font-semibold text-[12.5px] text-ink">
+              Code & Editor Font (Monospace)
+            </label>
             <p className="text-[11px] text-faint">Applied to code snippets, CodeMirror editor, and terminal outputs.</p>
             <select
               id="select-mono-font"
@@ -225,14 +318,33 @@ export function ThemesTab() {
         </div>
       </SectionCard>
 
-
       {/* Preset Themes Grid */}
       <SectionCard
         title="Theme Presets"
         icon={<Palette size={15} />}
-        description="Choose a curated color scheme preset or develop your own custom variables."
+        description="Choose a built-in preset, load your saved custom themes, or import theme files."
+        actions={
+          <div className="flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleFileChange}
+              className="hidden"
+            />
+            <Button variant="ghost" size="sm" onClick={handleImportClick}>
+              <Upload size={13} /> Import JSON
+            </Button>
+          </div>
+        }
       >
+        {importError && (
+          <div className="mb-3 rounded-md border border-danger/30 bg-danger/10 p-2.5 text-[12px] text-danger">
+            {importError}
+          </div>
+        )}
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3">
+          {/* Built-in themes */}
           {(Object.keys(PRESET_THEMES) as Array<keyof typeof PRESET_THEMES>).map((presetId) => {
             const preset = PRESET_THEMES[presetId];
             const isSelected = activePreset === presetId;
@@ -257,18 +369,105 @@ export function ThemesTab() {
 
                 {/* Color swatches preview */}
                 <div className="mt-3 flex items-center gap-1.5">
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.bg }} title="Background" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.panel }} title="Panel" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.panel2 }} title="Active Surface" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.accent }} title="Accent Glow" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.ink }} title="Text Ink" />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.bg }}
+                    title="Background"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.panel }}
+                    title="Panel"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.panel2 }}
+                    title="Active Surface"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.accent }}
+                    title="Accent Glow"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.ink }}
+                    title="Text Ink"
+                  />
                 </div>
               </button>
             );
           })}
+
+          {/* User saved presets */}
+          {userPresets.map((uPreset) => {
+            const isSelected = activePreset === uPreset.id;
+            const vars = getPresetVariables(uPreset.id, themeMode) ?? uPreset.darkVariables;
+
+            return (
+              <div
+                key={uPreset.id}
+                onClick={() => handleSelectPreset(uPreset.id)}
+                className={cn(
+                  'group relative flex flex-col justify-between rounded-lg border p-3.5 text-left transition-all cursor-pointer',
+                  isSelected
+                    ? 'border-accent bg-accent/10 shadow-sm'
+                    : 'border-line bg-panel2/40 hover:border-line2 hover:bg-panel2'
+                )}
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <div className="flex items-center gap-1.5 truncate">
+                    <span className="font-semibold text-[13px] text-ink truncate">{uPreset.name}</span>
+                    <span className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-[9.5px] font-medium text-accent">
+                      User
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {isSelected && <Check size={14} className="text-accent" />}
+                    <button
+                      type="button"
+                      onClick={(e) => handleDeleteUserPreset(e, uPreset.id)}
+                      title="Delete Theme Preset"
+                      className="rounded p-1 text-faint opacity-0 transition-opacity hover:bg-panel hover:text-danger group-hover:opacity-100"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Color swatches preview */}
+                <div className="mt-3 flex items-center gap-1.5">
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.bg }}
+                    title="Background"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.panel }}
+                    title="Panel"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.panel2 }}
+                    title="Active Surface"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.accent }}
+                    title="Accent Glow"
+                  />
+                  <div
+                    className="h-4 w-4 rounded-full border border-line"
+                    style={{ backgroundColor: vars.ink }}
+                    title="Text Ink"
+                  />
+                </div>
+              </div>
+            );
+          })}
         </div>
       </SectionCard>
-
 
       {/* Live Preview & Color Variable Customizer */}
       <SectionCard
@@ -279,7 +478,7 @@ export function ThemesTab() {
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
           {/* Color pickers column */}
           <div className="space-y-3 lg:col-span-7">
-            <div className="flex items-center justify-between pb-1 border-b border-line">
+            <div className="flex items-center justify-between border-b border-line pb-1">
               <span className="font-medium text-[12px] text-ink uppercase tracking-wider">CSS Variables</span>
               {activePreset === 'custom' && (
                 <span className="rounded bg-accent/20 px-2 py-0.5 text-[10px] font-medium text-accent">
@@ -329,6 +528,20 @@ export function ThemesTab() {
               })}
             </div>
 
+            {/* Save Custom Theme Form */}
+            <form onSubmit={handleSavePreset} className="flex items-center gap-2 border-t border-line pt-3">
+              <input
+                type="text"
+                placeholder="Save current theme as..."
+                value={savePresetName}
+                onChange={(e) => setSavePresetName(e.target.value)}
+                className="w-full rounded border border-line bg-inset px-2.5 py-1 text-[12px] text-ink outline-none focus:border-accent/50"
+              />
+              <Button variant="primary" size="sm" type="submit" disabled={!savePresetName.trim()} className="shrink-0">
+                <Save size={13} /> Save Preset
+              </Button>
+            </form>
+
             <div className="flex flex-wrap items-center gap-2 pt-2">
               <Button variant="ghost" size="sm" onClick={handleCopyCSS}>
                 {copiedCSS ? <Check size={13} className="text-ok" /> : <Code size={13} />}
@@ -338,6 +551,9 @@ export function ThemesTab() {
                 {copiedJSON ? <Check size={13} className="text-ok" /> : <Copy size={13} />}
                 {copiedJSON ? 'Copied JSON!' : 'Copy JSON'}
               </Button>
+              <Button variant="ghost" size="sm" onClick={handleExportJSONFile}>
+                <Download size={13} /> Export .json
+              </Button>
               <Button variant="ghost" size="sm" onClick={handleReset} className="ml-auto text-faint hover:text-danger">
                 <RotateCcw size={13} /> Reset Theme
               </Button>
@@ -346,7 +562,7 @@ export function ThemesTab() {
 
           {/* Live Preview column */}
           <div className="flex flex-col gap-3 lg:col-span-5">
-            <span className="font-medium text-[12px] text-ink uppercase tracking-wider pb-1 border-b border-line">
+            <span className="border-b border-line pb-1 font-medium text-[12px] text-ink uppercase tracking-wider">
               Live Surface Preview
             </span>
 
@@ -370,7 +586,7 @@ export function ThemesTab() {
               {/* User Message Bubble */}
               <div className="flex justify-end">
                 <div
-                  className="max-w-[85%] rounded-lg p-2.5 text-[12px] shadow-sm border border-line"
+                  className="max-w-[85%] rounded-lg border border-line p-2.5 text-[12px] shadow-sm"
                   style={{ backgroundColor: currentVars.panel2, color: currentVars.ink }}
                 >
                   Can you optimize this sorting function in Python?

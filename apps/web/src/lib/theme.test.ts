@@ -8,14 +8,19 @@ import {
   applyFontFamily,
   applyPresetTheme,
   applyTheme,
+  deleteUserThemePreset,
   exportThemeCSS,
+  exportThemeJSON,
   getStoredCustomVars,
   getStoredFontMono,
   getStoredFontSans,
   getStoredPreset,
   getStoredTheme,
   getSystemTheme,
+  getUserThemePresets,
+  parseAndValidateThemeJSON,
   resolveTheme,
+  saveUserThemePreset,
   subscribeTheme,
 } from './theme';
 
@@ -222,6 +227,51 @@ describe('theme preferences', () => {
     expect(docElement.style['--font-mono']).toBe("'Monaspace Neon', monospace");
     expect(getStoredFontSans()).toBe("'Fira Sans', sans-serif");
     expect(getStoredFontMono()).toBe("'Monaspace Neon', monospace");
+  });
+
+  it('saves, resolves, and deletes user-created theme presets', () => {
+    const darkVars = { ...PRESET_THEMES['midnight-lime'].darkVariables, accent: '#ff00bb' };
+    const lightVars = { ...PRESET_THEMES['midnight-lime'].lightVariables, accent: '#aa0088' };
+
+    const created = saveUserThemePreset('Cyberpunk Neon', darkVars, lightVars);
+    expect(created.name).toBe('Cyberpunk Neon');
+    expect(created.id).toContain('user-');
+
+    const userPresets = getUserThemePresets();
+    expect(userPresets).toHaveLength(1);
+    expect(userPresets[0].name).toBe('Cyberpunk Neon');
+
+    applyPresetTheme(created.id, null, 'dark');
+    expect(docElement.style['--color-accent']).toBe('#ff00bb');
+
+    deleteUserThemePreset(created.id);
+    expect(getUserThemePresets()).toHaveLength(0);
+  });
+
+  it('parses and validates imported theme JSON strings', () => {
+    const validJSON = JSON.stringify({
+      name: 'Emerald Dawn',
+      darkVariables: { bg: '#051d1a', panel: '#0a2d28', accent: '#00ffcc' },
+      lightVariables: { bg: '#e6f9f5', panel: '#ffffff', accent: '#00aa88' },
+    });
+
+    const parsed = parseAndValidateThemeJSON(validJSON);
+    expect(parsed.name).toBe('Emerald Dawn');
+    expect(parsed.darkVariables.bg).toBe('#051d1a');
+    expect(parsed.darkVariables.accent).toBe('#00ffcc');
+
+    expect(() => parseAndValidateThemeJSON('invalid json')).toThrow();
+  });
+
+  it('exports theme data into JSON format', () => {
+    const preset = {
+      name: 'Custom Sunset',
+      darkVariables: PRESET_THEMES['dracula'].darkVariables,
+      lightVariables: PRESET_THEMES['dracula'].lightVariables,
+    };
+    const jsonStr = exportThemeJSON(preset);
+    expect(jsonStr).toContain('"name": "Custom Sunset"');
+    expect(jsonStr).toContain('"accent": "#bd93f9"');
   });
 });
 

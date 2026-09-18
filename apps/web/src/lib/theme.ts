@@ -10,6 +10,7 @@ export type ResolvedTheme = 'dark' | 'light';
 export const STORAGE_KEY = 'ninfier-theme';
 export const PRESET_STORAGE_KEY = 'ninfier-preset-theme';
 export const CUSTOM_VARS_STORAGE_KEY = 'ninfier-custom-theme-vars';
+export const USER_PRESETS_STORAGE_KEY = 'ninfier-user-theme-presets';
 
 export interface ThemeVariables {
   bg: string;
@@ -36,13 +37,22 @@ export type ThemePresetId =
   | 'win95'
   | 'crisp-light'
   | 'solarized-light'
-  | 'custom';
+  | 'custom'
+  | (string & {});
 
 export interface ThemePreset {
   id: ThemePresetId;
   name: string;
   darkVariables: ThemeVariables;
   lightVariables: ThemeVariables;
+}
+
+export interface UserThemePreset {
+  id: string;
+  name: string;
+  darkVariables: ThemeVariables;
+  lightVariables: ThemeVariables;
+  createdAt: number;
 }
 
 export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset> = {
@@ -432,11 +442,105 @@ export function getStoredTheme(): ThemeMode {
   return 'system';
 }
 
+export function getUserThemePresets(): UserThemePreset[] {
+  try {
+    const raw = localStorage.getItem(USER_PRESETS_STORAGE_KEY);
+    if (raw) return JSON.parse(raw) as UserThemePreset[];
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
+export function saveUserThemePreset(
+  name: string,
+  darkVariables: ThemeVariables,
+  lightVariables: ThemeVariables
+): UserThemePreset {
+  const presets = getUserThemePresets();
+  const newPreset: UserThemePreset = {
+    id: `user-${Date.now()}`,
+    name: name.trim() || 'Custom Preset',
+    darkVariables,
+    lightVariables,
+    createdAt: Date.now(),
+  };
+  presets.push(newPreset);
+  try {
+    localStorage.setItem(USER_PRESETS_STORAGE_KEY, JSON.stringify(presets));
+  } catch {
+    // ignore
+  }
+  return newPreset;
+}
+
+export function deleteUserThemePreset(id: string): void {
+  const presets = getUserThemePresets().filter((p) => p.id !== id);
+  try {
+    localStorage.setItem(USER_PRESETS_STORAGE_KEY, JSON.stringify(presets));
+  } catch {
+    // ignore
+  }
+}
+
+export function parseAndValidateThemeJSON(jsonString: string): {
+  name: string;
+  darkVariables: ThemeVariables;
+  lightVariables: ThemeVariables;
+} {
+  const data = JSON.parse(jsonString);
+  if (!data || typeof data !== 'object') {
+    throw new Error('Invalid theme JSON format');
+  }
+  const name = typeof data.name === 'string' && data.name.trim() ? data.name.trim() : 'Imported Theme';
+  const fallbackVars = PRESET_THEMES['midnight-lime'].darkVariables;
+
+  const validateVars = (obj: any): ThemeVariables => {
+    if (!obj || typeof obj !== 'object') return { ...fallbackVars };
+    return {
+      bg: typeof obj.bg === 'string' ? obj.bg : fallbackVars.bg,
+      panel: typeof obj.panel === 'string' ? obj.panel : fallbackVars.panel,
+      panel2: typeof obj.panel2 === 'string' ? obj.panel2 : fallbackVars.panel2,
+      inset: typeof obj.inset === 'string' ? obj.inset : fallbackVars.inset,
+      ink: typeof obj.ink === 'string' ? obj.ink : fallbackVars.ink,
+      mute: typeof obj.mute === 'string' ? obj.mute : fallbackVars.mute,
+      accent: typeof obj.accent === 'string' ? obj.accent : fallbackVars.accent,
+      accentHover: typeof obj.accentHover === 'string' ? obj.accentHover : fallbackVars.accentHover,
+      line: typeof obj.line === 'string' ? obj.line : fallbackVars.line,
+      line2: typeof obj.line2 === 'string' ? obj.line2 : fallbackVars.line2,
+      btnRadius: typeof obj.btnRadius === 'string' ? obj.btnRadius : fallbackVars.btnRadius,
+    };
+  };
+
+  const darkVars = data.darkVariables
+    ? validateVars(data.darkVariables)
+    : data.variables
+    ? validateVars(data.variables)
+    : { ...fallbackVars };
+  const lightVars = data.lightVariables
+    ? validateVars(data.lightVariables)
+    : data.variables
+    ? validateVars(data.variables)
+    : PRESET_THEMES['midnight-lime'].lightVariables;
+
+  return { name, darkVariables: darkVars, lightVariables: lightVars };
+}
+
+export function exportThemeJSON(preset: {
+  name: string;
+  darkVariables: ThemeVariables;
+  lightVariables: ThemeVariables;
+}): string {
+  return JSON.stringify(preset, null, 2);
+}
+
 export function getStoredPreset(): ThemePresetId {
   try {
     const stored = localStorage.getItem(PRESET_STORAGE_KEY) as ThemePresetId | null;
-    if (stored && (stored === 'custom' || stored in PRESET_THEMES)) {
-      return stored;
+    if (stored) {
+      if (stored === 'custom' || stored in PRESET_THEMES) return stored;
+      const userPresets = getUserThemePresets();
+      if (userPresets.some((p) => p.id === stored)) return stored;
     }
   } catch {
     // fall through
@@ -455,10 +559,17 @@ export function getStoredCustomVars(): ThemeVariables | null {
 }
 
 export function getPresetVariables(presetId: ThemePresetId, mode?: ThemeMode): ThemeVariables | null {
-  if (!(presetId in PRESET_THEMES)) return null;
-  const preset = PRESET_THEMES[presetId as keyof typeof PRESET_THEMES];
   const resolved = resolveTheme(mode ?? getStoredTheme());
-  return resolved === 'light' ? preset.lightVariables : preset.darkVariables;
+  if (presetId in PRESET_THEMES) {
+    const preset = PRESET_THEMES[presetId as keyof typeof PRESET_THEMES];
+    return resolved === 'light' ? preset.lightVariables : preset.darkVariables;
+  }
+  const userPresets = getUserThemePresets();
+  const found = userPresets.find((p) => p.id === presetId);
+  if (found) {
+    return resolved === 'light' ? found.lightVariables : found.darkVariables;
+  }
+  return null;
 }
 
 export function applyCSSVariables(vars: ThemeVariables | null): void {
@@ -521,6 +632,13 @@ export function applyPresetTheme(presetId: ThemePresetId, customVars?: ThemeVari
       // localStorage unavailable
     }
     applyCSSVariables(customVars);
+  } else {
+    const userPresets = getUserThemePresets();
+    const found = userPresets.find((p) => p.id === presetId);
+    if (found) {
+      const vars = resolvedMode === 'light' ? found.lightVariables : found.darkVariables;
+      applyCSSVariables(vars);
+    }
   }
 }
 
