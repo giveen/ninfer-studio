@@ -1413,8 +1413,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                     {c.title || 'Untitled'}
                   </span>
                 )}
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-1.5 font-mono text-[10px] text-faint">
+                <span>{formatTime(c.createdAt)}</span>
                 {!selectMode && (
-                  <>
+                  <div className="flex items-center gap-0.5">
                     <button
                       type="button"
                       onClick={(e) => {
@@ -1467,11 +1470,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                     >
                       <Trash2 size={12} />
                     </button>
-                  </>
+                  </div>
                 )}
-              </div>
-              <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-faint">
-                <span>{formatTime(c.createdAt)}</span>
               </div>
             </div>
 
