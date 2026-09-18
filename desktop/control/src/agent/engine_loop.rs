@@ -1739,7 +1739,7 @@ mod tests {
             json!({ "role": "user", "content": "hi" }),
             json!({ "role": "assistant", "content": "ok", "reasoning": "hmm" }),
         ];
-        let req = build_request("m", Some("SYS"), &msgs, &params, &tools, false);
+        let req = build_request("m", Some("SYS"), &msgs, &params, &tools, true);
         assert_eq!(req["model"], "m");
         assert_eq!(req["stream"], true);
         // effort wins the thinking switch (one intent, no contradictory pair)
@@ -1752,9 +1752,14 @@ mod tests {
         assert_eq!(req["tools"][0]["function"]["name"], "read");
         // system prepended + transcript wired (reasoning_content on assistant)
         assert_eq!(req["messages"][0]["role"], "system");
-        assert_eq!(req["messages"][0]["content"], "SYS");
+        assert_eq!(req["messages"][0]["content"][0]["text"], "SYS");
         assert_eq!(req["messages"][2]["role"], "assistant");
         assert_eq!(req["messages"][2]["reasoning_content"], "hmm");
+
+        // local request (cache_system = false) strips top-level reasoning_effort
+        let req_local = build_request("m", Some("SYS"), &msgs, &params, &tools, false);
+        assert_eq!(req_local["enable_thinking"], true);
+        assert!(req_local.get("reasoning_effort").is_none() || req_local["reasoning_effort"].is_null());
         // system messages inside the transcript are skipped
         let msgs2 = vec![
             json!({ "role": "system", "content": "OLD" }),
