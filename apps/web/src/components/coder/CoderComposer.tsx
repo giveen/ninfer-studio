@@ -114,7 +114,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+    el.style.height = `${Math.max(38, Math.min(el.scrollHeight, 220))}px`;
   };
 
   useEffect(() => {
@@ -326,7 +326,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
         <textarea
           ref={textareaRef}
           rows={1}
-          className="flex-1 max-h-[220px] resize-none bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50 leading-relaxed"
+          className="flex-1 min-h-[38px] max-h-[220px] resize-none bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50 leading-relaxed"
           value={input}
           onChange={(e) => {
             setInput(e.target.value);

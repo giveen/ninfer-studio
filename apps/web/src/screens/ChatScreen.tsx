@@ -236,7 +236,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+    el.style.height = `${Math.max(38, Math.min(el.scrollHeight, 220))}px`;
   };
 
   useEffect(() => {
@@ -1679,7 +1679,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   ? `Message ${isCloudPrimary ? (primaryProviderConfig.model || 'cloud model') : (model || 'engine')}…  (Enter to send, Shift+Enter for newline)`
                   : 'Engine is offline — open the Engine tab to start it'
               }
-              className="max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
+              className="min-h-[38px] max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
             />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-1">
               <input ref={fileRef} type="file" accept="image/*,video/*" multiple hidden onChange={(e) => onFiles(e.target.files)} />
