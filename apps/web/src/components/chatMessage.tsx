@@ -3,11 +3,13 @@
 // memoized message row itself (user/tool/assistant variants).
 
 import { lazy, memo, useState, type ReactNode } from 'react';
-import { BrainCircuit, ChevronDown, ChevronsRight, Copy, GitBranch, Pencil, RefreshCw, Trash2 } from 'lucide-react';
+import { BrainCircuit, ChevronDown, ChevronsRight, Copy, GitBranch, Pencil, RefreshCw, Trash2, Zap, Clock, ArrowDownRight, ArrowUpRight, Cpu, Database } from 'lucide-react';
 import type { ChatMessage } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTokens } from '../lib/format';
 import { Button, cn } from './ui';
 import { ReportBlock, CollapsibleToolResult, CollapsibleToolCalls } from './toolResults';
+
+import { useChatAgent } from '../lib/chatAgent';
 
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
 // ~300KB chunk that costs nothing at startup this way, only when the first
@@ -32,34 +34,37 @@ export function CompactDivider() {
 // Message rendering
 // ---------------------------------------------------------------------------
 function ReasoningBlock({ text, streaming, workspace }: { text: string; streaming?: boolean; workspace?: string }) {
-  // Collapsed by default — long chains-of-thought shouldn't dominate the view.
-  // A live pulse shows while it's actively thinking; a short preview is shown so
-  // the gist is visible without expanding.
   const [open, setOpen] = useState(false);
+  const { showThinkingPreview } = useChatAgent();
   if (!text) return null;
-  const preview = !open ? text.replace(/\s+/g, ' ').trim().slice(0, 120) : '';
+
+  const preview = !open && showThinkingPreview ? text.replace(/\s+/g, ' ').trim().slice(0, 120) : '';
+
   return (
-    <div className="mb-2 overflow-hidden rounded-lg border border-line bg-inset/60">
+    <div className="mb-2 overflow-hidden rounded-xl border border-line/60 bg-inset/40 transition-colors hover:border-line">
       <button
         type="button"
         onClick={() => setOpen(!open)}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-[11.5px] font-medium uppercase tracking-wider text-faint hover:text-mute"
       >
-        <BrainCircuit size={13} className={open ? 'text-accent' : 'text-faint'} />
-        thinking
-        {streaming && !open && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
-        <ChevronDown size={13} className={cn('ml-auto transition-transform', !open && '-rotate-90')} />
+        <BrainCircuit size={13} className={cn('shrink-0', open ? 'text-accent' : streaming ? 'animate-pulse text-accent' : 'text-faint')} />
+        <span>Thinking</span>
+        {streaming ? (
+          <span className="inline-flex items-center gap-0.5 font-bold text-accent">
+            <span className="dot-wave-1">.</span>
+            <span className="dot-wave-2">.</span>
+            <span className="dot-wave-3">.</span>
+          </span>
+        ) : null}
+        <ChevronDown size={13} className={cn('ml-auto shrink-0 transition-transform text-faint', !open && '-rotate-90')} />
       </button>
-      {!open && preview && (
+      {!open && preview ? (
         <div className="border-t border-line px-3 py-1.5 text-[12px] leading-snug text-faint line-clamp-2">
           {preview}…
         </div>
-      )}
+      ) : null}
       {open && (
         <div className={cn('border-t border-line px-3 py-2 text-[12.5px] leading-relaxed text-mute', streaming && 'stream-caret')}>
-          {/* While streaming, render reasoning as plain pre-wrapped text instead of
-              re-parsing the whole (growing) markdown on every token — that O(n²)
-              reparse is what froze the chat view on long thinking traces. */}
           {streaming ? (
             <div className="whitespace-pre-wrap break-words">{text}</div>
           ) : (
@@ -74,32 +79,50 @@ function ReasoningBlock({ text, streaming, workspace }: { text: string; streamin
 export function MessageMeta({ m }: { m: ChatMessage }) {
   const t = m.meta;
   if (!t) return null;
-  const items: Array<[string, string]> = [];
-  if (t.finishReason) items.push([t.finishReason, '']);
-  if (t.ttftMs !== undefined) items.push(['TTFT', formatMs(t.ttftMs)]);
-  if (t.promptTokPerSec !== undefined) items.push(['prompt', formatRate(t.promptTokPerSec)]);
-  if (t.decodeTokPerSec !== undefined) items.push(['decode', formatRate(t.decodeTokPerSec)]);
-  if (t.cachedTokens) items.push(['cache', `${formatTokens(t.cachedTokens)} reused`]);
-  if (t.promptTokens) items.push(['in', formatTokens(t.promptTokens)]);
-  if (t.completionTokens) items.push(['out', formatTokens(t.completionTokens)]);
-  if (t.reasoningTokens) items.push(['think', formatTokens(t.reasoningTokens)]);
-  if (t.draftNAccepted !== undefined && t.draftN) {
-    items.push(['draft', `${t.draftNAccepted}/${t.draftN} (${Math.round((t.draftNAccepted / t.draftN) * 100)}%)`]);
+
+  const badges: Array<{ label: string; value: string; icon?: ReactNode }> = [];
+
+  if (t.ttftMs !== undefined) {
+    badges.push({ label: 'TTFT', value: formatMs(t.ttftMs), icon: <Clock size={11} className="text-info/80" /> });
   }
-  if (!items.length) return null;
+  if (t.promptTokPerSec !== undefined) {
+    badges.push({ label: 'prompt', value: formatRate(t.promptTokPerSec), icon: <Zap size={11} className="text-accent" /> });
+  }
+  if (t.decodeTokPerSec !== undefined) {
+    badges.push({ label: 'decode', value: formatRate(t.decodeTokPerSec), icon: <Cpu size={11} className="text-ok" /> });
+  }
+  if (t.cachedTokens) {
+    badges.push({ label: 'cache', value: `${formatTokens(t.cachedTokens)} reused`, icon: <Database size={11} className="text-warn" /> });
+  }
+  if (t.promptTokens) {
+    badges.push({ label: 'in', value: formatTokens(t.promptTokens), icon: <ArrowDownRight size={11} className="text-faint" /> });
+  }
+  if (t.completionTokens) {
+    badges.push({ label: 'out', value: formatTokens(t.completionTokens), icon: <ArrowUpRight size={11} className="text-faint" /> });
+  }
+  if (t.reasoningTokens) {
+    badges.push({ label: 'think', value: formatTokens(t.reasoningTokens), icon: <BrainCircuit size={11} className="text-accent" /> });
+  }
+
+  if (!badges.length && !t.finishReason) return null;
+
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 font-mono text-[10.5px] text-faint">
-      {items.map(([k, v], i) =>
-        k === items[0][0] && v === '' ? (
-          <span key={i} className="rounded border border-line bg-panel2 px-1.5 py-px text-mute">
-            {k}
-          </span>
-        ) : (
-          <span key={i} className="rounded border border-line bg-panel2 px-1.5 py-px">
-            <span className="text-faint">{k}</span> <span className="text-mute">{v}</span>
-          </span>
-        ),
+    <div className="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-[10.5px] text-faint">
+      {t.finishReason && (
+        <span className="rounded-md border border-line bg-panel2/80 px-2 py-0.5 font-sans font-medium text-mute shadow-2xs">
+          {t.finishReason}
+        </span>
       )}
+      {badges.map((b, i) => (
+        <span
+          key={i}
+          className="inline-flex items-center gap-1 rounded-md border border-line bg-panel2/80 px-2 py-0.5 transition-colors hover:border-line2"
+        >
+          {b.icon}
+          <span className="text-faint">{b.label}</span>
+          <span className="font-semibold text-mute">{b.value}</span>
+        </span>
+      ))}
     </div>
   );
 }
@@ -204,7 +227,7 @@ export const MessageRow = memo(function MessageRow({
     return (
       <div className="group relative flex justify-end">
         {toolbar}
-        <div className="max-w-[78%] rounded-xl rounded-br-sm border border-line bg-panel2 px-3.5 py-2.5">
+        <div className="max-w-[78%] rounded-2xl rounded-br-xs border border-line2 bg-panel2/90 px-4 py-3 shadow-xs">
           {editing ? (
             <div className="w-72 max-w-full">
               <textarea
@@ -282,7 +305,7 @@ export const MessageRow = memo(function MessageRow({
           {streaming && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
         </div>
         <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
-        <div className={cn('rounded-xl rounded-tl-sm border border-line bg-panel px-3.5 py-2.5', streaming && m.content && 'stream-caret')}>
+        <div className={cn('rounded-2xl rounded-tl-xs border border-line bg-panel/90 px-4 py-3 shadow-xs', streaming && m.content && 'stream-caret')}>
           {m.error ? (
             <div>
               <div className="text-[13px] text-danger">{m.content}</div>

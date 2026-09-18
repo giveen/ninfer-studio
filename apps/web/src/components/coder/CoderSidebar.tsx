@@ -190,7 +190,7 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
                         return (
                           <div
                             key={cid}
-                            className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
+                            className={cn('group flex items-center gap-1.5 rounded-lg px-2 py-1.5 transition-colors', isActive ? 'bg-accent/15 text-ink font-medium border-l-2 border-accent' : 'text-mute hover:bg-panel2/80 hover:text-ink')}
                           >
                             {isRunning && (
                               <span role="status" aria-label="Run in progress" className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="Run in progress — this conversation keeps updating in the background" />

@@ -122,7 +122,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
   }, [input]);
 
   return (
-    <div className="border-t border-line bg-panel p-3">
+    <div className="border-t border-line bg-panel/95 p-3.5 shadow-md backdrop-blur-md">
       {llmPhase && (
         <div className="mb-2 flex items-center gap-2 rounded-md border border-accent/25 bg-accent/8 px-2.5 py-1.5 text-[11.5px] text-mute">
           <BrainCircuit size={13} className="animate-pulse text-accent" />
@@ -328,7 +328,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
         <textarea
           ref={textareaRef}
           rows={1}
-          className="flex-1 min-h-[38px] max-h-[220px] resize-none bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50 leading-relaxed"
+          className="flex-1 min-h-[40px] max-h-[220px] resize-none bg-inset border border-line rounded-xl px-3.5 py-2 text-sm outline-none transition-all duration-150 focus:border-accent/60 focus:ring-1 focus:ring-accent/30 leading-relaxed shadow-2xs"
           value={input}
           onChange={(e) => {
             setInput(e.target.value);

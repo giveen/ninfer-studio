@@ -36,22 +36,22 @@
  * against near-black) so they stay legible against a light background. */
 :root[data-theme='light'] {
   color-scheme: light;
-  --color-bg: #dee1e6;
-  --color-panel: #eaecf0;
-  --color-panel2: #d7dae0;
-  --color-inset: #f3f4f6;
-  --color-line: rgba(15, 23, 42, 0.11);
-  --color-line2: rgba(15, 23, 42, 0.19);
-  --color-ink: #1a2030;
-  --color-mute: #5b6472;
-  --color-faint: #98a1b0;
-  --color-accent: #6a9c1f;
-  --color-accent-deep: #4f7817;
-  --color-accent-hover: #84b930;
-  --color-ok: #1f9d63;
-  --color-warn: #b8790a;
-  --color-danger: #d5433f;
-  --color-info: #1c7ed6;
+  --color-bg: #f1f5f9;
+  --color-panel: #ffffff;
+  --color-panel2: #f8fafc;
+  --color-inset: #f1f5f9;
+  --color-line: rgba(15, 23, 42, 0.08);
+  --color-line2: rgba(15, 23, 42, 0.15);
+  --color-ink: #0f172a;
+  --color-mute: #475569;
+  --color-faint: #64748b;
+  --color-accent: #5d8f16;
+  --color-accent-deep: #466e0f;
+  --color-accent-hover: #6ea71b;
+  --color-ok: #16a34a;
+  --color-warn: #d97706;
+  --color-danger: #dc2626;
+  --color-info: #0284c7;
 }
 
 html,
@@ -123,6 +123,20 @@ input[type='number'] {
 .pulse-dot {
   animation: pulse-dot 1.6s ease-in-out infinite;
 }
+
+@keyframes pulse-wave {
+  0%, 100% {
+    opacity: 0.2;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-1px);
+  }
+}
+.dot-wave-1 { animation: pulse-wave 1.2s ease-in-out infinite 0s; }
+.dot-wave-2 { animation: pulse-wave 1.2s ease-in-out infinite 0.2s; }
+.dot-wave-3 { animation: pulse-wave 1.2s ease-in-out infinite 0.4s; }
 
 @keyframes todo-flash {
   0%,
