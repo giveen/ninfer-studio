@@ -1,12 +1,17 @@
 import { useEffect, useState } from 'react';
-import { Palette, Check, Copy, RotateCcw, Sparkles, Sun, Moon, Laptop, Code } from 'lucide-react';
+import { Palette, Check, Copy, RotateCcw, Sparkles, Sun, Moon, Laptop, Code, Type } from 'lucide-react';
 import { Button, SectionCard, cn } from '../../components/ui';
 import {
+  FONT_MONO_PRESETS,
+  FONT_SANS_PRESETS,
   PRESET_THEMES,
+  applyFontFamily,
   applyPresetTheme,
   applyTheme,
   exportThemeCSS,
   getStoredCustomVars,
+  getStoredFontMono,
+  getStoredFontSans,
   getStoredPreset,
   getStoredTheme,
   type ThemeMode,
@@ -17,6 +22,8 @@ import {
 export function ThemesTab() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => getStoredTheme());
   const [activePreset, setActivePreset] = useState<ThemePresetId>(() => getStoredPreset());
+  const [sansFont, setSansFont] = useState<string>(() => getStoredFontSans());
+  const [monoFont, setMonoFont] = useState<string>(() => getStoredFontMono());
   const [customVars, setCustomVars] = useState<ThemeVariables>(() => {
     const stored = getStoredCustomVars();
     if (stored) return stored;
@@ -32,6 +39,7 @@ export function ThemesTab() {
     } else if (activePreset in PRESET_THEMES) {
       applyPresetTheme(activePreset);
     }
+    applyFontFamily(sansFont, monoFont);
   }, []);
 
   const handleSelectMode = (mode: ThemeMode) => {
@@ -49,6 +57,17 @@ export function ThemesTab() {
       applyPresetTheme('custom', customVars);
     }
   };
+
+  const handleSelectSansFont = (val: string) => {
+    setSansFont(val);
+    applyFontFamily(val, monoFont);
+  };
+
+  const handleSelectMonoFont = (val: string) => {
+    setMonoFont(val);
+    applyFontFamily(sansFont, val);
+  };
+
 
   const handleCustomVarChange = (key: keyof ThemeVariables, value: string) => {
     const updated = { ...customVars, [key]: value };
@@ -124,6 +143,52 @@ export function ThemesTab() {
           })}
         </div>
       </SectionCard>
+
+      {/* Typography & Fonts Card */}
+      <SectionCard
+        title="Typography & Fonts"
+        icon={<Type size={15} />}
+        description="Customize interface typography and code block monospaced font families."
+      >
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          {/* UI Sans Font Selector */}
+          <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
+            <label htmlFor="select-sans-font" className="font-semibold text-[12.5px] text-ink">Interface Font (Sans-Serif)</label>
+            <p className="text-[11px] text-faint">Applied across navigation, buttons, and conversation chat bubbles.</p>
+            <select
+              id="select-sans-font"
+              value={sansFont}
+              onChange={(e) => handleSelectSansFont(e.target.value)}
+              className="mt-1 w-full rounded border border-line bg-inset px-2.5 py-1.5 font-sans text-[12px] text-ink outline-none focus:border-accent/50"
+            >
+              {FONT_SANS_PRESETS.map((f) => (
+                <option key={f.id} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Code Mono Font Selector */}
+          <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
+            <label htmlFor="select-mono-font" className="font-semibold text-[12.5px] text-ink">Code & Editor Font (Monospace)</label>
+            <p className="text-[11px] text-faint">Applied to code snippets, CodeMirror editor, and terminal outputs.</p>
+            <select
+              id="select-mono-font"
+              value={monoFont}
+              onChange={(e) => handleSelectMonoFont(e.target.value)}
+              className="mt-1 w-full rounded border border-line bg-inset px-2.5 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent/50"
+            >
+              {FONT_MONO_PRESETS.map((f) => (
+                <option key={f.id} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </SectionCard>
+
 
       {/* Preset Themes Grid */}
       <SectionCard

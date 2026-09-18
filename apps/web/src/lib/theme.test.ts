@@ -1,18 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  FONT_MONO_PRESETS,
+  FONT_SANS_PRESETS,
   PRESET_STORAGE_KEY,
   PRESET_THEMES,
   STORAGE_KEY,
+  applyFontFamily,
   applyPresetTheme,
   applyTheme,
   exportThemeCSS,
   getStoredCustomVars,
+  getStoredFontMono,
+  getStoredFontSans,
   getStoredPreset,
   getStoredTheme,
   getSystemTheme,
   resolveTheme,
   subscribeTheme,
 } from './theme';
+
 
 
 class MockStorage implements Storage {
@@ -187,5 +193,31 @@ describe('theme preferences', () => {
     expect(css).toContain('--color-bg: #2e3440');
     expect(css).toContain('--color-accent: #88c0d0');
   });
+
+  it('supports Catppuccin, Dracula, and Monaspace Neon presets', () => {
+    applyPresetTheme('catppuccin-mocha');
+    expect(docElement.style['--color-bg']).toBe('#1e1e2e');
+    expect(docElement.style['--color-accent']).toBe('#cba6f7');
+
+    applyPresetTheme('dracula');
+    expect(docElement.style['--color-bg']).toBe('#282a36');
+    expect(docElement.style['--color-accent']).toBe('#bd93f9');
+
+    applyPresetTheme('monaspace-neon');
+    expect(docElement.style['--color-bg']).toBe('#0d1117');
+    expect(docElement.style['--color-accent']).toBe('#2f81f7');
+  });
+
+  it('manages font family configuration', () => {
+    expect(getStoredFontSans()).toBe(FONT_SANS_PRESETS[0].value);
+    expect(getStoredFontMono()).toBe(FONT_MONO_PRESETS[0].value);
+
+    applyFontFamily("'Fira Sans', sans-serif", "'Monaspace Neon', monospace");
+    expect(docElement.style['--font-sans']).toBe("'Fira Sans', sans-serif");
+    expect(docElement.style['--font-mono']).toBe("'Monaspace Neon', monospace");
+    expect(getStoredFontSans()).toBe("'Fira Sans', sans-serif");
+    expect(getStoredFontMono()).toBe("'Monaspace Neon', monospace");
+  });
 });
+
 

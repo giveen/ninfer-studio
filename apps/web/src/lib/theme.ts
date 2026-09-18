@@ -27,6 +27,9 @@ export interface ThemeVariables {
 export type ThemePresetId =
   | 'midnight-lime'
   | 'tokyo-night'
+  | 'catppuccin-mocha'
+  | 'dracula'
+  | 'monaspace-neon'
   | 'nordic-frost'
   | 'monokai-dark'
   | 'win95'
@@ -74,6 +77,57 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#c099ff',
       line: 'rgba(122, 162, 247, 0.15)',
       line2: 'rgba(122, 162, 247, 0.28)',
+    },
+  },
+  'catppuccin-mocha': {
+    id: 'catppuccin-mocha',
+    name: 'Catppuccin Mocha',
+    mode: 'dark',
+    variables: {
+      bg: '#1e1e2e',
+      panel: '#181825',
+      panel2: '#313244',
+      inset: '#11111b',
+      ink: '#cdd6f4',
+      mute: '#a6adc8',
+      accent: '#cba6f7',
+      accentHover: '#f5c2e7',
+      line: 'rgba(205, 214, 244, 0.12)',
+      line2: 'rgba(205, 214, 244, 0.24)',
+    },
+  },
+  'dracula': {
+    id: 'dracula',
+    name: 'Dracula',
+    mode: 'dark',
+    variables: {
+      bg: '#282a36',
+      panel: '#21222c',
+      panel2: '#44475a',
+      inset: '#191a21',
+      ink: '#f8f8f2',
+      mute: '#6272a4',
+      accent: '#bd93f9',
+      accentHover: '#ff79c6',
+      line: 'rgba(98, 114, 164, 0.3)',
+      line2: 'rgba(98, 114, 164, 0.5)',
+    },
+  },
+  'monaspace-neon': {
+    id: 'monaspace-neon',
+    name: 'Monaspace Neon',
+    mode: 'dark',
+    variables: {
+      bg: '#0d1117',
+      panel: '#161b22',
+      panel2: '#21262d',
+      inset: '#010409',
+      ink: '#e6edf3',
+      mute: '#8b949e',
+      accent: '#2f81f7',
+      accentHover: '#388bfd',
+      line: 'rgba(48, 54, 61, 0.7)',
+      line2: 'rgba(139, 148, 158, 0.3)',
     },
   },
   'nordic-frost': {
@@ -162,6 +216,72 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
     },
   },
 };
+
+export const FONT_SANS_STORAGE_KEY = 'ninfier-font-sans';
+export const FONT_MONO_STORAGE_KEY = 'ninfier-font-mono';
+
+export const FONT_SANS_PRESETS = [
+  { id: 'inter', label: 'Inter (Default)', value: "'Inter Variable', ui-sans-serif, system-ui, sans-serif" },
+  { id: 'system', label: 'System Native UI', value: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' },
+  { id: 'jetbrains-sans', label: 'JetBrains Sans', value: "'JetBrains Sans', 'Inter', ui-sans-serif, sans-serif" },
+  { id: 'fira-sans', label: 'Fira Sans', value: "'Fira Sans', ui-sans-serif, sans-serif" },
+  { id: 'trebuchet', label: 'Trebuchet / Clean', value: "'Trebuchet MS', 'Lucida Grande', sans-serif" },
+];
+
+export const FONT_MONO_PRESETS = [
+  { id: 'jetbrains-mono', label: 'JetBrains Mono (Default)', value: "'JetBrains Mono', ui-monospace, 'SF Mono', monospace" },
+  { id: 'monaspace-neon', label: 'Monaspace Neon', value: "'Monaspace Neon', 'JetBrains Mono', monospace" },
+  { id: 'monaspace-argon', label: 'Monaspace Argon', value: "'Monaspace Argon', 'JetBrains Mono', monospace" },
+  { id: 'fira-code', label: 'Fira Code', value: "'Fira Code', 'JetBrains Mono', monospace" },
+  { id: 'source-code', label: 'Source Code Pro', value: "'Source Code Pro', ui-monospace, monospace" },
+  { id: 'courier-new', label: 'Courier Retro', value: "'Courier New', Courier, monospace" },
+];
+
+export function getStoredFontSans(): string {
+  try {
+    return localStorage.getItem(FONT_SANS_STORAGE_KEY) || FONT_SANS_PRESETS[0].value;
+  } catch {
+    return FONT_SANS_PRESETS[0].value;
+  }
+}
+
+export function getStoredFontMono(): string {
+  try {
+    return localStorage.getItem(FONT_MONO_STORAGE_KEY) || FONT_MONO_PRESETS[0].value;
+  } catch {
+    return FONT_MONO_PRESETS[0].value;
+  }
+}
+
+export function applyFontFamily(sansVal?: string, monoVal?: string): void {
+  if (typeof document === 'undefined' || !document.documentElement) return;
+  const style = document.documentElement.style;
+  if (sansVal) {
+    if (style.setProperty) {
+      style.setProperty('--font-sans', sansVal);
+    } else {
+      (style as unknown as Record<string, string>)['--font-sans'] = sansVal;
+    }
+    try {
+      localStorage.setItem(FONT_SANS_STORAGE_KEY, sansVal);
+    } catch {
+      // ignore
+    }
+  }
+  if (monoVal) {
+    if (style.setProperty) {
+      style.setProperty('--font-mono', monoVal);
+    } else {
+      (style as unknown as Record<string, string>)['--font-mono'] = monoVal;
+    }
+    try {
+      localStorage.setItem(FONT_MONO_STORAGE_KEY, monoVal);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 
 export function getSystemTheme(): ResolvedTheme {
   try {
