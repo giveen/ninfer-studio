@@ -78,7 +78,8 @@ function ReasoningInline({ text, streaming, workspace }: { text: string; streami
   );
 }
 
-export function MessageMeta({ m }: { m: ChatMessage }) {
+export function MessageMeta({ m, streaming }: { m: ChatMessage; streaming?: boolean }) {
+  if (streaming) return null;
   const t = m.meta;
   if (!t) return null;
 
@@ -404,7 +405,7 @@ export const MessageRow = memo(function MessageRow({
           </div>
         )}
         <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 min-h-[26px]">
-          <MessageMeta m={m} />
+          <MessageMeta m={m} streaming={streaming} />
           <div className="ml-auto">
             {toolbar}
           </div>
