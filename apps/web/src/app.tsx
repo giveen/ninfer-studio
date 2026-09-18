@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Code2, Cpu, MessagesSquare, Monitor, Moon, Settings2, Layers, Sun, Terminal } from 'lucide-react';
+import { Activity, Code2, Cpu, MessagesSquare, Monitor, Moon, Settings2, Layers, Sun, Terminal, Command } from 'lucide-react';
 import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
@@ -8,6 +8,7 @@ import { applyTheme, getStoredTheme, subscribeTheme, type ThemeMode } from './li
 import { CoderSafetyProvider } from './lib/coderSafety';
 import { ChatAgentProvider } from './lib/chatAgent';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { ShortcutsModal } from './components/ShortcutsModal';
 import { ChatScreen } from './screens/ChatScreen';
 import { EngineScreen } from './screens/EngineScreen';
 import { ModelsScreen } from './screens/ModelsScreen';
@@ -79,7 +80,19 @@ export function App() {
   const [screen, setScreen] = useState<Screen>('chat');
   const [coderWs, setCoderWs] = useState('');
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const { status, error } = useStatus(2500);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === '/') {
+        e.preventDefault();
+        setShowShortcuts((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -144,10 +157,19 @@ export function App() {
         ))}
         <button
           type="button"
+          onClick={() => setShowShortcuts(true)}
+          title="Keyboard shortcuts (Cmd/Ctrl + /)"
+          aria-label="Keyboard shortcuts"
+          className="mt-auto flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
+        >
+          <Command size={18} strokeWidth={1.8} />
+        </button>
+        <button
+          type="button"
           onClick={() => setTheme((t) => nextTheme[t])}
           title={themeLabels[theme]}
           aria-label={themeLabels[theme]}
-          className="mt-auto flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
+          className="flex h-10 w-10 items-center justify-center rounded-lg text-faint transition-colors hover:bg-panel2 hover:text-ink"
         >
           {theme === 'dark' ? (
             <Sun size={18} strokeWidth={1.8} />
@@ -227,6 +249,8 @@ export function App() {
           </CoderSafetyProvider>
         </main>
       </div>
+
+      <ShortcutsModal open={showShortcuts} onClose={() => setShowShortcuts(false)} />
     </div>
   );
 }

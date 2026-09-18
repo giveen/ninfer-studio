@@ -7,6 +7,7 @@ import {
   PRESET_THEMES,
   applyFontFamily,
   applyPresetTheme,
+  applyUIScale,
   exportThemeCSS,
   getPresetVariables,
   getStoredCustomVars,
@@ -14,6 +15,7 @@ import {
   getStoredFontSans,
   getStoredPreset,
   getStoredTheme,
+  getStoredUIScale,
   type ThemeMode,
   type ThemePresetId,
   type ThemeVariables,
@@ -24,6 +26,7 @@ export function ThemesTab() {
   const [activePreset, setActivePreset] = useState<ThemePresetId>(() => getStoredPreset());
   const [sansFont, setSansFont] = useState<string>(() => getStoredFontSans());
   const [monoFont, setMonoFont] = useState<string>(() => getStoredFontMono());
+  const [uiScale, setUiScale] = useState<string>(() => getStoredUIScale());
   const [customVars, setCustomVars] = useState<ThemeVariables>(() => {
     const stored = getStoredCustomVars();
     if (stored) return stored;
@@ -46,6 +49,7 @@ export function ThemesTab() {
       if (vars) setCustomVars(vars);
     }
     applyFontFamily(sansFont, monoFont);
+    applyUIScale(uiScale);
   }, []);
 
   const handleSelectMode = (mode: ThemeMode) => {
@@ -78,6 +82,11 @@ export function ThemesTab() {
   const handleSelectMonoFont = (val: string) => {
     setMonoFont(val);
     applyFontFamily(sansFont, val);
+  };
+
+  const handleSelectUIScale = (val: string) => {
+    setUiScale(val);
+    applyUIScale(val);
   };
 
   const handleCustomVarChange = (key: keyof ThemeVariables, value: string) => {
@@ -161,7 +170,23 @@ export function ThemesTab() {
         icon={<Type size={15} />}
         description="Customize interface typography and code block monospaced font families."
       >
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          {/* UI Scale Selector */}
+          <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
+            <label htmlFor="select-ui-scale" className="font-semibold text-[12.5px] text-ink">Interface Text Scale</label>
+            <p className="text-[11px] text-faint">Adjust base text size for comfortable viewing.</p>
+            <select
+              id="select-ui-scale"
+              value={uiScale}
+              onChange={(e) => handleSelectUIScale(e.target.value)}
+              className="mt-1 w-full rounded border border-line bg-inset px-2.5 py-1.5 text-[12px] text-ink outline-none focus:border-accent/50"
+            >
+              <option value="12.5px">Compact (90%)</option>
+              <option value="14px">Normal (100%)</option>
+              <option value="15.5px">Large (110%)</option>
+            </select>
+          </div>
+
           {/* UI Sans Font Selector */}
           <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-panel2/40 p-3">
             <label htmlFor="select-sans-font" className="font-semibold text-[12.5px] text-ink">Interface Font (Sans-Serif)</label>

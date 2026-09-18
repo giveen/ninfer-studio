@@ -568,6 +568,25 @@ export function exportThemeCSS(vars: ThemeVariables): string {
 
 
 
+export function getStoredUIScale(): string {
+  try {
+    return localStorage.getItem('ninfier-ui-scale') || '14px';
+  } catch {
+    return '14px';
+  }
+}
+
+export function applyUIScale(scale: string): void {
+  try {
+    localStorage.setItem('ninfier-ui-scale', scale);
+  } catch {
+    // localStorage unavailable
+  }
+  if (typeof document !== 'undefined') {
+    document.documentElement.style.setProperty('--ui-scale', scale);
+  }
+}
+
 export function subscribeTheme(onChange: (resolved: ResolvedTheme) => void): () => void {
   if (typeof window === 'undefined' || !window.matchMedia) {
     return () => {};

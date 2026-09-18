@@ -156,6 +156,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
   const [text, setText] = useState('');
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
+  const [promptHistoryIndex, setPromptHistoryIndex] = useState<number>(-1);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   // Which conversation actually owns the in-flight stream — `streaming` alone
@@ -870,6 +872,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
   const send = useCallback(async () => {
     const content = text.trim();
+    if (content) {
+      setPromptHistory((prev) => [content, ...prev.filter((h) => h !== content)]);
+      setPromptHistoryIndex(-1);
+    }
     const resolvedConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     console.log('[ChatScreen] send triggered:', { content, isCloudPrimary, engineUpOrCloud, resolvedModel: resolvedConfig.model, baseUrl: resolvedConfig.baseUrl });
     if (!content && !attachments.length) return;
@@ -1308,7 +1314,31 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
-    <div className="flex h-full flex-col">
+    <div
+      className="relative flex h-full flex-col"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+          setDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length) onFiles(files);
+      }}
+    >
+      {dragOver && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-panel/90 backdrop-blur-xs border-2 border-dashed border-accent m-3 rounded-2xl pointer-events-none transition-all">
+          <Paperclip size={44} className="text-accent animate-bounce mb-2" />
+          <p className="text-base font-semibold text-ink">Drop files here to attach</p>
+          <p className="text-xs text-mute">Images or media files</p>
+        </div>
+      )}
       <div className={cn("flex min-h-0 flex-1", isResizingSidebar && "select-none cursor-col-resize")}>
           <>
             {/* conversation rail */}
@@ -1788,10 +1818,19 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  // Busy-elsewhere is the one case send() can't handle itself
-                  // (there's nothing sensible to queue against a conversation
-                  // that isn't even the one on screen streaming).
                   if (!(streamingConvId && streamingConvId !== activeId)) send();
+                } else if (e.key === 'ArrowUp' && (text === '' || (textareaRef.current?.selectionStart === 0 && textareaRef.current?.selectionEnd === 0))) {
+                  if (promptHistory.length > 0 && promptHistoryIndex < promptHistory.length - 1) {
+                    e.preventDefault();
+                    const nextIdx = promptHistoryIndex + 1;
+                    setPromptHistoryIndex(nextIdx);
+                    setText(promptHistory[nextIdx]);
+                  }
+                } else if (e.key === 'ArrowDown' && promptHistoryIndex >= 0) {
+                  e.preventDefault();
+                  const nextIdx = promptHistoryIndex - 1;
+                  setPromptHistoryIndex(nextIdx);
+                  setText(nextIdx >= 0 ? promptHistory[nextIdx] : '');
                 }
               }}
               onPaste={(e) => {

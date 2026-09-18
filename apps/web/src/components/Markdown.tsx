@@ -3,8 +3,10 @@ import hljs from 'highlight.js/lib/common';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { ReactNode } from 'react';
+import { Copy, Check, WrapText } from 'lucide-react';
 import { openExternalLink } from '../lib/externalLink';
 import { postJSON } from '../lib/api/core';
+import { cn } from './ui';
 
 // Per-workspace data-URL cache: the same image path can appear many times in
 // a long transcript, and each <img> mounts its own ImageWithFallback. Without
@@ -85,6 +87,8 @@ function escapeHtml(s: string): string {
 
 function CodeBlock({ code, lang }: { code: string; lang: string }) {
   const [copied, setCopied] = useState(false);
+  const [wrapped, setWrapped] = useState(false);
+
   const html = useMemo(() => {
     try {
       if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
@@ -105,18 +109,42 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   };
 
   return (
-    <div className="mdcode my-2.5 overflow-hidden rounded-lg border border-line bg-inset">
-      <div className="flex items-center justify-between border-b border-line px-3 py-1">
-        <span className="font-mono text-[10.5px] uppercase tracking-wider text-faint">{lang || 'text'}</span>
-        <button
-          type="button"
-          onClick={copy}
-          className="rounded-md px-1.5 py-0.5 text-[11px] font-medium text-mute transition-colors hover:bg-panel2 hover:text-ink"
-        >
-          {copied ? 'copied ✓' : 'copy'}
-        </button>
+    <div className="mdcode my-2.5 overflow-hidden rounded-lg border border-line bg-inset shadow-2xs">
+      <div className="flex items-center justify-between border-b border-line bg-panel2/60 px-3 py-1 text-[11px]">
+        <span className="font-mono text-[10.5px] uppercase tracking-wider text-faint font-semibold">{lang || 'text'}</span>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setWrapped((w) => !w)}
+            title={wrapped ? 'Unwrap lines' : 'Wrap lines'}
+            className={cn(
+              'flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] font-medium transition-colors',
+              wrapped ? 'bg-accent/20 text-accent font-semibold' : 'text-faint hover:text-ink hover:bg-panel2'
+            )}
+          >
+            <WrapText size={12} />
+            <span>wrap</span>
+          </button>
+          <button
+            type="button"
+            onClick={copy}
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] font-medium text-mute transition-colors hover:bg-panel2 hover:text-ink"
+          >
+            {copied ? (
+              <>
+                <Check size={12} className="text-accent" />
+                <span className="text-accent font-semibold">copied</span>
+              </>
+            ) : (
+              <>
+                <Copy size={12} />
+                <span>copy</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
-      <pre className="overflow-x-auto p-3">
+      <pre className={cn("p-3 text-[12px] font-mono leading-relaxed", wrapped ? "whitespace-pre-wrap break-words" : "overflow-x-auto")}>
         <code dangerouslySetInnerHTML={{ __html: html }} />
       </pre>
     </div>

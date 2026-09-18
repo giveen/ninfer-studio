@@ -64,7 +64,7 @@ body {
   background: var(--color-bg);
   color: var(--color-ink);
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--ui-scale, 14px);
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
 }
