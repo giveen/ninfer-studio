@@ -156,7 +156,7 @@ export function MessageMeta({ m }: { m: ChatMessage }) {
         <span
           key={i}
           title={b.title}
-          className="inline-flex items-center gap-1 rounded-md border border-line bg-panel2/80 px-2 py-0.5 transition-colors hover:border-line2 hover:text-ink cursor-help"
+          className="inline-flex items-center gap-1 rounded-md border border-line bg-panel2/80 px-2 py-0.5 transition-colors hover:border-line2 hover:text-ink cursor-default"
         >
           {b.icon}
           <span className="text-faint">{b.label}</span>
