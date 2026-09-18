@@ -307,32 +307,34 @@ export const MessageRow = memo(function MessageRow({
           {streaming && !m.reasoning && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
           <ReasoningInline text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
         </div>
-        <div className={cn('rounded-2xl rounded-tl-xs border border-line bg-panel/90 px-4 py-3 shadow-xs', streaming && m.content && 'stream-caret')}>
-          {m.error ? (
-            <div>
-              <div className="text-[13px] text-danger">{m.content}</div>
-              <Button size="sm" variant="subtle" className="mt-2" onClick={() => actions.onRegenerate(convId, index)} disabled={locked}>
-                <RefreshCw size={12} /> retry
-              </Button>
-            </div>
-          ) : m.content ? (
-            // Plain text while streaming (see ReasoningBlock): avoids re-parsing the
-            // growing answer through react-markdown on every token. Rendered to
-            // proper markdown once the turn completes (streaming === false).
-            streaming ? (
-              <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
-            ) : (
-              <div className="markdown text-[13.5px] leading-relaxed">
-                <Markdown workspace={workspace}>{m.content}</Markdown>
+        {(m.content || m.error || (m.tool_calls && m.tool_calls.length > 0) || (!streaming && !m.reasoning)) && (
+          <div className={cn('rounded-2xl rounded-tl-xs border border-line bg-panel/90 px-4 py-3 shadow-xs', streaming && m.content && 'stream-caret')}>
+            {m.error ? (
+              <div>
+                <div className="text-[13px] text-danger">{m.content}</div>
+                <Button size="sm" variant="subtle" className="mt-2" onClick={() => actions.onRegenerate(convId, index)} disabled={locked}>
+                  <RefreshCw size={12} /> retry
+                </Button>
               </div>
-            )
-          ) : !streaming && !m.reasoning && !m.tool_calls ? (
-            <span className="text-[13px] text-faint">—</span>
-          ) : null}
-          {m.tool_calls && m.tool_calls.length > 0 && (
-            <CollapsibleToolCalls toolCalls={m.tool_calls} />
-          )}
-        </div>
+            ) : m.content ? (
+              // Plain text while streaming (see ReasoningBlock): avoids re-parsing the
+              // growing answer through react-markdown on every token. Rendered to
+              // proper markdown once the turn completes (streaming === false).
+              streaming ? (
+                <div className="whitespace-pre-wrap break-words text-[13.5px] leading-relaxed">{m.content}</div>
+              ) : (
+                <div className="markdown text-[13.5px] leading-relaxed">
+                  <Markdown workspace={workspace}>{m.content}</Markdown>
+                </div>
+              )
+            ) : !streaming && !m.reasoning && !m.tool_calls ? (
+              <span className="text-[13px] text-faint">—</span>
+            ) : null}
+            {m.tool_calls && m.tool_calls.length > 0 && (
+              <CollapsibleToolCalls toolCalls={m.tool_calls} />
+            )}
+          </div>
+        )}
         {isLast && !m.error && !streaming && m.meta?.finishReason === 'length' && (
           <Button size="sm" variant="subtle" className="mt-1.5" onClick={() => actions.onContinue(convId, index)} disabled={locked}>
             <ChevronsRight size={12} /> continue
