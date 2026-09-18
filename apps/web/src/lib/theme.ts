@@ -27,6 +27,7 @@ export type ThemePresetId =
   | 'tokyo-night'
   | 'nordic-frost'
   | 'monokai-dark'
+  | 'win95'
   | 'crisp-light'
   | 'solarized-light'
   | 'custom';
@@ -99,6 +100,21 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#b6f23e',
     },
   },
+  'win95': {
+    id: 'win95',
+    name: 'Windows 95',
+    mode: 'light',
+    variables: {
+      bg: '#008080',
+      panel: '#c0c0c0',
+      panel2: '#d4d4d4',
+      inset: '#ffffff',
+      ink: '#000000',
+      mute: '#555555',
+      accent: '#000080',
+      accentHover: '#0000a0',
+    },
+  },
   'crisp-light': {
     id: 'crisp-light',
     name: 'Crisp Light',
@@ -130,6 +146,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
     },
   },
 };
+
 
 export function getSystemTheme(): ResolvedTheme {
   try {
