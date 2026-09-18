@@ -1472,12 +1472,9 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               </div>
               <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-faint">
                 <span>{formatTime(c.createdAt)}</span>
-                <span>·</span>
-                <span className="text-accent/80">{c.model}</span>
-                <span>·</span>
-                <span>{c.messages.length} msgs</span>
               </div>
             </div>
+
           ))}
         </div>
         {pendingDelete && (
