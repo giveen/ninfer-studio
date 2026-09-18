@@ -4,7 +4,7 @@ import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
 import type { StatusPayload } from './lib/types';
 import { formatBytes, formatPct } from './lib/format';
-import { applyTheme, getStoredTheme, subscribeTheme, type ThemeMode } from './lib/theme';
+import { applyTheme, getStoredTheme, initTheme, subscribeTheme, type ThemeMode } from './lib/theme';
 import { CoderSafetyProvider } from './lib/coderSafety';
 import { ChatAgentProvider } from './lib/chatAgent';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -82,6 +82,10 @@ export function App() {
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const { status, error } = useStatus(2500);
+
+  useEffect(() => {
+    initTheme();
+  }, []);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

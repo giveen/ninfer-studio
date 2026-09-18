@@ -584,7 +584,31 @@ export function applyUIScale(scale: string): void {
   }
   if (typeof document !== 'undefined') {
     document.documentElement.style.setProperty('--ui-scale', scale);
+    const zoomMap: Record<string, string> = {
+      '12.5px': '90%',
+      '14px': '100%',
+      '15.5px': '110%',
+    };
+    const zoomVal = zoomMap[scale] || scale;
+    (document.documentElement.style as any).zoom = zoomVal;
   }
+}
+
+export function initTheme(): void {
+  const preset = getStoredPreset();
+  const mode = getStoredTheme();
+  const sans = getStoredFontSans();
+  const mono = getStoredFontMono();
+  const scale = getStoredUIScale();
+
+  if (preset === 'custom') {
+    const customVars = getStoredCustomVars();
+    if (customVars) applyPresetTheme('custom', customVars, mode);
+  } else {
+    applyPresetTheme(preset, null, mode);
+  }
+  applyFontFamily(sans, mono);
+  applyUIScale(scale);
 }
 
 export function subscribeTheme(onChange: (resolved: ResolvedTheme) => void): () => void {
