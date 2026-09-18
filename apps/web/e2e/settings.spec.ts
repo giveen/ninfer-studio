@@ -16,7 +16,7 @@ test.describe('Settings Screen', () => {
       // mounted, just `hidden`-classed, per app.tsx, and getByRole correctly
       // drops anything under a hidden ancestor from the accessibility tree.
       // Not `exact` — the real "Safety" tab label is "Safety & Permissions".
-      const tabBtn = page.locator('main').getByRole('button', { name: tabName });
+      const tabBtn = page.locator('main').getByRole('tab', { name: tabName });
       await expect(tabBtn).toBeVisible();
       await tabBtn.click();
       await expect(tabBtn).toHaveClass(/text-accent/);

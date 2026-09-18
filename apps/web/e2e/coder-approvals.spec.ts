@@ -27,7 +27,7 @@ for (const decision of ['Approve once', 'Deny', 'Stop'] as const) {
     });
     await page.goto('/');
     await page.getByRole('navigation').getByRole('button', { name: 'Code', exact: true }).click();
-    await page.getByPlaceholder('Instruct the coder agent...').fill('Read approval-fixture.txt');
+    await page.getByPlaceholder('Instruct the coder agent').fill('Read approval-fixture.txt');
     await page.getByRole('button', { name: 'Run', exact: true }).click();
     await streamCount(page, 1);
     await chunk(page, { tool_calls: [{ index: 0, id: 'read-1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: 'approval-fixture.txt' }) } }] });
