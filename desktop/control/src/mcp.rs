@@ -1069,18 +1069,16 @@ pub async fn servers_upsert(
             spec.authorization = existing.authorization.clone();
         }
         for (k, v) in &mut spec.env {
-            if v == "***" {
-                if let Some(old_v) = existing.env.get(k) {
+            if v == "***"
+                && let Some(old_v) = existing.env.get(k) {
                     *v = old_v.clone();
                 }
-            }
         }
         for (k, v) in &mut spec.headers {
-            if v == "***" {
-                if let Some(old_v) = existing.headers.get(k) {
+            if v == "***"
+                && let Some(old_v) = existing.headers.get(k) {
                     *v = old_v.clone();
                 }
-            }
         }
     }
     validate_spec(&spec)?;

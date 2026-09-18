@@ -205,13 +205,12 @@ pub(crate) fn sanitize_and_merge_request_params(
 
     // 1. generic top-level defaults (client fields win)
     let defaults_trimmed = defaults_json.trim();
-    if !defaults_trimmed.is_empty() {
-        if let Ok(serde_json::Value::Object(defaults_map)) = serde_json::from_str::<serde_json::Value>(defaults_trimmed) {
+    if !defaults_trimmed.is_empty()
+        && let Ok(serde_json::Value::Object(defaults_map)) = serde_json::from_str::<serde_json::Value>(defaults_trimmed) {
             for (k, v) in defaults_map {
                 body_map.entry(k).or_insert(v);
             }
         }
-    }
 
     // 2. reasoning effort handling
     if is_local {
@@ -431,11 +430,10 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         resp_headers.insert(k, v.clone());
     }
 
-    if resp_headers.get(header::CACHE_CONTROL).is_none() {
-        if let Ok(v) = HeaderValue::from_str("no-cache") {
+    if resp_headers.get(header::CACHE_CONTROL).is_none()
+        && let Ok(v) = HeaderValue::from_str("no-cache") {
             resp_headers.insert(header::CACHE_CONTROL, v);
         }
-    }
 
     let stream = futures_util::StreamExt::boxed(resp.bytes_stream());
     let stream = if should_log {

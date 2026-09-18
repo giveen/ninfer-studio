@@ -8,6 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// `(built_at, root, hits)` — see `State::symbol_index`.
+type SymbolIndexCache = (
+    std::time::Instant,
+    std::path::PathBuf,
+    std::sync::Arc<Vec<crate::coder::SymHit>>,
+);
+
 /// Event emitted by the control plane for desktop-shell concerns (tray state,
 /// OS notifications). The control crate stays framework-agnostic: the Tauri app
 /// wires a receiver to the notification plugin + tray. `None` in `State` ⇒ the
@@ -175,13 +182,7 @@ pub struct State {
     /// it was built from so a workspace switch can't serve another
     /// workspace's stale index). See `bg_jobs` for why this lives on `State`.
     /// Uses `parking_lot::Mutex` to avoid mutex poisoning.
-    pub symbol_index: ParkingMutex<
-        Option<(
-            std::time::Instant,
-            std::path::PathBuf,
-            std::sync::Arc<Vec<crate::coder::SymHit>>,
-        )>,
-    >,
+    pub symbol_index: ParkingMutex<Option<SymbolIndexCache>>,
     /// Optional bridge to the desktop shell. `None` when running headless.
     pub event_tx: Option<UnboundedSender<AppEvent>>,
     pub data_dir: std::path::PathBuf,

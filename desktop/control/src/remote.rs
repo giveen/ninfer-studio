@@ -182,14 +182,13 @@ pub(crate) async fn post_start(
         .get("port")
         .and_then(|v| v.as_u64());
 
-    if let Some(p) = raw_port {
-        if p < 1024 || p > 65535 {
+    if let Some(p) = raw_port
+        && (!(1024..=65535).contains(&p)) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("invalid port {p}: must be between 1024 and 65535"),
             ));
         }
-    }
 
     let port = raw_port
         .map(|v| v as u16)

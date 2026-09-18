@@ -84,27 +84,24 @@ pub(crate) fn redact_config(mut v: Value) -> Value {
         if let Some(mcp_servers) = obj.get_mut("mcpServers").and_then(|m| m.as_array_mut()) {
             for server in mcp_servers {
                 if let Some(sobj) = server.as_object_mut() {
-                    if let Some(auth) = sobj.get("authorization").and_then(|a| a.as_str()) {
-                        if !auth.is_empty() {
+                    if let Some(auth) = sobj.get("authorization").and_then(|a| a.as_str())
+                        && !auth.is_empty() {
                             sobj.insert("authorization".into(), json!(SECRET_MASK));
                         }
-                    }
                     if let Some(headers) = sobj.get_mut("headers").and_then(|h| h.as_object_mut()) {
                         for (_k, val) in headers.iter_mut() {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() {
+                            if let Some(s) = val.as_str()
+                                && !s.is_empty() {
                                     *val = json!(SECRET_MASK);
                                 }
-                            }
                         }
                     }
                     if let Some(env) = sobj.get_mut("env").and_then(|e| e.as_object_mut()) {
                         for (_k, val) in env.iter_mut() {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() {
+                            if let Some(s) = val.as_str()
+                                && !s.is_empty() {
                                     *val = json!(SECRET_MASK);
                                 }
-                            }
                         }
                     }
                 }
@@ -317,18 +314,16 @@ pub(crate) async fn set_config(
                         spec.authorization = existing.authorization.clone();
                     }
                     for (k, v) in &mut spec.headers {
-                        if v == SECRET_MASK || v == "***" {
-                            if let Some(old_v) = existing.headers.get(k) {
+                        if (v == SECRET_MASK || v == "***")
+                            && let Some(old_v) = existing.headers.get(k) {
                                 *v = old_v.clone();
                             }
-                        }
                     }
                     for (k, v) in &mut spec.env {
-                        if v == SECRET_MASK || v == "***" {
-                            if let Some(old_v) = existing.env.get(k) {
+                        if (v == SECRET_MASK || v == "***")
+                            && let Some(old_v) = existing.env.get(k) {
                                 *v = old_v.clone();
                             }
-                        }
                     }
                 }
                 new_specs.push(spec);

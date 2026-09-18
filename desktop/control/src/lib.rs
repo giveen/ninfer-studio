@@ -293,14 +293,13 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
 
 fn strip_host_port(host: &str) -> &str {
     let host = host.trim();
-    if host.starts_with('[') {
-        if let Some(end_bracket_idx) = host.find(']') {
+    if host.starts_with('[')
+        && let Some(end_bracket_idx) = host.find(']') {
             let rest = &host[end_bracket_idx + 1..];
             if rest.is_empty() || rest.starts_with(':') {
                 return &host[..=end_bracket_idx];
             }
         }
-    }
     if host.bytes().filter(|&b| b == b':').count() > 1 {
         return host;
     }
@@ -440,7 +439,7 @@ pub async fn boot_adopt(state: &S) {
             .to_string(),
     );
     drop(eng);
-    if engine_health(&state, port).await {
+    if engine_health(state, port).await {
         refresh_engine_status(state).await;
         tracing::event!(
             name: "engine.adopt.found",

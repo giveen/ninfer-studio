@@ -308,11 +308,10 @@ pub async fn start_download(state: &Arc<State>, body: Value) -> Value {
                     r.exit_code = code;
                     r.done = true;
                     r.failed = code.map(|c| c != 0).unwrap_or(true);
-                    if !r.failed {
-                        if let Some(t) = r.total_bytes {
+                    if !r.failed
+                        && let Some(t) = r.total_bytes {
                             r.downloaded_bytes = Some(t);
                         }
-                    }
                     r.speed_bps = Some(0.0);
                     (r.file.clone().unwrap_or_default(), !r.failed)
                 }

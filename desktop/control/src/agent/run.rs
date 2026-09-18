@@ -1139,7 +1139,10 @@ pub(crate) async fn gate_decide(
 #[derive(Debug, Deserialize)]
 pub(crate) struct GateDecideBody {
     pub(crate) decision: String,
+    /// Accepted for symmetry with `ApproveBody` but never consulted — see
+    /// the doc comment above `gate_decide` for why a gate carries no token.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) token: Option<String>,
 }
 

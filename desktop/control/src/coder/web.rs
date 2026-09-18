@@ -59,12 +59,11 @@ fn html_to_text(html: &str, base: &reqwest::Url) -> String {
         let mut parent = el.parent();
         let mut in_head = false;
         while let Some(p) = parent {
-            if let Some(element) = p.value().as_element() {
-                if element.name() == "head" {
+            if let Some(element) = p.value().as_element()
+                && element.name() == "head" {
                     in_head = true;
                     break;
                 }
-            }
             parent = p.parent();
         }
         if in_head {
@@ -477,27 +476,24 @@ fn resolve_ddg_href(href: &str) -> String {
         let rest = &href[i + 5..];
         let end = rest.find('&').unwrap_or(rest.len());
         let decoded = pct_decode(&rest[..end]);
-        if let Ok(parsed) = reqwest::Url::parse(&decoded) {
-            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+        if let Ok(parsed) = reqwest::Url::parse(&decoded)
+            && (parsed.scheme() == "http" || parsed.scheme() == "https") {
                 return decoded;
             }
-        }
         return String::new();
     }
     if let Some(stripped) = href.strip_prefix("//") {
         let candidate = format!("https:{stripped}");
-        if let Ok(parsed) = reqwest::Url::parse(&candidate) {
-            if parsed.scheme() == "http" || parsed.scheme() == "https" {
+        if let Ok(parsed) = reqwest::Url::parse(&candidate)
+            && (parsed.scheme() == "http" || parsed.scheme() == "https") {
                 return candidate;
             }
-        }
         return String::new();
     }
-    if let Ok(parsed) = reqwest::Url::parse(href) {
-        if parsed.scheme() == "http" || parsed.scheme() == "https" {
+    if let Ok(parsed) = reqwest::Url::parse(href)
+        && (parsed.scheme() == "http" || parsed.scheme() == "https") {
             return href.to_string();
         }
-    }
     String::new()
 }
 

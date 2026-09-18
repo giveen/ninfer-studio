@@ -108,14 +108,12 @@ pub(crate) fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
     }
 
     // Reject user's root home directory ($HOME or %USERPROFILE%)
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        if let Ok(home_canon) = std::fs::canonicalize(&home) {
-            if canonical == home_canon {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+        && let Ok(home_canon) = std::fs::canonicalize(&home)
+            && canonical == home_canon {
                 tracing::warn!(path = %path_clean, "Rejecting root user home writable_root bind");
                 return None;
             }
-        }
-    }
 
     Some(canonical)
 }
@@ -126,6 +124,9 @@ pub(crate) fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
 /// literal `"`) reproduces the argument byte-for-byte. Pure string logic —
 /// kept out of the `cfg(windows)` module so its round-trip is testable (and
 /// tested) on every platform's CI.
+// Its only non-test caller is `sandbox::windows::command_line`, compiled
+// only on `cfg(windows)` — invisible to a Linux, non-`--tests` build.
+#[allow(dead_code)]
 pub(crate) fn arg_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();

@@ -318,11 +318,10 @@ pub(crate) async fn enforce_perm(
     if let Some(p) = all_perms.get(scope) {
         matched_perms.push(p);
     }
-    if scope != "default" {
-        if let Some(p) = all_perms.get("default") {
+    if scope != "default"
+        && let Some(p) = all_perms.get("default") {
             matched_perms.push(p);
         }
-    }
     let default_perm = CoderPerms::default();
     if matched_perms.is_empty() {
         matched_perms.push(&default_perm);
@@ -407,11 +406,10 @@ pub(crate) async fn denied_path_prefixes(state: &S, scope: &str) -> Vec<String> 
     if let Some(p) = all_perms.get(scope) {
         out.extend(p.deny_paths.iter().map(|d| normalize_rel_path(d)).filter(|s| !s.is_empty()));
     }
-    if scope != "default" {
-        if let Some(p) = all_perms.get("default") {
+    if scope != "default"
+        && let Some(p) = all_perms.get("default") {
             out.extend(p.deny_paths.iter().map(|d| normalize_rel_path(d)).filter(|s| !s.is_empty()));
         }
-    }
     out
 }
 

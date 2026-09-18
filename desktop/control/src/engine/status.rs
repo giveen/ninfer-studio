@@ -96,14 +96,12 @@ pub async fn refresh_engine_status(state: &State) {
     }
 
     if eng.state == EngineState::Stopped {
-        if let Some(port) = eng.port {
-            if is_healthy {
-                if let Some(ref all) = disc_engines {
+        if let Some(port) = eng.port
+            && is_healthy
+                && let Some(ref all) = disc_engines {
                     apply_adopt_external(&mut eng, &state.data_dir, port, all, cfg_port, model_info.clone());
                     update_engine_state_and_emit(&mut eng, state, EngineState::Running);
                 }
-            }
-        }
     } else if eng.state == EngineState::Failed && !has_child {
         let adopt_port = if port != cfg_port && is_cfg_healthy {
             Some(cfg_port)
@@ -112,12 +110,11 @@ pub async fn refresh_engine_status(state: &State) {
         } else {
             None
         };
-        if let Some(ap) = adopt_port {
-            if let Some(ref all) = disc_engines {
+        if let Some(ap) = adopt_port
+            && let Some(ref all) = disc_engines {
                 apply_adopt_external(&mut eng, &state.data_dir, ap, all, cfg_port, model_info.clone());
                 update_engine_state_and_emit(&mut eng, state, EngineState::Running);
             }
-        }
     } else if eng.state == EngineState::External && let Some(port) = eng.port {
         if is_healthy {
             if let Some(ref all) = disc_engines {

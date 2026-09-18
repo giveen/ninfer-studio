@@ -59,11 +59,10 @@ fn build_symbol_index_blocking(root: &Path) -> Vec<SymHit> {
         .hidden(true)
         .parents(false)
         .filter_entry(|e| {
-            if let Some(name) = e.file_name().to_str() {
-                if CODER_IGNORE.contains(&name) {
+            if let Some(name) = e.file_name().to_str()
+                && CODER_IGNORE.contains(&name) {
                     return false;
                 }
-            }
             true
         })
         .build();
@@ -117,11 +116,10 @@ fn search_symbol_index(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>
 fn search_cached_symbols(cache: &SymbolIndexCache, root: &Path) -> Arc<Vec<SymHit>> {
     {
         let guard = cache.lock();
-        if let Some((at, cached_root, idx)) = guard.as_ref() {
-            if at.elapsed() < SYMBOL_TTL && cached_root == root {
+        if let Some((at, cached_root, idx)) = guard.as_ref()
+            && at.elapsed() < SYMBOL_TTL && cached_root == root {
                 return Arc::clone(idx);
             }
-        }
     }
     search_symbol_index(cache, root)
 }
@@ -247,11 +245,10 @@ pub async fn search(
             .hidden(true)
             .parents(false)
             .filter_entry(|e| {
-                if let Some(name) = e.file_name().to_str() {
-                    if CODER_IGNORE.contains(&name) {
+                if let Some(name) = e.file_name().to_str()
+                    && CODER_IGNORE.contains(&name) {
                         return false;
                     }
-                }
                 true
             })
             .build();
@@ -274,11 +271,10 @@ pub async fn search(
                 continue;
             }
 
-            if let Ok(meta) = entry.metadata() {
-                if meta.len() > 10 * 1024 * 1024 {
+            if let Ok(meta) = entry.metadata()
+                && meta.len() > 10 * 1024 * 1024 {
                     continue;
                 }
-            }
 
             let Ok(content_text) = std::fs::read_to_string(entry.path()) else {
                 continue;
@@ -374,11 +370,10 @@ pub async fn repo_map(
             .hidden(true)
             .parents(false)
             .filter_entry(|e| {
-                if let Some(name) = e.file_name().to_str() {
-                    if CODER_IGNORE.contains(&name) {
+                if let Some(name) = e.file_name().to_str()
+                    && CODER_IGNORE.contains(&name) {
                         return false;
                     }
-                }
                 true
             })
             .build();
@@ -395,11 +390,10 @@ pub async fn repo_map(
                 continue;
             }
             let path = entry.path();
-            if let Ok(rel) = path.strip_prefix(&ws) {
-                if path_is_denied(&deny_prefixes, &rel.to_string_lossy()) {
+            if let Ok(rel) = path.strip_prefix(&ws)
+                && path_is_denied(&deny_prefixes, &rel.to_string_lossy()) {
                     continue;
                 }
-            }
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             let lang = match ext {
@@ -552,7 +546,7 @@ async fn git_run(root: &Path, extra_args: &[&str], secs: u64) -> Option<String> 
         Duration::from_secs(secs),
         Command::new("git")
             .arg("--no-pager")
-            .args(&[
+            .args([
                 "-c",
                 "core.fsmonitor=false",
                 "-c",
@@ -588,11 +582,10 @@ fn filter_diff_text(diff_text: &str, deny_prefixes: &[String]) -> String {
     let mut current: Option<(bool, String)> = None;
     for line in diff_text.split_inclusive('\n') {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let Some((denied, buf)) = current.take() {
-                if !denied {
+            if let Some((denied, buf)) = current.take()
+                && !denied {
                     out.push_str(&buf);
                 }
-            }
             let path_a = rest
                 .split(" b/")
                 .next()
@@ -606,11 +599,10 @@ fn filter_diff_text(diff_text: &str, deny_prefixes: &[String]) -> String {
             out.push_str(line);
         }
     }
-    if let Some((denied, buf)) = current {
-        if !denied {
+    if let Some((denied, buf)) = current
+        && !denied {
             out.push_str(&buf);
         }
-    }
     out
 }
 

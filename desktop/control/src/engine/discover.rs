@@ -28,12 +28,13 @@ pub async fn discover_engines() -> Vec<DiscoveredEngine> {
     }
 }
 
+/// `(args, bin_path, port, artifact)` — see [`parse_cmdline_bytes`].
+type ParsedCmdline = (Vec<String>, String, Option<u16>, Option<String>);
+
 /// Parse raw process cmdline bytes (split on NUL bytes, lossy UTF-8 decoded).
 /// Identifies `ninfer-serve` / `ninfer-serve.exe` (skipping wrapper launchers like `env`, `nice`, `numactl`),
 /// and extracts `(args, bin_path, port, artifact)`.
-pub fn parse_cmdline_bytes(
-    raw: &[u8],
-) -> Option<(Vec<String>, String, Option<u16>, Option<String>)> {
+pub fn parse_cmdline_bytes(raw: &[u8]) -> Option<ParsedCmdline> {
     if raw.is_empty() {
         return None;
     }
@@ -82,11 +83,10 @@ pub fn parse_cmdline_bytes(
             i += 2;
             continue;
         }
-        if let Some(stripped) = arg.strip_prefix("--port=").or_else(|| arg.strip_prefix("-p=")) {
-            if let Ok(p) = stripped.parse::<u16>() {
+        if let Some(stripped) = arg.strip_prefix("--port=").or_else(|| arg.strip_prefix("-p="))
+            && let Ok(p) = stripped.parse::<u16>() {
                 port = Some(p);
             }
-        }
 
         if (arg == "--model" || arg == "-m") && i + 1 < args.len() {
             if artifact.is_none() {
@@ -95,11 +95,10 @@ pub fn parse_cmdline_bytes(
             i += 2;
             continue;
         }
-        if let Some(stripped) = arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m=")) {
-            if artifact.is_none() {
+        if let Some(stripped) = arg.strip_prefix("--model=").or_else(|| arg.strip_prefix("-m="))
+            && artifact.is_none() {
                 artifact = Some(stripped.to_string());
             }
-        }
 
         if artifact.is_none()
             && !arg.starts_with('-')
@@ -135,11 +134,10 @@ async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
         }
         let proc_path = entry.path();
         if let Ok(meta) = std::fs::metadata(&proc_path) {
-            if let Some(uid) = current_uid {
-                if meta.uid() != uid {
+            if let Some(uid) = current_uid
+                && meta.uid() != uid {
                     continue;
                 }
-            }
         } else {
             continue;
         }
@@ -159,13 +157,11 @@ async fn discover_engines_proc() -> Vec<DiscoveredEngine> {
         let start_time = get_proc_starttime(pid);
 
         // Resolve relative artifact path against process working directory
-        if let Some(art) = artifact.as_ref() {
-            if std::path::Path::new(art).is_relative() {
-                if let Ok(cwd) = std::fs::read_link(format!("/proc/{name}/cwd")) {
+        if let Some(art) = artifact.as_ref()
+            && std::path::Path::new(art).is_relative()
+                && let Ok(cwd) = std::fs::read_link(format!("/proc/{name}/cwd")) {
                     artifact = Some(cwd.join(art).to_string_lossy().to_string());
                 }
-            }
-        }
 
         // If port is missing or 0, attempt socket inode resolution via /proc/net/tcp
         if port.unwrap_or(0) == 0 {
@@ -212,13 +208,11 @@ fn get_proc_socket_inodes(pid: u32) -> std::collections::HashSet<u64> {
     for entry in entries.flatten() {
         if let Ok(target) = std::fs::read_link(entry.path()) {
             let s = target.to_string_lossy();
-            if let Some(stripped) = s.strip_prefix("socket:[") {
-                if let Some(inode_str) = stripped.strip_suffix(']') {
-                    if let Ok(inode) = inode_str.parse::<u64>() {
+            if let Some(stripped) = s.strip_prefix("socket:[")
+                && let Some(inode_str) = stripped.strip_suffix(']')
+                    && let Ok(inode) = inode_str.parse::<u64>() {
                         inodes.insert(inode);
                     }
-                }
-            }
         }
     }
     inodes
@@ -237,15 +231,12 @@ fn parse_tcp_listening_ports_from_text(content: &str, inodes: &std::collections:
         let Ok(inode) = fields[9].parse::<u64>() else {
             continue;
         };
-        if inodes.contains(&inode) {
-            if let Some((_, port_hex)) = fields[1].rsplit_once(':') {
-                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-                    if port > 0 {
+        if inodes.contains(&inode)
+            && let Some((_, port_hex)) = fields[1].rsplit_once(':')
+                && let Ok(port) = u16::from_str_radix(port_hex, 16)
+                    && port > 0 {
                         return Some(port);
                     }
-                }
-            }
-        }
     }
     None
 }
@@ -253,11 +244,10 @@ fn parse_tcp_listening_ports_from_text(content: &str, inodes: &std::collections:
 #[cfg(target_os = "linux")]
 fn parse_proc_net_tcp_listening_ports(inodes: &std::collections::HashSet<u64>) -> Option<u16> {
     for net_file in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        if let Ok(content) = std::fs::read_to_string(net_file) {
-            if let Some(port) = parse_tcp_listening_ports_from_text(&content, inodes) {
+        if let Ok(content) = std::fs::read_to_string(net_file)
+            && let Some(port) = parse_tcp_listening_ports_from_text(&content, inodes) {
                 return Some(port);
             }
-        }
     }
     None
 }

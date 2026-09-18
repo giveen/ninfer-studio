@@ -399,11 +399,10 @@ pub async fn exec(
             if jobs.len() >= 32 {
                 let mut finished: Vec<(String, u64)> = Vec::new();
                 for (k, j) in jobs.iter() {
-                    if let Ok(st) = j.state.try_lock() {
-                        if st.done {
+                    if let Ok(st) = j.state.try_lock()
+                        && st.done {
                             finished.push((k.clone(), st.started_at));
                         }
-                    }
                 }
                 finished.sort_by_key(|(_, started_at)| *started_at);
                 for (k, _) in finished {
@@ -500,11 +499,10 @@ pub async fn exec(
                     let new_cwd = rest[..end].trim().to_string();
                     if !new_cwd.is_empty() {
                         let mut sessions = state.shell_sessions.lock().await;
-                        if sessions.len() >= 100 {
-                            if let Some(k) = sessions.keys().next().cloned() {
+                        if sessions.len() >= 100
+                            && let Some(k) = sessions.keys().next().cloned() {
                                 sessions.remove(&k);
                             }
-                        }
                         sessions.insert(sid.clone(), new_cwd.clone());
                         final_result_cwd = rel_of(&root, Path::new(&new_cwd));
                     }
@@ -571,6 +569,9 @@ impl BgJob {
         }
     }
     /// Non-blocking done check for eviction (contention ⇒ treat as busy).
+    // TODO: no eviction sweep calls this yet — completed background jobs
+    // stay in the job map until `bash_poll`/process shutdown reclaims them.
+    #[allow(dead_code)]
     fn try_done(&self) -> bool {
         self.state.try_lock().map(|s| s.done).unwrap_or(false)
     }
@@ -658,11 +659,10 @@ async fn drain_bg_job(
             let new_cwd = rest[..end].trim().to_string();
             if !new_cwd.is_empty() {
                 let mut sessions = state.shell_sessions.lock().await;
-                if sessions.len() >= 100 {
-                    if let Some(k) = sessions.keys().next().cloned() {
+                if sessions.len() >= 100
+                    && let Some(k) = sessions.keys().next().cloned() {
                         sessions.remove(&k);
                     }
-                }
                 sessions.insert(sid.clone(), new_cwd);
             }
         }

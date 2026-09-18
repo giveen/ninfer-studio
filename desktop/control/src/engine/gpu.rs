@@ -30,17 +30,15 @@ pub fn parse_capacity_line(line: &str) -> Option<(f64, f64)> {
                 let mut it = rest.split_whitespace();
                 if let Some(num_str) = it.next() {
                     let cleaned_num = num_str.replace(',', "");
-                    if let Ok(val) = cleaned_num.parse::<f64>() {
-                        if val.is_finite() && val >= 0.0 {
-                            if let Some(unit) = it.next() {
+                    if let Ok(val) = cleaned_num.parse::<f64>()
+                        && val.is_finite() && val >= 0.0
+                            && let Some(unit) = it.next() {
                                 match unit {
                                     "gib" => *slot = Some(val),
                                     "mib" => *slot = Some(val / 1024.0),
                                     _ => {}
                                 }
                             }
-                        }
-                    }
                 }
             }
         }

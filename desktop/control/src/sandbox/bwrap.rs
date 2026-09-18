@@ -11,7 +11,6 @@
 
 use super::{ExecChild, SpawnReq, is_secret_env_var, shell_quote};
 use std::io;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::LazyLock;
 use tokio::process::Command;
@@ -135,6 +134,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
 #[cfg(test)]
 mod bwrap_tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn validate_writable_root_rejects_danger_roots() {

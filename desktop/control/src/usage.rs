@@ -235,11 +235,10 @@ pub(crate) async fn usage_stats(
         if src == Some("local") {
             return false;
         }
-        if let Some(m) = e.get("model").and_then(Value::as_str) {
-            if !is_local_engine_model(m) {
+        if let Some(m) = e.get("model").and_then(Value::as_str)
+            && !is_local_engine_model(m) {
                 return true;
             }
-        }
         false
     };
 
@@ -481,19 +480,17 @@ impl UsageAccumulator {
             let usage_val = v
                 .get("usage")
                 .or_else(|| v.get("response").and_then(|r| r.get("usage")));
-            if let Some(u) = usage_val {
-                if !u.is_null() {
+            if let Some(u) = usage_val
+                && !u.is_null() {
                     self.usage_obj = Some(u.clone());
                 }
-            }
             let timings_val = v
                 .get("timings")
                 .or_else(|| v.get("response").and_then(|r| r.get("timings")));
-            if let Some(t) = timings_val {
-                if !t.is_null() {
+            if let Some(t) = timings_val
+                && !t.is_null() {
                     self.timings_obj = Some(t.clone());
                 }
-            }
             if let Some(choices) = v.get("choices").and_then(Value::as_array) {
                 for choice in choices {
                     if let Some(delta) = choice.get("delta") {
@@ -623,6 +620,11 @@ pub(crate) fn wrap_for_usage_logging(
 /// responses, or the whole body for a plain JSON completion — and log it.
 /// Silently does nothing when no `usage` object is found (e.g. the engine
 /// doesn't report usage for this call, or the request failed).
+// Production logging now goes through the streaming tap (usage_tap_stream);
+// this whole-body variant only has test callers left, invisible to a
+// non-`--tests` clippy build. Kept for its unit test coverage of the usage-
+// object parsing (Anthropic/DeepSeek cached-token field variants included).
+#[allow(dead_code)]
 async fn log_from_response_bytes(
     ctx: UsageLogCtx,
     buf: &[u8],
@@ -717,7 +719,7 @@ async fn log_usage_from_parsed(
     }
 
     if !found && completion_tokens == 0 && generated_chars > 0 {
-        completion_tokens = ((generated_chars + 3) / 4) as u64;
+        completion_tokens = generated_chars.div_ceil(4) as u64;
     }
     let _ = log_usage_event(
         &ctx.state,

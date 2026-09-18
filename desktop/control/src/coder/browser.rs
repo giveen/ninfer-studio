@@ -54,6 +54,11 @@ use tokio::task::LocalSet;
 use tokio::time::timeout;
 
 /// A browser session tears down after this much idle time.
+// TODO: nothing calls `reap_if_idle` yet — no periodic sweep is wired up, so
+// an idle session currently leaks its V8 isolate until the next `stop`/tool
+// call on that slot. Keeping the constant + method (not deleting) so the
+// documented intent above is still discoverable when that sweep gets added.
+#[allow(dead_code)]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Hard cap on a single navigation (matches Obscura's own ceiling).
 const NAV_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,6 +168,7 @@ impl BrowserSlot {
     }
 
     /// Drop the session if it has been idle past the timeout.
+    #[allow(dead_code)]
     async fn reap_if_idle(&mut self) {
         if self.is_open() && self.last_used.elapsed() > IDLE_TIMEOUT {
             self.stop();

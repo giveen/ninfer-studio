@@ -29,11 +29,10 @@ pub async fn engine_health_with_key(port: u16, api_key: Option<&str>) -> bool {
         return false;
     };
     let mut req = client.get(format!("http://127.0.0.1:{port}/health"));
-    if let Some(key) = api_key {
-        if !key.is_empty() {
+    if let Some(key) = api_key
+        && !key.is_empty() {
             req = req.bearer_auth(key);
         }
-    }
     match req.send().await {
         Ok(r) => {
             if r.status().is_success() {
@@ -78,11 +77,10 @@ pub async fn engine_model_info_with_key(
         return (None, None);
     };
     let mut req = client.get(format!("http://127.0.0.1:{port}/v1/models"));
-    if let Some(key) = api_key {
-        if !key.is_empty() {
+    if let Some(key) = api_key
+        && !key.is_empty() {
             req = req.bearer_auth(key);
         }
-    }
 
     let r = match req.send().await {
         Ok(res) => res,
@@ -152,13 +150,11 @@ pub fn argv_max_context(argv: Option<&Vec<String>>) -> Option<u64> {
             if let Some(parsed) = parse_context_val(rest) {
                 return Some(parsed);
             }
-        } else if a == "--max-context" || a == "-c" {
-            if i + 1 < argv.len() {
-                if let Some(parsed) = parse_context_val(&argv[i + 1]) {
+        } else if (a == "--max-context" || a == "-c")
+            && i + 1 < argv.len()
+                && let Some(parsed) = parse_context_val(&argv[i + 1]) {
                     return Some(parsed);
                 }
-            }
-        }
         i += 1;
     }
     None

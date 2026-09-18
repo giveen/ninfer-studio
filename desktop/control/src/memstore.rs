@@ -347,11 +347,10 @@ pub async fn apply_memory_update(
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                if v.get("id").and_then(|v| v.as_str()) == Some(drop_id) {
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed)
+                && v.get("id").and_then(|v| v.as_str()) == Some(drop_id) {
                     continue;
                 }
-            }
             keep_lines.push(trimmed);
         }
         let content = if keep_lines.is_empty() {

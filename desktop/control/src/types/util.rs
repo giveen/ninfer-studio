@@ -38,7 +38,7 @@ pub fn base_name(p: &str) -> &str {
         }
         return p;
     }
-    match trimmed.rsplit_once(|c| c == '/' || c == '\\') {
+    match trimmed.rsplit_once(['/', '\\']) {
         Some((_, rest)) if !rest.is_empty() => rest,
         _ => trimmed,
     }

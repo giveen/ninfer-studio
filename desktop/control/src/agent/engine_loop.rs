@@ -242,11 +242,10 @@ pub fn build_request(
     if let Some(b) = enable_thinking {
         body["enable_thinking"] = json!(b);
     }
-    if cache_system {
-        if let Some(e) = &effort {
+    if cache_system
+        && let Some(e) = &effort {
             body["reasoning_effort"] = json!(e);
         }
-    }
     if let Some(p) = params.get("preserveThinking").filter(|v| !v.is_null()) {
         body["preserve_thinking"] = p.clone();
     }

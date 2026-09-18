@@ -87,51 +87,47 @@ pub async fn grep(
             .hidden(false)
             .max_filesize(Some(10 * 1024 * 1024))
             .filter_entry(|e| {
-                if let Some(name) = e.file_name().to_str() {
-                    if CODER_IGNORE.contains(&name) {
+                if let Some(name) = e.file_name().to_str()
+                    && CODER_IGNORE.contains(&name) {
                         return false;
                     }
-                }
                 true
             })
             .build();
 
-        for result in walker {
-            if let Ok(entry) = result {
-                if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+        for entry in walker.flatten() {
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+                continue;
+            }
+
+            let path = entry.path();
+            let rel_path = path
+                .strip_prefix(&ws)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+
+            if let Some(ref matcher) = include_matcher
+                && !matcher.is_match(&rel_path) {
                     continue;
                 }
 
-                let path = entry.path();
-                let rel_path = path
-                    .strip_prefix(&ws)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-
-                if let Some(ref matcher) = include_matcher {
-                    if !matcher.is_match(&rel_path) {
-                        continue;
-                    }
-                }
-
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    for (i, line) in content.lines().enumerate() {
-                        if re.is_match(line) {
-                            let mut text = line.to_string();
-                            if text.len() > 400 {
-                                let mut cut = 400;
-                                while !text.is_char_boundary(cut) {
-                                    cut -= 1;
-                                }
-                                text.truncate(cut);
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let mut text = line.to_string();
+                        if text.len() > 400 {
+                            let mut cut = 400;
+                            while !text.is_char_boundary(cut) {
+                                cut -= 1;
                             }
-                            all_matches.push(json!({
-                                "file": rel_path,
-                                "line": i + 1,
-                                "text": text
-                            }));
+                            text.truncate(cut);
                         }
+                        all_matches.push(json!({
+                            "file": rel_path,
+                            "line": i + 1,
+                            "text": text
+                        }));
                     }
                 }
             }
