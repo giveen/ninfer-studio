@@ -72,10 +72,11 @@ describe('format module', () => {
   describe('formatRate', () => {
     it('formats tokens per second', () => {
       expect(formatRate(null)).toBe('—');
-      expect(formatRate(45.67)).toBe('45.7 tok/s');
-      expect(formatRate(1250)).toBe('1.25k tok/s');
+      expect(formatRate(45.67)).toBe('45.7 tks/s');
+      expect(formatRate(1250)).toBe('1.25k tks/s');
     });
   });
+
 
   describe('formatMs', () => {
     it('formats millisecond durations', () => {

@@ -1,5 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { applyTheme, getStoredTheme, getSystemTheme, resolveTheme, subscribeTheme, STORAGE_KEY } from './theme';
+import {
+  FONT_MONO_PRESETS,
+  FONT_SANS_PRESETS,
+  PRESET_STORAGE_KEY,
+  PRESET_THEMES,
+  STORAGE_KEY,
+  applyFontFamily,
+  applyPresetTheme,
+  applyTheme,
+  deleteUserThemePreset,
+  exportThemeCSS,
+  exportThemeJSON,
+  getStoredCustomVars,
+  getStoredFontMono,
+  getStoredFontSans,
+  getStoredPreset,
+  getStoredTheme,
+  getSystemTheme,
+  getUserThemePresets,
+  parseAndValidateThemeJSON,
+  resolveTheme,
+  saveUserThemePreset,
+  subscribeTheme,
+} from './theme';
+
+
 
 class MockStorage implements Storage {
   private store: Record<string, string> = {};
@@ -142,4 +167,112 @@ describe('theme preferences', () => {
     expect(getStoredTheme()).toBe('system');
     expect(() => applyTheme('dark')).not.toThrow();
   });
+
+  it('manages theme presets and applies CSS variables', () => {
+    expect(getStoredPreset()).toBe('midnight-lime');
+
+    applyPresetTheme('tokyo-night');
+    expect(localStorage.getItem(PRESET_STORAGE_KEY)).toBe('tokyo-night');
+    expect(docElement.style['--color-bg']).toBe('#1a1b26');
+    expect(docElement.style['--color-accent']).toBe('#bb9af7');
+
+    const customVars = {
+      bg: '#111111',
+      panel: '#222222',
+      panel2: '#333333',
+      inset: '#000000',
+      ink: '#ffffff',
+      mute: '#888888',
+      accent: '#ff0055',
+      accentHover: '#ff3377',
+    };
+    applyPresetTheme('custom', customVars);
+    expect(localStorage.getItem(PRESET_STORAGE_KEY)).toBe('custom');
+    expect(getStoredCustomVars()).toEqual(customVars);
+    expect(docElement.style['--color-bg']).toBe('#111111');
+    expect(docElement.style['--color-accent']).toBe('#ff0055');
+  });
+
+  it('exports CSS variables formatted correctly', () => {
+    const css = exportThemeCSS(PRESET_THEMES['nordic-frost'].darkVariables);
+    expect(css).toContain('--color-bg: #2e3440');
+    expect(css).toContain('--color-accent: #88c0d0');
+  });
+
+  it('supports Catppuccin, Dracula, and Monaspace Neon presets across dark and light modes', () => {
+    applyPresetTheme('catppuccin-mocha', null, 'dark');
+    expect(docElement.style['--color-bg']).toBe('#1e1e2e');
+    expect(docElement.style['--color-accent']).toBe('#cba6f7');
+
+    applyPresetTheme('catppuccin-mocha', null, 'light');
+    expect(docElement.style['--color-bg']).toBe('#eff1f5');
+    expect(docElement.style['--color-accent']).toBe('#8839ef');
+
+    applyPresetTheme('dracula', null, 'dark');
+    expect(docElement.style['--color-bg']).toBe('#282a36');
+    expect(docElement.style['--color-accent']).toBe('#bd93f9');
+
+    applyPresetTheme('dracula', null, 'light');
+    expect(docElement.style['--color-bg']).toBe('#f8f8f2');
+    expect(docElement.style['--color-accent']).toBe('#9542e5');
+  });
+
+
+  it('manages font family configuration', () => {
+    expect(getStoredFontSans()).toBe(FONT_SANS_PRESETS[0].value);
+    expect(getStoredFontMono()).toBe(FONT_MONO_PRESETS[0].value);
+
+    applyFontFamily("'Fira Sans', sans-serif", "'Monaspace Neon', monospace");
+    expect(docElement.style['--font-sans']).toBe("'Fira Sans', sans-serif");
+    expect(docElement.style['--font-mono']).toBe("'Monaspace Neon', monospace");
+    expect(getStoredFontSans()).toBe("'Fira Sans', sans-serif");
+    expect(getStoredFontMono()).toBe("'Monaspace Neon', monospace");
+  });
+
+  it('saves, resolves, and deletes user-created theme presets', () => {
+    const darkVars = { ...PRESET_THEMES['midnight-lime'].darkVariables, accent: '#ff00bb' };
+    const lightVars = { ...PRESET_THEMES['midnight-lime'].lightVariables, accent: '#aa0088' };
+
+    const created = saveUserThemePreset('Cyberpunk Neon', darkVars, lightVars);
+    expect(created.name).toBe('Cyberpunk Neon');
+    expect(created.id).toContain('user-');
+
+    const userPresets = getUserThemePresets();
+    expect(userPresets).toHaveLength(1);
+    expect(userPresets[0].name).toBe('Cyberpunk Neon');
+
+    applyPresetTheme(created.id, null, 'dark');
+    expect(docElement.style['--color-accent']).toBe('#ff00bb');
+
+    deleteUserThemePreset(created.id);
+    expect(getUserThemePresets()).toHaveLength(0);
+  });
+
+  it('parses and validates imported theme JSON strings', () => {
+    const validJSON = JSON.stringify({
+      name: 'Emerald Dawn',
+      darkVariables: { bg: '#051d1a', panel: '#0a2d28', accent: '#00ffcc' },
+      lightVariables: { bg: '#e6f9f5', panel: '#ffffff', accent: '#00aa88' },
+    });
+
+    const parsed = parseAndValidateThemeJSON(validJSON);
+    expect(parsed.name).toBe('Emerald Dawn');
+    expect(parsed.darkVariables.bg).toBe('#051d1a');
+    expect(parsed.darkVariables.accent).toBe('#00ffcc');
+
+    expect(() => parseAndValidateThemeJSON('invalid json')).toThrow();
+  });
+
+  it('exports theme data into JSON format', () => {
+    const preset = {
+      name: 'Custom Sunset',
+      darkVariables: PRESET_THEMES['dracula'].darkVariables,
+      lightVariables: PRESET_THEMES['dracula'].lightVariables,
+    };
+    const jsonStr = exportThemeJSON(preset);
+    expect(jsonStr).toContain('"name": "Custom Sunset"');
+    expect(jsonStr).toContain('"accent": "#bd93f9"');
+  });
 });
+
+

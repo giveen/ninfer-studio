@@ -34,9 +34,10 @@ export function formatTokens(n: number | null | undefined): string {
 
 export function formatRate(tps: number | null | undefined): string {
   if (tps === null || tps === undefined || !Number.isFinite(tps) || tps < 0) return '—';
-  if (tps >= 1000) return `${(tps / 1000).toFixed(2)}k tok/s`;
-  return `${tps.toFixed(1)} tok/s`;
+  if (tps >= 1000) return `${(tps / 1000).toFixed(2)}k tks/s`;
+  return `${tps.toFixed(1)} tks/s`;
 }
+
 
 export function formatMs(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) return '—';

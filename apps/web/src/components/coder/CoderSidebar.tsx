@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -120,9 +120,49 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
   boundPaths,
   clearBinds,
 }) => {
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ninfer_coder_sidebar_width');
+    const num = saved ? Number(saved) : NaN;
+    return !isNaN(num) ? Math.min(Math.max(180, num), 600) : 288;
+  });
+  const [isResizing, setIsResizing] = useState(false);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+
+  const startResizing = useCallback((mouseDownEvent: React.MouseEvent) => {
+    mouseDownEvent.preventDefault();
+    setIsResizing(true);
+    const startX = mouseDownEvent.clientX;
+    const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? sidebarWidth;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const newWidth = Math.min(Math.max(180, startWidth + delta), 600);
+      setSidebarWidth(newWidth);
+    };
+
+    const onMouseUp = () => {
+      setIsResizing(false);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      setSidebarWidth((w) => {
+        localStorage.setItem('ninfer_coder_sidebar_width', String(w));
+        return w;
+      });
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  }, [sidebarWidth]);
   return (
     <>
-      <div className="flex w-72 flex-col border-r border-line bg-panel">
+      <div
+        ref={sidebarRef}
+        style={{ width: `${sidebarWidth}px` }}
+        className={cn(
+          "relative flex shrink-0 flex-col border-r border-line bg-panel",
+          isResizing && "select-none cursor-col-resize"
+        )}
+      >
         <div className="flex items-center gap-2 border-b border-line p-2 text-sm font-semibold">
           <Terminal size={14} /> Conversations
           <button
@@ -175,7 +215,7 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
                 </div>
 
                 {wsd.expanded && (
-                  <div className="space-y-0.5 pb-1.5 pl-6 pr-1.5">
+                  <div className="space-y-1 pb-1.5 pl-6 pr-1.5">
                     {wsd.order
                       .filter((cid) => {
                         const c = wsd.conversations[cid];
@@ -190,59 +230,69 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
                         return (
                           <div
                             key={cid}
-                            className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-mute hover:bg-panel2')}
+                            className={cn(
+                              'group flex flex-col rounded-lg px-2 py-1.5 transition-colors',
+                              isActive ? 'bg-accent/15 text-ink border-l-2 border-accent' : 'text-mute hover:bg-panel2/80 hover:text-ink'
+                            )}
                           >
-                            {isRunning && (
-                              <span role="status" aria-label="Run in progress" className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="Run in progress — this conversation keeps updating in the background" />
-                            )}
-                            {isEditing ? (
-                              <input
-                                autoFocus
-                                defaultValue={c.title}
-                                className="min-w-0 flex-1 rounded border border-line bg-inset px-1 py-0.5 text-[11.5px] outline-none focus:border-accent/50"
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') handleRenameConv(ws, cid, (e.target as HTMLInputElement).value);
-                                  if (e.key === 'Escape') setEditingConv(null);
-                                }}
-                                onBlur={(e) => handleRenameConv(ws, cid, e.target.value)}
-                              />
-                            ) : (
-                              <button
-                                onClick={() => handleSelectConv(ws, cid)}
-                                className={cn('min-w-0 flex-1 truncate text-left text-[11.5px]', isActive ? 'font-medium' : '')}
-                                title={c.title}
-                              >
-                                {c.title || 'New conversation'}
-                              </button>
-                            )}
-                            {c.updatedAt && !isEditing ? (
-                              <span className="shrink-0 text-[9.5px] text-faint">{relTime(c.updatedAt)}</span>
-                            ) : null}
-                            {!isEditing && (
-                              <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
+                            <div className="flex items-center gap-1.5 min-w-0 w-full">
+                              {isRunning && (
+                                <span
+                                  role="status"
+                                  aria-label="Run in progress"
+                                  className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent"
+                                  title="Run in progress — this conversation keeps updating in the background"
+                                />
+                              )}
+                              {isEditing ? (
+                                <input
+                                  autoFocus
+                                  defaultValue={c.title}
+                                  className="min-w-0 flex-1 rounded border border-line bg-inset px-1 py-0.5 text-[11.5px] outline-none focus:border-accent/50"
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleRenameConv(ws, cid, (e.target as HTMLInputElement).value);
+                                    if (e.key === 'Escape') setEditingConv(null);
+                                  }}
+                                  onBlur={(e) => handleRenameConv(ws, cid, e.target.value)}
+                                />
+                              ) : (
                                 <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                  title="Rename conversation"
-                                  onClick={() => setEditingConv({ ws, cid })}
+                                  onClick={() => handleSelectConv(ws, cid)}
+                                  className={cn('min-w-0 flex-1 truncate text-left text-[11.5px]', isActive ? 'font-medium' : '')}
+                                  title={c.title}
                                 >
-                                  <Pencil size={14} />
+                                  {c.title || 'New conversation'}
                                 </button>
-                                <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                  title="Archive conversation"
-                                  onClick={() => handleArchiveConv(ws, cid, true)}
-                                >
-                                  <Archive size={14} />
-                                </button>
-                                <button
-                                  className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
-                                  title="Delete conversation"
-                                  onClick={() => handleDeleteConv(ws, cid)}
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                              </div>
-                            )}
+                              )}
+                            </div>
+                            <div className="mt-0.5 flex items-center justify-between text-[9.5px] font-mono text-faint">
+                              <span>{c.updatedAt && !isEditing ? relTime(c.updatedAt) : ''}</span>
+                              {!isEditing && (
+                                <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <button
+                                    className="rounded p-0.5 hover:bg-panel hover:text-ink"
+                                    title="Rename conversation"
+                                    onClick={() => setEditingConv({ ws, cid })}
+                                  >
+                                    <Pencil size={12} />
+                                  </button>
+                                  <button
+                                    className="rounded p-0.5 hover:bg-panel hover:text-ink"
+                                    title="Archive conversation"
+                                    onClick={() => handleArchiveConv(ws, cid, true)}
+                                  >
+                                    <Archive size={12} />
+                                  </button>
+                                  <button
+                                    className="rounded p-0.5 hover:bg-panel hover:text-danger"
+                                    title="Delete conversation"
+                                    onClick={() => handleDeleteConv(ws, cid)}
+                                  >
+                                    <Trash2 size={12} />
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
@@ -266,30 +316,36 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
                               return (
                                 <div
                                   key={cid}
-                                  className={cn('group flex items-center gap-1 rounded px-1.5 py-1', isActive ? 'bg-accent/15 text-ink' : 'text-faint hover:bg-panel2')}
+                                  className={cn(
+                                    'group flex flex-col rounded px-1.5 py-1',
+                                    isActive ? 'bg-accent/15 text-ink' : 'text-faint hover:bg-panel2'
+                                  )}
                                 >
                                   <button
                                     onClick={() => handleSelectConv(ws, cid)}
-                                    className="min-w-0 flex-1 truncate text-left text-[11.5px] line-through"
+                                    className="min-w-0 w-full truncate text-left text-[11.5px] line-through"
                                     title={c.title}
                                   >
                                     {c.title || 'New conversation'}
                                   </button>
-                                  <div className="flex shrink-0 items-center gap-1 rounded bg-panel2/60 px-1 opacity-60 group-hover:opacity-100">
-                                    <button
-                                      className="rounded p-1 text-faint hover:bg-panel hover:text-ink"
-                                      title="Restore conversation"
-                                      onClick={() => handleArchiveConv(ws, cid, false)}
-                                    >
-                                      <RotateCcw size={14} />
-                                    </button>
-                                    <button
-                                      className="rounded p-1 text-faint hover:bg-panel hover:text-danger"
-                                      title="Delete conversation"
-                                      onClick={() => handleDeleteConv(ws, cid)}
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
+                                  <div className="mt-0.5 flex items-center justify-between text-[9.5px] font-mono text-faint">
+                                    <span>{c.updatedAt ? relTime(c.updatedAt) : ''}</span>
+                                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <button
+                                        className="rounded p-0.5 hover:bg-panel hover:text-ink"
+                                        title="Restore conversation"
+                                        onClick={() => handleArchiveConv(ws, cid, false)}
+                                      >
+                                        <RotateCcw size={12} />
+                                      </button>
+                                      <button
+                                        className="rounded p-0.5 hover:bg-panel hover:text-danger"
+                                        title="Delete conversation"
+                                        onClick={() => handleDeleteConv(ws, cid)}
+                                      >
+                                        <Trash2 size={12} />
+                                      </button>
+                                    </div>
                                   </div>
                                 </div>
                               );
@@ -352,6 +408,17 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
             <RunsPanel />
           </div>
         </SidebarSection>
+
+        {/* Resize Handle */}
+        <div
+          onMouseDown={startResizing}
+          onDoubleClick={() => {
+            setSidebarWidth(288);
+            localStorage.setItem('ninfer_coder_sidebar_width', '288');
+          }}
+          className="absolute top-0 right-[-3px] bottom-0 w-2 cursor-col-resize hover:bg-accent/40 active:bg-accent transition-colors z-10"
+          title="Drag to resize sidebar (Double-click to reset)"
+        />
       </div>
 
       {/* File Tree panel */}

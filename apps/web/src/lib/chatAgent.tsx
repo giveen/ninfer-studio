@@ -72,6 +72,9 @@ interface ChatAgentState {
    *  to the control plane's perms map under `computerUseDir` as the scope. */
   computerUsePerms: PermConfig;
   setComputerUsePerms: (v: PermConfig) => void;
+  /** Whether to show a text preview snippet under collapsed thinking traces (default: false). */
+  showThinkingPreview: boolean;
+  setShowThinkingPreview: (v: boolean) => void;
 }
 
 const Ctx = createContext<ChatAgentState | null>(null);
@@ -96,6 +99,7 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
   const [computerUseDir, setComputerUseDirState] = useState('');
   const computerUseDirRef = useRef('');
   const [computerUsePerms, setComputerUsePermsState] = useState<PermConfig>(DEFAULT_PERMS);
+  const [showThinkingPreview, setShowThinkingPreviewState] = useState(false);
 
   const adoptMemory = useCallback((m: CoderMemory) => {
     setMemory(m);
@@ -122,6 +126,7 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
       setDeepResearchMaxStepsState(c.chatDeepResearchMaxSteps ?? 5);
       setReflectionCritiqueMaxTokensState(c.chatReflectionCritiqueMaxTokens ?? 400);
       setComputerUseEnabledState(c.chatComputerUseEnabled ?? false);
+      setShowThinkingPreviewState(c.chatShowThinkingPreview ?? false);
       const initialDir = c.chatComputerUseDir || '/tmp';
       setComputerUseDirState(initialDir);
       computerUseDirRef.current = initialDir;
@@ -182,6 +187,10 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     setComputerUseEnabledState(v);
     saveConfig({ chatComputerUseEnabled: v }).catch(() => {});
   }, []);
+  const setShowThinkingPreview = useCallback((v: boolean) => {
+    setShowThinkingPreviewState(v);
+    saveConfig({ chatShowThinkingPreview: v }).catch(() => {});
+  }, []);
   const setComputerUseDir = useCallback((v: string) => {
     const dir = v || '/tmp';
     setComputerUseDirState(dir);
@@ -216,8 +225,10 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
         deepResearchMaxSteps, setDeepResearchMaxSteps,
         reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
         computerUseEnabled, setComputerUseEnabled,
-        computerUseDir, setComputerUseDir, computerUseDirRef,
+        computerUseDir, setComputerUseDir,
+        computerUseDirRef,
         computerUsePerms, setComputerUsePerms,
+        showThinkingPreview, setShowThinkingPreview,
       }}
     >
       {children}

@@ -94,8 +94,10 @@ export interface AppSettings {
    *  its own directory (independent of Coder's workspace). */
   chatComputerUseEnabled?: boolean;
   chatComputerUseDir?: string;
-  /** JSON-serialized PermConfig ({tools, denyPaths}) for Computer Use's tools. */
+  /** Computer Use: JSON-serialized PermConfig ({tools, denyPaths}) for Computer Use's tools. */
   chatComputerUsePerms?: string;
+  /** Whether to render a short text preview snippet for collapsed thinking blocks in Chat (default: false). */
+  chatShowThinkingPreview?: boolean;
   /** Remote Access: serve the app on 0.0.0.0 instead of loopback-only.
    *  Live state (whether the listener is actually running, the LAN IP to
    *  open it from) comes from GET /api/remote, not this — see remote.ts. */

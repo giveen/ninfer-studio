@@ -67,7 +67,7 @@ test('switching conversations keeps streamed output in its owner and saves histo
   await chunk(page, { content: ' finished.' });
   await finishStream(page);
   await expect(page.getByText('Original response began here and finished.', { exact: true })).toBeHidden();
-  await page.getByRole('button', { name: /^Original conversation Pin conversation/ }).click();
+  await page.getByRole('button', { name: /^Original conversation/ }).click();
   await expect(page.getByText('Original response began here and finished.', { exact: true })).toBeVisible();
   // Wait for the real debounced history save, not a fixed timeout.
   await expect.poll(async () => {
@@ -75,7 +75,7 @@ test('switching conversations keeps streamed output in its owner and saves histo
     return JSON.stringify(response);
   }).toContain('Original response began here and finished.');
   await page.reload();
-  await page.getByRole('button', { name: /^Original conversation Pin conversation/ }).click();
+  await page.getByRole('button', { name: /^Original conversation/ }).click();
   await expect(page.getByText('Original response began here and finished.', { exact: true })).toHaveCount(1);
   await expect(page.getByText('Original response began here and finished.', { exact: true })).toBeVisible();
 });

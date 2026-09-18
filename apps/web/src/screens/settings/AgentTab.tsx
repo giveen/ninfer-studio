@@ -20,6 +20,7 @@ export function AgentTab({ status, active = true }: { status: StatusPayload | nu
     deepResearchMaxAngles, setDeepResearchMaxAngles, deepResearchMaxSteps, setDeepResearchMaxSteps,
     reflectionCritiqueMaxTokens, setReflectionCritiqueMaxTokens,
     computerUseEnabled, setComputerUseEnabled, computerUseDir, setComputerUseDir, computerUsePerms, setComputerUsePerms,
+    showThinkingPreview, setShowThinkingPreview,
   } = useChatAgent();
   const maxConcurrency = engineMaxConcurrency(status);
   const deepResearchAvailable = maxConcurrency > 1;
@@ -86,6 +87,24 @@ export function AgentTab({ status, active = true }: { status: StatusPayload | nu
             <TierRow label="browser" tier={browserTier} onChange={setBrowserTier} />
           </div>
         )}
+      </SectionCard>
+
+      <SectionCard
+        title="Thinking & Reasoning Display"
+        icon={<Brain size={15} />}
+        description="Configure how reasoning chains-of-thought are rendered in chat messages."
+      >
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-[12.5px] text-faint">
+            Show short text preview snippet under collapsed thinking blocks (Off shows only compact <span className="font-mono text-accent">Thinking . . .</span> wave indicator).
+          </p>
+          <ToggleRow
+            on={showThinkingPreview}
+            onToggle={setShowThinkingPreview}
+            onTitle="Showing text preview when thinking block is collapsed"
+            offTitle="Compact pulsing indicator only (default)"
+          />
+        </div>
       </SectionCard>
 
       <SectionCard

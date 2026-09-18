@@ -46,7 +46,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const {
     agentResearch, memoryEnabled, memoryRef, adoptMemory, loadMemory, reflectionEnabled, deepResearchEnabled, reflectionModel, browserTier, memoryToolTier,
     deepResearchMaxAngles, deepResearchMaxSteps, reflectionCritiqueMaxTokens,
-    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir,
+    computerUseEnabled, computerUseDirRef, computerUsePerms, setComputerUseDir, computerUseDir, showThinkingPreview,
   } = useChatAgent();
   // A tool call awaiting the user's approve/deny decision (permission tier `ask`) —
   // mirrors Coder's checkPerm/requestApproval/pendingApproval pattern.
@@ -119,10 +119,45 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
   const findInputRef = useRef<HTMLInputElement>(null);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ninfer_chat_sidebar_width');
+    const num = saved ? Number(saved) : NaN;
+    return !isNaN(num) ? Math.min(Math.max(160, num), 600) : 240;
+  });
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const sidebarRef = useRef<HTMLElement>(null);
+
+  const startResizingSidebar = useCallback((mouseDownEvent: React.MouseEvent) => {
+    mouseDownEvent.preventDefault();
+    setIsResizingSidebar(true);
+    const startX = mouseDownEvent.clientX;
+    const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? sidebarWidth;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const newWidth = Math.min(Math.max(160, startWidth + delta), 600);
+      setSidebarWidth(newWidth);
+    };
+
+    const onMouseUp = () => {
+      setIsResizingSidebar(false);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      setSidebarWidth((w) => {
+        localStorage.setItem('ninfer_chat_sidebar_width', String(w));
+        return w;
+      });
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  }, [sidebarWidth]);
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
   const [text, setText] = useState('');
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
+  const [promptHistoryIndex, setPromptHistoryIndex] = useState<number>(-1);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [streaming, setStreaming] = useState(false);
   // Which conversation actually owns the in-flight stream — `streaming` alone
@@ -571,7 +606,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           params,
           tools,
           registry,
-          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
+          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 24,
           // The system prompt (capabilities block + memory + tool list) is
           // resent verbatim every turn — cheap to try caching it whenever
           // the turn is cloud-routed (baseUrl set); a provider that doesn't
@@ -719,9 +754,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       }
 
       if (loopStop === 'steps' && !ac.signal.aborted) {
+        const runMaxSteps = (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 24;
         patchTarget((m) => ({
           ...m,
-          content: m.content + `\n\n[System: Tool execution limit reached after 12 steps — the agent could not finish. Try a more specific request, e.g. "give me an image URL of a golden retriever puppy".]`,
+          content: m.content + `\n\n[System: Tool execution limit reached after ${runMaxSteps} steps — the agent could not finish. Try a more specific request.]`,
           error: true,
         }));
       }
@@ -836,6 +872,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
   const send = useCallback(async () => {
     const content = text.trim();
+    if (content) {
+      setPromptHistory((prev) => [content, ...prev.filter((h) => h !== content)]);
+      setPromptHistoryIndex(-1);
+    }
     const resolvedConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     console.log('[ChatScreen] send triggered:', { content, isCloudPrimary, engineUpOrCloud, resolvedModel: resolvedConfig.model, baseUrl: resolvedConfig.baseUrl });
     if (!content && !attachments.length) return;
@@ -1274,11 +1314,39 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const ctxUsed = lastMeta ? (lastMeta.promptTokens ?? 0) + (lastMeta.completionTokens ?? 0) : null;
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex min-h-0 flex-1">
+    <div
+      className="relative flex h-full flex-col"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+          setDragOver(false);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length) onFiles(files);
+      }}
+    >
+      {dragOver && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-panel/90 backdrop-blur-xs border-2 border-dashed border-accent m-3 rounded-2xl pointer-events-none transition-all">
+          <Paperclip size={44} className="text-accent animate-bounce mb-2" />
+          <p className="text-base font-semibold text-ink">Drop files here to attach</p>
+          <p className="text-xs text-mute">Images or media files</p>
+        </div>
+      )}
+      <div className={cn("flex min-h-0 flex-1", isResizingSidebar && "select-none cursor-col-resize")}>
           <>
             {/* conversation rail */}
-            <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
+            <aside
+              ref={sidebarRef}
+              style={{ width: `${sidebarWidth}px` }}
+              className="relative flex shrink-0 flex-col border-r border-line bg-panel"
+            >
         <div className="p-2.5">
           <Button variant="primary" size="sm" className="w-full" onClick={newChat} title="New chat (Ctrl/Cmd+K)">
             <Plus size={14} /> new chat
@@ -1412,8 +1480,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                     {c.title || 'Untitled'}
                   </span>
                 )}
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-1.5 font-mono text-[10px] text-faint">
+                <span>{formatTime(c.createdAt)}</span>
                 {!selectMode && (
-                  <>
+                  <div className="flex items-center gap-0.5">
                     <button
                       type="button"
                       onClick={(e) => {
@@ -1466,17 +1537,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                     >
                       <Trash2 size={12} />
                     </button>
-                  </>
+                  </div>
                 )}
               </div>
-              <div className="mt-0.5 flex items-center gap-1.5 font-mono text-[10px] text-faint">
-                <span>{formatTime(c.createdAt)}</span>
-                <span>·</span>
-                <span className="text-accent/80">{c.model}</span>
-                <span>·</span>
-                <span>{c.messages.length} msgs</span>
-              </div>
             </div>
+
           ))}
         </div>
         {pendingDelete && (
@@ -1489,6 +1554,16 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
             </button>
           </div>
         )}
+        {/* Resize Handle */}
+        <div
+          onMouseDown={startResizingSidebar}
+          onDoubleClick={() => {
+            setSidebarWidth(240);
+            localStorage.setItem('ninfer_chat_sidebar_width', '240');
+          }}
+          className="absolute top-0 right-[-3px] bottom-0 w-2 cursor-col-resize hover:bg-accent/40 active:bg-accent transition-colors z-10"
+          title="Drag to resize sidebar (Double-click to reset)"
+        />
       </aside>
 
       {/* chat column */}
@@ -1595,11 +1670,13 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
                   const i = visibleStart + sliceI;
-                  // The per-turn date/time note (see contextNoteMessage in
-                  // agentLoop.ts) is real history the model needs, but it's
-                  // not something the user said or asked to see — keep it
-                  // out of the transcript entirely rather than a collapsed row.
                   if (m.displayName === 'Context') return null;
+                  if (!showThinkingPreview) {
+                    if (m.role === 'tool') return null;
+                    if (m.role === 'assistant' && !m.content && !m.error && m.tool_calls && m.tool_calls.length > 0 && !(streaming && streamingConvId === activeId && i === lastRelevantIndex)) {
+                      return null;
+                    }
+                  }
                   if (isCompactedMsg(m)) {
                     return (
                       <div id={`msg-${i}`} key={i}>
@@ -1741,10 +1818,19 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  // Busy-elsewhere is the one case send() can't handle itself
-                  // (there's nothing sensible to queue against a conversation
-                  // that isn't even the one on screen streaming).
                   if (!(streamingConvId && streamingConvId !== activeId)) send();
+                } else if (e.key === 'ArrowUp' && (text === '' || (textareaRef.current?.selectionStart === 0 && textareaRef.current?.selectionEnd === 0))) {
+                  if (promptHistory.length > 0 && promptHistoryIndex < promptHistory.length - 1) {
+                    e.preventDefault();
+                    const nextIdx = promptHistoryIndex + 1;
+                    setPromptHistoryIndex(nextIdx);
+                    setText(promptHistory[nextIdx]);
+                  }
+                } else if (e.key === 'ArrowDown' && promptHistoryIndex >= 0) {
+                  e.preventDefault();
+                  const nextIdx = promptHistoryIndex - 1;
+                  setPromptHistoryIndex(nextIdx);
+                  setText(nextIdx >= 0 ? promptHistory[nextIdx] : '');
                 }
               }}
               onPaste={(e) => {

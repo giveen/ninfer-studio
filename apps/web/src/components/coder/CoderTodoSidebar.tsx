@@ -1,5 +1,5 @@
-import React from 'react';
-import { CheckSquare, Plus, X } from 'lucide-react';
+import React, { useState, useRef, useCallback } from 'react';
+import { CheckSquare, Plus, X, ChevronRight, ChevronLeft } from 'lucide-react';
 import { Button, cn } from '../ui';
 import { TodoItem } from '../../lib/coderStore';
 
@@ -24,15 +24,113 @@ export function CoderTodoSidebar({
   removeTodo,
   addTodo,
 }: CoderTodoSidebarProps) {
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem('ninfer_coder_todo_collapsed') === 'true';
+  });
+
+  const [todoWidth, setTodoWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ninfer_coder_todo_width');
+    const num = saved ? Number(saved) : NaN;
+    return !isNaN(num) ? Math.min(Math.max(180, num), 500) : 256;
+  });
+
+  const [isResizing, setIsResizing] = useState(false);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+
+  const toggleCollapsed = (val: boolean) => {
+    setCollapsed(val);
+    localStorage.setItem('ninfer_coder_todo_collapsed', String(val));
+  };
+
+  const startResizing = useCallback(
+    (mouseDownEvent: React.MouseEvent) => {
+      mouseDownEvent.preventDefault();
+      setIsResizing(true);
+      const startX = mouseDownEvent.clientX;
+      const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? todoWidth;
+
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        const delta = startX - moveEvent.clientX;
+        const newWidth = Math.min(Math.max(180, startWidth + delta), 500);
+        setTodoWidth(newWidth);
+      };
+
+      const onMouseUp = () => {
+        setIsResizing(false);
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+        setTodoWidth((w) => {
+          localStorage.setItem('ninfer_coder_todo_width', String(w));
+          return w;
+        });
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    },
+    [todoWidth]
+  );
+
+  if (collapsed) {
+    return (
+      <div className="flex w-9 shrink-0 flex-col items-center border-l border-line bg-panel py-2 transition-colors">
+        <button
+          type="button"
+          onClick={() => toggleCollapsed(false)}
+          className="flex flex-col items-center gap-1.5 rounded p-1.5 text-faint hover:bg-panel2 hover:text-ink transition-colors cursor-pointer"
+          title="Expand Todos"
+        >
+          <ChevronLeft size={14} />
+          <CheckSquare size={16} />
+          {todos.length > 0 && (
+            <span
+              className="rounded-full bg-accent/20 px-1 py-0.2 font-mono text-[9px] font-bold text-accent"
+              title={`${todos.length} task(s)`}
+            >
+              {todos.length}
+            </span>
+          )}
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div className={cn('flex w-64 flex-col border-l border-line bg-panel', todosJustCreated && 'todo-flash')}>
+    <div
+      ref={sidebarRef}
+      style={{ width: `${todoWidth}px` }}
+      className={cn(
+        'relative flex shrink-0 flex-col border-l border-line bg-panel',
+        todosJustCreated && 'todo-flash',
+        isResizing && 'select-none cursor-col-resize'
+      )}
+    >
+      {/* Left-edge resize handle */}
+      <div
+        onMouseDown={startResizing}
+        onDoubleClick={() => {
+          setTodoWidth(256);
+          localStorage.setItem('ninfer_coder_todo_width', '256');
+        }}
+        className="absolute top-0 left-[-3px] bottom-0 w-2 cursor-col-resize hover:bg-accent/40 active:bg-accent transition-colors z-10"
+        title="Drag to resize Todos (Double-click to reset)"
+      />
+
       <div className="p-2 border-b border-line text-sm font-semibold flex items-center gap-2">
         <CheckSquare size={14} /> Todos
         {todosUpdatedAt != null && (
-          <span className="ml-auto font-mono text-[10px] font-normal text-faint" title="Last updated (agent todo_write or your edit)">
+          <span className="font-mono text-[10px] font-normal text-faint" title="Last updated (agent todo_write or your edit)">
             {new Date(todosUpdatedAt).toLocaleTimeString([], { hour12: false })}
           </span>
         )}
+        <button
+          type="button"
+          onClick={() => toggleCollapsed(true)}
+          className="ml-auto rounded p-0.5 text-faint hover:bg-panel2 hover:text-ink transition-colors cursor-pointer"
+          title="Collapse Todos"
+        >
+          <ChevronRight size={14} />
+        </button>
       </div>
       <div className="flex-1 p-2 text-[11.5px] text-mute overflow-auto">
         {todos.length === 0 ? (

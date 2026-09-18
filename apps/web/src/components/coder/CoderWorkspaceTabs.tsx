@@ -32,15 +32,27 @@ export function CoderWorkspaceTabs({
           {running && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" title="agent run in flight" />}
         </button>
         {tabs.tabs.map((t) => (
-          <div key={t.id} className="flex h-full shrink-0 items-center border-r border-line">
+          <div
+            key={t.id}
+            onMouseDown={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                tabs.closeTab(t.id);
+              }
+            }}
+            className={cn(
+              'group flex h-full shrink-0 items-center border-r border-line transition-colors',
+              tabs.activeTabId === t.id ? 'bg-panel2 text-ink' : 'text-mute hover:bg-panel2/60 hover:text-ink'
+            )}
+          >
             <button
               type="button"
-              className={cn('flex h-full min-w-0 items-center gap-1.5 px-2.5 text-[11.5px]', tabs.activeTabId === t.id ? 'bg-panel2 text-ink' : 'text-mute hover:text-ink')}
+              className="flex h-full min-w-0 items-center gap-1.5 px-2.5 text-[11.5px]"
               onClick={() => tabs.setActive(t.id)}
               title={t.path}
             >
-              {t.kind === 'image' ? <Image size={12} className="shrink-0" /> : <File size={12} className="shrink-0" />}
-              <span className="max-w-32 truncate font-mono text-[11px]">{t.path.split(/[\/]/).pop()}</span>
+              {t.kind === 'image' ? <Image size={12} className="shrink-0 text-accent" /> : <File size={12} className="shrink-0 text-mute" />}
+              <span className="max-w-36 truncate font-mono text-[11px]">{t.path.split(/[\/]/).pop()}</span>
               {t.gitStatus && (
                 <span className={cn('shrink-0 font-mono text-[10px] font-bold', GIT_BADGE_CLASS[t.gitStatus])} title={`git status: ${t.gitStatus}`}>
                   {t.gitStatus}
@@ -49,7 +61,15 @@ export function CoderWorkspaceTabs({
               {t.status === 'conflict' && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="changed elsewhere since you opened it" />}
               {t.dirty && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" title="unsaved changes" />}
             </button>
-            <button type="button" className="shrink-0 px-1 text-faint hover:text-ink" onClick={() => tabs.closeTab(t.id)} title={`Close ${t.path}`}>
+            <button
+              type="button"
+              className="shrink-0 rounded p-0.5 mr-1 text-faint opacity-60 hover:opacity-100 hover:bg-panel hover:text-ink transition-opacity"
+              onClick={(e) => {
+                e.stopPropagation();
+                tabs.closeTab(t.id);
+              }}
+              title={`Close ${t.path}`}
+            >
               <X size={12} />
             </button>
           </div>

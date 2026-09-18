@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import {
   BrainCircuit,
   Image,
@@ -109,12 +109,31 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
   store,
   defaultMaxAgentSteps,
 }) => {
+  const [history, setHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autoGrow = () => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.max(38, Math.min(el.scrollHeight, 220))}px`;
+    el.style.height = `${Math.max(40, Math.min(el.scrollHeight, 220))}px`;
+  };
+
+  useEffect(() => {
+    if (!input && textareaRef.current) {
+      textareaRef.current.style.height = '40px';
+    } else {
+      autoGrow();
+    }
+  }, [input]);
+
+  const handleSubmitWithHistory = () => {
+    if (input.trim()) {
+      setHistory((prev) => [input.trim(), ...prev.filter((h) => h !== input.trim())]);
+      setHistoryIndex(-1);
+    }
+    onSubmit();
   };
 
   useEffect(() => {
@@ -122,7 +141,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
   }, [input]);
 
   return (
-    <div className="border-t border-line bg-panel p-3">
+    <div className="border-t border-line bg-panel/95 p-3.5 shadow-md backdrop-blur-md">
       {llmPhase && (
         <div className="mb-2 flex items-center gap-2 rounded-md border border-accent/25 bg-accent/8 px-2.5 py-1.5 text-[11.5px] text-mute">
           <BrainCircuit size={13} className="animate-pulse text-accent" />
@@ -328,7 +347,7 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
         <textarea
           ref={textareaRef}
           rows={1}
-          className="flex-1 min-h-[38px] max-h-[220px] resize-none bg-inset border border-line rounded px-3 py-1.5 text-sm outline-none focus:border-accent/50 leading-relaxed"
+          className="flex-1 min-h-[40px] max-h-[220px] resize-none bg-inset border border-line rounded-xl px-3.5 py-2 text-sm outline-none transition-all duration-150 focus:border-accent/60 focus:ring-1 focus:ring-accent/30 leading-relaxed shadow-2xs"
           value={input}
           onChange={(e) => {
             setInput(e.target.value);
@@ -338,23 +357,35 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
               if ((input.trim() || attachments.length > 0) && activeWs && pendingQuestion === null) {
-                onSubmit();
+                handleSubmitWithHistory();
               }
+            } else if (e.key === 'ArrowUp' && (input === '' || (textareaRef.current?.selectionStart === 0 && textareaRef.current?.selectionEnd === 0))) {
+              if (history.length > 0 && historyIndex < history.length - 1) {
+                e.preventDefault();
+                const nextIdx = historyIndex + 1;
+                setHistoryIndex(nextIdx);
+                setInput(history[nextIdx]);
+              }
+            } else if (e.key === 'ArrowDown' && historyIndex >= 0) {
+              e.preventDefault();
+              const nextIdx = historyIndex - 1;
+              setHistoryIndex(nextIdx);
+              setInput(nextIdx >= 0 ? history[nextIdx] : '');
             }
           }}
-          placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent… (Enter to send, Shift+Enter for newline)"}
+          placeholder={pendingQuestion ? "Use the popup above to approve or disapprove…" : !activeWs ? "Add a workspace to begin" : running ? "Queue another instruction for when this run finishes…" : "Instruct the coder agent… (Enter/Cmd+Enter to send, Shift+Enter for newline, Up for history)"}
           disabled={!activeWs || pendingQuestion !== null}
         />
         {running ? (
           <div className="flex items-center gap-1.5 mb-0.5">
-            <Button variant="ghost" onClick={onSubmit} disabled={!input.trim() && attachments.length === 0} title="Queue this for when the current run finishes"><Plus size={14} /> Queue</Button>
+            <Button variant="ghost" onClick={handleSubmitWithHistory} disabled={!input.trim() && attachments.length === 0} title="Queue this for when the current run finishes"><Plus size={14} /> Queue</Button>
             <Button variant="danger" onClick={stop} disabled={runElsewhere}
               title={runElsewhere && runConv
                 ? `Run is in ${baseName(runConv.ws)} / ${store.workspaces[runConv.ws]?.conversations[runConv.convId]?.title || '…'} — switch to that conversation to stop it.`
                 : 'Stop the running agent'}><Square size={14} /> Stop</Button>
           </div>
         ) : (
-          <Button variant="primary" onClick={onSubmit} disabled={(!activeWs && attachments.length === 0) || pendingQuestion !== null} className="mb-0.5"><Play size={14} /> Run</Button>
+          <Button variant="primary" onClick={handleSubmitWithHistory} disabled={(!activeWs && attachments.length === 0) || pendingQuestion !== null} className="mb-0.5"><Play size={14} /> Run</Button>
         )}
       </div>
       {activeConv && (queued[activeConv]?.length ?? 0) > 0 && (
