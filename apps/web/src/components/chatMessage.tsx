@@ -293,8 +293,17 @@ export const MessageRow = memo(function MessageRow({
     );
   }
 
+  const { showThinkingPreview } = useChatAgent();
+
   if (m.role === 'tool') {
+    if (!showThinkingPreview) return null;
     return <CollapsibleToolResult name={m.name || 'tool'} content={m.content} />;
+  }
+
+  // Intermediate tool-only turns (assistant turns that executed tool calls but have no text content)
+  // are hidden when showThinkingPreview setting is OFF.
+  if (m.role === 'assistant' && !showThinkingPreview && !m.content && !m.error && m.tool_calls && m.tool_calls.length > 0 && !streaming) {
+    return null;
   }
 
   return (
@@ -307,7 +316,7 @@ export const MessageRow = memo(function MessageRow({
           {streaming && !m.reasoning && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
           <ReasoningInline text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
         </div>
-        {(m.content || m.error || (m.tool_calls && m.tool_calls.length > 0) || (!streaming && !m.reasoning)) && (
+        {(m.content || m.error || (m.tool_calls && m.tool_calls.length > 0 && showThinkingPreview) || (!streaming && !m.reasoning && !m.tool_calls)) && (
           <div className={cn('rounded-2xl rounded-tl-xs border border-line bg-panel/90 px-4 py-3 shadow-xs', streaming && m.content && 'stream-caret')}>
             {m.error ? (
               <div>
@@ -330,7 +339,7 @@ export const MessageRow = memo(function MessageRow({
             ) : !streaming && !m.reasoning && !m.tool_calls ? (
               <span className="text-[13px] text-faint">—</span>
             ) : null}
-            {m.tool_calls && m.tool_calls.length > 0 && (
+            {m.tool_calls && m.tool_calls.length > 0 && showThinkingPreview && (
               <CollapsibleToolCalls toolCalls={m.tool_calls} />
             )}
           </div>
