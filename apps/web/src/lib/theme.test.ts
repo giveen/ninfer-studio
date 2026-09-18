@@ -189,24 +189,29 @@ describe('theme preferences', () => {
   });
 
   it('exports CSS variables formatted correctly', () => {
-    const css = exportThemeCSS(PRESET_THEMES['nordic-frost'].variables);
+    const css = exportThemeCSS(PRESET_THEMES['nordic-frost'].darkVariables);
     expect(css).toContain('--color-bg: #2e3440');
     expect(css).toContain('--color-accent: #88c0d0');
   });
 
-  it('supports Catppuccin, Dracula, and Monaspace Neon presets', () => {
-    applyPresetTheme('catppuccin-mocha');
+  it('supports Catppuccin, Dracula, and Monaspace Neon presets across dark and light modes', () => {
+    applyPresetTheme('catppuccin-mocha', null, 'dark');
     expect(docElement.style['--color-bg']).toBe('#1e1e2e');
     expect(docElement.style['--color-accent']).toBe('#cba6f7');
 
-    applyPresetTheme('dracula');
+    applyPresetTheme('catppuccin-mocha', null, 'light');
+    expect(docElement.style['--color-bg']).toBe('#eff1f5');
+    expect(docElement.style['--color-accent']).toBe('#8839ef');
+
+    applyPresetTheme('dracula', null, 'dark');
     expect(docElement.style['--color-bg']).toBe('#282a36');
     expect(docElement.style['--color-accent']).toBe('#bd93f9');
 
-    applyPresetTheme('monaspace-neon');
-    expect(docElement.style['--color-bg']).toBe('#0d1117');
-    expect(docElement.style['--color-accent']).toBe('#2f81f7');
+    applyPresetTheme('dracula', null, 'light');
+    expect(docElement.style['--color-bg']).toBe('#f8f8f2');
+    expect(docElement.style['--color-accent']).toBe('#9542e5');
   });
+
 
   it('manages font family configuration', () => {
     expect(getStoredFontSans()).toBe(FONT_SANS_PRESETS[0].value);

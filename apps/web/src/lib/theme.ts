@@ -40,16 +40,15 @@ export type ThemePresetId =
 export interface ThemePreset {
   id: ThemePresetId;
   name: string;
-  mode: 'dark' | 'light';
-  variables: ThemeVariables;
+  darkVariables: ThemeVariables;
+  lightVariables: ThemeVariables;
 }
 
 export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset> = {
   'midnight-lime': {
     id: 'midnight-lime',
     name: 'Midnight Lime',
-    mode: 'dark',
-    variables: {
+    darkVariables: {
       bg: '#090d16',
       panel: '#111726',
       panel2: '#182032',
@@ -61,12 +60,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(255, 255, 255, 0.08)',
       line2: 'rgba(255, 255, 255, 0.16)',
     },
+    lightVariables: {
+      bg: '#f4f9eb',
+      panel: '#ffffff',
+      panel2: '#eef6df',
+      inset: '#e4f0cf',
+      ink: '#162206',
+      mute: '#4f6330',
+      accent: '#5d8f16',
+      accentHover: '#6ea71b',
+      line: 'rgba(93, 143, 22, 0.15)',
+      line2: 'rgba(93, 143, 22, 0.28)',
+    },
   },
   'tokyo-night': {
     id: 'tokyo-night',
     name: 'Tokyo Night',
-    mode: 'dark',
-    variables: {
+    darkVariables: {
       bg: '#1a1b26',
       panel: '#1f2335',
       panel2: '#24283b',
@@ -78,12 +88,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(122, 162, 247, 0.15)',
       line2: 'rgba(122, 162, 247, 0.28)',
     },
+    lightVariables: {
+      bg: '#e6e9ef',
+      panel: '#ffffff',
+      panel2: '#d5d6db',
+      inset: '#e1e2e7',
+      ink: '#343b58',
+      mute: '#4c566a',
+      accent: '#7aa2f7',
+      accentHover: '#89b4fa',
+      line: 'rgba(52, 59, 88, 0.12)',
+      line2: 'rgba(52, 59, 88, 0.22)',
+    },
   },
   'catppuccin-mocha': {
     id: 'catppuccin-mocha',
-    name: 'Catppuccin Mocha',
-    mode: 'dark',
-    variables: {
+    name: 'Catppuccin',
+    darkVariables: {
       bg: '#1e1e2e',
       panel: '#181825',
       panel2: '#313244',
@@ -95,12 +116,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(205, 214, 244, 0.12)',
       line2: 'rgba(205, 214, 244, 0.24)',
     },
+    lightVariables: {
+      bg: '#eff1f5',
+      panel: '#ffffff',
+      panel2: '#e6e9ef',
+      inset: '#dce0e8',
+      ink: '#4c4f69',
+      mute: '#6c6f85',
+      accent: '#8839ef',
+      accentHover: '#ea76cb',
+      line: 'rgba(76, 79, 105, 0.12)',
+      line2: 'rgba(76, 79, 105, 0.22)',
+    },
   },
   'dracula': {
     id: 'dracula',
     name: 'Dracula',
-    mode: 'dark',
-    variables: {
+    darkVariables: {
       bg: '#282a36',
       panel: '#21222c',
       panel2: '#44475a',
@@ -112,12 +144,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(98, 114, 164, 0.3)',
       line2: 'rgba(98, 114, 164, 0.5)',
     },
+    lightVariables: {
+      bg: '#f8f8f2',
+      panel: '#ffffff',
+      panel2: '#e8e8e2',
+      inset: '#deded6',
+      ink: '#282a36',
+      mute: '#6272a4',
+      accent: '#9542e5',
+      accentHover: '#d13894',
+      line: 'rgba(40, 42, 54, 0.15)',
+      line2: 'rgba(40, 42, 54, 0.25)',
+    },
   },
   'monaspace-neon': {
     id: 'monaspace-neon',
     name: 'Monaspace Neon',
-    mode: 'dark',
-    variables: {
+    darkVariables: {
       bg: '#0d1117',
       panel: '#161b22',
       panel2: '#21262d',
@@ -129,12 +172,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(48, 54, 61, 0.7)',
       line2: 'rgba(139, 148, 158, 0.3)',
     },
+    lightVariables: {
+      bg: '#f6f8fa',
+      panel: '#ffffff',
+      panel2: '#eaeef2',
+      inset: '#e1e4e8',
+      ink: '#1f2328',
+      mute: '#57606a',
+      accent: '#0969da',
+      accentHover: '#218bff',
+      line: 'rgba(31, 35, 40, 0.15)',
+      line2: 'rgba(31, 35, 40, 0.25)',
+    },
   },
   'nordic-frost': {
     id: 'nordic-frost',
     name: 'Nordic Frost',
-    mode: 'dark',
-    variables: {
+    darkVariables: {
       bg: '#2e3440',
       panel: '#3b4252',
       panel2: '#434c5e',
@@ -146,12 +200,23 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(216, 222, 233, 0.12)',
       line2: 'rgba(216, 222, 233, 0.22)',
     },
+    lightVariables: {
+      bg: '#e5e9f0',
+      panel: '#ffffff',
+      panel2: '#eceff4',
+      inset: '#d8dee9',
+      ink: '#2e3440',
+      mute: '#4c566a',
+      accent: '#5e81ac',
+      accentHover: '#81a1c1',
+      line: 'rgba(46, 52, 64, 0.12)',
+      line2: 'rgba(46, 52, 64, 0.22)',
+    },
   },
   'monokai-dark': {
     id: 'monokai-dark',
-    name: 'Monokai Dark',
-    mode: 'dark',
-    variables: {
+    name: 'Monokai',
+    darkVariables: {
       bg: '#272822',
       panel: '#3e3d32',
       panel2: '#49483e',
@@ -163,12 +228,35 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       line: 'rgba(248, 248, 242, 0.12)',
       line2: 'rgba(248, 248, 242, 0.22)',
     },
+    lightVariables: {
+      bg: '#f7f7f1',
+      panel: '#ffffff',
+      panel2: '#e8e8df',
+      inset: '#deded2',
+      ink: '#272822',
+      mute: '#75715e',
+      accent: '#689710',
+      accentHover: '#7da61a',
+      line: 'rgba(39, 40, 34, 0.15)',
+      line2: 'rgba(39, 40, 34, 0.25)',
+    },
   },
   'win95': {
     id: 'win95',
     name: 'Windows 95',
-    mode: 'light',
-    variables: {
+    darkVariables: {
+      bg: '#004040',
+      panel: '#2b2b2b',
+      panel2: '#3c3c3c',
+      inset: '#1a1a1a',
+      ink: '#ffffff',
+      mute: '#a0a0a0',
+      accent: '#1084d0',
+      accentHover: '#2094e0',
+      line: '#555555',
+      line2: '#000000',
+    },
+    lightVariables: {
       bg: '#008080',
       panel: '#c0c0c0',
       panel2: '#d4d4d4',
@@ -183,9 +271,20 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
   },
   'crisp-light': {
     id: 'crisp-light',
-    name: 'Crisp Light',
-    mode: 'light',
-    variables: {
+    name: 'Crisp Slate',
+    darkVariables: {
+      bg: '#0f172a',
+      panel: '#1e293b',
+      panel2: '#334155',
+      inset: '#090e1a',
+      ink: '#f8fafc',
+      mute: '#94a3b8',
+      accent: '#84cc16',
+      accentHover: '#a3e635',
+      line: 'rgba(248, 250, 252, 0.12)',
+      line2: 'rgba(248, 250, 252, 0.22)',
+    },
+    lightVariables: {
       bg: '#f1f5f9',
       panel: '#ffffff',
       panel2: '#f8fafc',
@@ -200,9 +299,20 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
   },
   'solarized-light': {
     id: 'solarized-light',
-    name: 'Solarized Light',
-    mode: 'light',
-    variables: {
+    name: 'Solarized',
+    darkVariables: {
+      bg: '#002b36',
+      panel: '#073642',
+      panel2: '#586e75',
+      inset: '#00212b',
+      ink: '#93a1a1',
+      mute: '#839496',
+      accent: '#b58900',
+      accentHover: '#cb9b00',
+      line: 'rgba(147, 161, 161, 0.15)',
+      line2: 'rgba(147, 161, 161, 0.28)',
+    },
+    lightVariables: {
       bg: '#fdf6e3',
       panel: '#eee8d5',
       panel2: '#e0d9c5',
@@ -282,7 +392,6 @@ export function applyFontFamily(sansVal?: string, monoVal?: string): void {
   }
 }
 
-
 export function getSystemTheme(): ResolvedTheme {
   try {
     return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
@@ -323,6 +432,13 @@ export function getStoredCustomVars(): ThemeVariables | null {
   return null;
 }
 
+export function getPresetVariables(presetId: ThemePresetId, mode?: ThemeMode): ThemeVariables | null {
+  if (!(presetId in PRESET_THEMES)) return null;
+  const preset = PRESET_THEMES[presetId as keyof typeof PRESET_THEMES];
+  const resolved = resolveTheme(mode ?? getStoredTheme());
+  return resolved === 'light' ? preset.lightVariables : preset.darkVariables;
+}
+
 export function applyCSSVariables(vars: ThemeVariables | null): void {
   if (typeof document === 'undefined' || !document.documentElement) return;
   const style = document.documentElement.style;
@@ -361,17 +477,20 @@ export function applyCSSVariables(vars: ThemeVariables | null): void {
   }
 }
 
-export function applyPresetTheme(presetId: ThemePresetId, customVars?: ThemeVariables | null): void {
+export function applyPresetTheme(presetId: ThemePresetId, customVars?: ThemeVariables | null, modeOverride?: ThemeMode): void {
   try {
     localStorage.setItem(PRESET_STORAGE_KEY, presetId);
   } catch {
     // localStorage unavailable
   }
 
+  const modeToUse = modeOverride ?? getStoredTheme();
+  const resolvedMode = applyTheme(modeToUse);
+
   if (presetId in PRESET_THEMES) {
     const preset = PRESET_THEMES[presetId as keyof typeof PRESET_THEMES];
-    applyTheme(preset.mode);
-    applyCSSVariables(preset.variables);
+    const vars = resolvedMode === 'light' ? preset.lightVariables : preset.darkVariables;
+    applyCSSVariables(vars);
   } else if (presetId === 'custom' && customVars) {
     try {
       localStorage.setItem(CUSTOM_VARS_STORAGE_KEY, JSON.stringify(customVars));
@@ -381,6 +500,7 @@ export function applyPresetTheme(presetId: ThemePresetId, customVars?: ThemeVari
     applyCSSVariables(customVars);
   }
 }
+
 
 export function resolveTheme(mode: ThemeMode): ResolvedTheme {
   if (mode === 'system') {

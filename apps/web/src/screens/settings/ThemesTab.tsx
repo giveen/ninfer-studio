@@ -7,8 +7,8 @@ import {
   PRESET_THEMES,
   applyFontFamily,
   applyPresetTheme,
-  applyTheme,
   exportThemeCSS,
+  getPresetVariables,
   getStoredCustomVars,
   getStoredFontMono,
   getStoredFontSans,
@@ -27,7 +27,11 @@ export function ThemesTab() {
   const [customVars, setCustomVars] = useState<ThemeVariables>(() => {
     const stored = getStoredCustomVars();
     if (stored) return stored;
-    return { ...PRESET_THEMES['midnight-lime'].variables };
+    const initialPreset = getStoredPreset();
+    if (initialPreset in PRESET_THEMES) {
+      return getPresetVariables(initialPreset, getStoredTheme())!;
+    }
+    return PRESET_THEMES['midnight-lime'].darkVariables;
   });
   const [copiedCSS, setCopiedCSS] = useState(false);
   const [copiedJSON, setCopiedJSON] = useState(false);
@@ -35,26 +39,34 @@ export function ThemesTab() {
   // Initialize theme state on mount
   useEffect(() => {
     if (activePreset === 'custom') {
-      applyPresetTheme('custom', customVars);
+      applyPresetTheme('custom', customVars, themeMode);
     } else if (activePreset in PRESET_THEMES) {
-      applyPresetTheme(activePreset);
+      applyPresetTheme(activePreset, null, themeMode);
+      const vars = getPresetVariables(activePreset, themeMode);
+      if (vars) setCustomVars(vars);
     }
     applyFontFamily(sansFont, monoFont);
   }, []);
 
   const handleSelectMode = (mode: ThemeMode) => {
     setThemeMode(mode);
-    applyTheme(mode);
+    if (activePreset in PRESET_THEMES) {
+      applyPresetTheme(activePreset, null, mode);
+      const vars = getPresetVariables(activePreset, mode);
+      if (vars) setCustomVars(vars);
+    } else {
+      applyPresetTheme('custom', customVars, mode);
+    }
   };
 
   const handleSelectPreset = (presetId: ThemePresetId) => {
     setActivePreset(presetId);
     if (presetId in PRESET_THEMES) {
-      const preset = PRESET_THEMES[presetId as keyof typeof PRESET_THEMES];
-      setCustomVars({ ...preset.variables });
-      applyPresetTheme(presetId);
+      const vars = getPresetVariables(presetId, themeMode);
+      if (vars) setCustomVars(vars);
+      applyPresetTheme(presetId, null, themeMode);
     } else {
-      applyPresetTheme('custom', customVars);
+      applyPresetTheme('custom', customVars, themeMode);
     }
   };
 
@@ -68,20 +80,19 @@ export function ThemesTab() {
     applyFontFamily(sansFont, val);
   };
 
-
   const handleCustomVarChange = (key: keyof ThemeVariables, value: string) => {
     const updated = { ...customVars, [key]: value };
     setCustomVars(updated);
     setActivePreset('custom');
-    applyPresetTheme('custom', updated);
+    applyPresetTheme('custom', updated, themeMode);
   };
 
   const handleReset = () => {
-    const defaultVars = { ...PRESET_THEMES['midnight-lime'].variables };
-    setCustomVars(defaultVars);
     setActivePreset('midnight-lime');
-    handleSelectMode('dark');
-    applyPresetTheme('midnight-lime');
+    setThemeMode('dark');
+    const defaultVars = PRESET_THEMES['midnight-lime'].darkVariables;
+    setCustomVars(defaultVars);
+    applyPresetTheme('midnight-lime', null, 'dark');
   };
 
   const handleCopyCSS = () => {
@@ -98,7 +109,7 @@ export function ThemesTab() {
     setTimeout(() => setCopiedJSON(false), 2000);
   };
 
-  const currentVars = activePreset === 'custom' ? customVars : PRESET_THEMES[activePreset as keyof typeof PRESET_THEMES]?.variables ?? customVars;
+  const currentVars = activePreset === 'custom' ? customVars : getPresetVariables(activePreset, themeMode) ?? customVars;
 
   return (
     <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
@@ -200,6 +211,8 @@ export function ThemesTab() {
           {(Object.keys(PRESET_THEMES) as Array<keyof typeof PRESET_THEMES>).map((presetId) => {
             const preset = PRESET_THEMES[presetId];
             const isSelected = activePreset === presetId;
+            const vars = getPresetVariables(presetId, themeMode) ?? preset.darkVariables;
+
             return (
               <button
                 key={presetId}
@@ -214,27 +227,23 @@ export function ThemesTab() {
               >
                 <div className="flex items-center justify-between">
                   <span className="font-semibold text-[13px] text-ink">{preset.name}</span>
-                  <div className="flex items-center gap-1">
-                    <span className="rounded bg-inset px-1.5 py-0.5 font-mono text-[10px] text-mute uppercase">
-                      {preset.mode}
-                    </span>
-                    {isSelected && <Check size={14} className="text-accent" />}
-                  </div>
+                  {isSelected && <Check size={14} className="text-accent" />}
                 </div>
 
                 {/* Color swatches preview */}
                 <div className="mt-3 flex items-center gap-1.5">
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: preset.variables.bg }} title="Background" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: preset.variables.panel }} title="Panel" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: preset.variables.panel2 }} title="Active Surface" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: preset.variables.accent }} title="Accent Glow" />
-                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: preset.variables.ink }} title="Text Ink" />
+                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.bg }} title="Background" />
+                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.panel }} title="Panel" />
+                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.panel2 }} title="Active Surface" />
+                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.accent }} title="Accent Glow" />
+                  <div className="h-4 w-4 rounded-full border border-line" style={{ backgroundColor: vars.ink }} title="Text Ink" />
                 </div>
               </button>
             );
           })}
         </div>
       </SectionCard>
+
 
       {/* Live Preview & Color Variable Customizer */}
       <SectionCard
