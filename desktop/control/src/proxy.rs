@@ -211,15 +211,13 @@ pub(crate) fn merge_default_request_params(
         }
     }
 
-    // 2. reasoning effort → top-level reasoning_effort field
-    //    (client explicit value wins; the dedicated control beats the generic
-    //     default for this one key)
+    // 2. reasoning effort → map to enable_thinking for local engine; remove top-level reasoning_effort
+    //    which local engine rejects with "unknown parameter: reasoning_effort"
     if !re_trimmed.is_empty() && !client_had_re {
-        body_map.insert(
-            "reasoning_effort".to_string(),
-            serde_json::Value::String(re_trimmed.to_string()),
-        );
+        let enable = re_trimmed != "none";
+        body_map.entry("enable_thinking".to_string()).or_insert(serde_json::Value::Bool(enable));
     }
+    body_map.remove("reasoning_effort");
 
     serde_json::to_vec(&body_val).ok()
 }
@@ -458,10 +456,11 @@ mod tests {
     fn test_merge_default_request_params_precedence() {
         let body = br#"{"model":"llama3","temperature":0.7}"#;
 
-        // Dedicated reasoning_effort sets field when absent
+        // Dedicated reasoning_effort sets enable_thinking and strips top-level reasoning_effort
         let res = merge_default_request_params(body, "", "high").unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
-        assert_eq!(val["reasoning_effort"], "high");
+        assert_eq!(val["enable_thinking"], true);
+        assert!(val.get("reasoning_effort").is_none());
 
         // Generic default merges non-conflicting fields
         let defaults = r#"{"top_p":0.9,"reasoning_effort":"low"}"#;
@@ -469,14 +468,14 @@ mod tests {
         let val2: Value = serde_json::from_slice(&res2).unwrap();
         assert_eq!(val2["top_p"], 0.9);
         assert_eq!(val2["temperature"], 0.7);
-        // Dedicated control beats generic default
-        assert_eq!(val2["reasoning_effort"], "high");
+        assert_eq!(val2["enable_thinking"], true);
+        assert!(val2.get("reasoning_effort").is_none());
 
-        // Client explicit reasoning_effort beats both generic default and dedicated control
+        // Client explicit body strips top-level reasoning_effort before passing to local engine
         let client_re_body = br#"{"model":"llama3","reasoning_effort":"medium"}"#;
         let res3 = merge_default_request_params(client_re_body, defaults, "high").unwrap();
         let val3: Value = serde_json::from_slice(&res3).unwrap();
-        assert_eq!(val3["reasoning_effort"], "medium");
+        assert!(val3.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -484,11 +483,12 @@ mod tests {
         let body = br#"{"model":"llama3"}"#;
         let bad_defaults = "{ invalid json ";
 
-        // Malformed default_request_params logs warning but doesn't abort reasoning_effort injection
+        // Malformed default_request_params logs warning but doesn't abort enable_thinking injection
         let res = merge_default_request_params(body, bad_defaults, "medium").unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
         assert_eq!(val["model"], "llama3");
-        assert_eq!(val["reasoning_effort"], "medium");
+        assert_eq!(val["enable_thinking"], true);
+        assert!(val.get("reasoning_effort").is_none());
     }
 }
 

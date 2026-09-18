@@ -251,12 +251,18 @@ export async function streamChat(
       extraHeaders: opts?.extraHeaders,
     });
 
+    const sendBody: Record<string, unknown> = { ...body };
+    const isLocal = !opts?.baseUrl || opts?.source === 'local' || opts.baseUrl.includes('127.0.0.1') || opts.baseUrl.includes('localhost');
+    if (isLocal) {
+      delete sendBody.reasoning_effort;
+    }
+
     const fetched = await fetchStream(
       endpoint,
       {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(sendBody),
       },
       { idleTimeoutMs: 180_000, connectTimeoutMs: 60_000, signal },
     );
