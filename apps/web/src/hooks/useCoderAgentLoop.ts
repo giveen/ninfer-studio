@@ -180,8 +180,8 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
     if (options?.scout && opts.scoutOn) {
       const subConfig = resolveProviderConfig('subagent', opts.appConfig, {
-        provider: opts.coderParams.subagentProvider,
-        cloudModel: opts.coderParams.subagentCloudModel,
+        subagentProvider: opts.coderParams.subagentProvider,
+        subagentCloudModel: opts.coderParams.subagentCloudModel,
         taskWeight: 'light',
       }, model);
       const isCloudSub = !!subConfig.baseUrl;

@@ -161,11 +161,12 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
                     <label className="flex items-center gap-1.5 text-[12px] text-mute">
                       provider
                       <SelectField
-                        value={effectivePrimaryProvider}
-                        onChange={(v: string) => setCoderParams({ ...coderParams, primaryProvider: v as 'ninfer' | 'cloud' })}
+                        value={coderParams.primaryProvider || ''}
+                        onChange={(v: string) => setCoderParams({ ...coderParams, primaryProvider: (v || undefined) as 'ninfer' | 'cloud' | undefined })}
                         options={[
-                          { value: 'ninfer', label: 'Local (ninfer)' },
-                          { value: 'cloud', label: 'Cloud API' },
+                          { value: '', label: `Default (${appConfig?.cloudUseForPrimary ? 'Cloud' : 'Local'})` },
+                          { value: 'ninfer', label: 'Force Local (ninfer)' },
+                          { value: 'cloud', label: 'Force Cloud API' },
                         ]}
                       />
                     </label>
@@ -195,11 +196,12 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
                     <label className="flex items-center gap-1.5 text-[12px] text-mute">
                       provider
                       <SelectField
-                        value={effectiveSubagentProvider}
-                        onChange={(v: string) => setCoderParams({ ...coderParams, subagentProvider: v as 'ninfer' | 'cloud' })}
+                        value={coderParams.subagentProvider || ''}
+                        onChange={(v: string) => setCoderParams({ ...coderParams, subagentProvider: (v || undefined) as 'ninfer' | 'cloud' | undefined })}
                         options={[
-                          { value: 'ninfer', label: 'Local (ninfer)' },
-                          { value: 'cloud', label: 'Cloud API' },
+                          { value: '', label: `Default (${appConfig?.cloudUseForSubagent ? 'Cloud' : 'Local'})` },
+                          { value: 'ninfer', label: 'Force Local (ninfer)' },
+                          { value: 'cloud', label: 'Force Cloud API' },
                         ]}
                       />
                     </label>

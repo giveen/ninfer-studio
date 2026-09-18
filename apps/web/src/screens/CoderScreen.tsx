@@ -204,7 +204,13 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
     try {
       const raw = localStorage.getItem(CODER_PARAMS_KEY);
-      if (raw) return { ...DEFAULT_CODER_PARAMS, ...JSON.parse(raw) };
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        // Clear legacy default provider overrides so global routing (Cloud Tab) is respected
+        delete parsed.primaryProvider;
+        delete parsed.subagentProvider;
+        return { ...DEFAULT_CODER_PARAMS, ...parsed };
+      }
     } catch { /* ignore */ }
     return { ...DEFAULT_CODER_PARAMS };
   });

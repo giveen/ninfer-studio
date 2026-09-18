@@ -51,11 +51,12 @@ export function ParamsPopover({
               <div className={row}>
                 <span className={lab}>Primary Agent</span>
                 <SelectField
-                  value={effectivePrimaryProvider}
-                  onChange={(v) => set({ primaryProvider: v as 'ninfer' | 'cloud' })}
+                  value={params.primaryProvider || ''}
+                  onChange={(v) => set({ primaryProvider: (v || undefined) as 'ninfer' | 'cloud' | undefined })}
                   options={[
-                    { value: 'ninfer', label: 'Local (ninfer)' },
-                    { value: 'cloud', label: 'Cloud API' },
+                    { value: '', label: `Default (${appConfig?.cloudUseForPrimary ? 'Cloud' : 'Local'})` },
+                    { value: 'ninfer', label: 'Force Local (ninfer)' },
+                    { value: 'cloud', label: 'Force Cloud API' },
                   ]}
                 />
               </div>

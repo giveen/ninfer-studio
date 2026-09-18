@@ -72,8 +72,8 @@ export function useCoderSubagents({
       };
       try {
         const subConfig = resolveProviderConfig('subagent', appConfig, {
-          provider: coderParams.subagentProvider,
-          cloudModel: coderParams.subagentCloudModel,
+          subagentProvider: coderParams.subagentProvider,
+          subagentCloudModel: coderParams.subagentCloudModel,
           taskWeight: 'light',
         }, model);
         const subProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
