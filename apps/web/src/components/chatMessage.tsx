@@ -33,7 +33,7 @@ export function CompactDivider() {
 // ---------------------------------------------------------------------------
 // Message rendering
 // ---------------------------------------------------------------------------
-function ReasoningBlock({ text, streaming, workspace }: { text: string; streaming?: boolean; workspace?: string }) {
+function ReasoningInline({ text, streaming, workspace }: { text: string; streaming?: boolean; workspace?: string }) {
   const [open, setOpen] = useState(false);
   const { showThinkingPreview } = useChatAgent();
   if (!text) return null;
@@ -41,14 +41,14 @@ function ReasoningBlock({ text, streaming, workspace }: { text: string; streamin
   const preview = !open && showThinkingPreview ? text.replace(/\s+/g, ' ').trim().slice(0, 120) : '';
 
   return (
-    <div className="mb-2 overflow-hidden rounded-xl border border-line/60 bg-inset/40 transition-colors hover:border-line">
+    <>
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-[11.5px] font-medium uppercase tracking-wider text-faint hover:text-mute"
+        className="inline-flex items-center gap-1 text-[11px] font-medium text-faint hover:text-mute transition-colors"
       >
-        <BrainCircuit size={13} className={cn('shrink-0', open ? 'text-accent' : streaming ? 'animate-pulse text-accent' : 'text-faint')} />
-        <span>Thinking</span>
+        <span className="text-faint/60">·</span>
+        <span className="lowercase">thinking</span>
         {streaming ? (
           <span className="inline-flex items-center gap-0.5 font-bold text-accent">
             <span className="dot-wave-1">.</span>
@@ -56,15 +56,17 @@ function ReasoningBlock({ text, streaming, workspace }: { text: string; streamin
             <span className="dot-wave-3">.</span>
           </span>
         ) : null}
-        <ChevronDown size={13} className={cn('ml-auto shrink-0 transition-transform text-faint', !open && '-rotate-90')} />
+        <ChevronDown size={11} className={cn('transition-transform text-faint', !open && '-rotate-90')} />
       </button>
+
       {!open && preview ? (
-        <div className="border-t border-line px-3 py-1.5 text-[12px] leading-snug text-faint line-clamp-2">
+        <div className="my-1.5 w-full rounded-lg border border-line bg-inset/50 px-3 py-1.5 text-[12px] leading-snug text-faint line-clamp-2">
           {preview}…
         </div>
       ) : null}
+
       {open && (
-        <div className={cn('border-t border-line px-3 py-2 text-[12.5px] leading-relaxed text-mute', streaming && 'stream-caret')}>
+        <div className={cn('my-1.5 w-full rounded-xl border border-line bg-inset/60 px-3 py-2 text-[12.5px] leading-relaxed text-mute', streaming && 'stream-caret')}>
           {streaming ? (
             <div className="whitespace-pre-wrap break-words">{text}</div>
           ) : (
@@ -72,7 +74,7 @@ function ReasoningBlock({ text, streaming, workspace }: { text: string; streamin
           )}
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -299,12 +301,12 @@ export const MessageRow = memo(function MessageRow({
     <div className="group relative max-w-full">
       {toolbar}
       <div className="max-w-full">
-        <div className="mb-1 flex items-center gap-2">
+        <div className="mb-1 flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-accent">ninfer</span>
           {m.model && <span className="font-mono text-[10.5px] text-faint">{m.model}</span>}
-          {streaming && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
+          {streaming && !m.reasoning && <span className="h-1.5 w-1.5 rounded-full bg-accent pulse-dot" />}
+          <ReasoningInline text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
         </div>
-        <ReasoningBlock text={m.reasoning || ''} streaming={streaming && !m.content} workspace={workspace} />
         <div className={cn('rounded-2xl rounded-tl-xs border border-line bg-panel/90 px-4 py-3 shadow-xs', streaming && m.content && 'stream-caret')}>
           {m.error ? (
             <div>
