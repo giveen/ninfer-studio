@@ -232,7 +232,7 @@ export const MessageRow = memo(function MessageRow({
   };
 
   const toolbar = (
-    <div className="absolute right-1 top-1 z-10 flex items-center gap-0.5 rounded-md border border-line bg-panel/90 p-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+    <div className="flex items-center gap-0.5 rounded-lg border border-line bg-panel2/90 px-1 py-0.5 shadow-xs opacity-0 transition-opacity duration-200 group-hover:opacity-100">
       <ActionBtn title="Copy" onClick={() => actions.onCopy(m)}>
         <Copy size={13} />
       </ActionBtn>
@@ -265,8 +265,7 @@ export const MessageRow = memo(function MessageRow({
 
   if (m.role === 'user') {
     return (
-      <div className="group relative flex justify-end">
-        {toolbar}
+      <div className="group relative flex flex-col items-end">
         <div className="max-w-[78%] rounded-2xl rounded-br-xs border border-line2 bg-panel2/90 px-4 py-3 shadow-xs">
           {editing ? (
             <div className="w-72 max-w-full">
@@ -327,6 +326,9 @@ export const MessageRow = memo(function MessageRow({
             </>
           )}
         </div>
+        <div className="mt-1 flex h-6 items-center justify-end">
+          {toolbar}
+        </div>
       </div>
     );
   }
@@ -346,7 +348,6 @@ export const MessageRow = memo(function MessageRow({
 
   return (
     <div className="group relative max-w-full">
-      {toolbar}
       <div className="max-w-full">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-accent">ninfer</span>
@@ -402,7 +403,12 @@ export const MessageRow = memo(function MessageRow({
             ))}
           </div>
         )}
-        <MessageMeta m={m} />
+        <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 min-h-[26px]">
+          <MessageMeta m={m} />
+          <div className="ml-auto">
+            {toolbar}
+          </div>
+        </div>
       </div>
     </div>
   );
