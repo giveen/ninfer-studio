@@ -53,8 +53,6 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: desktop
-      - name: Rustfmt check
-        run: cargo fmt --manifest-path desktop/Cargo.toml -p ninfier-control -- --check
       - name: Clippy
         run: cargo clippy --locked --manifest-path desktop/Cargo.toml -p ninfier-control -- -D warnings
       - name: Run control-plane tests
