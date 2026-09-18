@@ -119,6 +119,39 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
   const findInputRef = useRef<HTMLInputElement>(null);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ninfer_chat_sidebar_width');
+    const num = saved ? Number(saved) : NaN;
+    return !isNaN(num) ? Math.min(Math.max(160, num), 600) : 240;
+  });
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const sidebarRef = useRef<HTMLElement>(null);
+
+  const startResizingSidebar = useCallback((mouseDownEvent: React.MouseEvent) => {
+    mouseDownEvent.preventDefault();
+    setIsResizingSidebar(true);
+    const startX = mouseDownEvent.clientX;
+    const startWidth = sidebarRef.current?.getBoundingClientRect().width ?? sidebarWidth;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const newWidth = Math.min(Math.max(160, startWidth + delta), 600);
+      setSidebarWidth(newWidth);
+    };
+
+    const onMouseUp = () => {
+      setIsResizingSidebar(false);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      setSidebarWidth((w) => {
+        localStorage.setItem('ninfer_chat_sidebar_width', String(w));
+        return w;
+      });
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  }, [sidebarWidth]);
   const [loaded, setLoaded] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'danger'; text: string } | null>(null);
@@ -1276,10 +1309,14 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex min-h-0 flex-1">
+      <div className={cn("flex min-h-0 flex-1", isResizingSidebar && "select-none cursor-col-resize")}>
           <>
             {/* conversation rail */}
-            <aside className="flex w-60 shrink-0 flex-col border-r border-line bg-panel">
+            <aside
+              ref={sidebarRef}
+              style={{ width: `${sidebarWidth}px` }}
+              className="relative flex shrink-0 flex-col border-r border-line bg-panel"
+            >
         <div className="p-2.5">
           <Button variant="primary" size="sm" className="w-full" onClick={newChat} title="New chat (Ctrl/Cmd+K)">
             <Plus size={14} /> new chat
@@ -1487,6 +1524,16 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
             </button>
           </div>
         )}
+        {/* Resize Handle */}
+        <div
+          onMouseDown={startResizingSidebar}
+          onDoubleClick={() => {
+            setSidebarWidth(240);
+            localStorage.setItem('ninfer_chat_sidebar_width', '240');
+          }}
+          className="absolute top-0 right-[-3px] bottom-0 w-2 cursor-col-resize hover:bg-accent/40 active:bg-accent transition-colors z-10"
+          title="Drag to resize sidebar (Double-click to reset)"
+        />
       </aside>
 
       {/* chat column */}
