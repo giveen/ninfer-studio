@@ -286,7 +286,14 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
                     header::HeaderValue::from_static("http://127.0.0.1:5173"),
                 ])
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-                .allow_headers([header::CONTENT_TYPE]),
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::HeaderName::from_static("x-ninfer-source"),
+                    header::HeaderName::from_static("x-ninfer-base-url"),
+                    header::HeaderName::from_static("x-ninfer-api-key"),
+                    header::HeaderName::from_static("x-ninfer-extra-headers"),
+                    header::HeaderName::from_static("x-ninfer-allow-fallback"),
+                ]),
         )
         .layer(axum::middleware::from_fn(guard_local_host))
 }
