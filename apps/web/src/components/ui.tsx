@@ -35,7 +35,7 @@ export function Button({
     lg: 'h-10 px-5 text-sm',
   };
   const variants = {
-    primary: 'bg-accent text-[#101408] hover:bg-[var(--color-accent-hover)] active:bg-accent-deep',
+    primary: 'bg-accent text-[#0a0e05] font-semibold hover:bg-[var(--color-accent-hover)] active:bg-accent-deep shadow-[0_0_12px_rgba(183,240,74,0.22)] transition-all duration-150',
     ghost: 'border border-line bg-transparent text-ink hover:bg-panel2 hover:border-line2',
     subtle: 'bg-panel2 text-ink hover:bg-inset',
     danger: 'border border-danger/40 bg-danger/10 text-danger hover:bg-danger/20',
@@ -503,7 +503,7 @@ export function TabNav<T extends string>({
               className={cn(
                 'inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors',
                 isSelected
-                  ? 'border-accent/40 bg-accent/12 text-accent'
+                  ? 'border-accent/40 bg-accent/15 text-accent shadow-[0_0_10px_rgba(183,240,74,0.15)] font-semibold'
                   : 'border-line bg-inset text-mute hover:border-line2 hover:text-ink',
               )}
             >

@@ -8,21 +8,21 @@
   --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
 
-  --color-bg: #0d1015;
-  --color-panel: #141922;
-  --color-panel2: #1b212c;
-  --color-inset: #10131a;
+  --color-bg: #090d16;
+  --color-panel: #111726;
+  --color-panel2: #182032;
+  --color-inset: #0d121e;
   --color-line: rgba(255, 255, 255, 0.08);
-  --color-line2: rgba(255, 255, 255, 0.14);
-  --color-ink: #e9edf5;
-  --color-mute: #8b94a7;
-  --color-faint: #5c6577;
+  --color-line2: rgba(255, 255, 255, 0.16);
+  --color-ink: #f1f5f9;
+  --color-mute: #94a3b8;
+  --color-faint: #64748b;
   --color-accent: #b7f04a;
   --color-accent-deep: #7fae2c;
-  --color-ok: #59d499;
-  --color-warn: #e8b34b;
-  --color-danger: #f0625f;
-  --color-info: #5cb2f0;
+  --color-ok: #4ade80;
+  --color-warn: #fbbf24;
+  --color-danger: #f87171;
+  --color-info: #38bdf8;
   /* Brighten-on-hover shade for the lime accent button — a separate token
    * (not derivable from --color-accent alone) so the light theme can supply
    * its own hover shade instead of inheriting a lime tuned for a near-black
@@ -250,7 +250,7 @@ input[type='number'] {
 .markdown .mdcode .hljs-type,
 .markdown .mdcode .hljs-built_in,
 .markdown .mdcode .hljs-class {
-  color: var(--color-info);
+  color: #c084fc;
 }
 .markdown .mdcode .hljs-comment,
 .markdown .mdcode .hljs-quote,
