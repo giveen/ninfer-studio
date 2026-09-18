@@ -28,7 +28,8 @@ export function Button({
   type?: 'button' | 'submit';
 }) {
   const base =
-    'inline-flex items-center justify-center gap-1.5 rounded-lg font-medium transition-colors select-none focus-visible:outline-2 focus-visible:outline-accent/60 disabled:opacity-40 disabled:pointer-events-none';
+    'inline-flex items-center justify-center gap-1.5 rounded-[var(--btn-radius,8px)] font-medium transition-colors select-none focus-visible:outline-2 focus-visible:outline-accent/60 disabled:opacity-40 disabled:pointer-events-none';
+
   const sizes = {
     sm: 'h-7 px-2.5 text-[12.5px]',
     md: 'h-8.5 px-3.5 text-[13px]',

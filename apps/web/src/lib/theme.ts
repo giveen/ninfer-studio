@@ -22,6 +22,7 @@ export interface ThemeVariables {
   accentHover: string;
   line?: string;
   line2?: string;
+  btnRadius?: string;
 }
 
 export type ThemePresetId =
@@ -59,6 +60,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#c8f75e',
       line: 'rgba(255, 255, 255, 0.08)',
       line2: 'rgba(255, 255, 255, 0.16)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#f4f9eb',
@@ -71,6 +73,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#6ea71b',
       line: 'rgba(93, 143, 22, 0.15)',
       line2: 'rgba(93, 143, 22, 0.28)',
+      btnRadius: '8px',
     },
   },
   'tokyo-night': {
@@ -87,6 +90,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#c099ff',
       line: 'rgba(122, 162, 247, 0.15)',
       line2: 'rgba(122, 162, 247, 0.28)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#e6e9ef',
@@ -99,6 +103,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#89b4fa',
       line: 'rgba(52, 59, 88, 0.12)',
       line2: 'rgba(52, 59, 88, 0.22)',
+      btnRadius: '8px',
     },
   },
   'catppuccin-mocha': {
@@ -115,6 +120,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#f5c2e7',
       line: 'rgba(205, 214, 244, 0.12)',
       line2: 'rgba(205, 214, 244, 0.24)',
+      btnRadius: '10px',
     },
     lightVariables: {
       bg: '#eff1f5',
@@ -127,6 +133,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#ea76cb',
       line: 'rgba(76, 79, 105, 0.12)',
       line2: 'rgba(76, 79, 105, 0.22)',
+      btnRadius: '10px',
     },
   },
   'dracula': {
@@ -143,6 +150,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#ff79c6',
       line: 'rgba(98, 114, 164, 0.3)',
       line2: 'rgba(98, 114, 164, 0.5)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#f8f8f2',
@@ -155,6 +163,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#d13894',
       line: 'rgba(40, 42, 54, 0.15)',
       line2: 'rgba(40, 42, 54, 0.25)',
+      btnRadius: '8px',
     },
   },
   'monaspace-neon': {
@@ -171,6 +180,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#388bfd',
       line: 'rgba(48, 54, 61, 0.7)',
       line2: 'rgba(139, 148, 158, 0.3)',
+      btnRadius: '6px',
     },
     lightVariables: {
       bg: '#f6f8fa',
@@ -183,6 +193,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#218bff',
       line: 'rgba(31, 35, 40, 0.15)',
       line2: 'rgba(31, 35, 40, 0.25)',
+      btnRadius: '6px',
     },
   },
   'nordic-frost': {
@@ -199,6 +210,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#8fbcbb',
       line: 'rgba(216, 222, 233, 0.12)',
       line2: 'rgba(216, 222, 233, 0.22)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#e5e9f0',
@@ -211,6 +223,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#81a1c1',
       line: 'rgba(46, 52, 64, 0.12)',
       line2: 'rgba(46, 52, 64, 0.22)',
+      btnRadius: '8px',
     },
   },
   'monokai-dark': {
@@ -227,6 +240,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#b6f23e',
       line: 'rgba(248, 248, 242, 0.12)',
       line2: 'rgba(248, 248, 242, 0.22)',
+      btnRadius: '6px',
     },
     lightVariables: {
       bg: '#f7f7f1',
@@ -239,6 +253,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#7da61a',
       line: 'rgba(39, 40, 34, 0.15)',
       line2: 'rgba(39, 40, 34, 0.25)',
+      btnRadius: '6px',
     },
   },
   'win95': {
@@ -255,6 +270,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#2094e0',
       line: '#555555',
       line2: '#000000',
+      btnRadius: '2px',
     },
     lightVariables: {
       bg: '#008080',
@@ -267,6 +283,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#0000a0',
       line: '#808080',
       line2: '#000000',
+      btnRadius: '2px',
     },
   },
   'crisp-light': {
@@ -283,6 +300,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#a3e635',
       line: 'rgba(248, 250, 252, 0.12)',
       line2: 'rgba(248, 250, 252, 0.22)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#f1f5f9',
@@ -295,6 +313,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#6ea71b',
       line: 'rgba(15, 23, 42, 0.12)',
       line2: 'rgba(15, 23, 42, 0.22)',
+      btnRadius: '8px',
     },
   },
   'solarized-light': {
@@ -311,6 +330,7 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#cb9b00',
       line: 'rgba(147, 161, 161, 0.15)',
       line2: 'rgba(147, 161, 161, 0.28)',
+      btnRadius: '8px',
     },
     lightVariables: {
       bg: '#fdf6e3',
@@ -323,9 +343,11 @@ export const PRESET_THEMES: Record<Exclude<ThemePresetId, 'custom'>, ThemePreset
       accentHover: '#cb9b00',
       line: 'rgba(101, 123, 131, 0.18)',
       line2: 'rgba(101, 123, 131, 0.30)',
+      btnRadius: '8px',
     },
   },
 };
+
 
 export const FONT_SANS_STORAGE_KEY = 'ninfier-font-sans';
 export const FONT_MONO_STORAGE_KEY = 'ninfier-font-mono';
@@ -453,6 +475,7 @@ export function applyCSSVariables(vars: ThemeVariables | null): void {
     ['accentHover', '--color-accent-hover'],
     ['line', '--color-line'],
     ['line2', '--color-line2'],
+    ['btnRadius', '--btn-radius'],
   ];
 
   if (!vars) {
@@ -469,9 +492,9 @@ export function applyCSSVariables(vars: ThemeVariables | null): void {
   for (const [key, cssVar] of keys) {
     if (vars[key]) {
       if (style.setProperty) {
-        style.setProperty(cssVar, vars[key]);
+        style.setProperty(cssVar, vars[key]!);
       } else {
-        (style as unknown as Record<string, string>)[cssVar] = vars[key];
+        (style as unknown as Record<string, string>)[cssVar] = vars[key]!;
       }
     }
   }
@@ -500,7 +523,6 @@ export function applyPresetTheme(presetId: ThemePresetId, customVars?: ThemeVari
     applyCSSVariables(customVars);
   }
 }
-
 
 export function resolveTheme(mode: ThemeMode): ResolvedTheme {
   if (mode === 'system') {
@@ -540,8 +562,10 @@ export function exportThemeCSS(vars: ThemeVariables): string {
   --color-accent-hover: ${vars.accentHover};
   --color-line: ${vars.line ?? 'rgba(255, 255, 255, 0.08)'};
   --color-line2: ${vars.line2 ?? 'rgba(255, 255, 255, 0.16)'};
+  --btn-radius: ${vars.btnRadius ?? '8px'};
 }`;
 }
+
 
 
 export function subscribeTheme(onChange: (resolved: ResolvedTheme) => void): () => void {
