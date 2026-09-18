@@ -58,7 +58,7 @@ export function CheckpointsPanel({
                   </span>
                 )}
                 <span className="min-w-0 flex-1 truncate text-[11px] text-mute">
-                  {new Date(cp.time).toLocaleString()} · {cp.messages} msgs · {cp.todos.length} todos
+                  {new Date(cp.time).toLocaleString()} · {cp.messageCount ?? cp.messages ?? 0} msgs · {cp.todos.length} todos
                 </span>
                 <button
                   type="button"

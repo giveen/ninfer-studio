@@ -29,14 +29,15 @@ use crate::engine::{S, engine_health, refresh_engine_status};
 use crate::types::{AppEvent, AppSettings, LastStart, State, strip_extended_prefix};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Cap on a request body this control plane will buffer in memory — large
@@ -57,6 +58,8 @@ pub(crate) const LOG_TAIL_WINDOW_BYTES: usize = 512 * 1024;
 pub(crate) const LOG_TAIL_LINES: usize = 2000;
 pub(crate) const LOG_TAIL_LINE_CHARS: usize = 2000;
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Strip the Python/library env AppImage's AppRun sets for its own bundled
 /// runtime (`PYTHONHOME`, `PYTHONPATH`, `LD_LIBRARY_PATH`) before spawning an
 /// external interpreter or tool. Inherited unchanged, `PYTHONHOME` in
@@ -73,9 +76,33 @@ pub(crate) fn clear_appimage_env(cmd: &mut tokio::process::Command) {
 /// Append `line` to a rolling job log, keeping only the most recent
 /// `max_lines` lines.
 pub(crate) fn append_log_line(out: &mut String, line: &str, max_lines: usize) {
-    let lines: Vec<&str> = out.lines().chain(std::iter::once(line)).collect();
-    let start = lines.len().saturating_sub(max_lines);
-    *out = lines[start..].join("\n");
+    if max_lines == 0 {
+        out.clear();
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(line);
+
+    let line_count = out.as_bytes().iter().filter(|&&b| b == b'\n').count() + 1;
+    if line_count > max_lines {
+        let excess = line_count - max_lines;
+        let mut drop_idx = 0;
+        let mut found = 0;
+        for (i, &b) in out.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                found += 1;
+                if found == excess {
+                    drop_idx = i + 1;
+                    break;
+                }
+            }
+        }
+        if drop_idx > 0 {
+            out.drain(..drop_idx);
+        }
+    }
 }
 
 /// Drain `reader` line by line, truncating each line to
@@ -89,9 +116,10 @@ where
     Fut: std::future::Future,
 {
     let mut buf = String::new();
+    let max_bytes = (LOG_TAIL_LINE_CHARS * 4) as u64;
     loop {
         buf.clear();
-        match reader.read_line(&mut buf).await {
+        match (&mut reader).take(max_bytes).read_line(&mut buf).await {
             Ok(n) if n > 0 => {}
             _ => break,
         }
@@ -146,6 +174,10 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .route("/api/models/upgrade", post(routes_data::models_upgrade))
         .route("/api/models/convert", post(routes_data::models_convert))
         .route("/api/engine/update", post(routes_engine::engine_update))
+        .route(
+            "/api/engine/update/cancel",
+            post(routes_engine::engine_update_cancel),
+        )
         .route("/api/engine/args", post(routes_engine::engine_args))
         .route("/api/gpu", get(routes_data::gpu))
         // Coding harness — control-plane endpoints
@@ -231,6 +263,7 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         // runs survive window close; clients attach over SSE).
         .nest("/api/agent", crate::agent::run::router())
         .route("/v1/{*path}", axum::routing::any(proxy::proxy))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(axum::extract::Extension(request_source))
         .with_state(state)
         .fallback_service(tower_http::services::ServeDir::new(dist).not_found_service(spa));
@@ -258,6 +291,39 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
         .layer(axum::middleware::from_fn(guard_local_host))
 }
 
+fn strip_host_port(host: &str) -> &str {
+    let host = host.trim();
+    if host.starts_with('[')
+        && let Some(end_bracket_idx) = host.find(']') {
+            let rest = &host[end_bracket_idx + 1..];
+            if rest.is_empty() || rest.starts_with(':') {
+                return &host[..=end_bracket_idx];
+            }
+        }
+    if host.bytes().filter(|&b| b == b':').count() > 1 {
+        return host;
+    }
+    if let Some((h, _port)) = host.rsplit_once(':') {
+        return h;
+    }
+    host
+}
+
+fn is_local_origin(origin: &str) -> bool {
+    let bare = origin
+        .trim()
+        .strip_prefix("http://")
+        .or_else(|| origin.trim().strip_prefix("https://"))
+        .or_else(|| origin.trim().strip_prefix("tauri://"))
+        .unwrap_or(origin.trim());
+    let authority = bare.split('/').next().unwrap_or(bare);
+    let host = strip_host_port(authority);
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "[::1]" | "::1" | "tauri.localhost"
+    )
+}
+
 /// Reject requests whose Host (or Origin) does not point at this machine.
 /// A loopback API is still browser-reachable through DNS rebinding: an
 /// attacker page rebinds its own domain to 127.0.0.1 and the browser sends
@@ -272,8 +338,7 @@ async fn guard_local_host(
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    // Strip the port ("[::1]:8787" -> "[::1]"); IPv6 literals keep brackets.
-    let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let bare = strip_host_port(host);
     let host_ok = matches!(
         bare,
         "127.0.0.1" | "localhost" | "[::1]" | "::1" | "tauri.localhost"
@@ -283,16 +348,7 @@ async fn guard_local_host(
         .get(header::ORIGIN)
         .and_then(|o| o.to_str().ok())
     {
-        Some(o) => {
-            let bare = o
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .trim_start_matches("tauri://");
-            bare.starts_with("127.0.0.1")
-                || bare.starts_with("localhost")
-                || bare.starts_with("[::1]")
-                || bare.starts_with("tauri.localhost")
-        }
+        Some(o) => is_local_origin(o),
         None => true, // non-browser clients (curl, the engine probe) send none
     };
     if host_ok && origin_ok {
@@ -336,6 +392,40 @@ pub async fn serve_until_ready(
     axum::serve(listener, build_router(state, true)).await
 }
 
+/// Resolve the control plane port from `NINFIER_STUDIO_PORT` env var, falling back to 8787.
+pub fn control_plane_port() -> u16 {
+    std::env::var("NINFIER_STUDIO_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8787)
+}
+
+/// Unified boot sequence for both standalone dev mode and the Tauri desktop app:
+/// 1. Boot-time engine adoption (`boot_adopt`)
+/// 2. Remote Access listener initialization (`remote::boot_start`), with conflict checks
+/// 3. Loopback server binding (`serve_until_ready`)
+pub async fn boot(
+    state: S,
+    port: u16,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+) -> std::io::Result<()> {
+    boot_adopt(&state).await;
+
+    let remote_port = state.config.read().await.remote_access_port;
+    if remote_port == port {
+        tracing::event!(
+            name: "remote_access.port_conflict",
+            tracing::Level::WARN,
+            port,
+            "Remote Access port ({port}) conflicts with control plane port ({port}); disabling Remote Access on boot"
+        );
+    } else {
+        remote::boot_start(&state).await;
+    }
+
+    serve_until_ready(state, port, ready).await
+}
+
 /// Boot-time adoption of an externally running engine on the configured port.
 pub async fn boot_adopt(state: &S) {
     let port = state.config.read().await.engine_port;
@@ -349,7 +439,7 @@ pub async fn boot_adopt(state: &S) {
             .to_string(),
     );
     drop(eng);
-    if engine_health(port).await {
+    if engine_health(state, port).await {
         refresh_engine_status(state).await;
         tracing::event!(
             name: "engine.adopt.found",
@@ -373,7 +463,14 @@ pub async fn boot_adopt(state: &S) {
 pub(crate) async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, String)> {
     let bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
-        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "body too large".to_string()))?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("length limit exceeded") || msg.contains("too large") {
+                (StatusCode::PAYLOAD_TOO_LARGE, "body too large".to_string())
+            } else {
+                (StatusCode::BAD_REQUEST, format!("failed to read request body: {msg}"))
+            }
+        })?;
     if bytes.is_empty() {
         return Ok(json!({}));
     }
@@ -381,17 +478,31 @@ pub(crate) async fn read_json(req: Request<Body>) -> Result<Value, (StatusCode, 
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
 }
 
+fn make_tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let cnt = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("tmp");
+    path.with_file_name(format!(".{file_name}.{pid}.{cnt}.tmp"))
+}
+
 /// Write `contents` to `path` atomically: write to a sibling `.tmp` file
 /// then rename over the target. A crash or power loss mid-write leaves
 /// either the old file or the new one intact — never a half-written,
 /// corrupt `config.json`/`profile.json`/`chats.json`/`last-start.json`.
 pub async fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let tmp = path.with_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    });
-    tokio::fs::write(&tmp, contents).await?;
-    tokio::fs::rename(&tmp, path).await
+    let tmp = make_tmp_path(path);
+    if let Err(e) = tokio::fs::write(&tmp, contents.as_ref()).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Same as [`atomic_write`], additionally locking the file down to owner
@@ -399,11 +510,38 @@ pub async fn atomic_write(path: &Path, contents: impl AsRef<[u8]>) -> std::io::R
 /// in the clear and would otherwise inherit the umask's default (typically
 /// world-readable `0644`).
 pub async fn atomic_write_secret(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    atomic_write(path, contents).await?;
+    let tmp = make_tmp_path(path);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600);
+        let mut file = match options.open(&tmp).await {
+            Ok(f) => f,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, contents.as_ref()).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        if let Err(e) = file.sync_all().await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::fs::write(&tmp, contents.as_ref()).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
     }
     Ok(())
 }
@@ -437,6 +575,17 @@ pub fn default_dist_dir() -> PathBuf {
 pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     let data_dir = default_data_dir();
     let dist_dir = default_dist_dir();
+    let dist_index = dist_dir.join("index.html");
+    if !dist_index.exists() {
+        tracing::event!(
+            name: "control_plane.dist.missing",
+            tracing::Level::WARN,
+            dist_dir = ?dist_dir,
+            index_path = ?dist_index,
+            "web dist UI missing at {:?} (run 'pnpm build' in apps/web) — API active, but static web UI will return 404",
+            dist_index
+        );
+    }
     let state = Arc::new(State::new(data_dir, dist_dir, event_tx));
     // load persisted config
     let p = state.data_dir.join("config.json");
@@ -463,18 +612,22 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
                 // (`\\?\`) from an older canonicalize; normalize so the UI
                 // (which keys workspaces by plain paths) matches on restart.
                 cfg.coder_workspace = strip_extended_prefix(&cfg.coder_workspace).to_string();
+                cfg.ninfer_path = strip_extended_prefix(&cfg.ninfer_path).to_string();
+                cfg.models_dir = strip_extended_prefix(&cfg.models_dir).to_string();
+                cfg.chat_computer_use_dir =
+                    strip_extended_prefix(&cfg.chat_computer_use_dir).to_string();
                 *state.config.write().await = cfg;
             }
             Err(e) => {
-                // Falling back to defaults here means the user's settings
-                // silently vanish (ninferPath, hfToken, build command, …) —
-                // at minimum tell them, via the log, why.
+                let bad_path = state.data_dir.join("config.json.bad");
+                let _ = tokio::fs::rename(&p, &bad_path).await;
                 tracing::event!(
                     name: "config.load.failed",
                     tracing::Level::WARN,
                     error = %e,
                     path = ?p,
-                    "config.json is corrupt, falling back to defaults: {{error}}",
+                    bad_path = ?bad_path,
+                    "config.json is corrupt, renamed to config.json.bad and falling back to defaults: {{error}}",
                 );
             }
         }
@@ -496,8 +649,9 @@ pub async fn init_state(event_tx: Option<UnboundedSender<AppEvent>>) -> S {
     tokio::spawn(mcp::connect_all(state.clone()));
     state
 }
+
 #[cfg(test)]
-mod log_pump_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -523,20 +677,84 @@ mod log_pump_tests {
         pump_log_lines(
             tokio::io::BufReader::new(std::io::Cursor::new(input.into_bytes())),
             |line| {
-                // read_line hands each line WITH its trailing newline; EOF ends
-                // the loop with no extra empty line (3 lines in → 3 invocations).
                 out.push_str(&line);
                 async {}
             },
         )
         .await;
-        // Truncating the 2100-char line to 2000 chars chops off its trailing
-        // newline, so the next line concatenates onto it (pre-existing
-        // behavior of the original pumps; only a cosmetic edge case for
-        // abnormally long lines).
         assert_eq!(
             out,
             format!("short\n{}end\n", "x".repeat(LOG_TAIL_LINE_CHARS))
         );
+    }
+
+    #[test]
+    fn strip_host_port_handles_ipv4_ipv6_and_hostnames() {
+        assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(strip_host_port("127.0.0.1"), "127.0.0.1");
+        assert_eq!(strip_host_port("localhost:5173"), "localhost");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("[::1]:8787"), "[::1]");
+        assert_eq!(strip_host_port("[::1]"), "[::1]");
+        assert_eq!(strip_host_port("::1"), "::1");
+        assert_eq!(strip_host_port("tauri.localhost:3000"), "tauri.localhost");
+    }
+
+    #[test]
+    fn is_local_origin_rejects_prefix_injection_and_allows_valid() {
+        assert!(is_local_origin("http://localhost:5173"));
+        assert!(is_local_origin("http://127.0.0.1:5173"));
+        assert!(is_local_origin("tauri://localhost"));
+        assert!(is_local_origin("http://[::1]:8787"));
+        assert!(is_local_origin("http://[::1]"));
+        assert!(is_local_origin("http://::1"));
+
+        // Prefix injection attempts MUST be rejected
+        assert!(!is_local_origin("http://localhost.evil.com"));
+        assert!(!is_local_origin("http://127.0.0.1.attacker.com"));
+        assert!(!is_local_origin("http://[::1].evil.com"));
+        assert!(!is_local_origin("http://tauri.localhost.fake.net"));
+    }
+
+    #[tokio::test]
+    async fn atomic_write_secret_creates_unique_tmp_and_0600_permissions() {
+        let dir = std::env::temp_dir().join(format!("test-secret-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let target = dir.join("secret.json");
+        atomic_write_secret(&target, b"super-secret-data")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "super-secret-data"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = tokio::fs::metadata(&target).await.unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_write_handles_concurrent_writes() {
+        let dir = std::env::temp_dir().join(format!("test-atomic-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let target = dir.join("config.json");
+        let mut handles = vec![];
+        for i in 0..10 {
+            let target_clone = target.clone();
+            handles.push(tokio::spawn(async move {
+                atomic_write(&target_clone, format!("data-{i}")).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        let content = tokio::fs::read_to_string(&target).await.unwrap();
+        assert!(content.starts_with("data-"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

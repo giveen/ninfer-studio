@@ -9,6 +9,9 @@ vi.mock('./api', () => ({
 import {
   normalizeStore,
   loadStore,
+  saveStore,
+  saveStoreDebounced,
+  stripExtPrefix,
   todoSystemBlock,
   loadDefaultPerms,
   saveDefaultPerms,
@@ -33,7 +36,7 @@ function mockFiles(files: Record<string, string>) {
   });
 }
 
-// In Node environment Vitest, global.localStorage may be undefined. Mock simple storage map.
+// Ensure deterministic storage mock across test environments.
 const storageMock = (() => {
   let store: Record<string, string> = {};
   return {
@@ -44,9 +47,7 @@ const storageMock = (() => {
   };
 })();
 
-if (typeof globalThis.localStorage === 'undefined') {
-  Object.defineProperty(globalThis, 'localStorage', { value: storageMock });
-}
+Object.defineProperty(globalThis, 'localStorage', { value: storageMock, writable: true, configurable: true });
 
 describe('coderStore', () => {
   beforeEach(() => {
@@ -60,6 +61,27 @@ describe('coderStore', () => {
       const empty: CoderStore = { activeWs: '', activeConv: '', workspaces: {} };
       const norm = normalizeStore(empty);
       expect(norm).toEqual({ activeWs: '', activeConv: '', workspaces: {} });
+    });
+
+    it('honors top-level s.activeConv when it is valid for activeWs', () => {
+      const conv1 = emptyConv('c1');
+      const conv2 = emptyConv('c2');
+      const raw: CoderStore = {
+        activeWs: '/home/user/project',
+        activeConv: 'c2',
+        workspaces: {
+          '/home/user/project': {
+            expanded: true,
+            conversations: { c1: conv1, c2: conv2 },
+            order: ['c1', 'c2'],
+            activeConv: 'c1',
+          },
+        },
+      };
+      const norm = normalizeStore(raw);
+      expect(norm.activeWs).toBe('/home/user/project');
+      expect(norm.activeConv).toBe('c2');
+      expect(norm.workspaces['/home/user/project'].activeConv).toBe('c2');
     });
 
     it('strips extended-length path prefixes (\\\\?\\ and \\\\?/) from Windows paths and merges twin workspaces', () => {
@@ -118,10 +140,16 @@ describe('coderStore', () => {
     });
   });
 
-  describe('loadStore', () => {
+  describe('loadStore & V1 migration', () => {
     it('returns empty store when localStorage is empty', () => {
       const store = loadStore();
       expect(store).toEqual({ activeWs: '', activeConv: '', workspaces: {} });
+    });
+
+    it('returns empty store when CONV_KEY contains malformed JSON', () => {
+      localStorage.setItem(CONV_KEY, '{ malformed json... ');
+      const loaded = loadStore();
+      expect(loaded).toEqual({ activeWs: '', activeConv: '', workspaces: {} });
     });
 
     it('loads and normalizes store from localStorage', () => {
@@ -144,6 +172,58 @@ describe('coderStore', () => {
       expect(loaded.activeWs).toBe('/tmp/repo');
       expect(loaded.activeConv).toBe('conv-123');
       expect(loaded.workspaces['/tmp/repo'].conversations['conv-123'].id).toBe('conv-123');
+    });
+
+    it('migrates V1 store, saves V2 format to CONV_KEY, and deletes V1 key from localStorage', () => {
+      const v1Key = 'ninfier.coder.conversations.v1';
+      const v1Data = {
+        '/tmp/v1-repo': {
+          messages: [{ role: 'user', content: 'hello' }],
+          ledger: [],
+          todos: [],
+          lastPromptTokens: 100,
+        },
+      };
+      localStorage.setItem(v1Key, JSON.stringify(v1Data));
+
+      const loaded = loadStore();
+      expect(loaded.activeWs).toBe('/tmp/v1-repo');
+      expect(Object.keys(loaded.workspaces)).toEqual(['/tmp/v1-repo']);
+      expect(localStorage.getItem(v1Key)).toBeNull();
+      expect(localStorage.getItem(CONV_KEY)).not.toBeNull();
+    });
+
+    it('returns empty store when V1 key contains malformed JSON', () => {
+      const v1Key = 'ninfier.coder.conversations.v1';
+      localStorage.setItem(v1Key, '{ invalid v1 json... ');
+      const loaded = loadStore();
+      expect(loaded).toEqual({ activeWs: '', activeConv: '', workspaces: {} });
+    });
+
+    it('prunes store and retries save on QuotaExceededError', () => {
+      const conv = emptyConv('conv-1');
+      conv.ledger = Array.from({ length: 400 }, (_, i) => ({ id: `l-${i}`, time: i, type: 'bash', label: `cmd ${i}` }));
+      conv.checkpoints = Array.from({ length: 15 }, (_, i) => ({ id: `cp-${i}`, time: i, label: `cp ${i}`, commit: '123', messageCount: 1, ledgerCount: 1, todos: [] }));
+      const store: CoderStore = {
+        activeWs: '/tmp/repo',
+        activeConv: 'conv-1',
+        workspaces: {
+          '/tmp/repo': { expanded: true, conversations: { 'conv-1': conv }, order: ['conv-1'], activeConv: 'conv-1' },
+        },
+      };
+
+      const setItemSpy = vi.spyOn(localStorage, 'setItem');
+      setItemSpy.mockImplementationOnce(() => {
+        throw new Error('QuotaExceededError');
+      });
+
+      const saved = saveStore(store);
+      expect(saved).toBe(true);
+      expect(setItemSpy).toHaveBeenCalledTimes(2);
+
+      const loaded = loadStore();
+      expect(loaded.workspaces['/tmp/repo'].conversations['conv-1'].ledger.length).toBeLessThanOrEqual(300);
+      setItemSpy.mockRestore();
     });
   });
 
@@ -188,18 +268,28 @@ describe('coderStore', () => {
   });
 
   describe('helpers', () => {
+    it('stripExtPrefix reconstructs UNC paths from Windows extended-length prefixes', () => {
+      expect(stripExtPrefix('\\\\?\\UNC\\server\\share\\file.txt')).toBe('\\\\server\\share\\file.txt');
+      expect(stripExtPrefix('//?/UNC/server/share/file.txt')).toBe('\\\\server\\share\\file.txt');
+      expect(stripExtPrefix('/plain/path')).toBe('/plain/path');
+    });
+
     it('baseName extracts basename from path', () => {
       expect(baseName('/foo/bar/baz.txt')).toBe('baz.txt');
       expect(baseName('C:\\foo\\bar\\')).toBe('bar');
       expect(baseName('')).toBe('(root)');
     });
 
-    it('relTime computes human readable relative timestamps', () => {
+    it('relTime computes human readable relative timestamps including months, years, and future bounds', () => {
       const now = Date.now();
+      const DAY = 86_400_000;
+      expect(relTime(now + 10_000)).toBe('now');
       expect(relTime(now)).toBe('now');
       expect(relTime(now - 120_000)).toBe('2m');
       expect(relTime(now - 7_200_000)).toBe('2h');
       expect(relTime(now - 172_800_000)).toBe('2d');
+      expect(relTime(now - 35 * DAY)).toBe('1mo');
+      expect(relTime(now - 400 * DAY)).toBe('1y');
     });
 
     it('newConvId produces prefix conv-', () => {
@@ -220,6 +310,16 @@ describe('coderStore', () => {
       mockFiles({ 'package.json': JSON.stringify({ scripts: { lint: 'eslint .', test: 'jest', build: 'tsc' } }) });
       const cmds = await detectCommands();
       expect(cmds).toEqual({ lint: 'eslint .', test: 'jest', build: 'tsc' });
+    });
+
+    it('falls through to Cargo.toml when package.json exists but has no scripts', async () => {
+      mockGetConfig.mockResolvedValue({} as any);
+      mockFiles({
+        'package.json': JSON.stringify({ name: 'root-pkg', scripts: {} }),
+        'Cargo.toml': '[package]\nname = "foo"',
+      });
+      const cmds = await detectCommands();
+      expect(cmds).toEqual({ build: 'cargo build', test: 'cargo test', lint: 'cargo clippy -- -D warnings' });
     });
 
     it('falls back to fixed Cargo commands when no package.json exists', async () => {

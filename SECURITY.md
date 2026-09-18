@@ -52,9 +52,22 @@ This project takes a pragmatic stance on third-party advisories:
   in the desktop app it runs inside the Tauri core, so the engine's parent is the app
   itself (single-process supervision, no orphaned engines).
 - The engine API proxy injects the API key server-side. `data/config.json` holds
-  real secrets (`apiKey`, `hfToken`) in the clear, not just settings — the control
-  plane writes it `0600` (owner read/write only) and it must stay out of shared
-  locations regardless.
+  real secrets (`apiKey`, `hfToken`, `cloudProviderApiKey`, MCP server env/headers)
+  in the clear, not just settings — the control plane writes it `0600` (owner
+  read/write only) and it must stay out of shared locations regardless. API
+  responses redact all of these to `********`; a write of the mask preserves the
+  stored value rather than overwriting it with the literal mask.
+- **Chat's Computer Use tools are not a separate code path.** When enabled, Chat's
+  `read`/`write`/`edit`/`bash`/`grep`/`glob`/git tools call the exact same
+  `/api/coder/*` endpoints Coder mode does, scoped to the chosen directory — they
+  inherit the sandbox, Safe Mode, and credential-env scrubbing documented below for
+  Coder's `exec`, not a weaker Chat-specific implementation.
+- **MCP servers are an arbitrary code-execution / network trust boundary the user
+  opts into per server.** A stdio server is spawned as a local child process; an
+  HTTP server is an arbitrary endpoint the app sends tool-call payloads to. Either
+  can be given the same allow/ask/deny tiering as built-in tools, but a malicious or
+  compromised server can still act on anything an `ask`/`allow` tier grants it once
+  invoked. Only add MCP servers you trust the provenance of.
 - Closing the window hides to the tray and keeps the engine alive by design — quit
   explicitly from the tray menu to stop the engine.
 - **Coding harness shell sandbox (default ON, per-OS mechanism).** `exec` runs
@@ -105,7 +118,8 @@ This project takes a pragmatic stance on third-party advisories:
   intentionally unauthenticated.** Turning it on binds a second listener on
   `0.0.0.0:<remoteAccessPort>` (default 1337) serving the identical app and API
   the loopback listener does — the same `exec`/`fs`/`git`/`browser` tool access
-  described above, with no login, token, or CORS/Host restriction. Unlike the
+  described above (Chat's Computer Use and any configured MCP servers included),
+  with no login, token, or CORS/Host restriction. Unlike the
   loopback listener, it does not run `guard_local_host`, by design: the whole
   point is letting another device on the network open it directly. This is a
   user-opted-in tradeoff for zero-friction LAN access, not an oversight. Anyone

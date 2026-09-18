@@ -7,6 +7,7 @@
 //!   bank.md           curated markdown bank, injected into the system prompt
 //!   learnings.jsonl   append-only structured learning entries
 
+use super::common::{enforce_perm, perm_scope};
 use crate::engine::S;
 use crate::memstore::{apply_memory_update, read_bank_and_learnings};
 use axum::Json;
@@ -64,10 +65,6 @@ fn strip_ext_prefix(p: &str) -> &str {
 /// store. The `\\?\` prefix is stripped so the slug is stable across the
 /// workspace-identity fix.
 fn memory_ws(ws: &str) -> String {
-    // Strip the prefix from the INPUT, not only the outputs: on a non-Windows
-    // host a `\\?\`-prefixed string is not `Path::is_absolute()`, so without
-    // this it would be cwd-joined before any strip could run (and the test
-    // above would only pass on Windows).
     let ws = strip_ext_prefix(ws.trim());
     if let Ok(c) = std::fs::canonicalize(Path::new(ws)) {
         return strip_ext_prefix(&c.to_string_lossy()).to_string();
@@ -104,17 +101,9 @@ fn memory_dir(data_dir: &Path, ws: &str) -> PathBuf {
 /// `coderWorkspace` pointer).
 #[derive(Debug, Deserialize)]
 pub struct MemQuery {
-    // pub(crate): the in-process agent dispatch (src/agent/tools.rs) builds
-    // these extractors directly instead of round-tripping through HTTP.
     pub workspace: Option<String>,
 }
 
-/// Resolve this request's memory dir. An explicit `workspace` (GET query
-/// param / POST body field) takes precedence over the global
-/// `coderWorkspace` pointer: a caller that knows its target workspace (e.g.
-/// a UI panel mid-switch, while the pointer is being re-pointed
-/// asynchronously) can address the intended store directly. Without an
-/// override the global pointer is used (400 when it is unset).
 async fn resolve_mem_dir(
     state: &S,
     explicit: Option<&str>,
@@ -141,11 +130,13 @@ pub async fn memory_get(
     AxumState(state): AxumState<S>,
     Query(params): Query<MemQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let scope = perm_scope(&json!({ "workspace": params.workspace }));
+    enforce_perm(&state, &scope, "read", None, None).await?;
     let dir = match resolve_mem_dir(&state, params.workspace.as_deref()).await {
         Ok(dir) => dir,
         Err(e) => return Err(e),
     };
-    Ok(Json(read_bank_and_learnings(&dir).await))
+    Ok(Json(read_bank_and_learnings(&dir).await?))
 }
 
 /// POST /api/coder/memory — apply at most one of the three body shapes and
@@ -160,6 +151,14 @@ pub async fn memory_set(
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let explicit = req.get("workspace").and_then(|v| v.as_str());
+    enforce_perm(
+        &state,
+        &perm_scope(&req),
+        "write",
+        None,
+        req.get("approvalToken").and_then(|v| v.as_str()),
+    )
+    .await?;
     let dir = match resolve_mem_dir(&state, explicit).await {
         Ok(dir) => dir,
         Err(e) => return Err(e),
@@ -351,7 +350,8 @@ mod tests {
             &state.data_dir,
             &memory_ws(&ws_a.to_string_lossy()),
         ))
-        .await;
+        .await
+        .unwrap();
         assert_eq!(on_disk.len(), 1);
 
         // Second append, then drop the first — rewrite keeps the rest.

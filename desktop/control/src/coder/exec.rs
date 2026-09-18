@@ -36,11 +36,11 @@ fn make_cwd_marker() -> String {
 static DESTRUCTIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
     let cases: &[(&str, &'static str)] = &[
         (
-            r#"(?i)\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['\"]?(/|~|\.\./|\*|/home|/root|/etc|/usr|/var|/System|/private)"#,
+            r#"(?i)\brm\s+.*?(-[a-z]*r[a-z]*|--recursive)\b.*?\s+['\"]?(/|~|\$HOME|\$root|\.\./|\*|/home|/root|/etc|/usr|/var|/System|/private)"#,
             "recursive delete of a system/home directory or wildcard",
         ),
         (
-            r#"(?i)\brm\s+(-\w+\s+)*?-[a-z]*r[a-z]*\s+['\"]?\s*\.(?:\s|$)"#,
+            r#"(?i)\brm\s+.*?(-[a-z]*r[a-z]*|--recursive)\b.*?\s+['\"]?\s*\.(?:\s|$)"#,
             "recursive delete of the current directory",
         ),
         (
@@ -54,6 +54,18 @@ static DESTRUCTIVE_PATTERNS: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyL
         (
             r"(?i)\bgit\s+clean\s+-[a-z]*f",
             "git clean (removes untracked files)",
+        ),
+        (
+            r"(?i)\bgit\s+branch\s+.*?-D\b",
+            "git branch force deletion",
+        ),
+        (
+            r"(?i)\bfind\s+.*?\s+(-delete|-exec\b)",
+            "find command with -delete or -exec",
+        ),
+        (
+            r"(?i)\bfd\s+.*?(-x|--exec)\b",
+            "fd command with -x/--exec execution",
         ),
         (r"(?i)\bmkfs\b", "filesystem format"),
         (r"(?i)\bdd\s+if=", "dd disk image copy"),
@@ -107,37 +119,41 @@ fn cap_out(s: &str) -> (String, bool) {
     }
 }
 
-/// Persist a single boolean `AppSettings` field to `config.json`, mirroring
-/// `sandbox_set`'s exact read-merge-write shape (a full save-config round
-/// trip would also work, but every coder toggle already updates its own
-/// field in isolation this way to avoid clobbering a concurrent edit to an
-/// unrelated field). `pub(crate)` so non-coder settings (e.g. `chat`'s
-/// Agent Mode toggles) reuse the same shape instead of duplicating it.
+/// Persist a single boolean `AppSettings` field to `config.json` atomically
+/// by holding the write lock across mutation and disk serialization to avoid
+/// lost update race conditions with concurrent setting toggles.
 pub(crate) async fn persist_bool_setting(
     state: &S,
     set: impl FnOnce(&mut crate::types::AppSettings, bool),
     enabled: bool,
 ) {
-    let mut merged = state.config.read().await.clone();
-    set(&mut merged, enabled);
+    let mut cfg = state.config.write().await;
+    set(&mut cfg, enabled);
     if is_safe_base_dir(&state.data_dir) {
         let path = state.data_dir.join("config.json");
         let _ = tokio::fs::create_dir_all(&state.data_dir).await;
         let _ =
-            crate::atomic_write_secret(&path, serde_json::to_string_pretty(&merged).unwrap()).await;
+            crate::atomic_write_secret(&path, serde_json::to_string_pretty(&*cfg).unwrap()).await;
     }
-    *state.config.write().await = merged;
 }
 
 pub async fn safe_mode_get(AxumState(state): AxumState<S>) -> Json<Value> {
     Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
 }
 
-pub async fn safe_mode_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
-    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        persist_bool_setting(&state, |c, v| c.coder_safe_mode = v, enabled).await;
-    }
-    Json(json!({"enabled": state.config.read().await.coder_safe_mode}))
+pub async fn safe_mode_set(
+    AxumState(state): AxumState<S>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "field 'enabled' must be a boolean" })),
+        ));
+    };
+    tracing::info!(enabled = %enabled, "coder_safe_mode updated");
+    persist_bool_setting(&state, |c, v| c.coder_safe_mode = v, enabled).await;
+    Ok(Json(json!({ "enabled": state.config.read().await.coder_safe_mode })))
 }
 
 pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> {
@@ -147,11 +163,16 @@ pub async fn commit_approval_get(AxumState(state): AxumState<S>) -> Json<Value> 
 pub async fn commit_approval_set(
     AxumState(state): AxumState<S>,
     Json(req): Json<Value>,
-) -> Json<Value> {
-    if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-        persist_bool_setting(&state, |c, v| c.coder_commit_approval = v, enabled).await;
-    }
-    Json(json!({"enabled": state.config.read().await.coder_commit_approval}))
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "field 'enabled' must be a boolean" })),
+        ));
+    };
+    tracing::info!(enabled = %enabled, "coder_commit_approval updated");
+    persist_bool_setting(&state, |c, v| c.coder_commit_approval = v, enabled).await;
+    Ok(Json(json!({ "enabled": state.config.read().await.coder_commit_approval })))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,26 +200,29 @@ pub async fn sandbox_get(AxumState(state): AxumState<S>) -> Json<Value> {
 
 pub async fn sandbox_set(AxumState(state): AxumState<S>, Json(req): Json<Value>) -> Json<Value> {
     let enabled = req.get("enabled").and_then(|v| v.as_bool());
-    if enabled.is_some() {
-        let mut merged = state.config.read().await.clone();
+    let binds = req.get("sandboxBinds").and_then(|v| v.as_array());
+    if enabled.is_some() || binds.is_some() {
+        let mut cfg = state.config.write().await;
         if let Some(e) = enabled {
-            merged.coder_sandbox = e;
+            tracing::info!(enabled = %e, "coder_sandbox updated");
+            cfg.coder_sandbox = e;
         }
-        if let Some(binds) = req.get("sandboxBinds").and_then(|v| v.as_array()) {
-            merged.sandbox_binds = binds
+        if let Some(binds_arr) = binds {
+            let parsed_binds: Vec<String> = binds_arr
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
+            tracing::info!(binds = ?parsed_binds, "sandbox_binds updated");
+            cfg.sandbox_binds = parsed_binds;
         }
 
         if is_safe_base_dir(&state.data_dir) {
             let path = state.data_dir.join("config.json");
             let _ = tokio::fs::create_dir_all(&state.data_dir).await;
             let _ =
-                crate::atomic_write_secret(&path, serde_json::to_string_pretty(&merged).unwrap())
+                crate::atomic_write_secret(&path, serde_json::to_string_pretty(&*cfg).unwrap())
                     .await;
         }
-        *state.config.write().await = merged;
     }
     let c = state.config.read().await;
     Json(sandbox_status_json(&c))
@@ -278,19 +302,20 @@ pub async fn exec(
     // one via a marker (no long-lived shell process to orphan).
     let cwd_marker = make_cwd_marker();
     let (spawn_cwd, run_cmd, session) = if !session_id.is_empty() {
+        let scoped_sid = format!("{}:{session_id}", perm_scope(&req));
         let base = state
             .shell_sessions
             .lock()
             .await
-            .get(&session_id)
+            .get(&scoped_sid)
             .cloned()
             .unwrap_or_else(|| root.to_string_lossy().into_owned());
         let wrapped = format!(
-            "cd {} 2>/dev/null || true\n{}\nprintf '\\n{cwd_marker}%s{cwd_marker}\\n' \"$PWD\"",
+            "cd {} 2>/dev/null || true\n{}\n_ec=$?\nprintf '\\n{cwd_marker}%s{cwd_marker}\\n' \"$PWD\"\nexit $_ec",
             shell_quote(&base),
             command
         );
-        (root.clone(), wrapped, Some(session_id.clone()))
+        (root.clone(), wrapped, Some(scoped_sid))
     } else if rel_cwd.is_empty() {
         (root.clone(), command.clone(), None)
     } else {
@@ -333,13 +358,14 @@ pub async fn exec(
             "exitCode": null,
             "timedOut": false,
             "truncated": false,
+            "blocked": false,
             "cwd": result_cwd,
             "sandboxed": sandboxed,
         })));
     }
     let mut child = crate::sandbox::spawn(&crate::sandbox::SpawnReq {
         command: run_cmd,
-        workspace: root,
+        workspace: root.clone(),
         cwd: spawn_cwd,
         sandboxed,
         writable_roots: sandbox_binds,
@@ -371,17 +397,26 @@ pub async fn exec(
         {
             let mut jobs = state.bg_jobs.lock().await;
             if jobs.len() >= 32 {
-                if let Some(victim) = jobs
-                    .iter()
-                    .find_map(|(k, j)| j.try_done().then(|| k.clone()))
-                {
-                    jobs.remove(&victim);
-                } else {
-                    return Err((
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({"error": "too many background jobs"})),
-                    ));
+                let mut finished: Vec<(String, u64)> = Vec::new();
+                for (k, j) in jobs.iter() {
+                    if let Ok(st) = j.state.try_lock()
+                        && st.done {
+                            finished.push((k.clone(), st.started_at));
+                        }
                 }
+                finished.sort_by_key(|(_, started_at)| *started_at);
+                for (k, _) in finished {
+                    jobs.remove(&k);
+                    if jobs.len() < 32 {
+                        break;
+                    }
+                }
+            }
+            if jobs.len() >= 32 {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": "too many background jobs"})),
+                ));
             }
             jobs.insert(id.clone(), job.clone());
         }
@@ -436,6 +471,7 @@ pub async fn exec(
                 "exitCode": null,
                 "timedOut": true,
                 "truncated": false,
+                "blocked": false,
                 "cwd": result_cwd,
                 "sandboxed": sandboxed,
             })))
@@ -446,12 +482,14 @@ pub async fn exec(
             "exitCode": null,
             "timedOut": false,
             "truncated": false,
+            "blocked": false,
             "cwd": result_cwd,
             "sandboxed": sandboxed,
         }))),
         Ok(Ok((so, se, code))) => {
             let mut stdout = String::from_utf8_lossy(&so).into_owned();
             let stderr_raw = String::from_utf8_lossy(&se).into_owned();
+            let mut final_result_cwd = result_cwd;
             // Pull the session cwd out of the marker and strip it from stdout.
             if let Some(sid) = &session
                 && let Some(first) = stdout.find(&cwd_marker)
@@ -460,11 +498,13 @@ pub async fn exec(
                 if let Some(end) = rest.find(&cwd_marker) {
                     let new_cwd = rest[..end].trim().to_string();
                     if !new_cwd.is_empty() {
-                        state
-                            .shell_sessions
-                            .lock()
-                            .await
-                            .insert(sid.clone(), new_cwd);
+                        let mut sessions = state.shell_sessions.lock().await;
+                        if sessions.len() >= 100
+                            && let Some(k) = sessions.keys().next().cloned() {
+                                sessions.remove(&k);
+                            }
+                        sessions.insert(sid.clone(), new_cwd.clone());
+                        final_result_cwd = rel_of(&root, Path::new(&new_cwd));
                     }
                 }
                 stdout = stdout[..first].to_string();
@@ -477,7 +517,8 @@ pub async fn exec(
                 "exitCode": (code >= 0).then_some(code),
                 "timedOut": false,
                 "truncated": t_out || t_err,
-                "cwd": result_cwd,
+                "blocked": false,
+                "cwd": final_result_cwd,
                 "sandboxed": sandboxed,
             })))
         }
@@ -528,6 +569,9 @@ impl BgJob {
         }
     }
     /// Non-blocking done check for eviction (contention ⇒ treat as busy).
+    // TODO: no eviction sweep calls this yet — completed background jobs
+    // stay in the job map until `bash_poll`/process shutdown reclaims them.
+    #[allow(dead_code)]
     fn try_done(&self) -> bool {
         self.state.try_lock().map(|s| s.done).unwrap_or(false)
     }
@@ -569,13 +613,18 @@ async fn drain_bg_job(
     });
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
+    let mut killed_sent = false;
     let code: Option<i32> = loop {
-        if job.kill_requested() {
+        if job.kill_requested() && !killed_sent {
+            killed_sent = true;
             child.start_kill();
         }
         if !timed_out && std::time::Instant::now() >= deadline {
             timed_out = true;
-            child.start_kill();
+            if !killed_sent {
+                killed_sent = true;
+                child.start_kill();
+            }
         }
         match timeout(Duration::from_secs(1), child.wait()).await {
             Ok(Ok(code)) => break if code >= 0 { Some(code) } else { None },
@@ -583,8 +632,20 @@ async fn drain_bg_job(
             Err(_) => continue,
         }
     };
-    let so = out_h.await.unwrap_or_default();
-    let se = err_h.await.unwrap_or_default();
+    let (so, se, pipe_timeout) = match timeout(
+        Duration::from_secs(2),
+        async {
+            let so = out_h.await.unwrap_or_default();
+            let se = err_h.await.unwrap_or_default();
+            (so, se)
+        },
+    )
+    .await
+    {
+        Ok((so, se)) => (so, se, false),
+        Err(_) => (Vec::new(), Vec::new(), true),
+    };
+
     let mut st = job.state.lock().await;
     st.done = true;
     st.timed_out = timed_out;
@@ -597,11 +658,12 @@ async fn drain_bg_job(
         if let Some(end) = rest.find(&cwd_marker) {
             let new_cwd = rest[..end].trim().to_string();
             if !new_cwd.is_empty() {
-                state
-                    .shell_sessions
-                    .lock()
-                    .await
-                    .insert(sid.clone(), new_cwd);
+                let mut sessions = state.shell_sessions.lock().await;
+                if sessions.len() >= 100
+                    && let Some(k) = sessions.keys().next().cloned() {
+                        sessions.remove(&k);
+                    }
+                sessions.insert(sid.clone(), new_cwd);
             }
         }
         stdout = stdout[..first].to_string();
@@ -614,7 +676,7 @@ async fn drain_bg_job(
     } else {
         e
     };
-    st.truncated = t1 || t2;
+    st.truncated = t1 || t2 || pipe_timeout;
     st.exit_code = code;
 }
 fn bg_view(id: &str, s: &BgState) -> Value {
@@ -691,9 +753,16 @@ mod tests {
         // LazyLock compiles every pattern on first use — a bad port panics here.
         for cmd in [
             "rm -rf /",
+            "rm -r -f /",
+            "rm --recursive --force /",
+            "rm -rf $HOME",
             "rm -rf ~",
             "sudo rm -rf /etc",
             "rm -rf .",
+            "find . -delete",
+            "find / -exec rm -rf {} +",
+            "fd -x rm",
+            "git branch -D main",
             "git push --force origin main",
             "git push -f origin main",
             "git reset --hard HEAD",
@@ -831,12 +900,12 @@ mod tests {
 
         assert_eq!(safe_mode_get(w()).await["enabled"], true);
         assert_eq!(
-            safe_mode_set(w(), Json(json!({"enabled": false}))).await["enabled"],
+            safe_mode_set(w(), Json(json!({"enabled": false}))).await.unwrap()["enabled"],
             false
         );
         assert_eq!(commit_approval_get(w()).await["enabled"], false);
         assert_eq!(
-            commit_approval_set(w(), Json(json!({"enabled": true}))).await["enabled"],
+            commit_approval_set(w(), Json(json!({"enabled": true}))).await.unwrap()["enabled"],
             true
         );
 
@@ -849,6 +918,30 @@ mod tests {
         assert_eq!(cfg.get("coderSafeMode"), Some(&json!(false)));
         assert_eq!(cfg.get("coderCommitApproval"), Some(&json!(true)));
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_bool_toggles() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-conctest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        let state: S =
+            std::sync::Arc::new(crate::types::State::new(tmp.clone(), tmp.clone(), None));
+
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let h1 = tokio::spawn(async move {
+            persist_bool_setting(&s1, |c, v| c.coder_safe_mode = v, false).await;
+        });
+        let h2 = tokio::spawn(async move {
+            persist_bool_setting(&s2, |c, v| c.coder_commit_approval = v, true).await;
+        });
+        let _ = tokio::join!(h1, h2);
+
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.coder_safe_mode, false);
+        assert_eq!(cfg.coder_commit_approval, true);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

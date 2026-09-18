@@ -18,7 +18,7 @@ export function modelHistory(conv: Conversation): ChatMessage[] {
   const tail = conv.compactedSummary ? conv.messages.slice(conv.compactedCount ?? 0) : conv.messages;
   const filtered = tail.filter((m) => m.role !== 'assistant' || m.meta?.finishReason || m.content);
   if (conv.compactedSummary) {
-    const prefix: ChatMessage = { role: 'user', content: frameCompactedSummary(conv.compactedSummary) };
+    const prefix: ChatMessage = { role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(conv.compactedSummary) };
     return [prefix, ...filtered];
   }
   return filtered;
@@ -300,21 +300,99 @@ export function normalizeParams(raw: unknown): ChatParams {
 }
 
 /**
+ * Sanitizes a conversation message sequence so that:
+ * 1. Every `role: 'tool'` message has a matching `role: 'assistant'` message with `tool_calls` preceding it.
+ * 2. If a `role: 'tool'` message is orphaned (e.g. from context slicing or interrupted turns), it is converted to a user context note so OpenRouter/OpenAI API specs are satisfied.
+ * 3. Any unfulfilled `tool_calls` in an assistant message receive dummy tool responses.
+ */
+export function sanitizeMessagesForApi(history: ChatMessage[]): ChatMessage[] {
+  if (!history || history.length === 0) return [];
+  const out: ChatMessage[] = [];
+
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
+
+    if (m.role === 'tool') {
+      const tcid = m.tool_call_id;
+      let matched = false;
+      for (let j = out.length - 1; j >= 0; j--) {
+        const prev = out[j];
+        if (prev.role === 'assistant' && prev.tool_calls?.some((tc) => tc.id === tcid)) {
+          matched = true;
+          break;
+        }
+        if (prev.role === 'user' || prev.role === 'system') {
+          break;
+        }
+      }
+
+      if (matched) {
+        out.push(m);
+      } else {
+        out.push({
+          role: 'user',
+          displayName: 'Historical Tool Result',
+          collapsed: true,
+          content: `[Historical tool result for ${m.name || 'tool'}]:\n${m.content || ''}`,
+        });
+      }
+      continue;
+    }
+
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+      const expectedIds = new Set(m.tool_calls.map((tc) => tc.id));
+      const foundIds = new Set<string>();
+
+      let k = i + 1;
+      while (k < history.length && history[k].role === 'tool') {
+        if (history[k].tool_call_id) {
+          foundIds.add(history[k].tool_call_id!);
+        }
+        k++;
+      }
+
+      out.push(m);
+      for (let j = i + 1; j < k; j++) {
+        out.push(history[j]);
+      }
+
+      for (const tc of m.tool_calls) {
+        if (!foundIds.has(tc.id)) {
+          out.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            name: tc.name,
+            content: JSON.stringify({ error: 'tool execution was interrupted or omitted' }),
+          });
+        }
+      }
+
+      i = k - 1;
+      continue;
+    }
+
+    out.push(m);
+  }
+
+  return out;
+}
+
+/**
  * Prunes historical tool output dumps (> 1500 chars in older turns) before shipping
  * prompts to paid cloud providers. Preserves recent turns and current context intact
  * while trimming bloated legacy tool results, saving up to 70% in cloud API input tokens.
  */
 export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
-  if (messages.length <= 4) return messages;
+  if (messages.length <= 2) return sanitizeMessagesForApi(messages);
 
-  const cutoffIndex = messages.length - 4;
-  return messages.map((m, idx) => {
+  const cutoffIndex = Math.max(0, messages.length - 4);
+  let pruned = messages.map((m, idx) => {
     if (idx >= cutoffIndex) return m;
 
-    if (m.content && m.content.length > 1500) {
-      const head = m.content.slice(0, 750);
-      const tail = m.content.slice(-400);
-      const omittedBytes = m.content.length - 1150;
+    if (m.content && m.content.length > 1200) {
+      const head = m.content.slice(0, 600);
+      const tail = m.content.slice(-300);
+      const omittedBytes = m.content.length - 900;
       return {
         ...m,
         content: `${head}\n\n...[${omittedBytes} bytes of historical tool output pruned for cloud optimization]...\n\n${tail}`,
@@ -322,6 +400,40 @@ export function pruneContextForCloud(messages: ChatMessage[]): ChatMessage[] {
     }
     return m;
   });
+
+  // Safeguard: if total payload exceeds ~150k tokens (approx 600,000 chars),
+  // omit older middle turns to stay safely below 200k cloud context limits.
+  const MAX_CLOUD_CHARS = 600_000;
+  const totalChars = pruned.reduce((sum, m) => sum + (typeof m.content === 'string' ? m.content.length : 0), 0);
+  if (totalChars > MAX_CLOUD_CHARS && pruned.length > 6) {
+    const keepFirst = pruned.slice(0, 2);
+    const keepLast = pruned.slice(-4);
+    const middle = pruned.slice(2, -4);
+
+    let currentChars = keepFirst.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0) +
+                        keepLast.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
+
+    const keptMiddle: ChatMessage[] = [];
+    for (let i = middle.length - 1; i >= 0; i--) {
+      const len = typeof middle[i].content === 'string' ? middle[i].content.length : 0;
+      if (currentChars + len > MAX_CLOUD_CHARS) break;
+      currentChars += len;
+      keptMiddle.unshift(middle[i]);
+    }
+
+    const omittedCount = middle.length - keptMiddle.length;
+    if (omittedCount > 0) {
+      const summaryNotice: ChatMessage = {
+        role: 'user',
+        displayName: 'Pruned Context',
+        collapsed: true,
+        content: `[System Notice: ${omittedCount} older historical turns were automatically omitted to stay within cloud context limits.]`,
+      };
+      pruned = [...keepFirst, summaryNotice, ...keptMiddle, ...keepLast];
+    }
+  }
+
+  return sanitizeMessagesForApi(pruned);
 }
 
 /**
@@ -333,21 +445,15 @@ export function resolveProviderConfig(
   appConfig: AppSettings | null,
   params: Record<string, any>,
   fallbackModel?: string
-): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string } {
+): { baseUrl?: string; apiKey?: string; extraHeaders?: string; model: string; source: 'remote' | 'local' } {
   if (!appConfig?.cloudProviderEnabled) {
-    return { model: fallbackModel || 'ninfer' };
+    console.log('[resolveProviderConfig] Cloud disabled -> fallback:', fallbackModel || 'ninfer');
+    return { model: fallbackModel || 'ninfer', source: 'local' };
   }
 
   const explicitProvider = params[`${role}Provider`] || params.provider;
   let globalUseCloud = role === 'primary' ? appConfig.cloudUseForPrimary : appConfig.cloudUseForSubagent;
 
-  // Smart Task-Based Tiering: only downgrade a subagent call the caller has
-  // itself marked lightweight (`taskWeight: 'light'` — Scout probes,
-  // tagger/extractor classification, ideation, cut-off summaries, Critic
-  // review). A call that leaves taskWeight unset defaults to heavy, which
-  // covers the Worker (the subagent that actually writes code): tiering
-  // must never silently downgrade the one subagent role the user is most
-  // likely to have explicitly picked a strong cloud model for.
   if (appConfig.cloudSmartTiering && role === 'subagent' && params.taskWeight === 'light' && !explicitProvider && !params.forceCloud) {
     globalUseCloud = false;
   }
@@ -356,18 +462,30 @@ export function resolveProviderConfig(
 
   if (effectiveProvider === 'cloud') {
     const roleModel = role === 'primary' ? appConfig.cloudProviderPrimaryModel : appConfig.cloudProviderSubagentModel;
+    const defaultModel = appConfig.cloudProviderDefaultModel;
     const fallbackDefault = role === 'primary'
-      ? (appConfig.cloudProviderPrimaryModel || appConfig.cloudProviderDefaultModel || 'gpt-4o')
-      : (appConfig.cloudProviderSubagentModel || appConfig.cloudProviderDefaultModel || 'gpt-4o-mini');
-    return {
+      ? (roleModel || defaultModel || 'gpt-4o')
+      : (roleModel || defaultModel || 'gpt-4o-mini');
+
+    const rawParam = role === 'primary' ? (params.primaryCloudModel || params.cloudModel) : (params.subagentCloudModel || params.cloudModel);
+    const paramModel = typeof rawParam === 'string' ? rawParam.trim() : '';
+
+    const model = paramModel || roleModel || fallbackDefault;
+
+    const result = {
+      source: 'remote' as const,
       baseUrl: appConfig.cloudProviderBaseUrl,
       apiKey: appConfig.cloudProviderApiKey,
       extraHeaders: appConfig.cloudProviderExtraHeaders || undefined,
-      model: params[`${role}CloudModel`] || params.cloudModel || roleModel || fallbackDefault,
+      model,
     };
+    console.log('[resolveProviderConfig] Resolved cloud provider:', { role, model: result.model, baseUrl: result.baseUrl, hasApiKey: !!result.apiKey });
+    return result;
   }
 
+  console.log('[resolveProviderConfig] Resolved ninfer provider -> fallback:', fallbackModel || 'ninfer');
   return {
+    source: 'local',
     model: fallbackModel && fallbackModel !== 'ninfer' ? fallbackModel : 'ninfer',
   };
 }

@@ -10,7 +10,7 @@ test.describe('Coder Harness Screen', () => {
     const activeScreen = page.locator('main > div:not(.hidden)');
     await expect(activeScreen).toBeVisible();
 
-    const composer = activeScreen.locator('input[placeholder*="Instruct"], input[placeholder*="workspace"]').first();
+    const composer = activeScreen.locator('textarea[placeholder*="Instruct"], textarea[placeholder*="workspace"]').first();
     await expect(composer).toBeVisible();
   });
 

@@ -15,7 +15,7 @@ test.describe('Engine Screen', () => {
       // screen stays mounted, just `hidden`-classed, per app.tsx, and
       // getByRole correctly drops anything under a hidden ancestor from the
       // accessibility tree — a plain `button` + hasText locator would not).
-      const tabBtn = page.locator('main').getByRole('button', { name: tabName, exact: true });
+      const tabBtn = page.locator('main').getByRole('tab', { name: tabName, exact: true });
       await expect(tabBtn).toBeVisible();
       await tabBtn.click();
       await expect(tabBtn).toHaveClass(/text-accent/);

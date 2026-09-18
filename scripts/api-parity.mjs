@@ -31,7 +31,9 @@ const read = (p) => readFileSync(join(root, p), 'utf8');
 // to this gate and drift stops being caught.
 function uiEndpoints() {
   const dir = 'apps/web/src/lib/api';
-  const files = readdirSync(join(root, dir)).filter((f) => f.endsWith('.ts')).map((f) => join(dir, f));
+  const files = readdirSync(join(root, dir))
+    .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && !f.endsWith('.spec.ts'))
+    .map((f) => join(dir, f));
   // Server-run adapter lives beside the domain modules, not inside them.
   files.push('apps/web/src/lib/agentRuns.ts');
   const src = files.map((f) => read(f)).join('\n');

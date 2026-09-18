@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspens
 import { Play, Square, X, BrainCircuit, Terminal, CheckSquare, Plus, Folder, ChevronRight, ChevronDown, ChevronLeft, FolderPlus, Pencil, Archive, Trash2, RotateCcw, File, Paperclip, Image, GitCommit, GitBranch, RefreshCw, Shield, HelpCircle, Undo2, SlidersHorizontal, GitFork, Download, BookmarkPlus, MessageSquare, Activity } from 'lucide-react';
 import { CoderWorkspace, AgentToolCall, ChatMessage, ChatParams, ChatAttachment, FileNode } from '../lib/types';
 import { Button, CodeBlock, NumberField, Toggle, SelectField, cn } from '../components/ui';
-import { loadStore, baseName, relTime, CoderStore, ConvMeta, LogEntry, TodoItem, newConvId, emptyConv, WsData, loadDefaultPerms, detectCommands, todoSystemBlock, CONV_KEY } from '../lib/coderStore';
+import { loadStore, baseName, relTime, CoderStore, ConvMeta, LogEntry, TodoItem, newConvId, emptyConv, WsData, loadDefaultPerms, detectCommands, todoSystemBlock, CONV_KEY, saveStoreDebounced } from '../lib/coderStore';
 
 import { DirBrowser } from '../components/DirBrowser';
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
@@ -26,7 +26,7 @@ import { isImagePath } from '../lib/fileKind';
 import { parseDiagnostics } from '../lib/diagnostics';
 import { fetchFileDiff, GIT_BRANCH_LIST_CMD, parseBranchList } from '../lib/gitStatus';
 import { useFileTabs, GIT_BADGE_CLASS } from '../components/editor/tabModel';
-import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
+import { coderTree, coderRepoMap, coderRead, coderReadBase64, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderWebFetch, coderWebSearch, coderBrowser, streamChat, buildChatRequest, getConfig, setCoderWorkspace, getStatus, getEngineContextSize, summarizeConversation, frameCompactedSummary, coderPermsSet, coderPermsApprove, coderDiff, coderMemoryAddLearning, coderMemoryDropLearning, summarizeOutputVerified, renderOutputReceipt, formatSummarizedOutput, suggestFollowUps, mcpToolsGet, mcpCall, type McpToolInfo, type CoderDiffResult, type CoderLearningKind, type CoderLearning, type ChatStreamCallbacks } from '../lib/api';
 import { useCoderSafety } from '../lib/coderSafety';
 import { NOT_AI_CONTRACT, voiceSnippet, effectiveVoice, humanizeRewriteText, VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { resolveProviderConfig } from '../lib/chatHelpers';
@@ -70,15 +70,30 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const activeConv = store.activeConv;
   const activeMeta = store.workspaces[activeWs]?.conversations[activeConv];
   /** Effective workspace directory: worktree if set, otherwise the main workspace root. */
-  const activeWsDir = activeMeta?.worktree ? `${activeWs}/${activeMeta.worktree}` : activeWs;
+  const activeWsDir = activeMeta?.worktree
+    ? `${activeWs}/${activeMeta.worktree}`.replace(/\\/g, '/').replace(/\/+/g, '/')
+    : activeWs;
 
   const initialMeta = activeMeta;
   const [messages, setMessages] = useState<ChatMessage[]>(initialMeta?.messages ?? []);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
-  const [appConfig, setAppConfig] = useState<any>(null);
+  const [appConfig, setAppConfig] = useState<Awaited<ReturnType<typeof getConfig>> | null>(null);
+  const appConfigRef = useRef(appConfig);
+  appConfigRef.current = appConfig;
   useEffect(() => {
-    getConfig().then(setAppConfig).catch(() => {});
+    let timer: number | null = null;
+    const fetchCfg = () => {
+      getConfig()
+        .then(setAppConfig)
+        .catch(() => {
+          timer = window.setTimeout(fetchCfg, 5000);
+        });
+    };
+    fetchCfg();
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+    };
   }, []);
   // When the agent pauses via ask_user, this holds the question and the run halts
   // until the user answers (release blocker #5 — human-in-the-loop).
@@ -123,11 +138,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   /** Briefly highlights the todos panel so a freshly-created list (empty →
    *  populated) catches the eye instead of silently appearing in the sidebar. */
   const [todosJustCreated, setTodosJustCreated] = useState(false);
+  const flashTimerRef = useRef<number | null>(null);
   const flashTodosCreated = () => {
     setTodosJustCreated(false);
     requestAnimationFrame(() => setTodosJustCreated(true));
-    window.setTimeout(() => setTodosJustCreated(false), 1800);
+    if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      setTodosJustCreated(false);
+      flashTimerRef.current = null;
+    }, 1800);
   };
+  useEffect(() => {
+    return () => {
+      if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    };
+  }, []);
   const [todoDraft, setTodoDraft] = useState('');
   const [wsBusy, setWsBusy] = useState(false);
   // Re-pointed control-plane workspace + flush counter (see the workspace effect below);
@@ -179,7 +204,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const [coderParams, setCoderParams] = useState<CoderParams>(() => {
     try {
       const raw = localStorage.getItem(CODER_PARAMS_KEY);
-      if (raw) return { ...DEFAULT_CODER_PARAMS, ...JSON.parse(raw) };
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        // Clear legacy default provider overrides so global routing (Cloud Tab) is respected
+        delete parsed.primaryProvider;
+        delete parsed.subagentProvider;
+        try { localStorage.setItem(CODER_PARAMS_KEY, JSON.stringify(parsed)); } catch {}
+        return { ...DEFAULT_CODER_PARAMS, ...parsed };
+      }
     } catch { /* ignore */ }
     return { ...DEFAULT_CODER_PARAMS };
   });
@@ -196,7 +228,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     if (!llmPhase) return;
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
-  }, [llmPhase ? 1 : 0]);
+  }, [!!llmPhase]);
   // Commit panel collapse state lives in useCoderGit.
 
   /** streamChat wrapper that drives the prefill/decode phase indicator. */
@@ -530,7 +562,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
   /** Create a fresh conversation inside a workspace and make it active. */
   const newChat = (ws: string = activeWs) => {
-    if (running) return; // don't start a new conversation mid-run (P0 #2)
+    if (running) {
+      addLog({ type: 'error', label: 'chat', detail: 'Cannot create new conversation while an agent run is in flight. Stop the current run first.' });
+      return;
+    }
     if (!ws) return;
     const id = newConvId();
     setStore((prev) => {
@@ -549,7 +584,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   /** Fork the active conversation: duplicate its transcript into a new thread. */
   const forkConversation = () => {
-    if (running || !activeWs || !activeConv) return;
+    if (running) {
+      addLog({ type: 'error', label: 'chat', detail: 'Cannot fork conversation while an agent run is in flight. Stop the current run first.' });
+      return;
+    }
+    if (!activeWs || !activeConv) return;
     const src = storeRef.current.workspaces[activeWs]?.conversations[activeConv];
     if (!src) return;
     const id = newConvId();
@@ -745,19 +784,21 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   const refreshRepoMap = useCallback(async () => {
     const sys = CODER_SYSTEM;
     let ctx = '';
-    try {
-      const rMap = await coderRepoMap();
-      if (rMap && rMap.map) {
-        // Unlike conventions/skills/followed-files below, this comes straight
-        // from an AST scan of the whole repo with no size control of its own —
-        // cap it so a large codebase can't silently balloon every turn's prompt.
-        const REPO_MAP_CAP = 20000;
-        const map = rMap.map.length > REPO_MAP_CAP
-          ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds the context budget)'
-          : rMap.map;
-        ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
-      }
-    } catch { /* ignore */ }
+    if (appConfigRef.current?.coderRepoMapEnabled !== false) {
+      try {
+        const rMap = await coderRepoMap();
+        if (rMap && rMap.map) {
+          // Unlike conventions/skills/followed-files below, this comes straight
+          // from an AST scan of the whole repo with no size control of its own —
+          // cap it so a large codebase can't silently balloon every turn's prompt.
+          const REPO_MAP_CAP = 10000;
+          const map = rMap.map.length > REPO_MAP_CAP
+            ? rMap.map.slice(0, REPO_MAP_CAP) + '\n…(truncated — repo map exceeds context budget; use repo_map or ast_grep tools to search the codebase)'
+            : rMap.map;
+          ctx += `\n\n# Codebase Map (Auto-generated AST Signatures)\n\`\`\`\n${map}\n\`\`\`\n`;
+        }
+      } catch { /* ignore */ }
+    }
     // Project conventions: AGENTS.md preferred, CLAUDE.md fallback — refreshed
     let convName = '';
     try {
@@ -1043,9 +1084,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     }
     const target = typeof args.path === 'string' ? args.path : '';
     if (target) {
+      const normTarget = target.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
       const hit = perms.denyPaths.find((d) => {
-        const clean = d.trim().replace(/\/+$/, '');
-        return clean !== '' && (target === clean || target.startsWith(clean + '/'));
+        const clean = d.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+        return clean !== '' && (normTarget === clean || normTarget.startsWith(clean + '/'));
       });
       if (hit) return `Denied by workspace permissions (path is under denied prefix "${hit.trim()}").`;
     }
@@ -1130,7 +1172,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       // or outcome-mismatched) receipt — either way, fall back untouched.
       if (!receipt) return resultStr;
       const tail = text.slice(-SUMMARY_TAIL);
-      const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+      const wrapped = formatSummarizedOutput(text.length, receipt, tail);
       applyResultPlaceholder(res, wrapped);
       res._summarized = true;
       return JSON.stringify(res);
@@ -1168,6 +1210,8 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     [/\b(npm\s+install\s+-g|pnpm\s+add\s+-g|yarn\s+global\s+add)\b/i, 'installs a global package'],
   ];
   const detectRisky = (cmd: string): string | null => {
+    const trimmed = cmd.trim();
+    if (isReadOnlyCommand(trimmed)) return null;
     for (const [re, why] of RISKY_PATTERNS) if (re.test(cmd)) return why;
     return null;
   };
@@ -1181,8 +1225,9 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
   };
   const addApprovedCommand = (cmd: string) => {
     const norm = normalizeCommand(cmd);
+    const targetWs = runConvRef.current?.ws ?? storeRef.current.activeWs;
     setStore((prev) => {
-      const wsd = prev.workspaces[activeWs];
+      const wsd = prev.workspaces[targetWs];
       if (!wsd) return prev;
       const cur = wsd.perms?.approvedCommands || [];
       if (cur.includes(norm)) return prev;
@@ -1190,7 +1235,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
         ...prev,
         workspaces: {
           ...prev.workspaces,
-          [activeWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: [...cur, norm] } },
+          [targetWs]: { ...wsd, perms: { ...(wsd.perms || DEFAULT_PERMS), approvedCommands: [...cur, norm] } },
         },
       };
     });
@@ -1361,14 +1406,14 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       }
       const taskText = [...messages].reverse().find((m) => m.role === 'user' && !isCompactedMsg(m))?.content
         || 'Review the current uncommitted changes for correctness and quality.';
-      const c = await runCritic(d.diff, taskText);
+      const c = await runCritic(d.diff, taskText, abortRef.current?.signal);
       if (c.learnings.length) {
         await persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
       }
       addLog({
         type: c.approved ? 'bash' : 'error',
         label: 'critic',
-        detail: c.approved ? 'approved' : (c.issues || 'changes requested').slice(0, 300),
+        detail: c.approved ? 'approved (no issues found)' : `issues: ${c.issues.slice(0, 120)}`,
       });
     } catch (e) {
       addLog({ type: 'error', label: 'critic', detail: e instanceof Error ? e.message : String(e) });
@@ -1381,6 +1426,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     activeWs,
     activeConv,
     activeWsDir,
+    stream: trackedStream,
     setRunConv,
     setRunning,
     stoppedRef,
@@ -1454,7 +1500,7 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
       (async () => {
         let textContent = '';
         try {
-          await trackedStream(req, new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } }, {
+          await trackedStream(req, abortRef.current?.signal ?? new AbortController().signal, 'critic', { onContentDelta: (t) => { textContent += t; } }, {
             baseUrl: extractorCfg.baseUrl,
             apiKey: extractorCfg.apiKey,
             extraHeaders: extractorCfg.extraHeaders,
@@ -1542,11 +1588,11 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
     commitResolveRef.current?.(false);
   };
 
-  // Persist conversations + per-workspace permissions across reloads.
+  // Persist conversations + per-workspace permissions across reloads (debounced).
   useEffect(() => {
-    try {
-      localStorage.setItem(CONV_KEY, JSON.stringify(store));
-    } catch { /* quota or privacy mode — session still works in memory */ }
+    saveStoreDebounced(store, 500, () => {
+      console.warn('[storage] Failed to persist conversation store to localStorage (quota exceeded or private mode)');
+    });
   }, [store]);
   // Persist sampling params across reloads.
   useEffect(() => {
@@ -1605,6 +1651,10 @@ export function CoderScreen({ coderWs }: { coderWs: string }) {
 
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
+      // The per-turn date/time note (see contextNoteMessage in agentLoop.ts)
+      // is real history the model needs, but it's not something the user
+      // said or asked to see — keep it out of the transcript entirely.
+      if (m.displayName === 'Context') { flushTrajectory(); continue; }
       if (isCompactedMsg(m)) {
         flushTrajectory();
         groups.push({ type: 'compact', items: [m] });

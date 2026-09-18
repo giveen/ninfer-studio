@@ -5,12 +5,11 @@
 use crate::MAX_REQUEST_BODY_BYTES;
 use crate::engine::{S, discover_engines, engine_model_info};
 use crate::usage::{RequestSource, is_loggable_completion_path, wrap_for_usage_logging};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State as AxumState};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
-use std::time::Duration;
 
 /// Timeout for the `/v1/*` proxy to the engine — generation requests can run
 /// long (large max_tokens, slow hardware), so this is much longer than a
@@ -20,32 +19,52 @@ pub(crate) const ENGINE_PROXY_TIMEOUT_SECS: u64 = 3600;
 // ---------------------------------------------------------------------------
 // Engine API proxy (SSE-safe)
 // ---------------------------------------------------------------------------
-/// Choose the engine port for a proxied request. When the JSON body names a
-/// model, route to the engine that serves it; otherwise fall back to the
+
 /// Wait until the engine on `port` is ready (or transition from Starting to Running once health passes).
-/// Only waits if the managed engine is actively in `Starting` state.
+/// For the managed engine, only waits when it is in `Starting` state.
 pub(crate) async fn wait_for_engine_ready(state: &S, port: u16) -> Result<(), String> {
     let start_time = std::time::Instant::now();
     let max_wait = std::time::Duration::from_secs(120);
 
+    let is_managed = {
+        let eng = state.engine.read().await;
+        eng.port == Some(port)
+    };
+
+    if !is_managed {
+        loop {
+            if crate::engine::engine_health(state, port).await {
+                return Ok(());
+            }
+            if start_time.elapsed() >= max_wait {
+                return Err(format!(
+                    "timeout waiting for engine on port {port} to become ready"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     loop {
         let eng_state = {
             let eng = state.engine.read().await;
+            if eng.port != Some(port) {
+                return Ok(());
+            }
             eng.state
         };
 
         match eng_state {
             crate::types::EngineState::Starting => {
-                if crate::engine::engine_health(port).await {
+                if crate::engine::engine_health(state, port).await {
                     let mut eng = state.engine.write().await;
-                    if eng.state == crate::types::EngineState::Starting {
+                    if eng.port == Some(port) && eng.state == crate::types::EngineState::Starting {
                         eng.state = crate::types::EngineState::Running;
                     }
                     return Ok(());
                 }
             }
             _ => {
-                // Running, External, Stopped, Failed, Stopping — return immediately without waiting
                 return Ok(());
             }
         }
@@ -69,6 +88,31 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
             .and_then(|m| m.as_str())
             .map(|s| s.to_string())
     });
+
+    // 1. Short-circuit: check if primary managed engine matches model or if no model was requested
+    {
+        let primary = state.engine.read().await;
+        if let Some(p) = primary.port
+            && matches!(
+                primary.state,
+                crate::types::EngineState::Running
+                    | crate::types::EngineState::External
+                    | crate::types::EngineState::Starting
+            )
+        {
+            if let Some(ref req_m) = model {
+                if req_m == "ninfer" || req_m == "default" || req_m.is_empty() || primary.model_id.as_deref() == Some(req_m.as_str()) {
+                    wait_for_engine_ready(state, p).await?;
+                    return Ok(p);
+                }
+            } else {
+                wait_for_engine_ready(state, p).await?;
+                return Ok(p);
+            }
+        }
+    }
+
+    // 2. Fallback: discover other running engines
     let mut cands: Vec<(u16, Option<String>)> = Vec::new();
     {
         let primary = state.engine.read().await;
@@ -96,7 +140,13 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
         }
     }
     let port = if let Some(m) = model {
-        if let Some((p, _)) = cands
+        if m == "ninfer" || m == "default" || m.is_empty() {
+            if let Some((p, _)) = cands.first() {
+                *p
+            } else {
+                state.config.read().await.engine_port
+            }
+        } else if let Some((p, _)) = cands
             .iter()
             .find(|(_, cm)| cm.as_deref() == Some(m.as_str()))
         {
@@ -107,7 +157,7 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
                 .map(|(p, cm)| format!("{} (:{p})", cm.clone().unwrap_or_else(|| "?".into())))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!("no engine serves model '{m}' — available: {avail}"));
+            return Err(format!("503: no engine serves model '{m}' — available: {avail}"));
         } else if let Some((p, _)) = cands.first() {
             *p
         } else {
@@ -133,38 +183,50 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
 ///
 /// Returns the re-serialized body, or `None` if neither source applies / on any
 /// parse error.
-pub(crate) fn merge_default_request_params(
+/// Merge generic request parameters and map/sanitize reasoning_effort.
+///
+/// Local engines reject the top-level `reasoning_effort` parameter with
+/// "unknown parameter: reasoning_effort", so for local requests we strip
+/// `reasoning_effort` and map it to `enable_thinking`. For remote/cloud requests,
+/// we preserve `reasoning_effort`.
+pub(crate) fn sanitize_and_merge_request_params(
     body: &[u8],
     defaults_json: &str,
     reasoning_effort: &str,
+    is_local: bool,
 ) -> Option<Vec<u8>> {
-    let defaults_trimmed = defaults_json.trim();
-    let re_trimmed = reasoning_effort.trim();
-    if defaults_trimmed.is_empty() && re_trimmed.is_empty() {
-        return None;
-    }
     let mut body_val: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let serde_json::Value::Object(ref mut body_map) = body_val else {
+        return None;
+    };
+
+    let client_had_re = body_map.contains_key("reasoning_effort");
+    let client_re = body_map.remove("reasoning_effort").and_then(|v| v.as_str().map(str::to_string));
 
     // 1. generic top-level defaults (client fields win)
+    let defaults_trimmed = defaults_json.trim();
     if !defaults_trimmed.is_empty()
-        && let serde_json::Value::Object(defaults_map) =
-            serde_json::from_str::<serde_json::Value>(defaults_json).ok()?
-        && let serde_json::Value::Object(body_map) = &mut body_val
-    {
-        for (k, v) in defaults_map {
-            body_map.entry(k).or_insert(v);
+        && let Ok(serde_json::Value::Object(defaults_map)) = serde_json::from_str::<serde_json::Value>(defaults_trimmed) {
+            for (k, v) in defaults_map {
+                body_map.entry(k).or_insert(v);
+            }
         }
-    }
 
-    // 2. reasoning effort → top-level reasoning_effort field
-    //    (client explicit value wins; the dedicated control beats the generic
-    //     default for this one key)
-    if !re_trimmed.is_empty()
-        && let serde_json::Value::Object(body_map) = &mut body_val
-    {
-        body_map
-            .entry("reasoning_effort")
-            .or_insert_with(|| serde_json::Value::String(reasoning_effort.to_string()));
+    // 2. reasoning effort handling
+    if is_local {
+        // Local engine rejects top-level reasoning_effort: map to enable_thinking boolean
+        let effort_str = client_re.as_deref().or_else(|| {
+            let re_trimmed = reasoning_effort.trim();
+            if !re_trimmed.is_empty() && !client_had_re { Some(re_trimmed) } else { None }
+        });
+        if let Some(e) = effort_str {
+            let enable = e != "none";
+            body_map.entry("enable_thinking".to_string()).or_insert(serde_json::Value::Bool(enable));
+        }
+        body_map.remove("reasoning_effort");
+    } else if let Some(e) = client_re {
+        // Cloud target: keep/restore reasoning_effort for models that support it
+        body_map.insert("reasoning_effort".to_string(), serde_json::Value::String(e));
     }
 
     serde_json::to_vec(&body_val).ok()
@@ -174,48 +236,6 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    // Set once per listener by `build_router` (loopback vs Remote Access) —
-    // read before the request is consumed below.
-    let source = req
-        .extensions()
-        .get::<RequestSource>()
-        .copied()
-        .unwrap_or(RequestSource::Local);
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
-    };
-
-    // Inject configured default request params + reasoning effort (client fields
-    // win) so external clients hitting the endpoint inherit them without
-    // per-tool configuration.
-    let (defaults_json, reasoning_effort) = {
-        let c = state.config.read().await;
-        (c.default_request_params.clone(), c.reasoning_effort.clone())
-    };
-    let body_bytes =
-        match merge_default_request_params(&body_bytes, &defaults_json, &reasoning_effort) {
-            Some(v) => v.into(),
-            None => body_bytes,
-        };
-
-    // Usage logging is best-effort and only cares about completion-shaped
-    // endpoints; the request model (if named) seeds the logged event when the
-    // engine's own response doesn't echo one back.
-    let should_log = is_loggable_completion_path(uri.path());
-    let request_model: Option<String> = if should_log {
-        serde_json::from_slice::<Value>(&body_bytes)
-            .ok()
-            .and_then(|v| {
-                v.get("model")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-    } else {
-        None
-    };
-
     let base_url = headers
         .get("x-ninfer-base-url")
         .and_then(|v| v.to_str().ok())
@@ -225,22 +245,64 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let explicit_source = headers
+        .get("x-ninfer-source")
+        .and_then(|v| v.to_str().ok());
+
+    let source = if explicit_source == Some("remote") || base_url.is_some() {
+        RequestSource::Remote
+    } else if explicit_source == Some("local") {
+        RequestSource::Local
+    } else {
+        req.extensions()
+            .get::<RequestSource>()
+            .copied()
+            .unwrap_or(RequestSource::Local)
+    };
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+    };
+
+    let (defaults_json, reasoning_effort) = {
+        let c = state.config.read().await;
+        (c.default_request_params.clone(), c.reasoning_effort.clone())
+    };
+    let is_local_target = matches!(source, RequestSource::Local);
+    let body_bytes: Bytes =
+        match sanitize_and_merge_request_params(&body_bytes, &defaults_json, &reasoning_effort, is_local_target) {
+            Some(v) => v.into(),
+            None => body_bytes,
+        };
+
+    let parsed_body: Option<Value> = serde_json::from_slice(&body_bytes).ok();
+
+    let should_log = is_loggable_completion_path(uri.path());
+    let request_model: Option<String> = if should_log {
+        parsed_body
+            .as_ref()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
+    } else {
+        None
+    };
+
     let port_opt = if base_url.is_none() {
         match route_port(&state, &body_bytes).await {
             Ok(p) => Some(p),
-            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+            Err(msg) => {
+                let status = if msg.starts_with("503") {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return (status, msg).into_response();
+            }
         }
     } else {
         None
     };
-    // Usage logging should attribute a request to the actual model artifact
-    // (e.g. "qwen3_8_27b_nvfp4.ninfer") rather than the OpenAI-facing public
-    // alias (e.g. "qwen3.8-27b") both the request and the engine's own
-    // response echo back — the alias is a display/compat label (see
-    // BasicsTab's "Public model alias"), not the file actually loaded. Only
-    // known when `port` is this control plane's own managed engine; a
-    // request routed to a separately discovered/external engine has no
-    // artifact info available, so it keeps the alias (see `route_port`).
+
     let request_model = {
         let eng = state.engine.read().await;
         if let Some(port) = port_opt {
@@ -257,25 +319,19 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
             request_model
         }
     };
-    // Usage speed stats: capture when we hand the request to the engine
-    // (the tap measures first-chunk and stream-end against this) and whether
-    // the client asked for a streamed response (only those give a
-    // prefill/decode split worth measuring).
+
     let (usage_started, usage_streaming) = if should_log {
         (
             Some(std::time::Instant::now()),
-            serde_json::from_slice::<Value>(&body_bytes)
-                .ok()
+            parsed_body
+                .as_ref()
                 .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
                 .unwrap_or(false),
         )
     } else {
         (None, false)
     };
-    // A cloud-routed request (base_url present) authenticates against the
-    // stored *cloud* key, substituting the redaction mask/blank the client
-    // sends for an untouched field — see `resolve_secret`. A local-engine
-    // request keeps falling back to the local engine's own api_key.
+
     let api_key = if base_url.is_some() {
         let cfg = state.config.read().await;
         crate::routes_config::resolve_secret(
@@ -289,85 +345,96 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         }
     };
 
-    let target = if let Some(base) = base_url {
+    let target = if let Some(ref base) = base_url {
         let path = uri.path();
         let path = if path.starts_with("/v1/") {
             &path[3..]
         } else {
             path
-        }; // Trim /v1/ for raw base urls
+        };
         format!("{}{}", base.trim_end_matches('/'), path)
     } else {
         format!("http://127.0.0.1:{}{}", port_opt.unwrap(), uri.path())
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(ENGINE_PROXY_TIMEOUT_SECS))
-        .build()
-        .ok();
-    let Some(client) = client else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "client build failed").into_response();
-    };
+
+    let client = state.http_client.clone();
+    let mut rb = client.request(method, &target);
+
+    // Forward client headers except host, content-length, and x-ninfer-* control headers
+    for (k, v) in headers.iter() {
+        let k_str = k.as_str();
+        if k_str.eq_ignore_ascii_case("host")
+            || k_str.eq_ignore_ascii_case("content-length")
+            || k_str.starts_with("x-ninfer-")
+        {
+            continue;
+        }
+        rb = rb.header(k, v);
+    }
 
     let extra_headers_override = headers
         .get("x-ninfer-extra-headers")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let mut rb = client.request(method, &target);
-    if let Some(ct) = headers.get(header::CONTENT_TYPE)
-        && let Ok(v) = ct.to_str()
-    {
-        rb = rb.header(header::CONTENT_TYPE, v);
-    }
     if let Some(ref eh) = extra_headers_override
         && let Ok(parsed) = serde_json::from_str::<serde_json::Map<String, Value>>(eh)
     {
         for (k, v) in parsed {
             if let Some(s) = v.as_str() {
-                let name: Result<axum::http::HeaderName, _> = k.parse();
-                let value: Result<axum::http::HeaderValue, _> = s.parse();
+                let name: Result<HeaderName, _> = k.parse();
+                let value: Result<HeaderValue, _> = s.parse();
                 if let (Ok(name), Ok(value)) = (name, value) {
                     rb = rb.header(name, value);
                 }
             }
         }
     }
-    // inject the configured engine API key when the client sent no auth header
+
+    // Inject configured engine API key only when client sent no auth header
     if !api_key.is_empty()
         && headers.get(header::AUTHORIZATION).is_none()
         && headers.get("x-api-key").is_none()
     {
         rb = rb.bearer_auth(&api_key);
     }
-    let resp = rb.body(body_bytes.to_vec()).send().await;
 
-    let Ok(resp) = resp else {
-        return (StatusCode::BAD_GATEWAY, "engine unreachable").into_response();
+    if base_url.is_some() {
+        tracing::info!("Proxying /v1 request to cloud: target={}", target);
+    }
+
+    let resp = rb.body(body_bytes).send().await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!("Proxy request to {} failed: {}", target, err);
+            return (StatusCode::BAD_GATEWAY, "engine unreachable").into_response();
+        }
     };
 
     let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let request_id = resp
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
+    if base_url.is_some() {
+        tracing::info!("Cloud response from {}: {}", target, status);
+    }
     let mut resp_headers = HeaderMap::new();
-    if let Some(ct) = content_type {
-        resp_headers.insert(header::CONTENT_TYPE, ct.parse().unwrap());
-    }
-    if let Some(rid) = request_id {
-        resp_headers.insert("x-request-id", rid.parse().unwrap());
-    }
-    resp_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
 
-    // stream the body through (SSE-safe: chunks piped as they arrive), tapped
-    // for usage logging on completion-shaped endpoints only.
+    // Forward response headers from engine to client
+    for (k, v) in resp.headers().iter() {
+        let k_str = k.as_str();
+        if k_str.eq_ignore_ascii_case("transfer-encoding")
+            || k_str.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        resp_headers.insert(k, v.clone());
+    }
+
+    if resp_headers.get(header::CACHE_CONTROL).is_none()
+        && let Ok(v) = HeaderValue::from_str("no-cache") {
+            resp_headers.insert(header::CACHE_CONTROL, v);
+        }
+
     let stream = futures_util::StreamExt::boxed(resp.bytes_stream());
     let stream = if should_log {
         wrap_for_usage_logging(
@@ -390,3 +457,48 @@ pub(crate) async fn proxy(AxumState(state): AxumState<S>, req: Request<Body>) ->
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "bad response").into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_default_request_params_precedence() {
+        let body = br#"{"model":"llama3","temperature":0.7}"#;
+
+        // Dedicated reasoning_effort sets enable_thinking and strips top-level reasoning_effort
+        let res = sanitize_and_merge_request_params(body, "", "high", true).unwrap();
+        let val: Value = serde_json::from_slice(&res).unwrap();
+        assert_eq!(val["enable_thinking"], true);
+        assert!(val.get("reasoning_effort").is_none());
+
+        // Generic default merges non-conflicting fields
+        let defaults = r#"{"top_p":0.9,"reasoning_effort":"low"}"#;
+        let res2 = sanitize_and_merge_request_params(body, defaults, "high", true).unwrap();
+        let val2: Value = serde_json::from_slice(&res2).unwrap();
+        assert_eq!(val2["top_p"], 0.9);
+        assert_eq!(val2["temperature"], 0.7);
+        assert_eq!(val2["enable_thinking"], true);
+        assert!(val2.get("reasoning_effort").is_none());
+
+        // Client explicit body strips top-level reasoning_effort before passing to local engine
+        let client_re_body = br#"{"model":"llama3","reasoning_effort":"medium"}"#;
+        let res3 = sanitize_and_merge_request_params(client_re_body, defaults, "high", true).unwrap();
+        let val3: Value = serde_json::from_slice(&res3).unwrap();
+        assert!(val3.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_merge_default_request_params_malformed_json_fallback() {
+        let body = br#"{"model":"llama3"}"#;
+        let bad_defaults = "{ invalid json ";
+
+        // Malformed default_request_params logs warning but doesn't abort enable_thinking injection
+        let res = sanitize_and_merge_request_params(body, bad_defaults, "medium", true).unwrap();
+        let val: Value = serde_json::from_slice(&res).unwrap();
+        assert_eq!(val["model"], "llama3");
+        assert_eq!(val["enable_thinking"], true);
+        assert!(val.get("reasoning_effort").is_none());
+    }
+}
+

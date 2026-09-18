@@ -7,7 +7,7 @@ import { BrainCircuit, ChevronDown, ChevronsRight, Copy, GitBranch, Pencil, Refr
 import type { ChatMessage } from '../lib/types';
 import { formatBytes, formatMs, formatRate, formatTokens } from '../lib/format';
 import { Button, cn } from './ui';
-import { ReportBlock } from './toolResults';
+import { ReportBlock, CollapsibleToolResult, CollapsibleToolCalls } from './toolResults';
 
 // Dynamically imported: react-markdown + remark-gfm + highlight.js is a
 // ~300KB chunk that costs nothing at startup this way, only when the first
@@ -269,17 +269,7 @@ export const MessageRow = memo(function MessageRow({
   }
 
   if (m.role === 'tool') {
-    return (
-      <div className="group relative max-w-full my-2">
-        <div className="flex items-center gap-2 mb-1">
-           <span className="text-[10px] font-mono text-faint uppercase bg-inset px-1.5 py-0.5 rounded border border-line">Tool Result</span>
-           <span className="text-[11px] font-semibold text-accent">{m.name}</span>
-        </div>
-        <div className="text-[12px] font-mono whitespace-pre-wrap bg-panel2 border border-line rounded p-2 overflow-auto max-h-48 text-mute">
-           {m.content}
-        </div>
-      </div>
-    );
+    return <CollapsibleToolResult name={m.name || 'tool'} content={m.content} />;
   }
 
   return (
@@ -315,15 +305,7 @@ export const MessageRow = memo(function MessageRow({
             <span className="text-[13px] text-faint">—</span>
           ) : null}
           {m.tool_calls && m.tool_calls.length > 0 && (
-            <div className="mt-3 space-y-1.5 border-t border-line pt-2">
-              <div className="text-[10px] font-semibold text-faint uppercase tracking-wider">Tool Calls</div>
-              {m.tool_calls.map((tc, j) => (
-                <div key={j} className="text-[11.5px] font-mono text-accent bg-accent/10 p-1.5 rounded-md flex items-start gap-1">
-                  <span className="mt-0.5">⚡</span>
-                  <span className="break-all">{tc.name}({tc.arguments})</span>
-                </div>
-              ))}
-            </div>
+            <CollapsibleToolCalls toolCalls={m.tool_calls} />
           )}
         </div>
         {isLast && !m.error && !streaming && m.meta?.finishReason === 'length' && (

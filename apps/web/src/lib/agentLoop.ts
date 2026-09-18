@@ -23,7 +23,14 @@
 // The runner is UI-agnostic: screens mirror progress into their own stores
 // through the onDelta / onTurnStart / onAppended events.
 
-import { buildChatRequest, streamChat, type ChatStreamCallbacks } from './api';
+import {
+  buildChatRequest,
+  streamChat,
+  streamResponses,
+  knownResponsesSupport,
+  paramsSupportedByResponses,
+  type ChatStreamCallbacks,
+} from './api';
 import { localDateTimeBlock } from './chatHelpers';
 import { evaluate, needsHumanize, HUMANIZE_MAX_DEPTH, type VoiceProfile } from './notai';
 import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './types';
@@ -34,7 +41,10 @@ import type { AgentToolCall, ChatMessage, ChatParams, MessageMeta } from './type
 
 /** A compaction checkpoint message (the engine-side <compacted-summary> block). */
 export function isCompactedMsg(m: ChatMessage): boolean {
-  return m.role === 'user' && typeof m.content === 'string' && m.content.includes('<compacted-summary>');
+  if (m.displayName === 'Compaction Summary') return true;
+  if (m.role !== 'user' || typeof m.content !== 'string') return false;
+  const s = m.content.trimStart();
+  return s.startsWith('<compacted-summary>') || s.startsWith('This is an automatically generated checkpoint');
 }
 
 /** Model context for a loaded transcript: from the most recent compaction
@@ -195,7 +205,17 @@ export type StreamFn = (
   req: Record<string, unknown>,
   signal: AbortSignal,
   cb: ChatStreamCallbacks,
+  opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean; source?: 'local' | 'remote' }
 ) => Promise<void>;
+
+/** Picks the transport for a turn that didn't request one explicitly: the
+ *  Responses API when the local engine build is known to support it and `params`
+ *  doesn't use a sampling knob Responses can't express, falling back to the
+ *  proven Chat Completions path otherwise. Remote cloud endpoints always use streamChat. */
+function resolveDefaultStreamFn(params: ChatParams, opts?: { source?: 'local' | 'remote'; baseUrl?: string }): StreamFn {
+  if (opts?.source === 'remote' || !!opts?.baseUrl) return streamChat;
+  return knownResponsesSupport() && paramsSupportedByResponses(params) ? streamResponses : streamChat;
+}
 
 export interface TurnResult {
   content: string;
@@ -261,13 +281,22 @@ export async function streamTurn(opts: {
   params: ChatParams;
   tools?: unknown[];
   cacheSystem?: boolean;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
+  allowFallback?: boolean;
+  source?: 'local' | 'remote';
   signal: AbortSignal;
   stream?: StreamFn;
   recoverMarkup?: boolean;
   onDelta?: (kind: 'content' | 'reasoning', text: string) => void;
   onStreamError?: (message: string) => void;
 }): Promise<TurnResult> {
-  const { model, system, messages, params, tools, cacheSystem, signal, stream = streamChat, recoverMarkup = true, onDelta, onStreamError } = opts;
+  const {
+    model, system, messages, params, tools, cacheSystem,
+    baseUrl, apiKey, extraHeaders, allowFallback, source,
+    signal, stream = resolveDefaultStreamFn(params, { source, baseUrl }), recoverMarkup = true, onDelta, onStreamError
+  } = opts;
   let content = '';
   let reasoning = '';
   let toolCalls: AgentToolCall[] = [];
@@ -278,14 +307,18 @@ export async function streamTurn(opts: {
     tools && tools.length ? { tools } : undefined,
     cacheSystem,
   );
-  await stream(req, signal, {
-    onContentDelta: (t) => { content += t; onDelta?.('content', t); },
-    onReasoningDelta: (t) => { reasoning += t; onDelta?.('reasoning', t); },
-    onToolCalls: (c) => { toolCalls = c; },
-    onUsage: (_u, m) => { meta = m; },
-    onDone: (m) => { meta = { ...meta, ...m }; finishReason = m.finishReason; },
-    onError: (msg) => { onStreamError?.(msg); },
-  });
+  await stream(
+    req, signal,
+    {
+      onContentDelta: (t) => { content += t; onDelta?.('content', t); },
+      onReasoningDelta: (t) => { reasoning += t; onDelta?.('reasoning', t); },
+      onToolCalls: (c) => { toolCalls = c; },
+      onUsage: (_u, m) => { meta = m; },
+      onDone: (m) => { meta = { ...meta, ...m }; finishReason = m.finishReason; },
+      onError: (msg) => { onStreamError?.(msg); },
+    },
+    { baseUrl, apiKey, extraHeaders, allowFallback, source }
+  );
 
   let recoveredFromMarkup: TurnResult['recoveredFromMarkup'] = null;
   let dropped: string[] = [];
@@ -375,6 +408,11 @@ export interface ToolLoopOptions {
   maxSteps: number;
   signal: AbortSignal;
   stream?: StreamFn;
+  baseUrl?: string;
+  apiKey?: string;
+  extraHeaders?: string;
+  allowFallback?: boolean;
+  source?: 'local' | 'remote';
   cacheSystem?: boolean;
   /** Append a fresh `contextNoteMessage()` (date/time) to real history
    *  before every internal turn of this loop — persisted, not discarded;
@@ -406,7 +444,11 @@ export interface ToolLoopResult {
  *  appends the assistant message, then either stops (no calls, halt, empty,
  *  abort, budget) or dispatches through the registry and continues. */
 export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult> {
-  const { model, system, params, tools, registry, maxSteps, signal, stream, cacheSystem, appendDateTime, recoverMarkup } = opts;
+  const {
+    model, system, params, tools, registry, maxSteps, signal, stream,
+    baseUrl, apiKey, extraHeaders, allowFallback, source,
+    cacheSystem, appendDateTime, recoverMarkup
+  } = opts;
   let messages = [...opts.messages];
   let turns = 0;
   let finishReason: string | undefined;
@@ -421,11 +463,19 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
         opts.onAppended?.([note], turns);
       }
     }
+    let streamError: string | undefined;
     const t = await streamTurn({
       model, system, messages, params, tools, cacheSystem, signal, stream, recoverMarkup,
+      baseUrl, apiKey, extraHeaders, allowFallback, source,
       onDelta: (kind, text) => opts.onDelta?.(kind, text, turns),
-      onStreamError: (msg) => opts.onStreamError?.(msg, turns),
+      onStreamError: (msg) => {
+        streamError = msg;
+        opts.onStreamError?.(msg, turns);
+      },
     });
+    // Transports report errors via callbacks rather than rejecting. Do not
+    // treat an interrupted turn as success or dispatch its partial tool calls.
+    if (streamError !== undefined && !signal.aborted) throw new Error(streamError);
     finishReason = t.finishReason;
     meta = t.meta;
     // A response with neither content nor tool calls is a no-op — don't push
@@ -463,7 +513,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<ToolLoopResult
       const names = [...new Set(t.dropped)];
       const available = (tools ?? []).map(toolNameOf).filter((n): n is string => n !== null);
       const note: ChatMessage = {
-        role: 'system',
+        role: 'user',
         content: available.length
           ? `[System: your tool-call markup for ${names.join(', ')} was ignored — those tools are not available right now. Available tools: ${available.join(', ')}. Call one of the available tools using the native tool-call format, or answer directly in prose.]`
           : `[System: your tool-call markup for ${names.join(', ')} was ignored — no tools are available in this conversation. Answer directly in prose.]`,

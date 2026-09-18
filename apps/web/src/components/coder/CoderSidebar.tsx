@@ -307,7 +307,7 @@ export const CoderSidebar: React.FC<CoderSidebarProps> = ({
         <SidebarSection title="Session Ledger" defaultOpen={false}>
           <div className="max-h-44 shrink-0 overflow-auto border-t border-line p-2">
             <div className="space-y-1.5">
-              {ledger.map((l) => (
+              {[...ledger].reverse().map((l) => (
                 <div key={l.id} className="flex flex-col gap-0.5 border-l-2 border-line pl-2 ml-1 text-[10.5px]">
                   <div className="flex items-center gap-1.5">
                     <span className="font-mono text-faint">{new Date(l.time).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>

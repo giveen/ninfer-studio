@@ -46,7 +46,7 @@ export interface ModelArtifact {
   version?: number;
 }
 
-interface CatalogEntry {
+export interface CatalogEntry {
   file: string;
   modelId: string;
   model: string;

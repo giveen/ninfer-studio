@@ -37,8 +37,11 @@ export interface Checkpoint {
   time: number;
   label: string;
   commit: string;
-  messages: number;
-  ledger: number;
+  messageCount: number;
+  ledgerCount: number;
+  /** Legacy field aliases retained for backward-compatibility with older persisted JSON. */
+  messages?: number;
+  ledger?: number;
   todos: TodoItem[];
   /** Taken automatically before the turn's first mutating tool call, rather
    *  than via the manual "+ checkpoint" button — kept out of the way (not
@@ -76,6 +79,7 @@ export function baseName(p: string): string {
 }
 export function relTime(ts: number): string {
   const diff = Date.now() - ts;
+  if (diff < 0) return 'now';
   const MIN = 60_000, HOUR = 3_600_000, DAY = 86_400_000;
   if (diff < MIN) return 'now';
   if (diff < HOUR) return `${Math.floor(diff / MIN)}m`;
@@ -84,7 +88,7 @@ export function relTime(ts: number): string {
   if (diff < 365 * DAY) return `${Math.floor(diff / (30 * DAY))}mo`;
   return `${Math.floor(diff / (365 * DAY))}y`;
 }
-function stripExtPrefix(p: string): string {
+export function stripExtPrefix(p: string): string {
   let rest: string | null = null;
   for (const pre of ['\\\\?\\', '\\\\?/', '//?/']) {
     if (p.startsWith(pre)) { rest = p.slice(pre.length); break; }
@@ -144,11 +148,79 @@ export function normalizeStore(s: CoderStore): CoderStore {
     activeConv = activeWs ? (workspaces[activeWs].activeConv ?? workspaces[activeWs].order[0] ?? '') : '';
   } else {
     const wsd = workspaces[activeWs];
-    activeConv = wsd.activeConv ?? wsd.order[0] ?? '';
-    if (activeConv && !wsd.conversations[activeConv]) activeConv = wsd.order[0] ?? '';
+    const candidate = activeConv || wsd.activeConv;
+    activeConv = (candidate && wsd.conversations[candidate]) ? candidate : (wsd.activeConv && wsd.conversations[wsd.activeConv]) ? wsd.activeConv : (wsd.order[0] ?? '');
+    wsd.activeConv = activeConv;
   }
   return { activeWs, activeConv, workspaces };
 }
+export function pruneStoreForStorage(store: CoderStore): CoderStore {
+  const cloned: CoderStore = JSON.parse(JSON.stringify(store));
+  for (const [wsKey, ws] of Object.entries(cloned.workspaces)) {
+    for (const [convId, conv] of Object.entries(ws.conversations)) {
+      const isActive = wsKey === cloned.activeWs && convId === cloned.activeConv;
+      // Cap ledger entries (active: 300, non-active: 50)
+      const maxLedger = isActive ? 300 : 50;
+      if (conv.ledger && conv.ledger.length > maxLedger) {
+        conv.ledger = conv.ledger.slice(-maxLedger);
+      }
+      // Cap checkpoints (active: 10, non-active: 2)
+      if (conv.checkpoints && conv.checkpoints.length > (isActive ? 10 : 2)) {
+        conv.checkpoints = conv.checkpoints.slice(-(isActive ? 10 : 2));
+      }
+      // Truncate non-active conversation messages if excessive (keep last 60 messages)
+      if (!isActive && conv.messages && conv.messages.length > 60) {
+        conv.messages = conv.messages.slice(-60);
+      }
+    }
+  }
+  return cloned;
+}
+
+export function saveStore(store: CoderStore): boolean {
+  try {
+    localStorage.setItem(CONV_KEY, JSON.stringify(store));
+    return true;
+  } catch (err) {
+    console.warn('Failed to persist conversation store to localStorage, attempting pruned save...', err);
+    try {
+      const pruned = pruneStoreForStorage(store);
+      localStorage.setItem(CONV_KEY, JSON.stringify(pruned));
+      return true;
+    } catch (prunedErr) {
+      console.warn('Failed to persist pruned conversation store to localStorage:', prunedErr);
+      return false;
+    }
+  }
+}
+
+let debouncedSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingStoreToSave: CoderStore | null = null;
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    if (pendingStoreToSave !== null) {
+      saveStore(pendingStoreToSave);
+      pendingStoreToSave = null;
+    }
+  });
+}
+
+export function saveStoreDebounced(store: CoderStore, delayMs = 500, onError?: (err: unknown) => void): void {
+  pendingStoreToSave = store;
+  if (debouncedSaveTimer !== null) {
+    clearTimeout(debouncedSaveTimer);
+  }
+  debouncedSaveTimer = setTimeout(() => {
+    debouncedSaveTimer = null;
+    if (pendingStoreToSave) {
+      const ok = saveStore(pendingStoreToSave);
+      if (!ok && onError) onError(new Error('QuotaExceededError: Failed to persist conversation store'));
+      pendingStoreToSave = null;
+    }
+  }, delayMs);
+}
+
 export function loadStore(): CoderStore {
   try {
     const raw = localStorage.getItem(CONV_KEY);
@@ -174,7 +246,12 @@ export function loadStore(): CoderStore {
       }
       const first = Object.keys(workspaces)[0] ?? '';
       const activeConv = first ? workspaces[first].activeConv! : '';
-      return { activeWs: first, activeConv, workspaces };
+      const migrated: CoderStore = { activeWs: first, activeConv, workspaces };
+      try {
+        saveStore(migrated);
+        localStorage.removeItem(CONV_V1_KEY);
+      } catch { /* ignore */ }
+      return migrated;
     }
   } catch { /* ignore */ }
   return { activeWs: '', activeConv: '', workspaces: {} };
@@ -220,7 +297,14 @@ export async function detectCommands(): Promise<{ lint?: string; test?: string; 
     try { const r = await coderRead(p, 0, 200); return r.binary ? null : (r.content || null); } catch { return null; }
   };
   const pkg = await read('package.json');
-  if (pkg) { try { const s = (JSON.parse(pkg).scripts) || {}; return { lint: s.lint, test: s.test, build: s.build }; } catch { /* not json */ } }
+  if (pkg) {
+    try {
+      const s = (JSON.parse(pkg).scripts) || {};
+      if (s.lint || s.test || s.build) {
+        return { lint: s.lint, test: s.test, build: s.build };
+      }
+    } catch { /* not json */ }
+  }
   const cargo = await read('Cargo.toml');
   if (cargo) return { build: 'cargo build', test: 'cargo test', lint: 'cargo clippy -- -D warnings' };
   const mk = await read('Makefile');

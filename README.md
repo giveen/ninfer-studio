@@ -70,6 +70,36 @@ Linux, WebView2 on Windows) for the
   answer. Tool calls route through the engine's `/v1/responses` transport when
   available. `browser`/`memory_update` each get an independent allow/ask/deny
   permission tier with a HITL approval dialog on `ask`.
+- **Cloud Provider (hybrid local + cloud)** — bring-your-own-key access to any
+  OpenAI-compatible endpoint (presets for OpenAI, OpenRouter, Groq, DeepSeek, Together
+  AI, or a custom base URL), with independent **primary** and **subagent** model
+  selection, live model-list retrieval + connection test, and per-role **Global
+  Execution Routing** (force a surface to local/cloud regardless of the other's
+  setting). Requests still route through the local proxy (`x-ninfer-base-url` /
+  `x-ninfer-api-key` headers pick the target server-side) rather than the browser
+  calling out directly. Automatic **fallback to the local engine** on a 429/5xx from
+  the cloud endpoint, optional context pruning and a local compactor for
+  cloud-context budgets, and concurrency-gated deep-research fan-out only parallelizes
+  when the target is cloud (the local engine serves one lane at a time).
+- **Computer Use (Chat, opt-in)** — gives a Chat conversation the same tool surface
+  as Coder mode (file read/write/edit/patch, grep/glob, shell exec with jobs,
+  git status/diff/branch/commit/PR, repo search) scoped to a chosen directory,
+  gated by the same allow/ask/deny permission machinery and HITL approval dialog as
+  the Agent Mode `browser`/`memory_update` tiers. Runs through the same coder
+  endpoints as Coder mode, so it inherits that mode's sandbox/safe-mode protections
+  (see [Security](#security)).
+- **MCP tool servers** — connect external [Model Context Protocol](https://modelcontextprotocol.io)
+  servers (stdio child process or streamable-HTTP) from Settings; their tools are
+  discovered, cached, and exposed to the agent loop namespaced `mcp__<server>__<tool>`,
+  under the same permission tiers as built-in tools. A dead or misconfigured server
+  never takes the control plane down with it.
+- **Usage & cost tracking** — every proxied chat request is logged; the Engine →
+  Usage tab folds the log into daily totals split **local vs. remote**: tokens,
+  cache-hit rate, and (for the local engine) GPU energy in kWh at a configurable
+  price per kWh and currency symbol, plus per-model cloud $ cost from a cached
+  OpenRouter-sourced pricing table.
+- **Suggested follow-ups** — after a reply completes, Chat asks the model for three
+  short, one-click next questions shown as chips under the reply.
 - **Coder mode** — an agentic coding harness over the same engine: plan/act loop with
   file read/write/edit, grep/glob, shell exec with sessions and background jobs, git
   integration, **Scout / Verify / Critic** harness passes (opt-in, labeled, collapsible),
@@ -139,7 +169,10 @@ single process supervises the engine.
 | `GET/POST /api/profile-state` | engine profile, chosen artifact, saved named profiles (profile.json) |
 | `GET/POST /api/conversations` | chat conversations + per-conversation params (chats.json) |
 | `/api/coder/*` | coder harness: workspace, tree/dirs/read/write/edit/patch, grep/glob, exec + jobs, safe mode, memory, git diff/log |
-| `GET /health`, `/v1/*` | SSE-safe proxy to the engine port (injects API key) |
+| `GET /health`, `/v1/*` | SSE-safe proxy to the engine port (injects API key) — also the Cloud Provider proxy: `x-ninfer-base-url`/`x-ninfer-api-key`/`x-ninfer-extra-headers` request headers redirect a given call to a configured cloud endpoint instead of the local engine |
+| `GET /api/usage`, `POST /api/usage/reset` | fold the request log into daily totals (local/remote split, cache-hit rate, GPU energy cost) for the Usage tab; reset clears the log |
+| `GET/POST /api/mcp/servers`, `POST /api/mcp/servers/{name}`, `POST /api/mcp/servers/{name}/restart` | list/upsert/delete/restart configured MCP servers |
+| `GET /api/mcp/tools`, `POST /api/mcp/call` | namespaced tool catalog across connected MCP servers; invoke one tool |
 
 All state-changing endpoints accept only loopback `Host`/`Origin` values (browser
 cross-origin calls are limited to the allow-listed Tauri/Vite origins) — see
@@ -221,7 +254,7 @@ and each platform uploads its artifact into it.
 Trigger a release by pushing a version tag:
 
 ```bash
-git tag v0.3.12 && git push origin v0.3.12
+git tag v0.4.0 && git push origin v0.4.0
 ```
 
 (or run the workflow manually from the Actions tab). Windows artifacts are currently
@@ -259,6 +292,13 @@ created on first save. Key files:
 | `coderCommitApproval` | `false` | require explicit human sign-off before the agent commits |
 | `remoteAccessEnabled` | `false` | serve the app on `0.0.0.0` instead of loopback-only (Settings — Safety & Permissions → Remote Access) |
 | `remoteAccessPort` | `1337` | port the Remote Access listener binds when enabled |
+| `chatComputerUseEnabled` | `false` | opt into Computer Use tools in Chat, scoped to `chatComputerUseDir` |
+| `chatBrowserTier` / `chatMemoryToolTier` | `allow` | allow/ask/deny permission tier for the Agent Mode `browser` / `memory_update` tools |
+| `cloudProviderEnabled` | `false` | route chat/coder requests to `cloudProviderBaseUrl` instead of the local engine |
+| `cloudProviderBaseUrl` / `cloudProviderApiKey` | (none) | OpenAI-compatible endpoint + key; key is redacted to `********` in API responses like `hfToken` |
+| `cloudProviderPrimaryModel` / `cloudProviderSubagentModel` | (none) | model id used for the main turn vs. subagent/worker calls |
+| `cloudFallbackToLocal` | `true` | on a cloud 429/5xx, retry the same request against the local engine |
+| `costPerKwh` / `currencySymbol` | `0.1` / `$` | price used to convert the local engine's measured GPU energy into a cost figure on the Usage tab |
 
 ## Security
 
@@ -274,7 +314,8 @@ loopback boundary on purpose: it binds a second, unauthenticated listener on
 `0.0.0.0:<remoteAccessPort>` so another device on your network can open the same
 live session (e.g. from a laptop). There is no login or token — anyone who can reach
 that port gets the same agent access a local user has (shell, file writes, git, the
-browser tool). Only enable it on a network you trust; see [SECURITY.md](SECURITY.md)
+browser tool, and — if enabled — Chat's Computer Use and any configured MCP
+servers). Only enable it on a network you trust; see [SECURITY.md](SECURITY.md)
 for the full threat model.
 
 See [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy and the current

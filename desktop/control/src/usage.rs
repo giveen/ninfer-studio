@@ -7,9 +7,11 @@
 
 use crate::engine::S;
 use crate::memstore::{day_string, mem_lock};
+use crate::types::now_ms;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State as AxumState};
+use axum::http::StatusCode;
 use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
@@ -134,9 +136,10 @@ pub(crate) async fn usage_reset(AxumState(state): AxumState<S>) -> Json<Value> {
 }
 
 async fn read_usage_events(state: &S) -> Vec<Value> {
-    let Ok(raw) = tokio::fs::read_to_string(usage_log_path(state)).await else {
+    let Ok(bytes) = tokio::fs::read(usage_log_path(state)).await else {
         return Vec::new();
     };
+    let raw = String::from_utf8_lossy(&bytes);
     raw.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -173,9 +176,15 @@ pub(crate) struct UsageQuery {
 pub(crate) async fn usage_stats(
     AxumState(state): AxumState<S>,
     Query(q): Query<UsageQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let days = q.days.unwrap_or(30).max(1) as u64;
     let source = q.source.unwrap_or_else(|| "all".to_string());
+    if source != "all" && source != "local" && source != "remote" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid source parameter" })),
+        ));
+    }
     let now_ms = now_ms();
     let cutoff_ms = now_ms.saturating_sub(days * 86_400_000);
 
@@ -189,10 +198,48 @@ pub(crate) async fn usage_stats(
     // AppSettings::cloud_model_pricing / cloud_test). Computed at read time
     // (not log time) so a later price refresh re-prices old log lines too —
     // same reasoning as `display_model_name` above.
-    let pricing = state.config.read().await.cloud_model_pricing.clone();
+    let cfg = state.config.read().await;
+    let pricing = cfg.cloud_model_pricing.clone();
+    let mut cloud_models = BTreeSet::new();
+    for k in pricing.keys() {
+        cloud_models.insert(k.clone());
+    }
+    if !cfg.cloud_provider_default_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_default_model.clone());
+    }
+    if !cfg.cloud_provider_primary_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_primary_model.clone());
+    }
+    if !cfg.cloud_provider_subagent_model.is_empty() {
+        cloud_models.insert(cfg.cloud_provider_subagent_model.clone());
+    }
+
     let price_event = |model: &str, prompt: u64, completion: u64| -> Option<f64> {
         let p = pricing.get(model)?;
         Some(prompt as f64 * p.prompt_per_token + completion as f64 * p.completion_per_token)
+    };
+
+    let is_local_engine_model = |m: &str| -> bool {
+        m == "ninfer"
+            || m.ends_with(".ninfer")
+            || m.ends_with(".gguf")
+            || m.ends_with(".safetensors")
+            || m.ends_with(".bin")
+    };
+
+    let is_remote_event = |e: &Value| -> bool {
+        let src = e.get("source").and_then(Value::as_str);
+        if src == Some("remote") {
+            return true;
+        }
+        if src == Some("local") {
+            return false;
+        }
+        if let Some(m) = e.get("model").and_then(Value::as_str)
+            && !is_local_engine_model(m) {
+                return true;
+            }
+        false
     };
 
     let events: Vec<Value> = read_usage_events(&state)
@@ -201,10 +248,13 @@ pub(crate) async fn usage_stats(
         .filter(|e| {
             e.get("ts")
                 .and_then(Value::as_u64)
-                .is_some_and(|ts| ts >= cutoff_ms)
+                .is_some_and(|ts| ts >= cutoff_ms && ts <= now_ms)
         })
-        .filter(|e| {
-            source == "all" || e.get("source").and_then(Value::as_str) == Some(source.as_str())
+        .filter(|e| match source.as_str() {
+            "all" => true,
+            "remote" => is_remote_event(e),
+            "local" => !is_remote_event(e),
+            _ => true,
         })
         .collect();
 
@@ -301,7 +351,7 @@ pub(crate) async fn usage_stats(
         .max_by_key(|(_, tok)| **tok)
         .map(|(m, _)| m.clone());
     let cache_hit_rate = if prompt_total > 0 {
-        cached_total as f64 / prompt_total as f64
+        (cached_total as f64 / prompt_total as f64).min(1.0)
     } else {
         0.0
     };
@@ -320,9 +370,9 @@ pub(crate) async fn usage_stats(
         .iter()
         .map(|(day, agg)| {
             let day_hit_rate = if agg.prompt_tokens > 0 {
-                agg.cached_tokens as f64 / agg.prompt_tokens as f64
+                Some((agg.cached_tokens as f64 / agg.prompt_tokens as f64).min(1.0))
             } else {
-                0.0
+                None
             };
             json!({
                 "day": day,
@@ -345,7 +395,7 @@ pub(crate) async fn usage_stats(
         .collect();
     model_breakdown.sort_by(|a, b| b["tokens"].as_u64().cmp(&a["tokens"].as_u64()));
 
-    Json(json!({
+    Ok(Json(json!({
         "totals": {
             "tokenUsage": prompt_total + completion_total,
             "requests": requests,
@@ -359,25 +409,105 @@ pub(crate) async fn usage_stats(
         },
         "dailySeries": daily_series,
         "modelBreakdown": model_breakdown,
-    }))
-}
-
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    })))
 }
 
 // ---------------------------------------------------------------------------
 // Response tap: forwards the proxied stream to the client unchanged while
-// accumulating it to parse the trailing `usage` object once it ends.
+// accumulating line-by-line in O(1) memory to parse trailing usage.
 // ---------------------------------------------------------------------------
 
-/// Cap on how much of a proxied response is buffered for parsing — generous
-/// for any chat/completions JSON tail. Endpoints this is never wrapped around
-/// (models list, health, embeddings, …) never pay this cost at all.
-const MAX_USAGE_TAP_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Default)]
+struct UsageAccumulator {
+    line_buf: Vec<u8>,
+    usage_obj: Option<Value>,
+    timings_obj: Option<Value>,
+    resp_model: Option<String>,
+    generated_chars: usize,
+}
+
+impl UsageAccumulator {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.line_buf.extend_from_slice(chunk);
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes = self.line_buf[..pos].to_vec();
+            self.line_buf.drain(..pos + 1);
+            self.process_line(&line_bytes);
+        }
+        // Safety valve against a stream that never terminates a line (bug or
+        // hostile upstream), not a limit meant to engage in normal operation:
+        // the `usage`/`timings` object we actually care about always arrives
+        // in one small, final SSE `data:` line, so tripping this and
+        // force-processing + discarding the still-incomplete buffer would
+        // silently lose that object if it legitimately ever grew this large
+        // before its `\n`. 32MB (this app's other generous-but-bounded caps,
+        // e.g. `MAX_REQUEST_BODY_BYTES`, use the same order of magnitude)
+        // keeps this a genuine safety net rather than a likely-to-fire trim,
+        // and a 1MB retained tail comfortably covers a final metadata object
+        // appended after an oversized preceding field.
+        const MAX_UNTERMINATED_LINE_BYTES: usize = 32 * 1024 * 1024;
+        const RETAINED_TAIL_BYTES: usize = 1024 * 1024;
+        if self.line_buf.len() > MAX_UNTERMINATED_LINE_BYTES {
+            let chunk = self.line_buf.clone();
+            self.process_line(&chunk);
+            let drain_len = self.line_buf.len().saturating_sub(RETAINED_TAIL_BYTES);
+            self.line_buf.drain(..drain_len);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.line_buf.is_empty() {
+            let remaining = std::mem::take(&mut self.line_buf);
+            self.process_line(&remaining);
+        }
+    }
+
+    fn process_line(&mut self, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes);
+        let line = text.trim();
+        let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if let Some(m) = v
+                .get("model")
+                .or_else(|| v.get("response").and_then(|r| r.get("model")))
+                .and_then(Value::as_str)
+            {
+                self.resp_model = Some(m.to_string());
+            }
+            let usage_val = v
+                .get("usage")
+                .or_else(|| v.get("response").and_then(|r| r.get("usage")));
+            if let Some(u) = usage_val
+                && !u.is_null() {
+                    self.usage_obj = Some(u.clone());
+                }
+            let timings_val = v
+                .get("timings")
+                .or_else(|| v.get("response").and_then(|r| r.get("timings")));
+            if let Some(t) = timings_val
+                && !t.is_null() {
+                    self.timings_obj = Some(t.clone());
+                }
+            if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+                for choice in choices {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                            self.generated_chars += c.len();
+                        }
+                        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                            self.generated_chars += r.len();
+                        }
+                    } else if let Some(text) = choice.get("text").and_then(Value::as_str) {
+                        self.generated_chars += text.len();
+                    }
+                }
+            }
+        }
+    }
+}
 
 struct UsageLogCtx {
     state: S,
@@ -390,7 +520,7 @@ struct UsageLogCtx {
 
 struct UsageTapStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
-    buf: Vec<u8>,
+    acc: UsageAccumulator,
     ctx: Option<UsageLogCtx>,
     /// When `proxy::proxy` handed the request to the engine, captured just
     /// before `send()`; `None` disables timing entirely.
@@ -405,9 +535,7 @@ impl Stream for UsageTapStream {
         let this = self.get_mut();
         match this.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                if this.buf.len() < MAX_USAGE_TAP_BYTES {
-                    this.buf.extend_from_slice(&chunk);
-                }
+                this.acc.feed(&chunk);
                 if this.first_chunk.is_none() {
                     this.first_chunk = Some(std::time::Instant::now());
                 }
@@ -415,7 +543,11 @@ impl Stream for UsageTapStream {
             }
             Poll::Ready(None) => {
                 if let Some(ctx) = this.ctx.take() {
-                    let buf = std::mem::take(&mut this.buf);
+                    this.acc.finish();
+                    let usage_obj = this.acc.usage_obj.take();
+                    let timings_obj = this.acc.timings_obj.take();
+                    let resp_model = this.acc.resp_model.take();
+                    let generated_chars = this.acc.generated_chars;
                     // Pre-fill/decode timing is only meaningful for streamed
                     // responses (a single blob has no prefill/decode split).
                     let (prefill_ms, total_ms) = if ctx.streaming {
@@ -434,11 +566,22 @@ impl Stream for UsageTapStream {
                         (None, None)
                     };
                     tokio::spawn(async move {
-                        log_from_response_bytes(ctx, &buf, prefill_ms, total_ms).await
+                        log_usage_from_parsed(
+                            ctx,
+                            usage_obj,
+                            timings_obj,
+                            resp_model,
+                            generated_chars,
+                            prefill_ms,
+                            total_ms,
+                        )
+                        .await
                     });
                 }
                 Poll::Ready(None)
             }
+            // Best-effort: if an Err chunk occurs, it is forwarded to the client
+            // and subsequent chunks/stream end log best-effort.
             other => other,
         }
     }
@@ -459,7 +602,7 @@ pub(crate) fn wrap_for_usage_logging(
 ) -> BoxStream<'static, reqwest::Result<Bytes>> {
     UsageTapStream {
         inner,
-        buf: Vec::new(),
+        acc: UsageAccumulator::default(),
         ctx: Some(UsageLogCtx {
             state,
             model,
@@ -477,35 +620,41 @@ pub(crate) fn wrap_for_usage_logging(
 /// responses, or the whole body for a plain JSON completion — and log it.
 /// Silently does nothing when no `usage` object is found (e.g. the engine
 /// doesn't report usage for this call, or the request failed).
+// Production logging now goes through the streaming tap (usage_tap_stream);
+// this whole-body variant only has test callers left, invisible to a
+// non-`--tests` clippy build. Kept for its unit test coverage of the usage-
+// object parsing (Anthropic/DeepSeek cached-token field variants included).
+#[allow(dead_code)]
 async fn log_from_response_bytes(
     ctx: UsageLogCtx,
     buf: &[u8],
     prefill_ms: Option<u64>,
     total_ms: Option<u64>,
 ) {
-    let text = String::from_utf8_lossy(buf);
-    let mut usage_obj: Option<Value> = None;
-    let mut timings_obj: Option<Value> = None;
-    let mut resp_model: Option<String> = None;
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(payload) else {
-            continue;
-        };
-        if let Some(m) = v.get("model").and_then(Value::as_str) {
-            resp_model = Some(m.to_string());
-        }
-        if let Some(u) = v.get("usage") {
-            usage_obj = Some(u.clone());
-        }
-        if let Some(t) = v.get("timings") {
-            timings_obj = Some(t.clone());
-        }
-    }
+    let mut acc = UsageAccumulator::default();
+    acc.feed(buf);
+    acc.finish();
+    log_usage_from_parsed(
+        ctx,
+        acc.usage_obj,
+        acc.timings_obj,
+        acc.resp_model,
+        acc.generated_chars,
+        prefill_ms,
+        total_ms,
+    )
+    .await;
+}
+
+async fn log_usage_from_parsed(
+    ctx: UsageLogCtx,
+    usage_obj: Option<Value>,
+    timings_obj: Option<Value>,
+    resp_model: Option<String>,
+    generated_chars: usize,
+    prefill_ms: Option<u64>,
+    total_ms: Option<u64>,
+) {
     // `ctx.model` (set by `proxy::proxy`) is the actual artifact filename when
     // known — preferred over `resp_model`, which is just the engine's own
     // response echoing back the OpenAI-facing public alias, not the file
@@ -525,15 +674,25 @@ async fn log_from_response_bytes(
     if let Some(usage) = usage_obj {
         prompt_tokens = usage
             .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         completion_tokens = usage
             .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         cached_tokens = usage
             .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|d| d.get("cached_tokens").or_else(|| d.get("cache_read_input_tokens")))
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens").or_else(|| d.get("cache_read_input_tokens")))
+            })
+            .or_else(|| usage.get("cached_tokens"))
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .or_else(|| usage.get("prompt_cache_hit_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
         found = true;
@@ -559,8 +718,8 @@ async fn log_from_response_bytes(
         decode_tok_per_sec = timings.get("predicted_per_second").and_then(Value::as_f64);
     }
 
-    if !found {
-        return;
+    if !found && completion_tokens == 0 && generated_chars > 0 {
+        completion_tokens = generated_chars.div_ceil(4) as u64;
     }
     let _ = log_usage_event(
         &ctx.state,
@@ -673,7 +832,8 @@ mod tests {
                 source: None,
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(all["totals"]["requests"], 3);
         assert_eq!(all["totals"]["activeDays"], 3);
         assert_eq!(
@@ -693,7 +853,8 @@ mod tests {
                 source: Some("local".into()),
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(local_only["totals"]["requests"], 2);
 
         let Json(narrow) = usage_stats(
@@ -703,7 +864,8 @@ mod tests {
                 source: None,
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(narrow["totals"]["requests"], 1);
     }
 
@@ -793,7 +955,8 @@ mod tests {
                 source: None,
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert!((all["totals"]["energyKwh"].as_f64().unwrap() - 1.5).abs() < 1e-9);
 
         // "local" excludes the only (remote) request but still reports the
@@ -805,7 +968,8 @@ mod tests {
                 source: Some("local".into()),
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(local_only["totals"]["requests"], 0);
         assert!((local_only["totals"]["energyKwh"].as_f64().unwrap() - 1.5).abs() < 1e-9);
     }
@@ -895,7 +1059,8 @@ mod tests {
                 source: None,
             }),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(all["totals"]["mostUsedModel"], "qwen3_8_27b_nvfp4");
         assert!((all["totals"]["avgPrefillTps"].as_f64().unwrap() - 150.0).abs() < 1e-9);
         assert!((all["totals"]["avgGenerationTps"].as_f64().unwrap() - 100.0).abs() < 1e-9);
@@ -908,4 +1073,226 @@ mod tests {
         assert!(models.contains(&"qwen3_8_27b_nvfp4"));
         assert!(models.iter().all(|m| !m.ends_with(".ninfer")));
     }
+
+    #[tokio::test]
+    async fn usage_tap_stream_incremental_parse_handles_large_stream_with_usage_at_tail() {
+        let state = temp_state();
+        let chunk_padding = "x".repeat(50_000);
+        let mut chunks: Vec<Result<Bytes, reqwest::Error>> = Vec::new();
+
+        // 50 chunks of 50KB data (>2.5MB total stream size)
+        for _ in 0..50 {
+            let data = format!("data: {{\x22choices\x22:[{{\x22delta\x22:{{\x22content\x22:\x22{}\x22}}}}]\n\n", chunk_padding);
+            chunks.push(Ok(Bytes::from(data)));
+        }
+        // Final chunk carries the usage object
+        let final_data = "data: {\"model\":\"qwen3\",\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50}}\n\n";
+        chunks.push(Ok(Bytes::from(final_data)));
+
+        let inner_stream = futures_util::stream::iter(chunks).boxed();
+        let tapped = wrap_for_usage_logging(
+            state.clone(),
+            Some("qwen3_nvfp4.ninfer".into()),
+            RequestSource::Local,
+            true,
+            Some(std::time::Instant::now()),
+            inner_stream,
+        );
+
+        let _collected: Vec<_> = tapped.collect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["promptTokens"], 100);
+        assert_eq!(events[0]["completionTokens"], 50);
+        assert_eq!(events[0]["model"], "qwen3_nvfp4.ninfer");
+    }
+
+    #[test]
+    fn usage_accumulator_survives_oversized_unterminated_line() {
+        // A single SSE "line" (no embedded '\n') larger than the *old* 1MB
+        // force-process-and-trim threshold, but still comfortably under the
+        // current 32MB safety valve, so the whole line stays buffered intact
+        // until its real trailing '\n' arrives instead of being prematurely
+        // force-processed (as invalid, incomplete JSON) and truncated to a
+        // 64KB tail that no longer starts with `{` — which is exactly the
+        // scenario that used to silently discard the usage/timings object.
+        let mut acc = UsageAccumulator::default();
+        let padding = "x".repeat(5 * 1024 * 1024);
+        let head = format!("data: {{\"content\":\"{padding}\",");
+        let tail = "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3},\"timings\":{\"prompt_ms\":1.0}}\n";
+
+        for piece in [head.as_bytes(), tail.as_bytes()] {
+            for window in piece.chunks(64 * 1024) {
+                acc.feed(window);
+            }
+        }
+        acc.finish();
+
+        assert_eq!(acc.usage_obj, Some(json!({"prompt_tokens": 7, "completion_tokens": 3})));
+        assert_eq!(acc.timings_obj, Some(json!({"prompt_ms": 1.0})));
+    }
+
+    #[tokio::test]
+    async fn read_usage_events_handles_invalid_utf8() {
+        let state = temp_state();
+        let path = usage_log_path(&state);
+        let _ = tokio::fs::create_dir_all(&state.data_dir).await;
+
+        let valid_line = json!({
+            "ts": now_ms(),
+            "model": "m1",
+            "source": "local",
+            "promptTokens": 10,
+            "completionTokens": 5,
+            "cachedTokens": 0
+        })
+        .to_string();
+
+        let mut content = Vec::new();
+        content.extend_from_slice(valid_line.as_bytes());
+        content.push(b'\n');
+        // Invalid UTF-8 byte line
+        content.extend_from_slice(b"\xFF\xFE invalid utf8 line\n");
+        content.extend_from_slice(valid_line.as_bytes());
+        content.push(b'\n');
+
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn avg_cache_hit_rate_clamped_to_one() {
+        let state = temp_state();
+        log_usage_event(
+            &state,
+            UsageEvent {
+                ts_ms: now_ms(),
+                model: "model-a".into(),
+                source: RequestSource::Local,
+                prompt_tokens: 200,
+                completion_tokens: 50,
+                cached_tokens: 300, // cached > prompt
+                prefill_ms: None,
+                total_ms: None,
+                prompt_tok_per_sec: None,
+                decode_tok_per_sec: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let Json(all) = usage_stats(
+            AxumState(state),
+            Query(UsageQuery {
+                days: Some(30),
+                source: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(all["totals"]["avgCacheHitRate"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn invalid_source_query_param_returns_bad_request() {
+        let state = temp_state();
+        let res = usage_stats(
+            AxumState(state),
+            Query(UsageQuery {
+                days: Some(30),
+                source: Some("invalid_source".into()),
+            }),
+        )
+        .await;
+
+        assert!(res.is_err());
+        let (status, Json(err_val)) = res.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err_val["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn responses_api_streaming_usage_parsed_correctly() {
+        let state = temp_state();
+        let sse_event = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"model\":\"qwen3.8-27b\",\"usage\":{\"input_tokens\":11458,\"output_tokens\":34,\"input_tokens_details\":{\"cached_tokens\":10573}}}}\n\n";
+
+        let chunks = vec![Ok(Bytes::from(sse_event))];
+        let inner_stream = futures_util::stream::iter(chunks).boxed();
+        let tapped = wrap_for_usage_logging(
+            state.clone(),
+            Some("qwen3.8-27b".into()),
+            RequestSource::Local,
+            true,
+            Some(std::time::Instant::now()),
+            inner_stream,
+        );
+
+        let _collected: Vec<_> = tapped.collect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["promptTokens"], 11458);
+        assert_eq!(events[0]["completionTokens"], 34);
+        assert_eq!(events[0]["cachedTokens"], 10573);
+
+        let Json(stats) = usage_stats(
+            AxumState(state),
+            Query(UsageQuery {
+                days: Some(1),
+                source: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hit_rate = stats["totals"]["avgCacheHitRate"].as_f64().unwrap();
+        assert!((hit_rate - (10573.0 / 11458.0)).abs() < 1e-4);
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_alternative_fields_parsed_correctly() {
+        let state = temp_state();
+
+        // 1. Anthropic style
+        let body1 = br#"{"usage":{"input_tokens":1000,"output_tokens":50,"cache_read_input_tokens":800}}"#;
+        log_from_response_bytes(
+            UsageLogCtx {
+                state: state.clone(),
+                model: Some("m1".into()),
+                source: RequestSource::Local,
+                streaming: false,
+            },
+            body1,
+            None,
+            None,
+        )
+        .await;
+
+        // 2. DeepSeek / top-level cached_tokens style
+        let body2 = br#"{"usage":{"prompt_tokens":500,"completion_tokens":20,"cached_tokens":400}}"#;
+        log_from_response_bytes(
+            UsageLogCtx {
+                state: state.clone(),
+                model: Some("m2".into()),
+                source: RequestSource::Local,
+                streaming: false,
+            },
+            body2,
+            None,
+            None,
+        )
+        .await;
+
+        let events = read_usage_events(&state).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["cachedTokens"], 800);
+        assert_eq!(events[1]["cachedTokens"], 400);
+    }
 }
+
+

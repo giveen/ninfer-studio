@@ -91,21 +91,25 @@ pub enum EngineState {
 // ---------------------------------------------------------------------------
 // Runtime state shapes (serialized for the UI)
 // ---------------------------------------------------------------------------
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
     pub state: EngineState,
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub artifact: Option<String>,
     pub model_id: Option<String>,
+    pub max_context: Option<u64>,
     pub argv: Option<Vec<String>>,
     pub started_at: Option<u64>,
     pub log_path: Option<String>,
     pub adopted: bool,
     pub fail_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuApp {
     pub pid: u32,
@@ -117,16 +121,20 @@ pub struct GpuApp {
     pub mem_mib: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GpuStats {
     pub available: bool,
     pub name: Option<String>,
+    #[serde(rename = "memUsedMiB")]
     pub mem_used_mib: Option<u64>,
+    #[serde(rename = "memTotalMiB")]
     pub mem_total_mib: Option<u64>,
     pub util_pct: Option<u64>,
     /// Instantaneous board power draw in watts (`nvidia-smi`'s `power.draw`).
     /// `None` on GPUs/drivers that don't report it — power/cost tracking
     /// (see `power.rs`) simply skips the sample rather than guessing.
+    #[serde(rename = "powerDrawW")]
     pub power_draw_w: Option<f64>,
     pub apps: Vec<GpuApp>,
 }

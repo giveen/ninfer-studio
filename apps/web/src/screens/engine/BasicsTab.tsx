@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Box, ChevronDown, Rocket } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Box, ChevronDown, Sparkles } from 'lucide-react';
 import { Field, NumberField, SectionCard, SelectField, TextField, Toggle, cn } from '../../components/ui';
 import { PRESETS } from '../../lib/presets';
 import type { EngineProfile, ModelArtifact } from '../../lib/types';
@@ -42,10 +42,12 @@ interface BasicsTabProps {
 
 export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact, modelsDir, applyPreset }: BasicsTabProps) {
   const grid3 = 'grid grid-cols-1 gap-x-6 gap-y-4 md:grid-cols-3';
+  const selectedArtifact = useMemo(() => artifacts.find((a) => a.path === artifact), [artifacts, artifact]);
+
   return (
     <div className="space-y-4">
-      <SectionCard title="Presets" description="One-click profiles. Applying one fills every option below — review the command before starting." icon={<Rocket size={15} />} collapsible>
-        <div className="flex flex-wrap items-start gap-2">
+      <SectionCard title="Presets" description="Quickly apply a tested profile baseline, then adjust below." icon={<Sparkles size={15} />}>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-4">
           {PRESETS.map((p) => (
             <PresetCard key={p.id} name={p.name} description={p.description} onApply={() => applyPreset(p.id)} />
           ))}
@@ -62,7 +64,7 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
                 ...artifacts.map((a) => ({ value: a.path, label: `${a.file}${a.weights ? ` · ${a.weights}` : ''}` })),
               ]}
             />
-            {artifacts.find(a => a.path === artifact)?.version !== undefined && artifacts.find(a => a.path === artifact)!.version! < 3 && (
+            {selectedArtifact?.version !== undefined && selectedArtifact.version < 3 && (
               <p className="mt-1 text-[11px] text-danger">⚠️ This artifact is v2. ninfer-serve requires v3. Please upgrade it in the Models tab.</p>
             )}
           </Field>
@@ -73,8 +75,8 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
             <TextField value={profile.apiKey || ''} onChange={(v) => setU('apiKey', v || undefined)} placeholder="unset (open)" />
           </Field>
           <Field label="Chat template" hint="Jinja chat template. Defaults to the artifact's embedded template.">
-            <Toggle checked={profile.chatTemplate !== undefined} onChange={(v) => { if (v) setU('chatTemplate', ''); else setU('chatTemplate', undefined); }} label="Custom template" />
-            {profile.chatTemplate !== undefined && (
+            <Toggle checked={Boolean(profile.chatTemplate)} onChange={(v) => { if (v) set('chatTemplate', ''); else setU('chatTemplate', undefined); }} label="Custom template" />
+            {profile.chatTemplate !== undefined && profile.chatTemplate !== null && (
               <div className="mt-2">
                 <TextField value={profile.chatTemplate || ''} onChange={(v) => setU('chatTemplate', v || undefined)} placeholder="/path/to/template.jinja" />
               </div>
@@ -91,7 +93,7 @@ export function BasicsTab({ profile, set, setU, artifacts, artifact, setArtifact
           </Field>
         </div>
         {artifacts.length === 0 && (
-          <p className="mt-3 text-[12px] text-warn">No .ninfer artifacts found in {modelsDir} — download one from the Models tab first.</p>
+          <p className="mt-3 text-[12px] text-warn">No .ninfer artifacts found in {modelsDir || 'models directory'} — download one from the Models tab first.</p>
         )}
       </SectionCard>
     </div>

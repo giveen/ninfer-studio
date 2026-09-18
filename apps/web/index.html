@@ -14,7 +14,9 @@
         try {
           var stored = localStorage.getItem('ninfier-theme');
           var light = stored === 'light' || (stored !== 'dark' && window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
-          if (light) document.documentElement.setAttribute('data-theme', 'light');
+          var mode = light ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', mode);
+          document.documentElement.style.colorScheme = mode;
         } catch (e) {}
       })();
     </script>

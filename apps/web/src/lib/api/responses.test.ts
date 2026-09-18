@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   paramsSupportedByResponses,
   toResponsesItems,
@@ -7,8 +7,11 @@ import {
   buildResponsesBody,
   applyResponsesEvent,
   initResponsesState,
+  streamResponses,
 } from './responses';
+import { buildChatRequest } from './chat';
 import type { ChatParams } from '../types';
+import { getLatestRequestMetrics, clearLatestRequestMetrics } from '../liveMetrics';
 
 const BASE_PARAMS: ChatParams = { thinking: true };
 
@@ -109,6 +112,30 @@ describe('buildResponsesBody', () => {
     expect(body.tool_choice).toBe('auto');
     expect(body.tools).toEqual([{ type: 'function', name: 'web_search', description: undefined, parameters: {} }]);
   });
+  it('correctly reshapes a buildChatRequest output into a valid Responses body', () => {
+    const ccReq = buildChatRequest(
+      'model-a',
+      'sys prompt',
+      [{ role: 'user', content: 'user msg' }],
+      { thinking: false, maxTokens: 1024, temperature: 0.7, topP: 0.8, reasoningEffort: 'xhigh' },
+      { tools: [{ type: 'function', function: { name: 't1', parameters: {} } }] },
+    );
+    const responsesBody = buildResponsesBody(ccReq);
+    expect(responsesBody).toEqual({
+      model: 'model-a',
+      input: [
+        { role: 'system', content: 'sys prompt' },
+        { role: 'user', content: 'user msg' },
+      ],
+      stream: true,
+      max_output_tokens: 1024,
+      temperature: 0.7,
+      top_p: 0.8,
+      reasoning: { effort: 'xhigh' },
+      tools: [{ type: 'function', name: 't1', description: undefined, parameters: {} }],
+      tool_choice: 'auto',
+    });
+  });
 });
 
 describe('applyResponsesEvent', () => {
@@ -180,10 +207,26 @@ describe('applyResponsesEvent', () => {
     expect(state.meta.finishReason).toBe('length');
   });
 
-  it('response.failed surfaces the error message', () => {
+  it('response.incomplete event sets completed=true and finishReason=length', () => {
+    const state = initResponsesState();
+    const effect = applyResponsesEvent(
+      JSON.stringify({
+        type: 'response.incomplete',
+        response: { usage: { input_tokens: 50, output_tokens: 100 }, incomplete_details: { reason: 'max_output_tokens' } },
+      }),
+      state,
+    );
+    expect(state.completed).toBe(true);
+    expect(state.meta.finishReason).toBe('length');
+    expect(effect.error).toBeUndefined();
+    expect(effect.usage).toBeDefined();
+  });
+
+  it('response.failed surfaces the error message and sets state.errored=true', () => {
     const state = initResponsesState();
     const effect = applyResponsesEvent(JSON.stringify({ type: 'response.failed', response: { error: { message: 'boom' } } }), state);
     expect(effect.error).toBe('boom');
+    expect(state.errored).toBe(true);
   });
 
   it('an unknown event type is a no-op', () => {
@@ -197,3 +240,54 @@ describe('applyResponsesEvent', () => {
     expect(applyResponsesEvent('{not json', state)).toEqual({});
   });
 });
+
+describe('streamResponses metrics publishing', () => {
+  it('computes fallback prompt and decode rates and publishes live metrics', async () => {
+    clearLatestRequestMetrics();
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        controller.enqueue(encoder.encode('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n'));
+        await new Promise((r) => setTimeout(r, 50));
+        controller.enqueue(
+          encoder.encode(
+            'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":0},"output_tokens":20}}}\n\n',
+          ),
+        );
+        controller.close();
+      },
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+
+    try {
+      let metaResult: any;
+      await streamResponses(
+        { model: 'test-model' },
+        new AbortController().signal,
+        {
+          onDone: (m) => {
+            metaResult = m;
+          },
+        },
+      );
+
+      expect(metaResult).toBeDefined();
+      expect(metaResult.promptTokens).toBe(100);
+      expect(metaResult.completionTokens).toBe(20);
+      expect(metaResult.ttftMs).toBeGreaterThan(0);
+      expect(metaResult.promptTokPerSec).toBeGreaterThan(0);
+      expect(metaResult.decodeTokPerSec).toBeGreaterThan(0);
+
+      const latest = getLatestRequestMetrics();
+      expect(latest).not.toBeNull();
+      expect(latest?.model).toBe('test-model');
+      expect(latest?.meta.promptTokPerSec).toBe(metaResult.promptTokPerSec);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+

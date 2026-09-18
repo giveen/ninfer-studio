@@ -130,7 +130,7 @@ function AskUserResultView({ data, content }: { data: any, content: string }) {
 
 /** Renders one tool's result by name; each shape has its own small view
  *  component above so this stays a plain lookup. */
-function ToolResultBlock({ name, content }: { name: string, content: string }) {
+export function ToolResultBlock({ name, content }: { name: string; content: string }) {
   try {
     const data = JSON.parse(content);
     switch (name) {
@@ -162,6 +162,79 @@ function ToolResultBlock({ name, content }: { name: string, content: string }) {
     // fallback
   }
   return <div className="text-sm whitespace-pre-wrap">{content}</div>;
+}
+
+export function CollapsibleToolResult({ name, content }: { name: string; content: string }) {
+  const [open, setOpen] = useState(false);
+  const preview = !open
+    ? (content || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+    : '';
+
+  return (
+    <div className="group relative max-w-full my-2 overflow-hidden rounded-lg border border-line bg-panel2">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-panel transition-colors"
+      >
+        <span className="text-[10px] font-mono text-faint uppercase bg-inset px-1.5 py-0.5 rounded border border-line shrink-0">
+          Tool Result
+        </span>
+        <span className="text-[11px] font-semibold text-accent shrink-0">{name}</span>
+        {!open && preview && (
+          <span className="truncate text-[11px] text-faint flex-1 font-mono min-w-0">{preview}</span>
+        )}
+        <div className="ml-auto flex items-center gap-1 shrink-0 text-[11px] text-faint">
+          <span>{open ? 'Hide' : 'Show'}</span>
+          <ChevronDown size={13} className={cn('transition-transform', !open && '-rotate-90')} />
+        </div>
+      </button>
+      {open && (
+        <div className="border-t border-line p-2 bg-panel">
+          <ToolResultBlock name={name} content={content} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function CollapsibleToolCalls({ toolCalls }: { toolCalls: Array<{ name: string; arguments: string }> }) {
+  const [open, setOpen] = useState(false);
+  const preview = toolCalls.map((tc) => `${tc.name}(${tc.arguments})`).join(', ');
+
+  return (
+    <div className="mt-3 rounded-lg border border-line bg-inset/50 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-panel transition-colors"
+      >
+        <span className="text-accent shrink-0 text-[12px]">⚡</span>
+        <span className="text-[10px] font-semibold text-faint uppercase tracking-wider shrink-0">
+          Tool Calls ({toolCalls.length})
+        </span>
+        {!open && preview && (
+          <span className="truncate text-[11px] font-mono text-faint normal-case flex-1 min-w-0">
+            {preview}
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-1 shrink-0 text-[11px] text-faint normal-case font-normal">
+          <span>{open ? 'Hide' : 'Show'}</span>
+          <ChevronDown size={13} className={cn('transition-transform', !open && '-rotate-90')} />
+        </div>
+      </button>
+      {open && (
+        <div className="border-t border-line p-2 space-y-1.5 bg-panel">
+          {toolCalls.map((tc, j) => (
+            <div key={j} className="text-[11.5px] font-mono text-accent bg-accent/10 p-1.5 rounded-md flex items-start gap-1">
+              <span className="mt-0.5 shrink-0">⚡</span>
+              <span className="break-all">{tc.name}({tc.arguments})</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Collapsed-by-default harness report (Scout / Verify / Critic). These are
@@ -219,17 +292,10 @@ export function TrajectoryBlock({ items, workspace }: { items: ChatMessage[]; wo
                   : <div className="break-words text-[12px] whitespace-pre-wrap">{m.content}</div>
               )}
               {m.role === 'tool' && m.content && (
-                 <ToolResultBlock name={m.name!} content={m.content} />
+                 <CollapsibleToolResult name={m.name!} content={m.content} />
               )}
               {m.tool_calls && (
-                <div className="mt-2 space-y-1">
-                  {m.tool_calls.map((tc, j) => (
-                    <div key={j} className="text-[11px] font-mono text-accent bg-accent/10 p-1.5 rounded flex items-start gap-1">
-                      <span className="mt-0.5">⚡</span>
-                      <span className="break-all">{tc.name}({tc.arguments})</span>
-                    </div>
-                  ))}
-                </div>
+                 <CollapsibleToolCalls toolCalls={m.tool_calls} />
               )}
             </div>
           ))}

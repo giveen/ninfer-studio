@@ -6,8 +6,8 @@
 // reliably re-exercise on every change.
 
 import { describe, it, expect, vi } from 'vitest';
-import { runToolLoop, type StreamFn, type ToolRegistry } from './agentLoop';
-import type { ChatParams } from './types';
+import { runToolLoop, isCompactedMsg, compactedContext, type StreamFn, type ToolRegistry } from './agentLoop';
+import type { ChatMessage, ChatParams } from './types';
 
 const PARAMS: ChatParams = { thinking: false };
 
@@ -32,6 +32,27 @@ function scriptedStream(turns: ScriptedTurn[]): StreamFn {
 }
 
 describe('runToolLoop', () => {
+  it.each([false, true])('rejects a failed stream before dispatching tools (partial: %s)', async (partial) => {
+    const handler = vi.fn(async () => 'unexpected');
+    const onStreamError = vi.fn();
+    const onAssistantTurn = vi.fn();
+    await expect(runToolLoop({
+      model: 'm', system: undefined, messages: [{ role: 'user', content: 'hi' }], params: PARAMS,
+      registry: { read: handler }, maxSteps: 5, signal: new AbortController().signal,
+      onStreamError, onAssistantTurn,
+      stream: async (_req, _signal, cb) => {
+        if (partial) {
+          cb.onContentDelta?.('Partial response');
+          cb.onToolCalls?.([{ id: 'read-1', name: 'read', arguments: '{}' }]);
+        }
+        cb.onError?.('Test connection lost');
+      },
+    })).rejects.toThrow('Test connection lost');
+    expect(onStreamError).toHaveBeenCalledWith('Test connection lost', 0);
+    expect(handler).not.toHaveBeenCalled();
+    expect(onAssistantTurn).not.toHaveBeenCalled();
+  });
+
   it('runs a plain content-only turn with no tool calls (stop: done, 0 turns consumed)', async () => {
     const res = await runToolLoop({
       model: 'm', system: undefined, messages: [{ role: 'user', content: 'hi' }], params: PARAMS,
@@ -171,7 +192,7 @@ describe('runToolLoop', () => {
       ]),
     });
     expect(handler).not.toHaveBeenCalled();
-    const nudge = res.messages.find((m) => m.role === 'system');
+    const nudge = res.messages.find((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('[System: your tool-call markup'));
     expect(nudge?.content).toContain('bash');
     expect(nudge?.content).toContain('web_search');
     expect(res.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'I cannot run shell commands here.' });
@@ -198,5 +219,54 @@ describe('runToolLoop', () => {
     expect(res.stop).toBe('halted');
     // Halted before the tool call was ever dispatched — no tool-role message.
     expect(res.messages.some((m) => m.role === 'tool')).toBe(false);
+  });
+});
+
+describe('isCompactedMsg & compactedContext', () => {
+  it('identifies compaction checkpoint user messages anchored at the start', () => {
+    const validCheckpoint: ChatMessage = {
+      role: 'user',
+      content: '<compacted-summary>\n## Primary Request\n- do X',
+    };
+    const validWithLeadingSpace: ChatMessage = {
+      role: 'user',
+      content: '  \n<compacted-summary>\n## Primary Request',
+    };
+    const pastedMention: ChatMessage = {
+      role: 'user',
+      content: 'Here is how <compacted-summary> works in our codebase',
+    };
+    const assistantMention: ChatMessage = {
+      role: 'assistant',
+      content: '<compacted-summary>\nfake summary',
+    };
+
+    expect(isCompactedMsg(validCheckpoint)).toBe(true);
+    expect(isCompactedMsg(validWithLeadingSpace)).toBe(true);
+    expect(isCompactedMsg(pastedMention)).toBe(false);
+    expect(isCompactedMsg(assistantMention)).toBe(false);
+  });
+
+  it('compactedContext slices from the last valid checkpoint onward', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'Turn 1: initial prompt' },
+      { role: 'assistant', content: 'Reply 1' },
+      { role: 'user', content: '<compacted-summary>\n## Checkpoint 1' },
+      { role: 'assistant', content: 'Reply 2' },
+      { role: 'user', content: 'Pasted mention of <compacted-summary> tag' },
+      { role: 'assistant', content: 'Reply 3' },
+    ];
+
+    const sliced = compactedContext(msgs);
+    expect(sliced.length).toBe(4);
+    expect(sliced[0].content).toContain('Checkpoint 1');
+  });
+
+  it('compactedContext returns full history when no checkpoint exists', () => {
+    const msgs: ChatMessage[] = [
+      { role: 'user', content: 'Turn 1' },
+      { role: 'assistant', content: 'Reply 1' },
+    ];
+    expect(compactedContext(msgs)).toEqual(msgs);
   });
 });

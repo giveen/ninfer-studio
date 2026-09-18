@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Bot, Globe, Brain, Sparkles, Users, BookmarkPlus, Terminal, FolderOpen } from 'lucide-react';
 import { Button, TextField, NumberField, cn, SectionCard } from '../../components/ui';
 import { MemoryModal } from '../../components/MemoryModal';
@@ -9,50 +9,9 @@ import { engineMaxConcurrency } from '../../lib/engineInfo';
 import { COMPUTER_USE_TOOLS } from '../../lib/chatHelpers';
 import { mcpToolTier, type PermTier } from '../../lib/coderTools';
 import type { StatusPayload } from '../../lib/types';
+import { ToggleRow, TierRow } from './settingsHelpers';
 
-function ToggleRow({ on, onToggle, onTitle, offTitle }: {
-  on: boolean; onToggle: (next: boolean) => void; onTitle: string; offTitle: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={() => onToggle(!on)}
-      className={cn('shrink-0 rounded px-2.5 py-1 text-[11px] font-medium', on ? 'bg-ok/20 text-ok' : 'bg-danger/20 text-danger')}
-      title={on ? onTitle : offTitle}
-    >
-      {on ? 'ON' : 'OFF'}
-    </button>
-  );
-}
-
-/** 3-way allow/ask/deny selector for a single Chat tool — same visual
- *  language as Coder's per-tool tier grid in SafetyTab, scoped to
- *  useChatAgent's two Chat-only tiers instead of Coder's PermConfig. */
-function TierRow({ label, tier, onChange }: { label: string; tier: PermTier; onChange: (v: PermTier) => void }) {
-  return (
-    <div className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
-      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute">{label}</span>
-      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-        <button
-          key={v}
-          type="button"
-          onClick={() => onChange(v)}
-          title={`${v} ${label}`}
-          className={cn(
-            'rounded px-2 py-0.5 text-[11px] font-medium',
-            tier === v
-              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-              : 'text-faint hover:bg-panel2 hover:text-mute',
-          )}
-        >
-          {v}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-export function AgentTab({ status }: { status: StatusPayload | null }) {
+export function AgentTab({ status, active = true }: { status: StatusPayload | null; active?: boolean }) {
   const {
     agentResearch, setAgentResearch, memoryEnabled, setMemoryEnabled, reflectionEnabled, setReflectionEnabled, deepResearchEnabled, setDeepResearchEnabled,
     memory, loadMemory, adoptMemory, memoryModalOpen, setMemoryModalOpen,
@@ -68,12 +27,31 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
   const setComputerUseToolPerm = (tool: string, tier: PermTier) =>
     setComputerUsePerms({ ...computerUsePerms, tools: { ...computerUsePerms.tools, [tool]: tier } });
 
+  const [denyPathsInput, setDenyPathsInput] = useState(() => computerUsePerms.denyPaths.join(' '));
+  const denyPathsRef = useRef(denyPathsInput);
+  denyPathsRef.current = denyPathsInput;
+
+  useEffect(() => {
+    setDenyPathsInput(computerUsePerms.denyPaths.join(' '));
+  }, [computerUsePerms.denyPaths]);
+
+  const commitDenyPaths = useCallback((val: string) => {
+    const paths = val.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+    setComputerUsePerms({ ...computerUsePerms, denyPaths: paths });
+  }, [computerUsePerms, setComputerUsePerms]);
+
+  useEffect(() => {
+    return () => {
+      commitDenyPaths(denyPathsRef.current);
+    };
+  }, [commitDenyPaths]);
+
   // MCP tools offered to Chat's agent (same scope/directory as the loop in
   // ChatScreen). The catalog can take a while on a cold start — it connects
   // the servers on demand — so fire-and-forget and render when it lands.
   const [mcpTools, setMcpTools] = useState<McpToolInfo[]>([]);
   useEffect(() => {
-    if (!computerUseEnabled) {
+    if (!computerUseEnabled || !active) {
       setMcpTools([]);
       return;
     }
@@ -82,10 +60,10 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
       .then((r) => { if (live) setMcpTools(r.tools); })
       .catch(() => { if (live) setMcpTools([]); });
     return () => { live = false; };
-  }, [computerUseEnabled, computerUseDir]);
+  }, [computerUseEnabled, computerUseDir, active]);
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
+    <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
       <SectionCard
         title="Agent Mode"
         icon={<Bot size={15} />}
@@ -142,25 +120,13 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
               {COMPUTER_USE_TOOLS.map((t) => {
                 const tier = computerUsePerms.tools[t.function.name] ?? 'allow';
                 return (
-                  <div key={t.function.name} className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
-                    <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={t.function.description}>{t.function.name}</span>
-                    {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                      <button
-                        key={v}
-                        type="button"
-                        onClick={() => setComputerUseToolPerm(t.function.name, v)}
-                        title={`${v} ${t.function.name}`}
-                        className={cn(
-                          'rounded px-2 py-0.5 text-[11px] font-medium',
-                          tier === v
-                            ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                            : 'text-faint hover:bg-panel2 hover:text-mute',
-                        )}
-                      >
-                        {v}
-                      </button>
-                    ))}
-                  </div>
+                  <TierRow
+                    key={t.function.name}
+                    label={t.function.name}
+                    tier={tier}
+                    onChange={(v) => setComputerUseToolPerm(t.function.name, v)}
+                    title={t.function.description}
+                  />
                 );
               })}
             </div>
@@ -173,40 +139,30 @@ export function AgentTab({ status }: { status: StatusPayload | null }) {
                 {mcpTools.map((t) => {
                   const tier = mcpToolTier(computerUsePerms, t.name);
                   return (
-                    <div key={t.name} className="flex items-center gap-1.5 rounded border border-line px-2 py-1">
-                      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-mute" title={t.description}>{t.name}</span>
-                      {(['allow', 'ask', 'deny'] as PermTier[]).map((v) => (
-                        <button
-                          key={v}
-                          type="button"
-                          onClick={() => setComputerUseToolPerm(t.name, v)}
-                          title={`${v} ${t.name}`}
-                          className={cn(
-                            'rounded px-2 py-0.5 text-[11px] font-medium',
-                            tier === v
-                              ? v === 'allow' ? 'bg-ok/20 text-ok' : v === 'ask' ? 'bg-warn/20 text-warn' : 'bg-danger/20 text-danger'
-                              : 'text-faint hover:bg-panel2 hover:text-mute',
-                          )}
-                        >
-                          {v}
-                        </button>
-                      ))}
-                    </div>
+                    <TierRow
+                      key={t.name}
+                      label={t.name}
+                      tier={tier}
+                      onChange={(v) => setComputerUseToolPerm(t.name, v)}
+                      title={t.description}
+                    />
                   );
                 })}
               </div>
             )}
             <input
-              defaultValue={computerUsePerms.denyPaths.join(' ')}
+              value={denyPathsInput}
+              onChange={(e) => setDenyPathsInput(e.target.value)}
               placeholder="Denied paths, space-separated (e.g. secrets/ .env)"
               title="Tool calls touching these directory-relative paths are denied"
-              onBlur={(e) => setComputerUsePerms({ ...computerUsePerms, denyPaths: e.target.value.split(/\s+/).map((s) => s.trim()).filter(Boolean) })}
+              onBlur={(e) => commitDenyPaths(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
               className="w-full rounded border border-line bg-inset px-2 py-1.5 font-mono text-[11.5px] outline-none placeholder:text-faint focus:border-accent/50"
             />
           </div>
         )}
       </SectionCard>
+
 
       {showDirBrowser && (
         <DirBrowser

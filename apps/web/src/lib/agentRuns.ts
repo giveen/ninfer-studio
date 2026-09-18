@@ -26,13 +26,13 @@
 //  * `done`/`error` are terminal; the snapshot's `status` is always the
 //    ground truth a re-attaching client reads first.
 
-import { API_BASE, getJSON, postJSON } from './api/core';
+import { API_BASE, getJSON, postJSON, fetchStream } from './api/core';
 
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
 
-export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'awaiting_gate' | 'done' | 'stopped' | 'error';
+export type RunStatusWire = 'running' | 'awaiting_approval' | 'awaiting_user' | 'awaiting_hook' | 'awaiting_gate' | 'done' | 'stopped' | 'error';
 
 export interface PendingApprovalWire {
   id: string;
@@ -65,6 +65,12 @@ export interface RunSnapshot {
   kind: string;
   label: string;
   model: string;
+  system?: string | null;
+  maxSteps?: number;
+  createdAt?: number;
+  toolSet?: string;
+  toolNames?: string[];
+  parent?: string | null;
   status: RunStatusWire;
   messages: RunMessageWire[];
   turns: number;
@@ -77,8 +83,13 @@ export interface RunSnapshot {
   /** A pending risky/commit gate pause (the polling client's dialog). */
   pendingGate: { id: string; kind: 'risky' | 'commit'; command: string; reason: string | null } | null;
   scope: string | null;
+  todo?: unknown | null;
   usage: RunUsageWire;
   lastMeta: Record<string, unknown> | null;
+  hookMode?: string;
+  pendingHook?: string | null;
+  plan?: boolean;
+  todoRev?: number;
 }
 
 export interface RunSummary {
@@ -204,16 +215,21 @@ export const agentRunsApi = {
   ): Promise<{ ok: boolean }> {
     return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/hooks/${encodeURIComponent(hookId)}`, body, 5000);
   },
+  /** Update the run's task list (user edit). Bumps `user_todo_rev` on server. */
+  setTodo(id: string, todos: unknown[]): Promise<{ ok: boolean; count: number; rev: number }> {
+    return postJSON(`/api/agent/runs/${encodeURIComponent(id)}/todo`, { todos }, 5000);
+  },
   /** Resolve a pending risky/commit gate. Risky: once|remember|deny;
    *  commit: approve|deny. */
   decideGate(
     id: string,
     gateId: string,
     decision: 'once' | 'remember' | 'deny' | 'approve',
+    token?: string,
   ): Promise<{ ok: boolean; decision: string }> {
     return postJSON(
       `/api/agent/runs/${encodeURIComponent(id)}/gates/${encodeURIComponent(gateId)}`,
-      { decision },
+      { decision, token },
       5000,
     );
   },
@@ -313,47 +329,54 @@ export class RunStream {
   }
 
   private async consume(): Promise<void> {
-    const r = await fetch(`${API_BASE}/api/agent/runs/${encodeURIComponent(this.runId)}/events`, {
-      signal: this.ctrl.signal,
-    });
-    if (!r.ok || !r.body) {
-      // 404 → the run is gone; anything else → treat as a cut.
-      if (r.status === 404) {
-        this.onDrop('closed');
-        throw new Error('run gone');
+    const { response: r, idle } = await fetchStream(
+      `/api/agent/runs/${encodeURIComponent(this.runId)}/events`,
+      {},
+      { idleTimeoutMs: 180_000, signal: this.ctrl.signal },
+    );
+    try {
+      if (!r.ok || !r.body) {
+        // 404 → the run is gone; anything else → treat as a cut.
+        if (r.status === 404) {
+          this.onDrop('closed');
+          throw new Error('run gone');
+        }
+        throw new Error(`events → HTTP ${r.status}`);
       }
-      throw new Error(`events → HTTP ${r.status}`);
-    }
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    // The server re-sends the snapshot as its first frame (`event: state`)
-    // — apply it (it is newer than the one we fetched moments ago).
-    let sawStateFrame = false;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let sep: number;
-      while ((sep = buf.indexOf('\n\n')) !== -1) {
-        const frame = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        const ev = parseFrame(frame);
-        if (!ev) continue;
-        if (ev.type === 'state') {
-          if (!sawStateFrame) {
-            sawStateFrame = true;
-            this.onSnapshot((ev as unknown as { snapshot: RunSnapshot }).snapshot);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      // The server re-sends the snapshot as its first frame (`event: state`)
+      // — apply it (it is newer than the one we fetched moments ago).
+      let sawStateFrame = false;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        idle.touch();
+        buf += dec.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const ev = parseFrame(frame);
+          if (!ev) continue;
+          if (ev.type === 'state') {
+            if (!sawStateFrame) {
+              sawStateFrame = true;
+              this.onSnapshot((ev as unknown as { snapshot: RunSnapshot }).snapshot);
+            }
+            continue;
           }
-          continue;
+          this.onEvent(ev);
+          if (ev.type === 'done' || ev.type === 'error') {
+            this.terminal = true;
+            return;
+          }
         }
-        this.onEvent(ev);
-        if (ev.type === 'done' || ev.type === 'error') {
-          this.terminal = true;
-          return;
-        }
+        if (this.done) return;
       }
-      if (this.done) return;
+    } finally {
+      idle.dispose();
     }
   }
 }

@@ -49,7 +49,15 @@ A from-scratch, Linux-first desktop UI for the **NInfer** C++/CUDA inference eng
   The same binary serves browser dev mode (Vite HMR against :8787). The UI
   code is identical in both because it only speaks the loopback HTTP contract.
 - The proxy (`/v1/*`, `/health` → engine port) keeps the UI on a single origin (no CORS),
-  injects the configured API key, and is SSE-safe (chunks piped as they arrive).
+  injects the configured API key, and is SSE-safe (chunks piped as they arrive). The same proxy
+  doubles as the Cloud Provider gateway: per-request `x-ninfer-base-url`/`x-ninfer-api-key`
+  headers redirect a call to a configured OpenAI-compatible endpoint instead of the local engine,
+  so cloud traffic never has to leave the renderer for an arbitrary origin directly.
+- MCP (Model Context Protocol) servers are a separate client subsystem (`desktop/control/src/mcp.rs`,
+  the official `rmcp` SDK): configured servers are spawned (stdio) or addressed (streamable-HTTP)
+  from a dedicated actor thread (rmcp's client service is `!Send`), tool schemas are cached per
+  connection and exposed to the agent loop namespaced `mcp__<server>__<tool>`, and invocation goes
+  through the same allow/ask/deny permission machinery as built-in tools.
 
 **Key lifecycle behaviors** (all implemented and verified):
 - **adopt-don't-kill**: if the configured port already serves `/health: ok`, the control plane marks
@@ -94,11 +102,46 @@ A from-scratch, Linux-first desktop UI for the **NInfer** C++/CUDA inference eng
   media as `image_url` / `video_url` (NInfer extension) parts.
 - **Offline banner**: if the engine is down, chat shows a warning with a jump-to-Engine action
   instead of failing silently.
+- **Suggested follow-ups**: after a reply completes (skipped on a truncated/`length`-finished
+  reply), a best-effort background pass asks the model for 3 short next questions and renders
+  them as one-click chips under the last real assistant turn — a per-turn "Context" note
+  (date/time, persisted into real history for KV-cache contiguity; see `contextNoteMessage` in
+  `agentLoop.ts`) is excluded from that "last message" reckoning and from the transcript
+  entirely, since it's mechanical context, not something the user said.
+- **Computer Use** (opt-in, Settings > Agent): gives the conversation the same tool surface as
+  Coder mode — read/write/edit/apply_patch/bash (+ background jobs)/grep/glob/git — scoped to a
+  chosen directory, routed through the identical `/api/coder/*` endpoints Coder uses (same
+  sandbox/Safe Mode), gated per-tool by the allow/ask/deny permission machinery with a HITL
+  approval dialog on `ask`. MCP servers configured in Settings ride on the same surface,
+  namespaced `mcp__<server>__<tool>`.
+- **Cloud Provider**: when configured (Settings/Engine > Cloud), chat and coder requests can
+  target any OpenAI-compatible endpoint instead of the local engine. The request still goes
+  through the local `/v1/*` proxy — `x-ninfer-base-url`/`x-ninfer-api-key`/`x-ninfer-extra-headers`
+  headers tell the Rust proxy which upstream to call — rather than the browser calling the cloud
+  endpoint directly. Independent primary/subagent model selection, automatic fallback to the
+  local engine on a cloud 429/5xx, optional context pruning + a local compactor for cloud context
+  budgets, and Global Execution Routing to pin a surface to local or cloud regardless of the
+  provider's own enabled/disabled state.
 
 ### 2.2 Engine
 
-Top: **status row** — engine state (stopped/starting/running/stopping/failed/external), loaded
-model + uptime + port, GPU memory bar + utilization + process list, Start/Stop action.
+Split into tabs — **Basics / Performance / Advanced / Profiles / Cloud / Usage** — to cut down on
+scrolling through every `ninfer-serve` option at once. Basics/Performance/Advanced/Profiles carry
+the option catalog and presets described below; the other two:
+
+- **Cloud** — hybrid local + cloud provider config: enable toggle, base URL (presets for OpenAI,
+  OpenRouter, Groq, DeepSeek, Together AI, or custom), API key, extra headers, independent
+  primary/subagent model pick with live model-list retrieval + a connection test, fallback-to-local
+  on error, context pruning / local compactor toggles for cloud budgets, and per-surface Global
+  Execution Routing overrides.
+- **Usage** — GPU power/cost + token usage tracking: daily totals split local vs. remote, cache-hit
+  rate, GPU energy in kWh × a configurable price/currency for the local engine, and per-model $
+  cost for cloud requests from a cached pricing table. Backed by `GET/POST /api/usage[/reset]`,
+  which folds a best-effort per-request JSON-line log (mirrors `coder::memory`'s learnings store
+  shape) rather than a database.
+
+Top of Basics: **status row** — engine state (stopped/starting/running/stopping/failed/external),
+loaded model + uptime + port, GPU memory bar + utilization + process list, Start/Stop action.
 Fail reasons surface inline (e.g. "weights require 18 GiB, only 3 GiB free" from the engine's own
 FATAL line).
 
@@ -261,6 +304,20 @@ what runs.
      configurable max angles and per-angle step budget.
    - **Permission tiers**: `browser`/`memory_update` each get an independent allow/ask/deny tier
      (mirrors Coder's `PermTier`); `ask` pauses the tool loop on a HITL approval dialog.
+8. **Computer Use in Chat** — **done**: opt-in tool parity with Coder mode (file
+   read/write/edit/patch, grep/glob, shell exec + jobs, git) scoped to a chosen directory, same
+   permission tiers, same underlying `/api/coder/*` endpoints (and therefore the same sandbox).
+9. **Cloud Provider (hybrid local + cloud)** — **done**: bring-your-own-key OpenAI-compatible
+   endpoint (OpenAI/OpenRouter/Groq/DeepSeek/Together AI presets or custom), independent
+   primary/subagent model selection, fallback-to-local on error, context pruning + local
+   compactor for cloud budgets, and per-surface Global Execution Routing.
+10. **MCP tool servers** — **done**: connect external Model Context Protocol servers (stdio or
+    streamable-HTTP); tools surface to the agent loop namespaced `mcp__<server>__<tool>` under the
+    existing permission tiers.
+11. **Usage & cost tracking** — **done**: per-request usage log folded into local-vs-remote daily
+    totals, cache-hit rate, and GPU energy → cost (configurable price/currency) on the Usage tab.
+12. **Suggested follow-ups** — **done**: a background pass proposes 3 one-click next questions
+    after each completed reply in Chat.
 
 ## 7. Desktop build notes (Ubuntu 26.10 dev branch, 2026-09-09)
 

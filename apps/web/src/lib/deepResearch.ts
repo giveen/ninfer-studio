@@ -45,6 +45,7 @@ async function planResearchAngles(opts: {
   baseUrl?: string;
   apiKey?: string;
   extraHeaders?: string;
+  source?: 'local' | 'remote';
 }): Promise<string[]> {
   const plannerParams: ChatParams = { thinking: false, reasoningEffort: '', preserveThinking: false, maxTokens: 300 };
   const body = buildChatRequest(opts.model, RESEARCH_PLANNER_SYSTEM(opts.maxAngles), [{ role: 'user', content: opts.question.slice(0, 2000) }], plannerParams);
@@ -56,7 +57,7 @@ async function planResearchAngles(opts: {
         onContentDelta: (d) => { acc += d; },
         onDone: () => resolve(),
         onError: (m) => reject(new Error(m)),
-      }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders });
+      }, { baseUrl: opts.baseUrl, apiKey: opts.apiKey, extraHeaders: opts.extraHeaders, source: opts.source });
     });
   } catch {
     return [opts.question];
@@ -75,7 +76,7 @@ const RESEARCH_ANGLE_SYSTEM = 'You are researching one specific angle of a large
  *  (the old client registry never permission-checked these tools, so
  *  allow-with-denial-on-ask preserves its effective behavior without a UI).
  *  Abort stops the server run. */
-async function runResearchAngle(opts: { model: string; angle: string; maxSteps: number; signal: AbortSignal; baseUrl?: string; apiKey?: string; extraHeaders?: string }): Promise<string> {
+async function runResearchAngle(opts: { model: string; angle: string; maxSteps: number; signal: AbortSignal; baseUrl?: string; apiKey?: string; extraHeaders?: string; source?: 'local' | 'remote' }): Promise<string> {
   let id: string | null = null;
   const stop = () => { if (id) agentRunsApi.stop(id).catch(() => {}); };
   try {
@@ -93,6 +94,7 @@ async function runResearchAngle(opts: { model: string; angle: string; maxSteps: 
       toolNames: ['web_fetch', 'web_search', 'browser'],
       tools: [...CHAT_TOOLS, CHAT_BROWSER_TOOL],
       params: { thinking: false, maxTokens: 1024 },
+      hookMode: 'client',
     });
     id = started.id;
     if (opts.signal.aborted) { stop(); return '(aborted)'; }
@@ -110,7 +112,7 @@ async function runResearchAngle(opts: { model: string; angle: string; maxSteps: 
         for (const a of snap.pendingApprovals ?? []) {
           await agentRunsApi.approve(id, a.id, 'deny').catch(() => {});
         }
-        await new Promise((r) => setTimeout(r, 750));
+        await new Promise((r) => setTimeout(r, 250));
       }
     } finally {
       opts.signal.removeEventListener('abort', stop);
@@ -142,12 +144,13 @@ export async function runDeepResearch(opts: {
   baseUrl?: string;
   apiKey?: string;
   extraHeaders?: string;
+  source?: 'local' | 'remote';
 }): Promise<DeepResearchResult> {
-  const { baseUrl, apiKey, extraHeaders } = opts;
-  const angles = await planResearchAngles({ model: opts.model, question: opts.question, maxAngles: opts.maxAngles, signal: opts.signal, baseUrl, apiKey, extraHeaders });
+  const { baseUrl, apiKey, extraHeaders, source } = opts;
+  const angles = await planResearchAngles({ model: opts.model, question: opts.question, maxAngles: opts.maxAngles, signal: opts.signal, baseUrl, apiKey, extraHeaders, source });
   if (opts.signal.aborted) return { angles, report: '' };
   const runAngle = (angle: string) =>
-    runResearchAngle({ model: opts.model, angle, maxSteps: opts.maxStepsPerAngle ?? 5, signal: opts.signal, baseUrl, apiKey, extraHeaders });
+    runResearchAngle({ model: opts.model, angle, maxSteps: opts.maxStepsPerAngle ?? 5, signal: opts.signal, baseUrl, apiKey, extraHeaders, source });
   let findings: string[];
   if (baseUrl) {
     findings = await Promise.all(angles.map(runAngle));

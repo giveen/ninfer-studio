@@ -2,7 +2,7 @@ import { SectionCard } from '../../components/ui';
 
 export function AboutTab() {
   return (
-    <div className="mx-auto max-w-3xl px-5 py-4">
+    <div className="mx-auto max-w-5xl px-5 py-4">
       <SectionCard title="About">
         <div className="space-y-2 text-[12.5px] leading-relaxed text-mute">
           <p>

@@ -59,8 +59,8 @@ export function useCoderCheckpoints({
         time: Date.now(),
         label: commit ? commit.slice(0, 7) : 'transcript',
         commit,
-        messages: messages.length,
-        ledger: ledger.length,
+        messageCount: messages.length,
+        ledgerCount: ledger.length,
         todos,
         auto,
       };
@@ -88,7 +88,7 @@ export function useCoderCheckpoints({
       addLog({
         type: 'compact',
         label: auto ? 'checkpoint (auto)' : 'checkpoint',
-        detail: `saved (${cp.messages} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})`,
+        detail: `saved (${cp.messageCount} msgs${commit ? ` @ ${cp.label}` : ', no git repo'})`,
       });
       if (!auto) setShowCheckpoints(true);
     },
@@ -99,12 +99,14 @@ export function useCoderCheckpoints({
   const restoreCheckpoint = useCallback(
     async (cp: Checkpoint) => {
       if (running || !activeWs || !activeConv) return;
+      const targetMsgCount = cp.messageCount ?? cp.messages ?? 0;
+      const targetLedgerCount = cp.ledgerCount ?? cp.ledger ?? 0;
       const wsFiles = cp.commit
         ? `Workspace files reset to ${cp.label} (git reset --hard). Uncommitted changes will be lost.`
         : 'No git commit recorded — only the transcript will be truncated.';
       if (
         !window.confirm(
-          `Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${cp.messages} messages.`,
+          `Restore checkpoint from ${new Date(cp.time).toLocaleString()}?\n\n${wsFiles}\nTranscript truncated to ${targetMsgCount} messages.`,
         )
       )
         return;
@@ -117,8 +119,8 @@ export function useCoderCheckpoints({
         loadGitCommits?.();
         refreshRepoMap?.();
       }
-      const keptMessages = messages.slice(0, cp.messages);
-      const keptLedger = ledger.slice(0, cp.ledger);
+      const keptMessages = messages.slice(0, targetMsgCount);
+      const keptLedger = ledger.slice(0, targetLedgerCount);
       setMessages(keptMessages);
       applyTodos(cp.todos, null);
       setLedger([

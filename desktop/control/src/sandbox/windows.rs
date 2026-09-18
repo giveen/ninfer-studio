@@ -5,7 +5,7 @@
 //! Containment model (the "codex" one):
 //!
 //! * The child is created at **low integrity** (`S-1-16-4`) via
-//!   `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL`. The integrity policy then
+//!   `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL` with `SE_GROUP_INTEGRITY`. The integrity policy then
 //!   refuses that child's writes to **medium**-integrity objects host-wide —
 //!   files, directories, the registry, other processes — *even when the
 //!   object's DACL would allow them*. The DACL is a second, weaker gate;
@@ -16,14 +16,11 @@
 //! * A **Job Object** (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) holds the whole
 //!   tree: a timeout, `start_kill`, or dropping the child kills the shell
 //!   *and everything it spawned* atomically — no orphaned grandchildren.
-//!   The job is assigned at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`, so
-//!   the process can never briefly run uncontained.
-//!
-//! Inherent MIC caveat: pre-existing *files* created by a medium-integrity
-//! process (e.g. a freshly checked-out source tree) stay medium-labeled, so
-//! the low child can read but not modify them until a run touches them —
-//! new files the sandbox creates are low-labeled and stay writable. This
-//! matches the model codex runs on Windows.
+//!   Breakaway from job (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) is explicitly disabled.
+//! * Stdin is bound to NUL to prevent child processes from reading interactive user input.
+//! * Note on file integrity: files created during low-integrity execution retain
+//!   low integrity (`S-1-16-4`) on host NTFS after execution ends.
+//! * MIC applies to write operations; read access is governed by DACLs host-wide.
 
 use super::{ExecChild, SpawnReq, is_secret_env_var};
 use std::io;
@@ -48,7 +45,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -63,6 +60,9 @@ use windows_sys::core::PCWSTR;
 /// `PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL` — winnt.h value `0x00020012`,
 /// which windows-sys 0.59 does not export as a named constant.
 const PROC_THREAD_ATTRIBUTE_MANDATORY_LABEL: usize = 0x0002_0012;
+/// Mandatory Integrity Control attribute flag (`SE_GROUP_INTEGRITY` = 0x20, per
+/// winnt.h / windows-sys's `SystemServices::SE_GROUP_INTEGRITY`).
+const SE_GROUP_INTEGRITY: u32 = 0x20;
 /// Low mandatory integrity level SID (`SEC_MANDATORY_LABEL` low level).
 const LOW_INTEGRITY_SID: &str = "S-1-16-4";
 /// `EXPLICIT_ACCESS_W.grfAccessMode` value that REMOVES a matching ACE
@@ -77,6 +77,20 @@ fn to_wide(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
     v
+}
+
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut v: Vec<u16> = path.as_os_str().encode_wide().collect();
+        v.push(0);
+        v
+    }
+    #[cfg(not(windows))]
+    {
+        to_wide(&path.to_string_lossy())
+    }
 }
 
 fn last_os_error() -> io::Error {
@@ -140,9 +154,12 @@ fn command_line(shell: &Shell, script: &str) -> String {
             super::arg_quote("bash"),
             super::arg_quote(script)
         ),
-        // `cmd /d /s /c` runs everything between the outer quotes verbatim
-        // (degraded fallback only: POSIX-specific scripts need git-bash).
-        Shell::Cmd => format!("{} /d /s /c \"{}\"", super::arg_quote("cmd"), script),
+        // `cmd /d /s /c` runs everything between outer quotes verbatim.
+        // Internal quotes are escaped to avoid terminating the wrapper early.
+        Shell::Cmd => {
+            let escaped = script.replace('"', "\"\"");
+            format!("{} /d /s /c \"{}\"", super::arg_quote("cmd"), escaped)
+        }
     }
 }
 
@@ -166,6 +183,20 @@ fn env_block() -> Vec<u16> {
 // Workspace write grants (DACL)
 // ---------------------------------------------------------------------------
 
+/// Normalize a path for map keying in `ACL_GRANTS` so different path spellings
+/// (casing, trailing slashes, forward vs back slashes) resolve to the exact same key.
+fn normalize_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let s = canon.to_string_lossy();
+        let cleaned = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        PathBuf::from(cleaned.to_lowercase())
+    } else {
+        let clean = path.to_string_lossy().replace('/', "\\");
+        let trimmed = clean.trim_end_matches('\\');
+        PathBuf::from(trimmed.to_lowercase())
+    }
+}
+
 /// Process-global refcounts of active low-integrity grants, by path.
 ///
 /// Multiple sandboxed shells can run concurrently on the same workspace (a
@@ -181,9 +212,10 @@ static ACL_GRANTS: LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, 
 /// first use. Fails only if the FIRST grant fails (a path already granted
 /// here cannot newly fail).
 fn acquire_acl(path: &Path) -> io::Result<()> {
+    let key = normalize_path(path);
     let first = {
-        let mut grants = ACL_GRANTS.lock().unwrap();
-        let count = grants.entry(path.to_path_buf()).or_insert(0);
+        let mut grants = ACL_GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+        let count = grants.entry(key.clone()).or_insert(0);
         let first = *count == 0;
         *count += 1;
         first
@@ -192,11 +224,11 @@ fn acquire_acl(path: &Path) -> io::Result<()> {
         if let Err(e) = set_low_integrity_ace(path, true) {
             // Roll the count back so the next run isn't left believing a
             // grant exists when it doesn't.
-            let mut grants = ACL_GRANTS.lock().unwrap();
-            if let Some(c) = grants.get_mut(path) {
+            let mut grants = ACL_GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = grants.get_mut(&key) {
                 *c -= 1;
                 if *c == 0 {
-                    grants.remove(path);
+                    grants.remove(&key);
                 }
             }
             return Err(e);
@@ -207,14 +239,15 @@ fn acquire_acl(path: &Path) -> io::Result<()> {
 
 /// Release one refcount; revoke the ACE when the last holder leaves.
 fn release_acl(path: &Path) {
+    let key = normalize_path(path);
     let last = {
-        let mut grants = ACL_GRANTS.lock().unwrap();
-        match grants.get_mut(path) {
+        let mut grants = ACL_GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+        match grants.get_mut(&key) {
             Some(c) => {
                 *c -= 1;
                 let last = *c == 0;
                 if last {
-                    grants.remove(path);
+                    grants.remove(&key);
                 }
                 last
             }
@@ -223,8 +256,10 @@ fn release_acl(path: &Path) {
     };
     if last {
         // The grant must not outlive the last child. Deleting an ACE that is
-        // already gone is a no-op we can ignore.
-        let _ = set_low_integrity_ace(path, false);
+        // already gone is a no-op we can ignore; log any unexpected failure.
+        if let Err(e) = set_low_integrity_ace(path, false) {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to revoke low-integrity ACE");
+        }
     }
 }
 
@@ -248,7 +283,7 @@ fn set_low_integrity_ace(path: &Path, add: bool) -> io::Result<()> {
     use windows_sys::Win32::Security::Authorization::{NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_W};
     use windows_sys::Win32::Security::{ACL, CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE, PSID};
 
-    let wide = to_wide(&path.to_string_lossy());
+    let wide = path_to_wide(path);
     let name = wide.as_ptr() as PCWSTR;
 
     let mut sid: PSID = std::ptr::null_mut();
@@ -408,14 +443,20 @@ impl WinChild {
             tokio::task::spawn_blocking(move || {
                 let handle = raw as *mut std::ffi::c_void;
                 let code = unsafe {
-                    windows_sys::Win32::System::Threading::WaitForSingleObject(
+                    let wait_res = windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
                         windows_sys::Win32::System::Threading::INFINITE,
                     );
+                    if wait_res == windows_sys::Win32::Foundation::WAIT_FAILED {
+                        return; // Handle closed or invalid; drop tx to signal exit watcher dropped
+                    }
                     let mut code: u32 = 0;
-                    let _ = windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                    let get_res = windows_sys::Win32::System::Threading::GetExitCodeProcess(
                         handle, &mut code,
                     );
+                    if get_res == 0 {
+                        return; // Exit code query failed
+                    }
                     if code == STILL_ACTIVE {
                         -1
                     } else {
@@ -475,8 +516,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         return Err(last_os_error());
     }
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if unsafe {
         SetInformationJobObject(
             job,
@@ -495,22 +535,32 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
     let mut label_sid: windows_sys::Win32::Security::PSID = std::ptr::null_mut();
     let mut label: Option<TOKEN_MANDATORY_LABEL> = None;
     if req.sandboxed {
-        let roots: Vec<PathBuf> = std::iter::once(req.workspace.clone())
-            .chain(
-                req.writable_roots
-                    .iter()
-                    .filter(|r| !r.is_empty())
-                    .map(PathBuf::from),
-            )
-            .collect();
-        for r in &roots {
-            if !r.is_dir() {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if !req.workspace.is_dir() {
+            unsafe { CloseHandle(job) };
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("sandbox workspace root does not exist: {}", req.workspace.display()),
+            ));
+        }
+        roots.push(req.workspace.clone());
+
+        for raw_root in &req.writable_roots {
+            if raw_root.trim().is_empty() {
+                continue;
+            }
+            if let Some(validated) = super::validate_writable_root(raw_root) {
+                roots.push(validated);
+            } else {
                 unsafe { CloseHandle(job) };
                 return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("sandbox root does not exist: {}", r.display()),
+                    io::ErrorKind::PermissionDenied,
+                    format!("rejected dangerous or invalid writable_root: {raw_root}"),
                 ));
             }
+        }
+
+        for r in &roots {
             acquire_acl(r).map_err(|e| {
                 // The local `acls` guard revokes the earlier grants as
                 // spawn() unwinds; report the failing root.
@@ -532,7 +582,7 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         label = Some(TOKEN_MANDATORY_LABEL {
             Label: SID_AND_ATTRIBUTES {
                 Sid: label_sid,
-                Attributes: 0,
+                Attributes: SE_GROUP_INTEGRITY,
             },
         });
     }
@@ -648,43 +698,35 @@ pub fn spawn(req: &SpawnReq) -> io::Result<ExecChild> {
         return Err(last_os_error());
     }
 
-    // stdin: the console handle if one exists, else NUL — the control plane
-    // is a GUI app with no console, where `GetStdHandle` would return
-    // INVALID_HANDLE_VALUE. The NUL handle is created inheritable (same
-    // `sa` as the pipes): with `bInheritHandles` set, a non-inheritable
-    // handle would arrive invalid in the child.
-    let mut stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let mut stdin_nul: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
-    if stdin.is_null() || stdin == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        let nul_wide = to_wide("NUL");
-        let h = unsafe {
-            CreateFileW(
-                wide_ptr(&nul_wide),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                &sa as *const _ as *mut _,
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            unsafe {
-                CloseHandle(out_read);
-                CloseHandle(out_write);
-                CloseHandle(err_read);
-                CloseHandle(err_write);
-                DeleteProcThreadAttributeList(list);
-                CloseHandle(job);
-                if !label_sid.is_null() {
-                    FreeSid(label_sid);
-                }
+    // stdin: bound to NUL unconditionally so a sandboxed command cannot read
+    // interactive user input typed at the host console.
+    let nul_wide = to_wide("NUL");
+    let stdin_nul = unsafe {
+        CreateFileW(
+            wide_ptr(&nul_wide),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa as *const _ as *mut _,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if stdin_nul.is_null() || stdin_nul == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        unsafe {
+            CloseHandle(out_read);
+            CloseHandle(out_write);
+            CloseHandle(err_read);
+            CloseHandle(err_write);
+            DeleteProcThreadAttributeList(list);
+            CloseHandle(job);
+            if !label_sid.is_null() {
+                FreeSid(label_sid);
             }
-            return Err(last_os_error());
         }
-        stdin_nul = h;
-        stdin = h;
+        return Err(last_os_error());
     }
+    let stdin = stdin_nul;
 
     // 5. Create the process (in the job, at the label).
     let mut si = unsafe { std::mem::zeroed::<STARTUPINFOW>() };
@@ -831,5 +873,12 @@ mod tests {
             std::env::remove_var("NINFIER_TEST_SECRET_XYZ");
             std::env::remove_var("NINFIER_TEST_KEEP_XYZ");
         }
+    }
+
+    #[test]
+    fn acl_path_normalization_handles_case_and_separators() {
+        let p1 = Path::new("C:/Users/Test/Project");
+        let p2 = Path::new("c:\\users\\test\\project\\");
+        assert_eq!(normalize_path(p1), normalize_path(p2));
     }
 }

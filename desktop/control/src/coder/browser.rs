@@ -54,6 +54,11 @@ use tokio::task::LocalSet;
 use tokio::time::timeout;
 
 /// A browser session tears down after this much idle time.
+// TODO: nothing calls `reap_if_idle` yet — no periodic sweep is wired up, so
+// an idle session currently leaks its V8 isolate until the next `stop`/tool
+// call on that slot. Keeping the constant + method (not deleting) so the
+// documented intent above is still discoverable when that sweep gets added.
+#[allow(dead_code)]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Hard cap on a single navigation (matches Obscura's own ceiling).
 const NAV_TIMEOUT: Duration = Duration::from_secs(30);
@@ -114,10 +119,6 @@ pub(crate) struct PanicGuard<F>(pub F);
 impl<F: std::future::Future<Output = ()>> std::future::Future for PanicGuard<F> {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
-        // `PanicGuard` holds only `F`; projecting the field through the same
-        // `Pin` is sound.
-        // `PanicGuard` holds only `F`; projecting the field through the same
-        // `Pin` is sound.
         // SAFETY: `PanicGuard` holds only `F` and no data that references
         // inside of it; projecting the field through the same `Pin` cannot
         // violate `F`'s invariants.
@@ -167,6 +168,7 @@ impl BrowserSlot {
     }
 
     /// Drop the session if it has been idle past the timeout.
+    #[allow(dead_code)]
     async fn reap_if_idle(&mut self) {
         if self.is_open() && self.last_used.elapsed() > IDLE_TIMEOUT {
             self.stop();
@@ -234,22 +236,29 @@ impl BrowserSlot {
 }
 
 /// Push one command and return the receiver for its reply. Spawns the session
-/// on first use; the reply channel is paired with the command in the same
+/// on first use or after a dead driver; the reply channel is paired with the command in the same
 /// channel write, so no reply can be lost.
 async fn send_cmd(
     slot: &mut BrowserSlot,
     cmd: BrowserCmd,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Reply>, (StatusCode, Json<Value>)> {
-    slot.reap_if_idle().await;
-    if slot.cmd_tx.is_none() {
+    if !slot.is_open() {
+        slot.stop();
         slot.spawn_driver()?;
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Reply>();
-    slot.cmd_tx
-        .as_ref()
-        .ok_or_else(|| http_err(StatusCode::INTERNAL_SERVER_ERROR, "no browser session"))?
-        .send((cmd, tx))
-        .map_err(|_| http_err(StatusCode::INTERNAL_SERVER_ERROR, "browser session ended"))?;
+    let res = if let Some(cmd_tx) = slot.cmd_tx.as_ref() {
+        cmd_tx.send((cmd, tx))
+    } else {
+        Err(tokio::sync::mpsc::error::SendError((BrowserCmd::Status, tx)))
+    };
+    if res.is_err() {
+        slot.stop();
+        return Err(http_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "browser session ended — session cleared, please retry command",
+        ));
+    }
     slot.last_used = Instant::now();
     Ok(rx)
 }
@@ -287,18 +296,17 @@ fn js(s: &str) -> String {
 }
 
 fn cap(s: String) -> (String, bool) {
-    if s.chars().count() <= MAX_SNAPSHOT_CHARS {
-        (s, false)
+    if let Some((idx, _)) = s.char_indices().nth(MAX_SNAPSHOT_CHARS) {
+        (s[..idx].to_string(), true)
     } else {
-        let out: String = s.chars().take(MAX_SNAPSHOT_CHARS).collect();
-        (out, true)
+        (s, false)
     }
 }
 
 fn eval_js(page: &mut Page, expr: &str) -> String {
-    let val = page.evaluate(expr);
+    let val = page.evaluate_with_timeout(expr, EVAL_TIMEOUT);
     if val.is_null() {
-        "page script threw".to_string()
+        "page script threw or timed out".to_string()
     } else {
         val.as_str()
             .map(|s| s.to_string())
@@ -339,17 +347,17 @@ async fn actor_main(
                     Ok(()) => json!({
                         "ok": true,
                         "url": page.url_string(),
-                        "title": page.evaluate("document.title").as_str().map(|s| s.to_string()),
+                        "title": page.evaluate_with_timeout("document.title", EVAL_TIMEOUT).as_str().unwrap_or(""),
                     }),
                 }
             }
             BrowserCmd::Snapshot => {
                 let title = page
-                    .evaluate("document.title")
+                    .evaluate_with_timeout("document.title", EVAL_TIMEOUT)
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let md = match page.evaluate(HTML_TO_MARKDOWN_JS) {
+                let md = match page.evaluate_with_timeout(HTML_TO_MARKDOWN_JS, EVAL_TIMEOUT) {
                     Value::String(s) => s,
                     other => other.to_string(),
                 };
@@ -421,7 +429,7 @@ async fn actor_main(
                 let expr = format!("document.querySelector({}) !== null", js(&selector));
                 let deadline = Instant::now() + Duration::from_secs(timeout_secs);
                 loop {
-                    if page.evaluate(&expr).as_bool() == Some(true) {
+                    if page.evaluate_with_timeout(&expr, EVAL_TIMEOUT).as_bool() == Some(true) {
                         break json!({ "ok": true, "found": true });
                     }
                     if Instant::now() > deadline {

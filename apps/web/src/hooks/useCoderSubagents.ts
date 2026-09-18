@@ -72,8 +72,8 @@ export function useCoderSubagents({
       };
       try {
         const subConfig = resolveProviderConfig('subagent', appConfig, {
-          provider: coderParams.subagentProvider,
-          cloudModel: coderParams.subagentCloudModel,
+          subagentProvider: coderParams.subagentProvider,
+          subagentCloudModel: coderParams.subagentCloudModel,
           taskWeight: 'light',
         }, model);
         const subProvider: 'cloud' | 'local' = subConfig.baseUrl ? 'cloud' : 'local';
@@ -103,6 +103,7 @@ export function useCoderSubagents({
             seed: coderParams.seed,
             maxTokens: 2048,
           },
+          hookMode: 'client',
           scope: activeWsDir,
         }, signal);
         id = started.id;
@@ -115,7 +116,13 @@ export function useCoderSubagents({
             id,
             () => {},
             (ev: any) => {
-              if (signal.aborted || ev.type !== 'approval_requested') return;
+              if (signal.aborted) return;
+              if (ev.type === 'hook_requested') {
+                const h = ev as unknown as { id: string };
+                void agentRunsApi.decideHook(id as string, h.id, { action: 'continue' }).catch(() => {});
+                return;
+              }
+              if (ev.type !== 'approval_requested') return;
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
@@ -156,7 +163,7 @@ export function useCoderSubagents({
       depth = 0
     ): Promise<string> => {
       if (depth > 5) return '(subagent failed: maximum depth 5 exceeded)';
-      const subId = `${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+      const subId = `${label}-${crypto.randomUUID().slice(0, 8)}`;
       jobs.registerSub({ id: subId, label, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
       try {
         return await runSubagentInner(label, prompt, model, signal, maxSteps, allowedTools, depth);
@@ -247,7 +254,7 @@ export function useCoderSubagents({
       depth = 0
     ): Promise<{ summary: string; diff: string; ok: boolean }> => {
       if (depth > 5) return { summary: '(worker failed: maximum depth 5 exceeded)', diff: '', ok: false };
-      const subId = `worker-${label}-${Date.now()}-${Math.floor(Math.random() * 1e4)}`;
+      const subId = `worker-${label}-${crypto.randomUUID().slice(0, 8)}`;
       jobs.registerSub({ id: subId, label: `worker:${label}`, task: prompt.replace(/^Task: /, '').slice(0, 100), ws: activeWsDir });
       try {
         const allowed = allowedTools ? new Set(allowedTools) : new Set(['read', 'grep', 'glob', 'ast_grep', 'edit', 'apply_patch', 'write', 'cmd']);
@@ -287,6 +294,7 @@ export function useCoderSubagents({
             seed: coderParams.seed,
             maxTokens: 4096,
           },
+          hookMode: 'client',
           scope: activeWsDir,
         }, signal);
         const id = started.id;
@@ -305,7 +313,13 @@ export function useCoderSubagents({
             id,
             () => {},
             (ev: any) => {
-              if (signal.aborted || ev.type !== 'approval_requested') return;
+              if (signal.aborted) return;
+              if (ev.type === 'hook_requested') {
+                const h = ev as unknown as { id: string };
+                void agentRunsApi.decideHook(id, h.id, { action: 'continue' }).catch(() => {});
+                return;
+              }
+              if (ev.type !== 'approval_requested') return;
               const a = ev as unknown as { id: string; tool: string; rel: string | null; args: string };
               const detail = a.rel ?? a.args.slice(0, 160);
               void (async () => {
@@ -347,7 +361,8 @@ export function useCoderSubagents({
   const runCritic = useCallback(
     async (
       diff: string,
-      taskText: string
+      taskText: string,
+      signal?: AbortSignal
     ): Promise<{ approved: boolean; issues: string; learnings: any[] }> => {
       const fallbackModel = coderParams.criticModel || 'qwen-coder';
       const subConfig = resolveProviderConfig('subagent', appConfig, {
@@ -358,7 +373,7 @@ export function useCoderSubagents({
       const prompt = `CRITIC REVIEW:\nTask: ${taskText.slice(0, 1500)}\n\nDiff to review:\n${diff.slice(0, 12000)}`;
       let out = '';
       try {
-        const ctrl = new AbortController();
+        const sig = signal ?? new AbortController().signal;
         await streamChat(
           buildChatRequest(
             subConfig.model,
@@ -368,7 +383,7 @@ export function useCoderSubagents({
             {},
             coderParams.promptCache
           ),
-          ctrl.signal,
+          sig,
           {
             onContentDelta: (t: string) => {
               out += t;

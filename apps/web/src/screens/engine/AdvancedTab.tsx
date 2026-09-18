@@ -55,11 +55,12 @@ export function AdvancedTab({ profile, set, setU }: AdvancedTabProps) {
               <NumberField value={profile.minP ?? null} onChange={(v) => set('minP', v)} onEmpty={() => setU('minP', undefined)} min={0} max={1} step={0.05} placeholder="model preset" />
             </Field>
             <Field label="Presence penalty">
-              <NumberField value={profile.presencePenalty ?? null} onChange={(v) => set('presencePenalty', v)} onEmpty={() => setU('presencePenalty', undefined)} step={0.1} placeholder="model preset" />
+              <NumberField value={profile.presencePenalty ?? null} onChange={(v) => set('presencePenalty', v)} onEmpty={() => setU('presencePenalty', undefined)} min={-2} max={2} step={0.1} placeholder="model preset" />
             </Field>
             <Field label="Frequency penalty">
-              <NumberField value={profile.frequencyPenalty ?? null} onChange={(v) => set('frequencyPenalty', v)} onEmpty={() => setU('frequencyPenalty', undefined)} step={0.1} placeholder="0" />
+              <NumberField value={profile.frequencyPenalty ?? null} onChange={(v) => set('frequencyPenalty', v)} onEmpty={() => setU('frequencyPenalty', undefined)} min={-2} max={2} step={0.1} placeholder="model preset" />
             </Field>
+
             <Field label="Seed" hint="Fixed seed when a request omits one; unset = fresh random seed per request.">
               <NumberField value={profile.seed ?? null} onChange={(v) => set('seed', v)} onEmpty={() => setU('seed', undefined)} min={0} placeholder="random" />
             </Field>

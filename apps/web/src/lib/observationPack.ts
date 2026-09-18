@@ -13,8 +13,8 @@
 // Inspired by SoL-Pi's ObservationPack (github.com/NVlabs/SoL-Pi).
 
 import type { ChatMessage } from './types';
-import { CHARS_PER_TOKEN } from './format';
-import { summarizeOutputVerified, renderOutputReceipt } from './api/chat';
+import { CHARS_PER_TOKEN_CODE } from './format';
+import { summarizeOutputVerified, formatSummarizedOutput } from './api/chat';
 
 const SUMMARY_THRESHOLD = 16 * 1024;
 const SUMMARY_TAIL = 1500;
@@ -113,7 +113,7 @@ function countLines(text: string): number {
 }
 
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  return Math.ceil(text.length / CHARS_PER_TOKEN_CODE);
 }
 
 function completeLineExcerpt(text: string, budgetBytes: number, fromEnd: boolean): string {
@@ -155,6 +155,7 @@ function placeholderFor(id: string, toolName: string, text: string): string {
 export interface RecallResult {
   text?: string;
   nextOffset?: number;
+  next_offset?: number;
   eof?: boolean;
   error?: string;
 }
@@ -183,8 +184,8 @@ export async function readRecallChunk(id: string, offset: number): Promise<Recal
   // fatal:false tolerates a chunk boundary landing mid-character (rare, and
   // only ever cosmetic — one stray replacement character at a page edge).
   const text2 = new TextDecoder('utf-8', { fatal: false }).decode(chunk);
-  const nextOffset = offset + chunk.length;
-  return { text: text2, nextOffset, eof: nextOffset >= bytes.length };
+  const nextVal = offset + chunk.length < bytes.length ? offset + chunk.length : undefined;
+  return { text: text2, nextOffset: nextVal, next_offset: nextVal, eof: nextVal === undefined };
 }
 
 export interface ToolResultText {
@@ -373,7 +374,7 @@ export async function maybeSummarizeTool(
     });
     if (!receipt) return resultStr;
     const tail = text.slice(-SUMMARY_TAIL);
-    const wrapped = `[AI-summarized output — ${text.length} chars condensed for brevity; evidence quotes below are verified byte-for-byte against the original]\n${renderOutputReceipt(receipt)}\n\n--- raw tail (last ${SUMMARY_TAIL} chars) ---\n${tail}`;
+    const wrapped = formatSummarizedOutput(text.length, receipt, tail);
     applyResultPlaceholder(res, wrapped);
     res._summarized = true;
     return JSON.stringify(res);

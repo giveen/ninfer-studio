@@ -93,14 +93,19 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
             .map(String::as_str)
             .filter(|n| !matches!(*n, "delegate" | "subagent" | "ask_user" | "todo_write"))
             .collect();
+        let default_tools = if defaults.is_empty() {
+            SUBAGENT_TOOLS
+        } else {
+            &defaults[..]
+        };
         return spawn_child(
             state,
             parent,
             "subagent",
             "worker",
             &task,
-            &defaults[..],
-            &defaults[..],
+            default_tools,
+            default_tools,
             20,
             args,
         )
@@ -113,13 +118,13 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
         .map(String::from)
         .unwrap_or_else(|| parent.meta.model.clone());
 
-    let pre = git_tree(parent.scope_opt().as_deref()).await;
     let ideation = crate::agent::engine_loop::chat_once(
         &parent.client,
         state,
         &wmodel,
         parent.meta.base_url.as_deref(),
         parent.meta.api_key.as_deref(),
+        parent.meta.extra_headers.as_deref(),
         IDEATION_SYSTEM,
         &format!("TASK:\n{task}"),
         Some(0.4),
@@ -148,6 +153,7 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
     let mut res_ok = false;
     let mut exhausted = false;
     let mut critic_approved: Option<bool> = None;
+    let mut critic_error: Option<String> = None;
     let mut critique = String::new();
     let mut prev_critique = String::new();
     let mut diff = String::new();
@@ -170,14 +176,37 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
             args,
         )
         .await;
+
+        if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
+            return json!({
+                "error": err,
+                "ok": false,
+                "summary": err,
+                "diff": diff,
+                "criticApproved": None::<bool>,
+                "criticError": None::<String>,
+            });
+        }
+
         summary = res["summary"].as_str().unwrap_or_default().to_string();
         res_ok = res["ok"].as_bool().unwrap_or(false);
         exhausted = res["stop"].as_str() == Some("steps");
-        diff = net_diff(parent.scope_opt().as_deref(), pre.as_deref())
+        if exhausted {
+            res_ok = false;
+        }
+
+        diff = net_diff(parent.scope_opt().as_deref())
             .await
             .unwrap_or_default();
+
+        if critic.is_some() && diff.trim().is_empty() {
+            eprintln!(
+                "[agent] run {} subagent diff is empty; critic skipped",
+                parent.meta.id
+            );
+        }
+
         let Some(spec) = critic.as_ref().filter(|_| !diff.trim().is_empty()) else {
-            res_ok = true;
             break;
         };
         match run_critic(state, parent, spec, &diff, &task).await {
@@ -212,7 +241,8 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
             }
             Err(e) => {
                 eprintln!("[agent] run {} critic error: {e}", parent.meta.id);
-                critic_approved = Some(true);
+                critic_approved = None;
+                critic_error = Some(e);
                 break;
             }
         }
@@ -223,8 +253,14 @@ pub(crate) async fn subagent(state: &S, parent: &Arc<RunShared>, args: &Value) -
             if summary.is_empty() { "" } else { "\n" }
         );
     }
-    let ok = res_ok && critic_approved != Some(false);
-    json!({ "summary": summary, "diff": diff, "ok": ok, "criticApproved": critic_approved })
+    let ok = res_ok && critic_approved != Some(false) && critic_error.is_none();
+    json!({
+        "summary": summary,
+        "diff": diff,
+        "ok": ok,
+        "criticApproved": critic_approved,
+        "criticError": critic_error,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +401,7 @@ pub(crate) async fn spawn_child(
         usage: Default::default(),
         last_meta: None,
         todo_rev: 0,
+        user_todo_rev: 0,
         todo_base_rev: 0,
     };
 
@@ -390,19 +427,36 @@ pub(crate) async fn spawn_child(
     });
 
     let mut rx = child.tx.subscribe();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1800), async {
-        loop {
-            match rx.recv().await {
-                Ok(AgentEvent::Done { status, .. }) => break status,
-                Ok(_) => continue,
-                Err(_) => break RunStatus::Error,
+    let initial_status = child.snapshot().status;
+    let outcome = if initial_status != RunStatus::Running {
+        initial_status
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(1800), async {
+            loop {
+                match rx.recv().await {
+                    Ok(AgentEvent::Done { status, .. }) => break status,
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break RunStatus::Error,
+                }
+            }
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                child.stop_run();
+                RunStatus::Error
             }
         }
-    })
-    .await;
+    };
 
     let snap = child.snapshot();
-    let status = outcome.unwrap_or(snap.status);
+    let status = if outcome == RunStatus::Running {
+        snap.status
+    } else {
+        outcome
+    };
     if status == RunStatus::Error {
         return json!({
             "error": format!("{tool} run failed: {}", snap.error.clone().unwrap_or_else(|| "unknown error".into())),
@@ -435,11 +489,10 @@ pub(crate) async fn spawn_child(
 // ---------------------------------------------------------------------------
 
 async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Option<String> {
+    let s = scope?;
     let mut c = tokio::process::Command::new("git");
     c.args(argv);
-    if let Some(s) = scope {
-        c.current_dir(s);
-    }
+    c.current_dir(s);
     c.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), c.output())
@@ -454,22 +507,11 @@ async fn git_run(scope: Option<&str>, argv: &[&str], timeout_secs: u64) -> Optio
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-async fn git_tree(scope: Option<&str>) -> Option<String> {
-    git_run(scope, &["write-tree"], 10)
-        .await
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-async fn net_diff(scope: Option<&str>, pre: Option<&str>) -> Option<String> {
-    let post = git_tree(scope).await?;
-    let pre = pre.filter(|p| *p != post)?;
-    git_run(scope, &["--no-pager", "diff", pre, &post], 60)
+async fn net_diff(scope: Option<&str>) -> Option<String> {
+    git_run(scope, &["diff", "HEAD"], 60)
         .await
         .map(|s| s.chars().take(60_000).collect())
 }
-
-const CRITIC_SYSTEM_TEXT: &str = CRITIC_SYSTEM;
 
 async fn run_critic(
     state: &S,
@@ -484,7 +526,7 @@ async fn run_critic(
         .and_then(|s| s.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(String::from)
-        .unwrap_or_else(|| CRITIC_SYSTEM_TEXT.to_string());
+        .unwrap_or_else(|| CRITIC_SYSTEM.to_string());
     let prompt = format!(
         "TASK:\n{}\n\nDIFF (working tree vs HEAD):\n```diff\n{}\n```\n\nReview the diff against the task.",
         task.chars().take(2000).collect::<String>(),
@@ -496,6 +538,7 @@ async fn run_critic(
         &model,
         parent.meta.base_url.as_deref(),
         parent.meta.api_key.as_deref(),
+        parent.meta.extra_headers.as_deref(),
         &system,
         &prompt,
         None,
@@ -535,13 +578,13 @@ async fn run_critic(
 
 static RE_VERDICT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 fn re_verdict() -> &'static Regex {
-    RE_VERDICT.get_or_init(|| Regex::new("(?i)VERDICT:\\s*APPROVED").expect("static regex"))
+    RE_VERDICT.get_or_init(|| Regex::new(r"(?im)^\s*VERDICT:\s*APPROVED\b").expect("static regex"))
 }
 
 static RE_VERDICT_TOKEN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 fn re_verdict_token() -> &'static Regex {
     RE_VERDICT_TOKEN.get_or_init(|| {
-        Regex::new(r"(?i)VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\s*").expect("static regex")
+        Regex::new(r"(?im)^\s*VERDICT:\s*(?:APPROVED|CHANGES_REQUESTED)\b").expect("static regex")
     })
 }
 
@@ -591,3 +634,89 @@ impl RunScopeExt for Arc<RunShared> {
         live.scope.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_regex_anchoring() {
+        assert!(re_verdict().is_match("VERDICT: APPROVED"));
+        assert!(re_verdict().is_match("   VERDICT: APPROVED\n"));
+        assert!(re_verdict().is_match("line 1\nVERDICT: APPROVED\nline 2"));
+
+        // Discussing the verdict string in prose must NOT trigger approval
+        assert!(!re_verdict().is_match("Discussing whether VERDICT: APPROVED is appropriate"));
+        assert!(!re_verdict().is_match("Prefix VERDICT: APPROVED"));
+        assert!(!re_verdict().is_match("VERDICT: APPROVED_SUFFIX"));
+
+        assert!(re_verdict_token().is_match("VERDICT: CHANGES_REQUESTED"));
+        assert!(re_verdict_token().is_match("  VERDICT: APPROVED"));
+    }
+
+    #[test]
+    fn learning_and_avoid_extraction() {
+        let text = "VERDICT: APPROVED\nLEARNING: Use ripgrep instead of cat | grep\nAVOID: Hardcoding static offsets\n* LEARNING: Prefer std::time::Instant";
+        let mut learnings = Vec::new();
+        let re_l = re_learning();
+        let re_a = re_avoid();
+        for line in text.lines() {
+            let l = line.trim();
+            if let Some(c) = re_l.captures(l).and_then(|m| m.get(1)) {
+                learnings.push(("success", c.as_str().trim().to_string()));
+            } else if let Some(c) = re_a.captures(l).and_then(|m| m.get(1)) {
+                learnings.push(("avoid", c.as_str().trim().to_string()));
+            }
+        }
+        assert_eq!(learnings.len(), 3);
+        assert_eq!(learnings[0], ("success", "Use ripgrep instead of cat | grep".to_string()));
+        assert_eq!(learnings[1], ("avoid", "Hardcoding static offsets".to_string()));
+        assert_eq!(learnings[2], ("success", "Prefer std::time::Instant".to_string()));
+    }
+
+    #[tokio::test]
+    async fn git_run_none_scope_returns_none() {
+        assert!(git_run(None, &["status"], 5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn net_diff_captures_working_tree_changes() {
+        let tmp = std::env::temp_dir().join(format!("ninfier-childrun-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let git = |args: &[&str]| -> std::io::Result<std::process::Output> {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+        };
+
+        let Ok(out) = git(&["init", "-q"]) else {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        if !out.status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        std::fs::write(tmp.join("foo.txt"), "hello\n").unwrap();
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-q", "-m", "init"]).unwrap();
+
+        // Make uncommitted working tree edit
+        std::fs::write(tmp.join("foo.txt"), "hello world\n").unwrap();
+
+        let scope_str = tmp.to_string_lossy().into_owned();
+        let diff = net_diff(Some(&scope_str)).await.expect("net_diff output");
+        assert!(diff.contains("hello world"), "diff missing uncommitted change: {diff}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+

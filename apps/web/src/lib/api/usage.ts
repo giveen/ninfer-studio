@@ -12,7 +12,7 @@ export interface UsageDailyPoint {
   day: string;
   tokens: number;
   requests: number;
-  cacheHitRate: number;
+  cacheHitRate: number | null;
   /** Token count for that day, split by model — lets the trend chart stack
    *  bars per model instead of just showing the daily total. */
   models: Record<string, number>;
@@ -61,8 +61,10 @@ export interface UsageStats {
   modelBreakdown: UsageModelBreakdown[];
 }
 
-export function getUsageStats(days: number, source: UsageSource): Promise<UsageStats> {
-  return getJSON<UsageStats>(`/api/usage?days=${days}&source=${source}`, 8000);
+export function getUsageStats(days: number, source: UsageSource, signal?: AbortSignal): Promise<UsageStats> {
+  const qDays = encodeURIComponent(String(days));
+  const qSource = encodeURIComponent(source);
+  return getJSON<UsageStats>(`/api/usage?days=${qDays}&source=${qSource}`, 8000, signal);
 }
 
 /** Delete the usage log outright — irreversible, for starting a clean stats
@@ -79,18 +81,28 @@ export function useUsageStats(days: number, source: UsageSource) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const seq = useRef(0);
+  const abortCtrlRef = useRef<AbortController | null>(null);
 
   const load = useCallback(() => {
+    if (abortCtrlRef.current) {
+      abortCtrlRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortCtrlRef.current = controller;
+
     const id = ++seq.current;
     setLoading(true);
-    getUsageStats(days, source)
+    setStats(null);
+    setError(null);
+
+    getUsageStats(days, source, controller.signal)
       .then((s) => {
         if (id !== seq.current) return;
         setStats(s);
         setError(null);
       })
       .catch((e) => {
-        if (id !== seq.current) return;
+        if (id !== seq.current || controller.signal.aborted) return;
         setError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
@@ -100,7 +112,13 @@ export function useUsageStats(days: number, source: UsageSource) {
 
   useEffect(() => {
     load();
+    return () => {
+      if (abortCtrlRef.current) {
+        abortCtrlRef.current.abort();
+      }
+    };
   }, [load]);
 
   return { stats, error, loading, refresh: load };
 }
+

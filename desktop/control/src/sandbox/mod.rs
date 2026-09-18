@@ -31,7 +31,21 @@ use std::path::PathBuf;
 /// own environment must not be handed to it wholesale, or a var like
 /// `GITHUB_TOKEN` already exported in the user's own shell before launch
 /// becomes readable/leakable by an agent-run command.
-pub(crate) const SECRET_ENV_PATTERNS: [&str; 4] = ["KEY", "SECRET", "TOKEN", "PASSWORD"];
+pub(crate) const SECRET_ENV_PATTERNS: &[&str] = &[
+    "KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+    "CREDENTIALS",
+    "COOKIE",
+    "SESSION",
+    "GIT_ASKPASS",
+];
 
 pub(crate) fn is_secret_env_var(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
@@ -44,13 +58,75 @@ pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Validate an extra writable root path. Rejects:
+///   - Relative or non-existent paths
+///   - System danger roots (`/`, `/etc`, `C:\`, `C:\Windows`, etc.) that would compromise containment
+///   - User's home directory ($HOME / %USERPROFILE%)
+pub(crate) fn validate_writable_root(path_str: &str) -> Option<PathBuf> {
+    use std::path::Path;
+    let p = Path::new(path_str.trim());
+    if !p.is_absolute() || !p.exists() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(p).ok()?;
+    let path_clean = canonical.to_string_lossy();
+
+    const DANGER_ROOTS_UNIX: &[&str] = &[
+        "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc",
+        "/root", "/run", "/sbin", "/sys", "/usr", "/var",
+        // On usr-merged distros (Debian/Ubuntu since ~2019, Fedora, Arch,
+        // RHEL 9+ — the current majority of Linux systems) `/bin`, `/sbin`,
+        // `/lib`, and `/lib64` are themselves symlinks into these, so
+        // `canonicalize()` above resolves a request for e.g. `/bin` to
+        // `/usr/bin` — which isn't literally any of the names above and
+        // would otherwise sail through this exact-match check.
+        "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
+    ];
+
+    for &danger in DANGER_ROOTS_UNIX {
+        if path_clean == danger || path_clean == format!("{danger}/") {
+            tracing::warn!(path = %path_clean, "Rejecting dangerous writable_root bind");
+            return None;
+        }
+    }
+
+    let lower = path_clean.to_lowercase();
+    // Reject Windows drive roots (e.g., C:\, \\?\C:\) and system folders
+    let clean_trimmed = lower.trim_start_matches(r"\\?\");
+    if clean_trimmed.len() <= 3 && (clean_trimmed.ends_with(":\\") || clean_trimmed.ends_with(':')) {
+        tracing::warn!(path = %path_clean, "Rejecting drive root writable_root bind");
+        return None;
+    }
+    const DANGER_PATTERNS_WIN: &[&str] = &[
+        "\\windows", "\\program files", "\\program files (x86)", "\\system32"
+    ];
+    for &danger in DANGER_PATTERNS_WIN {
+        if clean_trimmed.ends_with(danger) || clean_trimmed.contains(&format!("{danger}\\")) {
+            tracing::warn!(path = %path_clean, "Rejecting system directory writable_root bind");
+            return None;
+        }
+    }
+
+    // Reject user's root home directory ($HOME or %USERPROFILE%)
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+        && let Ok(home_canon) = std::fs::canonicalize(&home)
+            && canonical == home_canon {
+                tracing::warn!(path = %path_clean, "Rejecting root user home writable_root bind");
+                return None;
+            }
+
+    Some(canonical)
+}
+
 /// Quote one argument for a `CreateProcessW` command line (MSVCRT rules):
 /// unquoted when safe, otherwise quoted with internal `"` encoded so the
 /// UCRT argv parser (`2N` backslashes + `"` → N + toggle; `2N+1` → N +
 /// literal `"`) reproduces the argument byte-for-byte. Pure string logic —
 /// kept out of the `cfg(windows)` module so its round-trip is testable (and
 /// tested) on every platform's CI.
-#[cfg(any(windows, test))]
+// Its only non-test caller is `sandbox::windows::command_line`, compiled
+// only on `cfg(windows)` — invisible to a Linux, non-`--tests` build.
+#[allow(dead_code)]
 pub(crate) fn arg_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
@@ -62,23 +138,21 @@ pub(crate) fn arg_quote(s: &str) -> String {
     }
     let mut out = String::from("\"");
     let mut backslashes = 0usize;
-    for b in s.bytes() {
-        match b {
-            b'\\' => backslashes += 1,
-            b'"' => {
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
                 out.push_str(&"\\".repeat(2 * backslashes + 1));
                 out.push('"');
                 backslashes = 0;
             }
             _ => {
                 out.push_str(&"\\".repeat(backslashes));
-                out.push(b as char);
+                out.push(c);
                 backslashes = 0;
             }
         }
     }
-    // A trailing backslash run is followed by the closing quote, and MSVCRT
-    // halves such runs — so double it to encode the run literally.
     out.push_str(&"\\".repeat(2 * backslashes));
     out.push('"');
     out
@@ -260,7 +334,7 @@ mod quoting_tests {
     /// line.
     fn msvcrt_parse_arg(encoded: &str) -> String {
         let b: Vec<u8> = encoded.as_bytes().to_vec();
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let mut in_quotes = false;
         let mut i = 0usize;
         // The parser skips leading whitespace before each argument.
@@ -268,7 +342,7 @@ mod quoting_tests {
             i += 1;
         }
         if i >= b.len() {
-            return out;
+            return String::new();
         }
         loop {
             let mut copy_character = true;
@@ -278,7 +352,7 @@ mod quoting_tests {
                 numslash += 1;
             }
             if i < b.len() && b[i] == b'"' {
-                if numslash.is_multiple_of(2) {
+                if numslash % 2 == 0 {
                     // `""` inside a quoted string is a literal `"` (the UCRT
                     // special case); `arg_quote` never relies on it — it
                     // always emits an odd backslash run before a literal
@@ -293,17 +367,26 @@ mod quoting_tests {
                 numslash /= 2;
             }
             for _ in 0..numslash {
-                out.push('\\');
+                out.push(b'\\');
             }
             if i >= b.len() || (!in_quotes && (b[i] == b' ' || b[i] == b'\t')) {
                 break;
             }
             if copy_character {
-                out.push(b[i] as char);
+                out.push(b[i]);
             }
             i += 1;
         }
-        out
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    #[test]
+    fn shell_quoting_escapes_single_quotes_and_preserves_utf8() {
+        use super::shell_quote;
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("it's a test"), "'it'\\''s a test'");
+        assert_eq!(shell_quote("données 'café'"), "'données '\\''café'\\'''");
     }
 
     #[test]
@@ -313,6 +396,7 @@ mod quoting_tests {
         assert_eq!(arg_quote("C:\\Git\\bin\\bash"), "\"C:\\Git\\bin\\bash\"");
         assert_eq!(arg_quote("a b"), "\"a b\"");
         assert_eq!(arg_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(arg_quote("say \"données\""), "\"say \\\"données\\\"\"");
         // Trailing run: doubled so the closing quote survives the parser.
         assert_eq!(arg_quote("trail\\"), "\"trail\\\\\"");
         // Run NOT followed by a quote: copied verbatim (MSVCRT only treats
@@ -339,6 +423,8 @@ mod quoting_tests {
             "grep -r \"'single' and \\\"double\\\"\" .",
             "echo $HOME && echo `id`",
             "printf '%s\\n' line1 line2",
+            "echo \"données et café\"",
+            "cd \"/home/user/日本語\" && ls",
         ] {
             let encoded = arg_quote(script);
             let parsed = msvcrt_parse_arg(&encoded);

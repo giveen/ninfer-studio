@@ -1,52 +1,103 @@
 import { useEffect, useState } from 'react';
 import { getLogs } from './api';
 
-// One shared tail of the engine log. Both the Engine screen's embedded pane
-// and the dedicated Log tab subscribe here, so the app runs a SINGLE
-// /api/logs poll (every 2s) no matter how many log panes are mounted —
-// App keeps all screens mounted (hidden), so per-component polls would
-// double the indefinite log reads.
+/** Number of log lines requested per tail poll. */
+export const LOG_TAIL_LINES = 1000;
 const INTERVAL_MS = 2000;
-const N = 1000;
+const STALE_THRESHOLD_MS = 6000;
+
+export interface EngineLogsState {
+  lines: string[];
+  size: number;
+  lastOkAt: number | null;
+  error: string | null;
+  isStale: boolean;
+}
 
 let lines: string[] = [];
+let lastSize = -1;
+let lastOkAt: number | null = null;
+let lastError: string | null = null;
 let listeners = new Set<() => void>();
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight: Promise<void> | null = null;
 
+export function getLogsState(): EngineLogsState {
+  const isStale = lastOkAt !== null && Date.now() - lastOkAt > STALE_THRESHOLD_MS;
+  return {
+    lines,
+    size: Math.max(0, lastSize),
+    lastOkAt,
+    error: lastError,
+    isStale: isStale || lastError !== null,
+  };
+}
+
+export function resetLogs() {
+  lines = [];
+  lastSize = -1;
+  lastOkAt = null;
+  lastError = null;
+  listeners.forEach((l) => l());
+}
+
 async function tick() {
   if (inFlight) return; // never stack polls on a slow control plane
+  if (typeof document !== 'undefined' && document.hidden) return; // pause when browser tab is hidden
   inFlight = (async () => {
     try {
-      const r = await getLogs(N);
+      const r = await getLogs(LOG_TAIL_LINES);
+      lastOkAt = Date.now();
+      lastError = null;
+      if (r.size === lastSize && r.lines.length === lines.length) return; // no new content appended -> skip re-render notify
+      lastSize = r.size;
       lines = r.lines;
       listeners.forEach((l) => l());
-    } catch {
-    /* control plane busy — keep the last good tail */
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : 'Control plane busy';
+      listeners.forEach((l) => l());
     } finally {
       inFlight = null;
     }
   })();
 }
 
-/** Subscribe to the shared engine-log tail. Polling starts with the first
- *  subscriber and stops when the last one unmounts. */
-export function useEngineLogs(): string[] {
-  const [v, setV] = useState(lines);
+/** Subscribe to the shared engine-log tail. Polling starts when the first active
+ *  subscriber mounts and stops when all subscribers unmount or become inactive. */
+export function useEngineLogs(active: boolean = true): string[] & EngineLogsState {
+  const [state, setState] = useState<EngineLogsState>(getLogsState);
+
   useEffect(() => {
-    const notify = () => setV(lines);
+    if (!active) return;
+
+    const notify = () => setState(getLogsState());
     listeners.add(notify);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && active) {
+        void tick();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange);
+    }
+
     if (!timer) {
-      tick();
+      void tick();
       timer = setInterval(tick, INTERVAL_MS);
     }
+
     return () => {
       listeners.delete(notify);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+      }
       if (!listeners.size && timer) {
         clearInterval(timer);
         timer = null;
       }
     };
-  }, []);
-  return v;
+  }, [active]);
+
+  return Object.assign([...state.lines], state);
 }

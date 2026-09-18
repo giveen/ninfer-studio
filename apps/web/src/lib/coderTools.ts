@@ -154,15 +154,13 @@ export const TOOLS = [
     type: "function",
     function: {
       name: "grep",
-      description: "Search for a regex pattern in files. Results are paginated — if the result's `more` is true, pass `offset` to fetch the next page (the `total` field shows the true count).",
+      description: "Search for a regex pattern in files using ripgrep. Returns matching lines and file paths up to the match limit.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
-          include: { type: "string", description: "Glob pattern to include (e.g. *.ts)" },
-          ignoreCase: { type: "boolean" },
-          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
-          limit: { type: "number", description: "Max matches to return per page (default 200, max 2000)." }
+          path: { type: "string", description: "Subdirectory path relative to workspace root to restrict the search to." },
+          ignoreCase: { type: "boolean" }
         },
         required: ["pattern"]
       }
@@ -172,13 +170,12 @@ export const TOOLS = [
     type: "function",
     function: {
       name: "glob",
-      description: "Find files matching a glob pattern. Paginated — if `more` is true, pass `offset` for the next page.",
+      description: "Find files matching a glob pattern relative to the workspace root or specified subfolder.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
-          offset: { type: "number", description: "Page offset for large result sets (default 0)." },
-          limit: { type: "number", description: "Max files to return per page (default 200)." }
+          path: { type: "string", description: "Subdirectory path relative to workspace root to restrict the search to." }
         },
         required: ["pattern"]
       }
@@ -259,7 +256,7 @@ export const TOOLS = [
           id: { type: "string", description: "Observation id from the placeholder, e.g. obs_ab12cd34ef56..." },
           offset: { type: "number", description: "Byte offset to resume from — 0 for the first call, then the previous response's next_offset." }
         },
-        required: ["id", "offset"]
+        required: ["id"]
       }
     }
   },
@@ -415,7 +412,7 @@ export const TOOLS = [
           text: { type: "string", description: "One concise, self-contained learning (imperative, e.g. 'Run `pnpm test` (not npm) — this repo uses pnpm.')." },
           kind: { type: "string", enum: ["success", "tip", "avoid"], description: "success = a working approach/fix; tip = a convention/fact/command; avoid = a mistake or anti-pattern." }
         },
-        required: ["component", "scope", "target_key", "value", "text", "kind"]
+        required: ["text"]
       }
     }
   },
@@ -441,7 +438,7 @@ export type PermTier = 'allow' | 'ask' | 'deny';
 export interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; approvedCommands?: string[]; }
 export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
 /** Tools that mutate the workspace or run code — gated by plan mode + permissions. */
-export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'subagent']);
+export const MUTATING_TOOLS = new Set(['write', 'edit', 'apply_patch', 'udiff_edit', 'bash', 'git_commit', 'git_branch', 'git_worktree', 'git_pr', 'memory_update', 'subagent']);
 
 import type { AppSettings } from './types';
 export function filterToolsByConfig(tools: any[], config: any): any[] {
@@ -479,19 +476,35 @@ export function filterToolAllowList(raw: unknown, allowed: Set<string>): string[
 
 /** Binaries bash may run in plan mode (inspection only). */
 const READONLY_BASH = new Set(['find', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'fd', 'file', 'stat', 'du', 'df', 'tree', 'pwd', 'which', 'uname', 'date', 'sort', 'uniq', 'diff', 'nl', 'basename', 'dirname', 'realpath', 'readlink', 'md5sum', 'sha256sum']);
-/** Read-only git subcommands allowed in plan mode. */
-const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'branch', 'tag', 'remote', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
+/** Read-only git subcommands allowed in plan mode.
+ *  Note: branch, tag, and remote are omitted because they write/mutate state
+ *  when passed flags or arguments. */
+const READONLY_GIT = new Set(['status', 'log', 'diff', 'show', 'blame', 'shortlog', 'describe', 'ls-files', 'rev-parse']);
 
 /** True when a bash command is pure inspection (plan mode). Conservative:
  *  rejects shell composition (redirection, pipes, chaining, substitution)
- *  outright, then allow-lists the first word — and for git, the subcommand. */
+ *  and newlines outright, then allow-lists the first word — and for git, the subcommand. */
 export function isReadOnlyCommand(cmd: string): boolean {
   if (!cmd) return false;
-  if (/[>|;&`]|\$\(/.test(cmd)) return false;
-  const words = cmd.split(/\s+/).filter(Boolean);
-  const first = words[0].replace(/^.*\//, '');
-  if (first === 'git') return words.length >= 2 && READONLY_GIT.has(words[1]);
-  return READONLY_BASH.has(first);
+  if (/[>|;&`\(\n\r]|\$\(/.test(cmd) || cmd.includes('\n') || cmd.includes('\r')) return false;
+  const words = cmd.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const first = words[0].replace(/^.*[/\\]/, '');
+  if (first === 'git') {
+    if (words.length < 2 || !READONLY_GIT.has(words[1])) return false;
+    if (words[1] === 'diff' && words.some((w) => w.startsWith('--output'))) return false;
+    return true;
+  }
+  if (!READONLY_BASH.has(first)) return false;
+  if (first === 'find' && words.some((w) => ['-delete', '-exec', '-execdir', '-ok', '-okdir'].includes(w))) return false;
+  if (first === 'fd' && words.some((w) => ['-x', '-X', '--exec', '--exec-batch'].includes(w))) return false;
+  if (first === 'rg' && words.some((w) => w.startsWith('--pre'))) return false;
+  if (first === 'sort' && words.some((w) => w === '-o' || w.startsWith('--output'))) return false;
+  if (first === 'uniq') {
+    const nonFlags = words.slice(1).filter((w) => !w.startsWith('-'));
+    if (nonFlags.length >= 2) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

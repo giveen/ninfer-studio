@@ -31,10 +31,11 @@ import type { AgentToolCall, ChatAttachment, ChatMessage, ChatParams, Conversati
 import { Badge, Button, cn } from '../components/ui';
 import { ActionBtn, CompactDivider, MessageRow } from '../components/chatMessage';
 import { ParamsPopover, ContextMeter } from '../components/chatParams';
-import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud } from '../lib/chatHelpers';
+import { modelHistory, withMessages, RECENT_MESSAGE_WINDOW, DEFAULT_PARAMS, chatSystemWithCapabilities, CHAT_TOOLS, CHAT_BROWSER_TOOL, CHAT_MEMORY_TOOL, COMPUTER_USE_TOOLS, dedupeTools, SLASH_COMMANDS, normalizeParams, resolveProviderConfig, pruneContextForCloud, checkComputerUsePerm } from '../lib/chatHelpers';
 import { probeResponsesSupport } from '../lib/api/responses';
 import { useChatAgent } from '../lib/chatAgent';
-import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, type McpToolInfo } from '../lib/api';
+import { critiqueChatReply, regenerateChatReply, coderPermsApprove, mcpToolsGet, getConfig, coderWebSearch, coderWebFetch, coderBrowser, coderMemoryAddLearning, mcpCall, coderRead, coderWrite, coderEdit, coderPatch, coderExec, coderJob, coderGrep, coderGlob, coderSearch, coderDiff, type McpToolInfo } from '../lib/api';
+import { readRecallChunk } from '../lib/observationPack';
 import { mcpToolTier, mcpToolSchema, filterToolsByConfig } from '../lib/coderTools';
 import { runDeepResearch } from '../lib/deepResearch';
 
@@ -88,7 +89,20 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const [params, setParamsState] = useState<ChatParams>(() => ({ ...DEFAULT_PARAMS, maxTokens: undefined }));
   const [appConfig, setAppConfig] = useState<any>(null);
   useEffect(() => {
-    getConfig().then(setAppConfig).catch(() => {});
+    let active = true;
+    const fetchCfg = () => {
+      getConfig()
+        .then((cfg) => {
+          if (active) setAppConfig(cfg);
+        })
+        .catch(() => {});
+    };
+    fetchCfg();
+    const timer = setInterval(fetchCfg, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
   }, []);
   const [presets, setPresets] = useState<SavedChatParams[]>([]);
   const [convSearch, setConvSearch] = useState('');
@@ -151,6 +165,16 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const engineUp = upEngines.length > 0;
   const runningModel = upEngines[0]?.modelId || '';
 
+  const effectiveAppConfig = appConfig || status?.config || null;
+  const primaryProviderConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+  const isCloudPrimary = !!(
+    effectiveAppConfig?.cloudProviderEnabled &&
+    (params.primaryProvider === 'cloud' ||
+      (effectiveAppConfig.cloudUseForPrimary && params.primaryProvider !== 'ninfer'))
+  );
+  const engineUpOrCloud = engineUp || isCloudPrimary;
+  const effectiveRunningModel = runningModel || (isCloudPrimary ? primaryProviderConfig.model : '');
+
   // Hydrate conversations + chat params from the user's profile dir on the
   // control plane (survives a fresh install / AppImage run). Then keep them in
   // sync: any change is written back through the API.
@@ -179,18 +203,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // (multi-engine setups), and that disagreement must NOT keep resetting.
   const syncedRunningModelRef = useRef('');
   useEffect(() => {
-    // Keep the selector pointed at the running engine's actual id. The engine
-    // only answers to the id it was started with — if it changes underneath
-    // us (the user restarts it with a different model/artifact), a selection
-    // still pointed at the old id 404s on every turn, forever, until this
-    // fires. Comparing against the *previous* runningModel (not the current
-    // `model`) is what makes this fire again after such a restart, not just
-    // on the very first engine-up.
-    if (runningModel && runningModel !== syncedRunningModelRef.current) {
-      setModel(runningModel);
-      syncedRunningModelRef.current = runningModel;
+    if (effectiveRunningModel && effectiveRunningModel !== syncedRunningModelRef.current) {
+      setModel(effectiveRunningModel);
+      syncedRunningModelRef.current = effectiveRunningModel;
     }
-  }, [runningModel]);
+  }, [effectiveRunningModel]);
 
   // Probe once per engine readiness change whether /v1/responses is
   // implemented (community forks may not have it) — cached, so `send` can
@@ -220,8 +237,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
+    el.style.height = `${Math.max(38, Math.min(el.scrollHeight, 220))}px`;
   };
+
+  useEffect(() => {
+    autoGrow();
+  }, [text]);
 
   // Driven by a ResizeObserver on the actual content (not a [messages]
   // dependency) so it re-sticks to the bottom no matter WHY the content grew —
@@ -255,7 +276,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const runCompact = useCallback(async () => {
     if (compacting) return;
     setNotice(null);
-    if (!engineUp) {
+    if (!engineUpOrCloud) {
       onNavigate('engine');
       return;
     }
@@ -264,7 +285,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setNotice({ tone: 'warn', text: 'Nothing to compact in this chat yet.' });
       return;
     }
-    const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+    const { model: useModel, baseUrl, apiKey, extraHeaders, source: resolvedSource } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
     if (!useModel) return;
 
     setCompacting(true);
@@ -276,17 +297,18 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // the summary (and the context it carries) injected back into the model
       // after the visible context is cleared.
       const prior: ChatMessage[] = conv.compactedSummary
-        ? [{ role: 'user', content: frameCompactedSummary(conv.compactedSummary) }]
+        ? [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(conv.compactedSummary) }]
         : [];
       const summary = await summarizeConversation({
         model: useModel,
         baseUrl,
         apiKey,
         extraHeaders,
+        source: resolvedSource,
         systemPrompt: params.systemPrompt,
         history: [...prior, ...conv.messages],
         signal: ac.signal,
-        useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
+        useLocalCompactor: effectiveAppConfig?.cloudUseLocalCompactor !== false,
       });
       if (!summary) throw new Error('compaction produced no summary');
       const compacted: Conversation = { ...conv, compactedSummary: summary, compactedCount: conv.messages.length };
@@ -304,19 +326,19 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setCompacting(false);
       abortRef.current = null;
     }
-  }, [compacting, engineUp, convs, activeId, model, runningModel, params, onNavigate]);
+  }, [compacting, engineUpOrCloud, convs, activeId, model, runningModel, params, onNavigate]);
 
   // Stream an assistant reply into the LAST message of `convId`, given the prior
   // `history` (everything before the placeholder). Shared by send / regenerate /
   // edit-and-resend so they stay in lockstep.
   const runStream = useCallback(
     async (convId: string, history: ChatMessage[], _depth = 0, placeholderId?: string) => {
-      if (!engineUp) {
+      if (!engineUpOrCloud) {
         onNavigate('engine');
         return;
       }
-      const { model: useModel, baseUrl, apiKey, extraHeaders } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
-      const runAllowFallback = appConfig?.cloudFallbackToLocal !== false;
+      const { model: useModel, baseUrl, apiKey, extraHeaders, source: resolvedSource } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+      const runAllowFallback = effectiveAppConfig?.cloudFallbackToLocal !== false;
       setStreaming(true);
       setStreamingConvId(convId);
       const ac = new AbortController();
@@ -348,7 +370,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           const maxAngles = deepResearchMaxAngles;
           setNotice({ tone: 'ok', text: `Deep research: fanning out across up to ${maxAngles} angle${maxAngles === 1 ? '' : 's'}…` });
           try {
-            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal, baseUrl, apiKey, extraHeaders });
+            const { angles, report } = await runDeepResearch({ model: useModel, question, maxAngles, maxStepsPerAngle: deepResearchMaxSteps, signal: ac.signal, baseUrl, apiKey, extraHeaders, source: resolvedSource });
             if (report && !ac.signal.aborted) {
               const researchMsg: ChatMessage = {
                 role: 'user',
@@ -397,14 +419,15 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // Use) — de-duplicated by name, first entry wins, so the dedicated
       // toggles come before Computer Use and their schema is what the model
       // actually gets when both are on.
-      const computerUseOn = computerUseEnabled && !!computerUseDirRef.current;
+      const effectiveComputerUseDir = computerUseDirRef.current || '/tmp';
+      const computerUseOn = computerUseEnabled;
       // De-duplicated by name, first entry wins — agentResearch/memoryEnabled
       // come before Computer Use.
       const tools = dedupeTools([
         ...CHAT_TOOLS,
-        ...(agentResearch ? [CHAT_BROWSER_TOOL] : []),
-        ...(memoryEnabled ? [CHAT_MEMORY_TOOL] : []),
-        ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, appConfig) : []),
+        ...(agentResearch && browserTier !== 'deny' ? [CHAT_BROWSER_TOOL] : []),
+        ...(memoryEnabled && memoryToolTier !== 'deny' ? [CHAT_MEMORY_TOOL] : []),
+        ...(computerUseOn ? filterToolsByConfig(COMPUTER_USE_TOOLS, effectiveAppConfig) : []),
         // MCP tools ride on Computer Use — they're external, potentially
         // mutating actions, so they never ship without its permission gate.
         ...(computerUseOn
@@ -417,35 +440,34 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       // (tools dispatch in-process through the same endpoints the old client
       // registry called, with tiers enforced from the mirrored perms). This
       // client starts the run and attaches over SSE — closing the window no
-      // longer kills it; re-attaching resyncs from the snapshot.
-      const toAgentCalls = (tcs: unknown): AgentToolCall[] => {
-        if (!Array.isArray(tcs)) return [];
-        return tcs.map((tc) => {
-          const o = tc as Record<string, unknown>;
-          const fn = (o.function ?? o) as Record<string, unknown>;
-          const args = fn.arguments ?? o.arguments ?? {};
-          return { id: String(o.id ?? ''), name: String(fn.name ?? o.name ?? ''), arguments: typeof args === 'string' ? args : JSON.stringify(args) };
-        });
-      };
       const cloudRun = !!baseUrl;
-      const prunedHistory = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
-      const seedMessages: ChatMessage[] = cloudRun && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
+      const seedMessages: ChatMessage[] = cloudRun && effectiveAppConfig?.cloudPruneContext !== false ? pruneContextForCloud(effectiveHistory) : effectiveHistory;
 
       const registry: ToolRegistry = {
         web_search: async (args, sig) => {
-          const res = await coderWebSearch(String(args.query || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderWebSearch(String(args.query || ''), sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         web_fetch: async (args, sig) => {
-          const res = await coderWebFetch(String(args.url || ''), sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderWebFetch(String(args.url || ''), sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         browser: async (args, sig) => {
+          if (browserTier === 'deny') return JSON.stringify({ error: 'Tool browser is denied by Agent Mode settings.' });
+          if (browserTier === 'ask') {
+            const ok = await requestApproval('browser', JSON.stringify(args));
+            if (!ok) return JSON.stringify({ error: 'User denied permission to run browser.' });
+          }
           const action = String(args.action || 'open');
-          const res = await coderBrowser(action, args as Record<string, string | number>, sig, undefined, computerUseOn ? computerUseDirRef.current : undefined);
+          const res = await coderBrowser(action, args as Record<string, string | number>, sig, undefined, computerUseOn ? effectiveComputerUseDir : undefined);
           return JSON.stringify(res);
         },
         memory_update: async (args) => {
+          if (memoryToolTier === 'deny') return JSON.stringify({ error: 'Tool memory_update is denied by settings.' });
+          if (memoryToolTier === 'ask') {
+            const ok = await requestApproval('memory_update', JSON.stringify(args));
+            if (!ok) return JSON.stringify({ error: 'User denied permission to run memory_update.' });
+          }
           const res = await coderMemoryAddLearning({ text: String(args.text || ''), kind: (String(args.kind || 'tip')) as any });
           if (memoryEnabled) await loadMemory();
           return JSON.stringify({ ok: true, learnings: res?.learnings?.length ?? 1 });
@@ -459,17 +481,78 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
         set_directory: async (args) => {
           const p = String(args.path || '').trim();
           if (p) setComputerUseDir(p);
-          return JSON.stringify({ ok: true, scope: p });
+          return JSON.stringify({ ok: true, scope: p || effectiveComputerUseDir });
         },
       };
 
-      if (computerUseOn && mcpToolsRef.current.length > 0) {
-        for (const t of mcpToolsRef.current) {
-          if (mcpToolTier(computerUsePerms, t.name) !== 'deny') {
-            registry[`mcp__${t.name}`] = async (args, sig) => {
-              const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope: computerUseDirRef.current ?? undefined }, sig);
-              return JSON.stringify(res);
-            };
+      if (computerUseOn) {
+        const scope = effectiveComputerUseDir;
+
+        const execCuTool = async (name: string, args: Record<string, any>, fn: (tok?: string) => Promise<any>) => {
+          const permCheck = checkComputerUsePerm(computerUsePerms, name, args);
+          if (typeof permCheck === 'string' && permCheck !== 'ask') {
+            return JSON.stringify({ error: permCheck });
+          }
+          let approvalToken: string | undefined;
+          if (permCheck === 'ask') {
+            if (scope) {
+              const app = await coderPermsApprove(name, typeof args.path === 'string' ? args.path : undefined, scope).catch(() => null);
+              if (app?.token) approvalToken = app.token;
+            }
+            if (!approvalToken) {
+              const ok = await requestApproval(name, JSON.stringify(args));
+              if (!ok) return JSON.stringify({ error: `User denied permission to run ${name}.` });
+            }
+          }
+          try {
+            const res = await fn(approvalToken);
+            return typeof res === 'string' ? res : JSON.stringify(res);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return JSON.stringify({ error: msg });
+          }
+        };
+
+        registry.read = (args, sig) => execCuTool('read', args, (tok) => coderRead(String(args.path || ''), Number(args.offset || 0), Number(args.limit || 2000), sig, scope, tok));
+        registry.write = (args, sig) => execCuTool('write', args, (tok) => coderWrite(String(args.path || ''), String(args.content || ''), sig, scope, tok));
+        registry.edit = (args, sig) => execCuTool('edit', args, (tok) => coderEdit(String(args.path || ''), String(args.old_string || args.oldString || ''), String(args.new_string || args.newString || ''), false, sig, scope, tok));
+        registry.apply_patch = (args, sig) => execCuTool('apply_patch', args, (tok) => coderPatch(String(args.path || ''), (args.edits as any[]) || [], sig, scope, tok));
+        registry.udiff_edit = (args, sig) => execCuTool('udiff_edit', args, (tok) => coderEdit(String(args.path || ''), String(args.old_string || ''), String(args.new_string || ''), false, sig, scope, tok));
+        registry.bash = (args, sig) => execCuTool('bash', args, (tok) => coderExec(String(args.command || ''), undefined, Number(args.timeout || 30) * 1000, undefined, false, sig, scope, tok));
+        registry.bash_poll = (args, sig) => execCuTool('bash_poll', args, () => coderJob(String(args.job_id || args.jobId || ''), sig, scope));
+        registry.grep = (args, sig) => execCuTool('grep', args, (tok) => coderGrep(String(args.query || args.pattern || ''), String(args.path || ''), undefined, Boolean(args.ignore_case || args.ignoreCase), 0, Number(args.limit || 100), sig, scope, tok));
+        registry.glob = (args, sig) => execCuTool('glob', args, (tok) => coderGlob(String(args.pattern || '*'), String(args.path || ''), Number(args.offset || 0), Number(args.limit || 200), sig, scope, tok));
+        registry.ast_grep = (args, sig) => execCuTool('ast_grep', args, (tok) => coderGrep(String(args.pattern || args.query || ''), String(args.path || ''), undefined, false, 0, Number(args.limit || 100), sig, scope, tok));
+        registry.repo_search = (args, sig) => execCuTool('repo_search', args, () => coderSearch(String(args.query || ''), Number(args.limit || 15), sig, scope));
+        registry.git_diff = (args) => execCuTool('git_diff', args, () => coderDiff(scope));
+        registry.git_branch = (args, sig) => execCuTool('git_branch', args, async (tok) => {
+          const res = await coderExec(GIT_BRANCH_LIST_CMD, undefined, 10_000, undefined, false, sig, scope, tok);
+          return { branches: parseBranchList(res.stdout || '') };
+        });
+        const q = (s: string) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+        registry.git_commit = (args, sig) => execCuTool('git_commit', args, (tok) => coderExec(`git commit -m ${q(String(args.message || 'commit'))}`, undefined, 30_000, undefined, false, sig, scope, tok));
+        registry.git_pr = (args, sig) => execCuTool('git_pr', args, (tok) => coderExec(`gh pr create --title ${q(String(args.title || 'PR'))} --body ${q(String(args.body || ''))}`, undefined, 30_000, undefined, false, sig, scope, tok));
+        registry.git_worktree = (args, sig) => execCuTool('git_worktree', args, (tok) => coderExec('git worktree list', undefined, 10_000, undefined, false, sig, scope, tok));
+        registry.obs_recall = (args) => execCuTool('obs_recall', args, () => readRecallChunk(String(args.chunk_id || args.chunkId || ''), Number(args.offset || 0)));
+        registry.todo_write = async () => JSON.stringify({ ok: true });
+        registry.ask_user = async () => JSON.stringify({ ok: true, note: "User received your prompt" });
+        registry.subagent = async () => JSON.stringify({ error: "Subagents are handled in the Coder harness" });
+        registry.delegate = async () => JSON.stringify({ error: "Subagents are handled in the Coder harness" });
+
+        if (mcpToolsRef.current.length > 0) {
+          for (const t of mcpToolsRef.current) {
+            const tier = mcpToolTier(computerUsePerms, t.name);
+            if (tier !== 'deny') {
+              registry[`mcp__${t.name}`] = async (args, sig) => {
+                let approvalToken: string | undefined;
+                if (tier === 'ask' && scope) {
+                  const app = await coderPermsApprove(`mcp__${t.name}`, undefined, scope).catch(() => null);
+                  if (app?.token) approvalToken = app.token;
+                }
+                const res = await mcpCall({ name: `mcp__${t.name}`, arguments: args as Record<string, unknown>, scope, approvalToken }, sig);
+                return JSON.stringify(res);
+              };
+            }
           }
         }
       }
@@ -478,12 +561,17 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       try {
         const loopResult = await runToolLoop({
           model: useModel,
-          system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+          baseUrl,
+          apiKey,
+          extraHeaders,
+          source: resolvedSource,
+          allowFallback: runAllowFallback,
+          system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? effectiveComputerUseDir : undefined, tools.map((t) => t.function.name)),
           messages: seedMessages,
           params,
           tools,
           registry,
-          maxSteps: 12,
+          maxSteps: (effectiveAppConfig as { chatMaxSteps?: number })?.chatMaxSteps ?? 12,
           // The system prompt (capabilities block + memory + tool list) is
           // resent verbatim every turn — cheap to try caching it whenever
           // the turn is cloud-routed (baseUrl set); a provider that doesn't
@@ -533,7 +621,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               if (reflectionEnabled && !toolsActive && content.trim()) {
                 setNotice({ tone: 'ok', text: 'Reflection: reviewing reply…' });
                 try {
-                  const critiqueHistory = baseUrl && appConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
+                  const critiqueHistory = baseUrl && effectiveAppConfig?.cloudPruneContext !== false ? pruneContextForCloud(history) : history;
                   const critique = await critiqueChatReply({
                     model: reflectionModel.trim() || useModel,
                     baseUrl,
@@ -551,7 +639,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                       baseUrl,
                       apiKey,
                       extraHeaders,
-                      system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? computerUseDirRef.current : undefined, tools.map((t) => t.function.name)),
+                      system: chatSystemWithCapabilities(params, memoryEnabled ? memoryRef.current : undefined, computerUseEnabled ? effectiveComputerUseDir : undefined, tools.map((t) => t.function.name)),
                       history,
                       originalReply: content,
                       critique,
@@ -650,7 +738,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           // Look up the engine actually serving `useModel`, not just the
           // first/primary one — matters when multiple engines with different
           // context sizes are running (same fix as ctxLimit above).
-          const limit = allEngines.find((e) => e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? null;
+          const limit = allEngines.find((e) => e.artifact === useModel || e.modelId === useModel)?.maxContext ?? status?.engine?.maxContext ?? (baseUrl ? 200_000 : 128_000);
           const convForCompact = convsRef.current.find((c) => c.id === convId);
           const msgsForCompact = convForCompact?.messages ?? [];
           // The final reply is the last assistant message (past the original
@@ -660,7 +748,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           const thresholdPct = params.compactAt ?? 80;
           if (convForCompact && limit && usedTok > 0 && usedTok >= (thresholdPct / 100) * limit) {
             const prior: ChatMessage[] = convForCompact.compactedSummary
-              ? [{ role: 'user', content: frameCompactedSummary(convForCompact.compactedSummary) }]
+              ? [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(convForCompact.compactedSummary) }]
               : [];
             const summary = await summarizeConversation({
               model: useModel,
@@ -670,7 +758,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
               systemPrompt: params.systemPrompt,
               history: [...prior, ...convForCompact.messages],
               signal: ac.signal,
-              useLocalCompactor: appConfig?.cloudUseLocalCompactor !== false,
+              useLocalCompactor: effectiveAppConfig?.cloudUseLocalCompactor !== false,
             });
             if (summary) {
               const compacted: Conversation = { ...convForCompact, compactedSummary: summary, compactedCount: convForCompact.messages.length };
@@ -748,6 +836,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
 
   const send = useCallback(async () => {
     const content = text.trim();
+    const resolvedConfig = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
+    console.log('[ChatScreen] send triggered:', { content, isCloudPrimary, engineUpOrCloud, resolvedModel: resolvedConfig.model, baseUrl: resolvedConfig.baseUrl });
     if (!content && !attachments.length) return;
     if (content.startsWith('/') && runCommand(content)) {
       setText('');
@@ -765,11 +855,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       setAttachments([]);
       return;
     }
-    if (!engineUp) {
+    if (!engineUpOrCloud) {
+      console.warn('[ChatScreen] send blocked: engineUpOrCloud is false');
       onNavigate('engine');
       return;
     }
-    const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+    const useModel = resolvedConfig.model;
     if (!useModel) return;
 
     let conv = convs.find((c) => c.id === activeId);
@@ -800,7 +891,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     const history: ChatMessage[] = modelHistory(base);
     await runStream(newId, history, 0, asstMsg.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, attachments, engineUp, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting]);
+  }, [text, attachments, engineUpOrCloud, model, runningModel, convs, activeId, params, onNavigate, runStream, streaming, streamingConvId, compacting, effectiveAppConfig]);
 
   // Send a suggested follow-up question straight away (bypassing the composer) —
   // always appends to the active conversation, which is the only one a
@@ -809,11 +900,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     async (content: string) => {
       const trimmed = content.trim();
       if (!trimmed || streaming || compacting) return;
-      if (!engineUp) {
+      if (!engineUpOrCloud) {
         onNavigate('engine');
         return;
       }
-      const { model: useModel } = resolveProviderConfig('primary', appConfig, params, model || runningModel);
+      const { model: useModel } = resolveProviderConfig('primary', effectiveAppConfig, params, model || runningModel);
       if (!useModel) return;
       const conv = convs.find((c) => c.id === activeId);
       if (!conv) return;
@@ -822,11 +913,11 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
       const base: Conversation = { ...conv, messages: [...conv.messages, userMsg, asstMsg] };
       setConvs((cs) => cs.map((c) => (c.id === conv.id ? base : c)));
       stick.current = true;
-    setAtBottom(true);
+      setAtBottom(true);
       const history: ChatMessage[] = modelHistory(base);
       await runStream(conv.id, history, 0, asstMsg.id);
     },
-    [streaming, compacting, engineUp, model, runningModel, convs, activeId, runStream, onNavigate],
+    [streaming, compacting, engineUpOrCloud, model, runningModel, convs, activeId, runStream, onNavigate, effectiveAppConfig, params],
   );
 
   // --- message-level actions (hover toolbar) ---
@@ -1120,6 +1211,18 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const visibleStart = windowingActive ? messages.length - RECENT_MESSAGE_WINDOW : 0;
   const hiddenMessageCount = visibleStart;
 
+  // The agent loop persists a per-turn "Context" note (date/time) into real
+  // history right before each turn's request (see contextNoteMessage in
+  // agentLoop.ts — persisted rather than discarded so the engine's KV cache
+  // keeps matching across turns). Because the user's placeholder assistant
+  // message is inserted before that note lands, the note ends up trailing
+  // the reply it was actually generated ahead of — so "last message in the
+  // array" is that inert note, not the assistant turn a viewer would call
+  // "last" (continue / follow-ups both anchor on isLast). Skip trailing
+  // auto-notes to find the last message that actually matters.
+  let lastRelevantIndex = messages.length - 1;
+  while (lastRelevantIndex >= 0 && messages[lastRelevantIndex].displayName === 'Context') lastRelevantIndex--;
+
   // Find-in-conversation: indices of messages whose content matches the
   // query, cycled through by findIndex. Message-level, not sub-string
   // highlighting — injecting <mark> into rendered markdown isn't worth the
@@ -1155,7 +1258,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // just the first/primary engine) — matters once more than one engine with
   // a different context size is running. Falls back to the primary engine
   // when the model isn't found among the known engines yet.
-  const ctxLimit = allEngines.find((e) => e.modelId === (model || runningModel))?.maxContext ?? status?.engine?.maxContext ?? null;
+  const targetModel = model || runningModel;
+  const ctxLimit = allEngines.find((e) => e.artifact === targetModel || e.modelId === targetModel)?.maxContext ?? status?.engine?.maxContext ?? null;
   // A backward scan instead of `[...messages].reverse().find(...)` — the
   // spread+reverse copied the whole conversation's message array on every
   // single streamed token (onContentDelta re-renders this component per
@@ -1398,7 +1502,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
           </div>
         )}
 
-        {!engineUp && (
+        {!engineUpOrCloud && (
           <div className="flex shrink-0 items-center gap-3 border-b border-warn/20 bg-warn/8 px-4 py-2 text-[12.5px] text-warn">
             <span>
               The engine is {engine?.state === 'starting' ? 'starting' : 'not running'} — messages will be sent once it is ready.
@@ -1491,7 +1595,27 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
                   const i = visibleStart + sliceI;
-                  if (isCompactedMsg(m)) return <CompactDivider key={`div-${i}`} />;
+                  // The per-turn date/time note (see contextNoteMessage in
+                  // agentLoop.ts) is real history the model needs, but it's
+                  // not something the user said or asked to see — keep it
+                  // out of the transcript entirely rather than a collapsed row.
+                  if (m.displayName === 'Context') return null;
+                  if (isCompactedMsg(m)) {
+                    return (
+                      <div id={`msg-${i}`} key={i}>
+                        <MessageRow
+                          m={{ ...m, displayName: m.displayName || 'Compaction Summary', collapsed: true }}
+                          convId={activeId ?? ''}
+                          index={i}
+                          isLast={i === lastRelevantIndex}
+                          streaming={false}
+                          locked={streaming || compacting}
+                          actions={msgActions}
+                          workspace={computerUseDir || undefined}
+                        />
+                      </div>
+                    );
+                  }
                   const showDivider = !!active?.compactedSummary && i === (active.compactedCount ?? 0);
                   return (
                     <Fragment key={i}>
@@ -1501,8 +1625,8 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                           m={m}
                           convId={activeId ?? ''}
                           index={i}
-                          isLast={i === messages.length - 1}
-                          streaming={streaming && streamingConvId === activeId && i === messages.length - 1}
+                          isLast={i === lastRelevantIndex}
+                          streaming={streaming && streamingConvId === activeId && i === lastRelevantIndex}
                           locked={streaming || compacting}
                           actions={msgActions}
                           workspace={computerUseDir || undefined}
@@ -1633,8 +1757,12 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   onFiles(files);
                 }
               }}
-              placeholder={engineUp ? `Message ${model || 'engine'}…  (Enter to send, Shift+Enter for newline)` : 'Engine is offline — open the Engine tab to start it'}
-              className="max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
+              placeholder={
+                engineUpOrCloud
+                  ? `Message ${isCloudPrimary ? (primaryProviderConfig.model || 'cloud model') : (model || 'engine')}…  (Enter to send, Shift+Enter for newline)`
+                  : 'Engine is offline — open the Engine tab to start it'
+              }
+              className="min-h-[38px] max-h-[220px] w-full resize-none bg-transparent px-3.5 pt-3 text-[13.5px] leading-relaxed text-ink placeholder:text-faint focus:outline-none"
             />
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-1">
               <input ref={fileRef} type="file" accept="image/*,video/*" multiple hidden onChange={(e) => onFiles(e.target.files)} />
@@ -1679,7 +1807,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   </Button>
                 </>
               ) : (
-                <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUp}>
+                <Button variant="primary" size="sm" onClick={send} disabled={(!text.trim() && !attachments.length) || !engineUpOrCloud}>
                   <Send size={13} /> send
                 </Button>
               )}

@@ -2,7 +2,7 @@ import { useRef, useCallback } from 'react';
 import type { ChatMessage, AgentToolCall, ChatParams } from '../lib/types';
 import type { CoderMemory } from '../lib/api/coder';
 import type { LogEntry, TodoItem, CoderStore } from '../lib/coderStore';
-import type { McpToolInfo } from '../lib/api';
+import type { McpToolInfo, ChatStreamCallbacks } from '../lib/api';
 import type { CoderParams, QueuedItem } from '../components/coder/CoderComposer';
 import {
   getStatus,
@@ -76,7 +76,7 @@ export interface UseCoderAgentLoopOptions {
   verifyMode: boolean;
   runPostEditChecks: (result: any, preview: string, signal?: AbortSignal) => Promise<any>;
   criticMode: boolean;
-  runCritic: (diff: string, taskText: string) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
+  runCritic: (diff: string, taskText: string, signal?: AbortSignal) => Promise<{ approved: boolean; issues: string; learnings: any[] }>;
   persistLearnings: (learnings: any[], provenance: string, taskText: string) => Promise<void>;
   updateRunMessages: (updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
   noteRunTokens: (n: number) => void;
@@ -86,6 +86,13 @@ export interface UseCoderAgentLoopOptions {
   storeRef: React.MutableRefObject<CoderStore>;
   setStore: React.Dispatch<React.SetStateAction<CoderStore>>;
   runSubagent: (label: string, prompt: string, model: string, signal: AbortSignal, maxSteps?: number, allowedTools?: string[], depth?: number) => Promise<string>;
+  stream?: (
+    req: Record<string, unknown>,
+    signal: AbortSignal,
+    label: string,
+    cb: ChatStreamCallbacks,
+    opts?: { baseUrl?: string; apiKey?: string; extraHeaders?: string; allowFallback?: boolean }
+  ) => Promise<unknown>;
 }
 
 export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
@@ -173,8 +180,8 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
     if (options?.scout && opts.scoutOn) {
       const subConfig = resolveProviderConfig('subagent', opts.appConfig, {
-        provider: opts.coderParams.subagentProvider,
-        cloudModel: opts.coderParams.subagentCloudModel,
+        subagentProvider: opts.coderParams.subagentProvider,
+        subagentCloudModel: opts.coderParams.subagentCloudModel,
         taskWeight: 'light',
       }, model);
       const isCloudSub = !!subConfig.baseUrl;
@@ -257,6 +264,11 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
         /* ignore */
       }
     }
+    if (!maxContext && (primaryConfig.baseUrl || opts.appConfig?.cloudProviderEnabled)) {
+      maxContext = 200_000;
+    } else if (!maxContext) {
+      maxContext = 128_000;
+    }
     opts.setCtxLimit(maxContext > 0 ? maxContext : null);
     const COMPACT_AT = (opts.coderParams.compactAt ?? 80) / 100;
     const MAX_ATTEMPTS = 3;
@@ -314,7 +326,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               useLocalCompactor: opts.appConfig?.cloudUseLocalCompactor !== false,
             });
             if (!summary) throw new Error('compaction produced no summary');
-            currentMessages = [{ role: 'user', content: frameCompactedSummary(summary) }];
+            currentMessages = [{ role: 'user', displayName: 'Compaction Summary', collapsed: true, content: frameCompactedSummary(summary) }];
             opts.updateRunMessages((prev) => [...prev, ...currentMessages]);
             opts.noteRunTokens(0);
             opts.readPathsRef.current = new Set();
@@ -448,17 +460,23 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               tools: activeTools,
               cacheSystem: opts.coderParams.promptCache,
               signal: opts.abortRef.current.signal,
-              stream: (r, sig, cb) => {
+              stream: async (r, sig, cb) => {
                 const primaryConfig = resolveProviderConfig('primary', opts.appConfig, {
                   primaryProvider: opts.coderParams.primaryProvider,
                   primaryCloudModel: opts.coderParams.primaryCloudModel,
                 });
-                return streamChat(r, sig, cb, {
+                const streamOpts = {
+                  source: primaryConfig.source,
                   baseUrl: primaryConfig.baseUrl,
                   apiKey: primaryConfig.apiKey,
                   extraHeaders: primaryConfig.extraHeaders,
                   allowFallback: opts.appConfig?.cloudFallbackToLocal !== false,
-                });
+                };
+                if (opts.stream) {
+                  await opts.stream(r, sig, 'coder', cb, streamOpts);
+                  return;
+                }
+                await streamChat(r, sig, cb, streamOpts);
               },
               onStreamError: (msg) => {
                 streamErrorMsg = msg;
@@ -510,13 +528,21 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
 
         const isEmptyResponse = !content.trim() && toolCalls.length === 0;
         if (isEmptyResponse) {
+          const errorDetail = streamErrorMsg
+            ? streamErrorMsg
+            : 'Model returned an empty response (no content or tool calls).';
           opts.addLog({
             type: 'error',
             label: 'empty',
-            detail: streamErrorMsg
-              ? `${streamErrorMsg} — stopping the turn.`
-              : 'Model returned an empty response (no content or tool calls) — stopping the turn.',
+            detail: `${errorDetail} — stopping turn.`,
           });
+          const errAssistantMsg: ChatMessage = {
+            role: 'assistant',
+            content: `⚠️ *${errorDetail}*`,
+            error: true,
+          };
+          currentMessages = [...currentMessages, errAssistantMsg];
+          opts.updateRunMessages((prev) => [...prev, errAssistantMsg]);
           break;
         }
 
@@ -644,7 +670,7 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
               d = '';
             }
             if (d.trim()) {
-              const c = await opts.runCritic(d, taskText);
+              const c = await opts.runCritic(d, taskText, opts.abortRef.current?.signal);
               if (c.learnings.length) {
                 await opts.persistLearnings(c.learnings, c.approved ? 'critic:approve' : 'critic:reject', taskText);
               }
@@ -686,9 +712,9 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
       if (!isAbort) {
         const msg = err instanceof Error ? err.message : String(err);
         opts.addLog({ type: 'error', label: 'System Error', detail: msg });
-        opts.setMessages((prev) => [
+        opts.updateRunMessages((prev) => [
           ...prev,
-          { role: 'user', displayName: 'System', content: `[Run failed: ${msg}]`, error: true },
+          { role: 'assistant', displayName: 'System', content: `[Run failed: ${msg}]`, error: true },
         ]);
       }
     } finally {

@@ -21,7 +21,7 @@ export const PRESETS: Preset[] = [
     id: 'coding-agent-cache-optimized',
     name: 'Coding agent (cache-optimized)',
     description:
-      'RTX 5090 (32 GB), 3.8 nvfp4 artifact: 200k k8v4 context tuned for the Coder harness\'s long, tool-call-heavy sessions, where every turn re-sends the growing conversation and depends on the engine reusing its own KV/prefix cache. `--device-state-slots 8` (vs the engine default of 2, which only covers the 2 active lanes with no spare) gives real "extra checkpoint capacity beyond active lanes" — headroom so a scout probe, a subagent, or the Chat harness\'s own concurrent session don\'t evict this run\'s cached continuation just by touching the same engine. `--max-long-anchors-per-continuation 4` (default 2) keeps more intermediate checkpoints per run. Verified on this exact artifact/dtype/context: ~2.6 GiB free at these settings (vs ~3.7 GiB at the engine defaults) — comfortably above the 1.8 GiB safety floor. Combine with the harness-side fixes on improve-kv-cache-hit-rate (persisted context notes, batched tool-output packing) for the actual hit-rate win — this preset only removes the engine-side slot-starvation ceiling on top of those.',
+      'Optimized for agentic coding: 200k k8v4 context, C=2, MTP3 draft, and 8 device state slots to maximize prefix cache hits during tool calls.',
     profile: {
       port: 8080,
       maxContext: 200_000,
@@ -42,10 +42,10 @@ export const PRESETS: Preset[] = [
     id: 'long-context-mtp3',
     name: 'Long context MTP3',
     description:
-      '240k context, FP8 KV, 2 lanes, 4 device (was 2 — the engine default equals max-concurrency, i.e. zero *extra* checkpoint capacity beyond the 2 active lanes; audited up so a second continuation, e.g. a scout probe, has somewhere to live without evicting the first) + 8 host state slots, 4 long anchors/continuation (was 2, cheap bookkeeping), 8 GiB host KV, MTP3 with optimized head, vision, thinking preserved. Fits the 3.6-27B (~18.2 GiB loaded) and the pre-repack 3.8 gw-int (19.0 GiB loaded, ~3.3 GiB free — the published RTX 5090 run); the 2 extra device slots cost well under 1 GiB there. Fresh 3.8 gw-int downloads (19.0 GiB file, ~21.3 loaded) overflow at 240k fp8 — use 192k there, or k8v4 to keep 320k. KV capacity is `auto` (sizes from free VRAM, 1 GiB headroom): a fixed 240k here would exactly fill the shared pool with one sequence, leaving no room for the 2nd lane to actually admit anything near full context concurrently.',
+      '160k context with FP8 KV, C=2, and MTP3 speculative decoding. Tuned for long sessions on 32 GB GPUs.',
     profile: {
       port: 8080,
-      maxContext: 240_000,
+      maxContext: 160_000,
       kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'fp8',
@@ -64,7 +64,7 @@ export const PRESETS: Preset[] = [
     id: 'chat-mtp3',
     name: 'Chat MTP3',
     description:
-      'Balanced chat: 32k context, FP8 KV, auto KV pool, MTP3, thinking on. 6 device state slots and 4 long anchors/continuation (both above engine defaults) audited in for cache headroom — cheap at this context size, and Chat\'s own end-of-turn follow-up-suggestion call is exactly the kind of second continuation that benefits from somewhere to live besides the main conversation\'s slot.',
+      'Balanced chat profile: 32k context, FP8 KV, C=2, and MTP3 speculative decoding with cache headroom for follow-up suggestions.',
     profile: {
       port: 8080,
       maxContext: 32_768,
@@ -84,7 +84,7 @@ export const PRESETS: Preset[] = [
     id: 'vision-mtp3',
     name: 'Vision multimodal',
     description:
-      'Image/video input enabled (Vision weights resident) with MTP3 text decode. 3 device state slots (was the engine default of 1) and 4 long anchors/continuation audited in for cache headroom — modest since media budgets already claim VRAM here.',
+      'Vision/multimodal profile: 80k context with image and video input enabled, single lane, and MTP3 text decode.',
     profile: {
       port: 8080,
       maxContext: 81_920,
@@ -105,7 +105,7 @@ export const PRESETS: Preset[] = [
     id: 'max-concurrency',
     name: 'Max concurrency (C=8)',
     description:
-      'Eight active lanes with matching device state slots for maximum aggregate decode throughput on nvfp4 artifacts. 10 device state slots (was 8, exactly matching concurrency = zero extra) and 4 long anchors/continuation audited in for a little cache headroom on top — small context here, so the extra 2 slots cost little.',
+      'High-throughput serving: C=8 active lanes, 32k context, FP8 KV, and MTP3 draft decoding.',
     profile: {
       port: 8080,
       maxContext: 32_768,
@@ -125,7 +125,7 @@ export const PRESETS: Preset[] = [
     id: 'dflash-35b',
     name: '35B-A3B DFlash',
     description:
-      'DFlash speculative backend (1..15 drafts, 7 recommended) for Qwen3.6-35B-A3B. 6 device state slots and 4 long anchors/continuation audited in (was the engine default of 2/2) — cheap at 32k context, and gives a subagent or scout probe its own slot instead of contending with the main conversation\'s.',
+      'Speculative decode for Qwen3.6-35B-A3B: 32k context, FP8 KV, and DFlash speculative backend (7 draft tokens).',
     profile: {
       port: 8080,
       maxContext: 32_768,
@@ -143,7 +143,7 @@ export const PRESETS: Preset[] = [
     id: 'dflash2-38',
     name: '3.8-27B DFlash2',
     description:
-      'DFlash2 (1..15 drafts, 7 recommended) for Qwen3.8-27B artifacts that carry the companion weights.',
+      'Speculative decode for Qwen3.8-27B: 32k context, FP8 KV, and DFlash2 companion backend (7 draft tokens, requires artifact compiled with dflash2).',
     profile: {
       port: 8080,
       maxContext: 32_768,
@@ -159,12 +159,12 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'max-fidelity-bf16',
-    name: 'Max fidelity 128k (bf16 KV)',
+    name: 'Max fidelity 96k (bf16 KV)',
     description:
-      'RTX 5090 (32 GB), gw-int artifacts: 128k context with full-precision bf16 KV — best long-range recall. Local 3.8 gw-int (~19.0 GiB loaded) → ~29.3 GiB total, ~2.4 GiB free; 3.6-27B (~18.2) → ~3.5 free. Fresh 3.8 downloads (~21.3 loaded) must drop to 96k. nvfp4 artifacts do not fit at 128k. KV capacity is `auto` rather than a fixed 128k — a fixed pool exactly matching max-context leaves no room for the 2nd lane to admit a second sizeable request; `auto` claims what free VRAM allows (1 GiB headroom) instead, so watch the free-GiB figures above for how much a concurrent request actually has to work with. Audited for cache headroom (device-state-slots, long anchors) like the other presets, but deliberately left untouched here: bf16 KV is the most expensive dtype per resident device state, and the tightest documented case (~2.4 GiB free) is too close to the 1.8 GiB safety floor to guess a slot count without testing on that exact artifact — raise `--device-state-slots` above 2 by hand only if the capacity line after startup shows enough spare GiB.',
+      'Full precision KV cache: 96k context with bf16 KV for maximum long-range recall within 32 GB VRAM.',
     profile: {
       port: 8080,
-      maxContext: 128_000,
+      maxContext: 96_000,
       kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'bf16',
@@ -181,10 +181,10 @@ export const PRESETS: Preset[] = [
     id: 'nvfp4-serving-c4',
     name: 'Multi-client serving C=4 (nvfp4 artifact)',
     description:
-      'RTX 5090 (32 GB): the 3.8 nvfp4 artifact (loads ~20.0 GiB local / ~22.1 fresh) + fp8 KV, four concurrent lanes with queued overflow (16 pending, 60 s timeout). ~28.5-30.6 GiB total — fresh downloads are at the 1.8 GiB floor; drop max-context if the capacity line shows under 2 GiB free. KV capacity is `auto`, not a fixed 160k: a fixed pool the same size as max-context fits exactly ONE full-context sequence, so a single long-running session (e.g. an agentic coding job) can fill the whole shared pool and leave every other concurrent request queued until it hits the pending timeout and fails — the "4 lanes" only actually hold 4 requests at once when their combined context fits in the pool. `auto` gives the shared pool real headroom beyond one session; for genuinely reliable 4-way concurrency at full 160k context each, size VRAM (or lower per-client context) accordingly. For 2-4 simultaneous clients that are not all running near-max-context at once. Device state slots audited from 4 to 6 (still only +2 beyond concurrency) — this preset is the one that benefits most in principle from extra catalog headroom (separate clients are exactly the separate-continuations case slots exist for), but the documented margin is already thin for fresh downloads, so watch the capacity line and drop back to 4 if free VRAM is under ~2.5 GiB.',
+      'Multi-client serving: 144k FP8 context across 4 concurrent lanes with request queuing tuned for 32 GB GPUs.',
     profile: {
       port: 8080,
-      maxContext: 160_000,
+      maxContext: 144_000,
       kvCapacity: 'auto',
       maxConcurrency: 4,
       maxPendingRequests: 16,
@@ -204,7 +204,7 @@ export const PRESETS: Preset[] = [
     id: 'low-latency-c1',
     name: 'Low-latency coding (C=1, 96k)',
     description:
-      'RTX 5090 (32 GB): single lane, 96k fp8 context, MTP3 — fastest first token. Fits EVERY catalog artifact including the 35B-A3B MoE (~27.7 GiB total worst case). 32k default output cap; thinking preserved for agentic work. Device state slots audited 2→4 and long anchors 2→4 for cache headroom — worst-case artifact still leaves ~4.3 GiB free, comfortable margin for the extra slots.',
+      'Low-latency single-lane profile (C=1): 96k FP8 context, MTP3 speculative decode, and fast first-token latency.',
     profile: {
       port: 8080,
       maxContext: 96_000,
@@ -226,7 +226,7 @@ export const PRESETS: Preset[] = [
     id: 'moe-35b-a3b',
     name: '35B-A3B MoE (128k, fp8)',
     description:
-      'RTX 5090 (32 GB): the Qwen3.6-35B-A3B MoE (21.2 GiB file, ~23.8 loaded — only ~3B params active per token, so decode is fast) at 128k fp8 context, 2 lanes, MTP3. ~28.8 GiB total, ~2.4 GiB free. 64k if you want comfortable headroom. KV capacity is `auto` rather than a fixed 128k, since a pool exactly matching max-context leaves no room for the 2nd lane to admit a second sizeable request alongside a large one. Device state slots audited 2→3 (only +1, not the usual +2-4, since the ~2.4 GiB documented margin is thin) and long anchors 2→4; if the capacity line shows under ~2.5 GiB free after startup, drop back to 2.',
+      'Tuned for Qwen3.6-35B-A3B MoE: 128k FP8 context, C=2, and MTP3 draft decoding.',
     profile: {
       port: 8080,
       maxContext: 128_000,
@@ -245,16 +245,16 @@ export const PRESETS: Preset[] = [
   },
   {
     id: 'ultra-context-k8v4',
-    name: 'Ultra context 256k (k8v4)',
+    name: 'Ultra context 240k (k8v4)',
     description:
-      'RTX 5090 (32 GB), gw-int artifacts: full 262,144-token native window via k8v4 KV (FP8 keys, NVFP4 values — ~33 tok/MiB → ~7.9 GiB pool at the full window). Local 3.8 gw-int (loads 19.0 GiB) → ~27 GiB total; fresh 3.8 downloads (~21.3 loaded) → ~29 GiB — both fit with headroom. Watch long-range recall (4-bit V). KV capacity is `auto`, not a fixed 262,144: at this context size a fixed pool the same size as max-context is already the whole ~7.9 GiB budget for ONE sequence, so the 2nd lane would have nothing left to admit a concurrent full-window request — `auto` at least claims whatever free VRAM remains instead of hard-capping at exactly one window. Device state slots audited 2→4 and long anchors 2→4, based on measured k8v4 slot cost at 200k context (~0.2-0.25 GiB/slot) scaled to this window (~0.3 GiB/slot) — the 2 extra slots cost roughly 0.6 GiB. Comfortable for local artifacts; for fresh downloads (~3 GiB free documented) watch the capacity line and drop back to 2 if it reads under ~2.5 GiB.',
+      'Ultra long context: 240k window using k8v4 (FP8 keys / NVFP4 values) with 3 device state slots.',
     profile: {
       port: 8080,
-      maxContext: 262_144,
+      maxContext: 240_000,
       kvCapacity: 'auto',
       maxConcurrency: 2,
       kvDtype: 'k8v4',
-      deviceStateSlots: 4,
+      deviceStateSlots: 3,
       hostStateSlots: 8,
       hostKvMib: 8192,
       maxLongAnchorsPerContinuation: 4,
@@ -268,7 +268,7 @@ export const PRESETS: Preset[] = [
     id: 'ultra-context-nvfp4',
     name: 'Ultra context 256k (NVFP4 KV)',
     description:
-      'RTX 5090 (32 GB), single lane: the full 262,144-token native window via NVFP4 KV (~49 tok/MiB → ~5.3 GiB pool). Fits every registered artifact with room to spare (fresh 3.8 gw-int ~21.3 loaded → ~27 GiB total). Single sequence owns the whole window; NVFP4 KV costs long-range recall — verify answers on long documents before trusting them. Device state slots audited 1→3 and long anchors 2→4 — NVFP4\'s smaller footprint than k8v4 means the 2 extra slots should cost less than the ~0.6 GiB estimated for the k8v4 preset at the same context, and ~5+ GiB documented free here leaves plenty of margin either way.',
+      'Ultra long context: full 262k native window using NVFP4 KV cache for single-lane sequence processing.',
     profile: {
       port: 8080,
       maxContext: 262_144,
@@ -289,7 +289,7 @@ export const PRESETS: Preset[] = [
     id: 'community-262k-fp8',
     name: 'Community 262k fp8 (5090)',
     description:
-      'Community-validated profile (headpiece747/ninfer-5090-windows): full 262,144-token window, fp8 KV (~24.9 tok/MiB → ~10.1 GiB pool), single lane, prefill-chunk 1024, MTP5 — the upstream draft ceiling (~207–221 tok/s decode, ~80% acceptance measured). Best recall of the quantized KV types. On a 20 GiB nvfp4 artifact expect ~30 GiB total: right at the safety floor, watch the VRAM warning. Deliberately NOT audited for cache headroom, unlike the other presets here: fp8 at full 262k context is the most expensive combination in this catalog, and this profile is already documented at the safety floor with no margin to spare for extra device state slots.',
+      'Community profile: full 262k window with FP8 KV, single lane, prefill chunking, and MTP5 draft decoding.',
     profile: {
       port: 8080,
       maxContext: 262_144,

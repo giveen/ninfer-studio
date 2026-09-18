@@ -22,11 +22,11 @@ use mimalloc::MiMalloc;
 use tauri::{Manager, WindowEvent};
 
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static ALLOCATOR: MiMalloc = MiMalloc;
 
 use ninfier_control::engine::S;
 use ninfier_control::types::AppEvent;
-use ninfier_control::{boot_adopt, init_state, serve_until_ready};
+use ninfier_control::{boot, control_plane_port, init_state};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(feature = "tray")]
@@ -74,17 +74,24 @@ fn main() {
         // Close -> hide to tray (keep the engine alive) instead of quitting.
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                // If an engine is still running, reassure the user it lives on.
-                if engine_running_ev.load(Ordering::SeqCst) {
-                    let _ = window
-                        .app_handle()
-                        .notification()
-                        .builder()
-                        .title("NInfer Studio hidden to tray")
-                        .body("The inference engine is still running in the background.")
-                        .show();
+                #[cfg(feature = "tray")]
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    // If an engine is still running, reassure the user it lives on.
+                    if engine_running_ev.load(Ordering::SeqCst) {
+                        let _ = window
+                            .app_handle()
+                            .notification()
+                            .builder()
+                            .title("NInfer Studio hidden to tray")
+                            .body("The inference engine is still running in the background.")
+                            .show();
+                    }
+                }
+                #[cfg(not(feature = "tray"))]
+                {
+                    let _ = window;
                 }
             }
         })
@@ -123,17 +130,8 @@ fn main() {
                             }
                         }
                         "quit" => {
-                            // Stop the engine before exiting — otherwise Quit
-                            // silently orphans a running (VRAM-heavy) engine
-                            // child with no owning process to stop it.
-                            let app = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let state = app.state::<ControlState>().0.lock().unwrap().clone();
-                                if let Some(state) = state {
-                                    ninfier_control::engine::stop_engine(&state, None).await;
-                                }
-                                app.exit(0);
-                            });
+                            // Trigger app exit — handled by the ExitRequested hook below.
+                            app.exit(0);
                         }
                         _ => {}
                     })
@@ -169,6 +167,7 @@ fn main() {
             // resolve to (CARGO_MANIFEST_DIR is frozen at build time and points
             // at the CI runner, not the user's machine).
             if !cfg!(debug_assertions)
+                && std::env::var_os("NINFIER_STUDIO_DIST").is_none()
                 && let Ok(res) = app.path().resource_dir()
             {
                 // SAFETY: runs synchronously inside Tauri's `setup()` callback,
@@ -184,10 +183,7 @@ fn main() {
             }
 
             // ---- control plane on a dedicated tokio runtime ------------------
-            let port: u16 = std::env::var("NINFIER_STUDIO_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8787);
+            let port = control_plane_port();
 
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
             std::thread::spawn(move || {
@@ -197,16 +193,16 @@ fn main() {
                     .expect("failed to build tokio runtime");
                 rt.block_on(async move {
                     let state = init_state(Some(ev_tx)).await;
-                    *control_state.0.lock().unwrap() = Some(state.clone());
-                    boot_adopt(&state).await;
-                    ninfier_control::remote::boot_start(&state).await;
-                    if let Err(e) = serve_until_ready(state, port, Some(ready_tx)).await {
-                        tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {{error}}");
+                    *control_state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state.clone());
+                    if let Err(e) = boot(state, port, Some(ready_tx)).await {
+                        tracing::event!(name: "control_plane.serve.failed", tracing::Level::ERROR, error = %e, "control plane error: {error}");
                     }
                 });
             });
             // block this thread until the listener is bound (5 s cap)
-            let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
+            if let Err(e) = ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                tracing::warn!(error = %e, "Control plane bind wait timed out or failed; proceeding to load window");
+            }
 
             // ---- event pump: notifications + tray state ----------------------
             let pump_handle = app.handle().clone();
@@ -218,8 +214,26 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running NInfer Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building NInfer Studio")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let state = app
+                    .state::<ControlState>()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(state) = state {
+                    api.prevent_exit();
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        ninfier_control::engine::stop_engine(&state, None).await;
+                        app_handle.exit(0);
+                    });
+                }
+            }
+        });
 }
 
 /// Map a control-plane event to an OS notification and update tray state.
@@ -258,19 +272,32 @@ fn handle_event(app: &tauri::AppHandle, ev: &AppEvent) {
             } else {
                 format!("{action} failed")
             },
-            String::new(),
+            format!("Build action '{action}' ended."),
         ),
     };
 
     let _ = app.notification().builder().title(title).body(body).show();
 
     // Reflect engine state in the tray ("engine still running" indicator).
-    let running = matches!(ev, AppEvent::EngineReady { .. });
-    app.state::<EngineRunning>()
-        .0
-        .store(running, Ordering::SeqCst);
+    match ev {
+        AppEvent::EngineReady { .. } => {
+            app.state::<EngineRunning>().0.store(true, Ordering::SeqCst);
+        }
+        AppEvent::EngineStopped | AppEvent::EngineFailed { .. } => {
+            app.state::<EngineRunning>().0.store(false, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+
     #[cfg(feature = "tray")]
-    if let Some(tray) = app.state::<TrayState>().0.lock().unwrap().as_ref() {
+    if let Some(tray) = app
+        .state::<TrayState>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        let running = app.state::<EngineRunning>().0.load(Ordering::SeqCst);
         let tip = if running {
             "NInfer Studio — engine running"
         } else if matches!(ev, AppEvent::EngineFailed { .. }) {

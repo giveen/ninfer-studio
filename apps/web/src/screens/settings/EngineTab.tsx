@@ -1,13 +1,14 @@
-import { useEffect, useState } from 'react';
-import { FolderCog, GitBranch, Hammer, Save, Zap } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { FolderCog, GitBranch, Hammer, RefreshCw, Save, Zap } from 'lucide-react';
 import { getConfig, saveConfig, startEngineUpdate } from '../../lib/api';
 import type { AppSettings, StatusPayload } from '../../lib/types';
 import { Badge, Button, Field, LogPane, NumberField, SectionCard, TextField, Toggle } from '../../components/ui';
 
-export function EngineTab({ status }: { status: StatusPayload | null }) {
+export function EngineTab({ status, active = true }: { status: StatusPayload | null; active?: boolean }) {
   const [form, setForm] = useState<AppSettings | null>(null);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [needPath, setNeedPath] = useState(false);
   const [pathInput, setPathInput] = useState('');
   const [apiKeyDraft, setApiKeyDraft] = useState('');
@@ -15,9 +16,22 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
   useEffect(() => {
     if (!form && status?.config) setForm(status.config);
   }, [status, form]);
-  useEffect(() => {
-    getConfig().then(setForm).catch(() => undefined);
+
+  const fetchConfig = useCallback(() => {
+    setLoadError(null);
+    getConfig()
+      .then((c) => {
+        setForm(c);
+        setLoadError(null);
+      })
+      .catch((e) => {
+        setLoadError(e instanceof Error ? e.message : 'Failed to load settings');
+      });
   }, []);
+
+  useEffect(() => {
+    if (active) fetchConfig();
+  }, [active, fetchConfig]);
 
   const update = status?.update ?? null;
   const updating = !!update && !update.done;
@@ -32,6 +46,16 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
   };
 
   if (!form) {
+    if (loadError) {
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-3 text-[13px] text-danger">
+          <p>{loadError}</p>
+          <Button size="sm" variant="ghost" onClick={fetchConfig}>
+            <RefreshCw size={12} /> Retry
+          </Button>
+        </div>
+      );
+    }
     return (
       <div className="flex h-full items-center justify-center text-[13px] text-faint">loading settings…</div>
     );
@@ -61,8 +85,12 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
       });
       setForm(c);
       setApiKeyDraft('');
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+      if (c.rejected?.length) {
+        setError(`Not applied (invalid or conflicting value): ${c.rejected.join(', ')}`);
+      } else {
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1500);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -80,7 +108,7 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4 px-5 py-4">
+    <div className="mx-auto max-w-5xl space-y-4 px-5 py-4">
       <SectionCard title="Engine paths" description="Studio spawns the compiled engine binary and scans the models directory. Both must exist on this machine." icon={<FolderCog size={15} />}>
         <div className="space-y-4">
           <Field label="Ninfer path" hint="Root of your NInfer checkout/build. Studio derives the ninfer-serve binary (build/apps/ninfer-serve), the ninfer CLI, and the git source for pull/build automatically.">
@@ -200,9 +228,10 @@ export function EngineTab({ status }: { status: StatusPayload | null }) {
         <div className="space-y-4">
           <Field label="Default engine port" hint="ninfer-serve's default listen port when the profile doesn't set one.">
             <div className="w-32">
-              <TextField value={String(form.enginePort)} onChange={(v) => set('enginePort', Number(v) || 0)} className="font-mono" />
+              <NumberField value={form.enginePort} onChange={(v) => set('enginePort', v)} min={1} max={65535} className="font-mono" />
             </div>
           </Field>
+
           <Field
             label="API key"
             hint={

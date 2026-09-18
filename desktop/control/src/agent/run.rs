@@ -8,6 +8,7 @@
 
 use crate::agent::engine_loop;
 use crate::engine::S;
+pub(crate) use crate::types::now_ms;
 use axum::extract::{Path, State as AxumState};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -25,6 +26,9 @@ use tokio::sync::{broadcast, oneshot, watch};
 /// real generation via maxConcurrency; this just stops a runaway fan-out
 /// (deep research x many tabs) from pinning this process's memory.
 pub(crate) const MAX_CONCURRENT_RUNS: usize = 16;
+
+/// Hard ceiling on total retained runs (active + terminal) in memory.
+pub(crate) const MAX_STORED_RUNS: usize = 64;
 
 /// SSE event payload — one JSON object per server-sent event, `type`-tagged.
 /// Clients attach at any time; the first frame is always a `state` snapshot
@@ -346,7 +350,9 @@ pub struct RunLive {
     /// A `todo_write` whose snapshot predates the bump is stale and discarded
     /// (the client's mid-run edit guard).
     pub todo_rev: u64,
-    /// The rev captured at the start of the in-flight turn — the list the
+    /// User-initiated task-list revision: bumped ONLY by human edits via `todo_set`.
+    pub user_todo_rev: u64,
+    /// The user_todo_rev captured at the start of the in-flight turn — the list the
     /// current response was generated from.
     pub todo_base_rev: u64,
 }
@@ -360,9 +366,10 @@ pub struct RunMeta {
     pub label: String,
     pub model: String,
     pub base_url: Option<String>,
+    #[serde(skip)]
     pub api_key: Option<String>,
     /// JSON object string of extra headers forwarded to the cloud provider.
-    #[serde(default)]
+    #[serde(skip)]
     pub extra_headers: Option<String>,
     /// Fall back to the local engine on cloud 429/5xx (default true for cloud runs).
     #[serde(default = "default_allow_fallback")]
@@ -428,13 +435,6 @@ impl std::fmt::Debug for RunShared {
 /// never held across an await.
 pub type RunRegistry = Arc<Mutex<HashMap<String, Arc<RunShared>>>>;
 
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn lock<'a>(m: &'a Mutex<RunLive>) -> MutexGuard<'a, RunLive> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -445,6 +445,15 @@ fn shared_hook_mode(r: &RunShared) -> HookMode {
 
 impl RunShared {
     pub fn snapshot(&self) -> RunSnapshot {
+        let hook_mode_val = shared_hook_mode(self);
+        let pending_gate_val = self
+            .gate_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slot
+            .as_ref()
+            .map(|s| s.pending.clone());
+
         let live = lock(&self.live);
         let meta = &self.meta;
         RunSnapshot {
@@ -471,21 +480,21 @@ impl RunShared {
             last_meta: live.last_meta.clone(),
             pending_approvals: live.pending_approvals.clone(),
             user_question: live.user_question.clone(),
-            hook_mode: match shared_hook_mode(self) {
+            hook_mode: match hook_mode_val {
                 HookMode::Auto => "auto".to_string(),
                 HookMode::Client => "client".to_string(),
             },
             pending_hook: live.pending_hook.clone(),
-            pending_gate: self
-                .gate_state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .slot
-                .as_ref()
-                .map(|s| s.pending.clone()),
+            pending_gate: pending_gate_val,
             plan: meta.plan,
             todo_rev: live.todo_rev,
         }
+    }
+
+    pub fn set_turns(&self, turns: usize) {
+        let mut live = lock(&self.live);
+        live.turns = turns;
+        live.updated_at = now_ms();
     }
 
     pub fn status(&self) -> RunStatus {
@@ -522,7 +531,12 @@ impl RunShared {
             live.updated_at = now_ms();
             live.pending_approvals.clear();
             live.user_question = None;
+            live.pending_hook = None;
         }
+        self.approvals.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.question_tx.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.gate_state.lock().unwrap_or_else(|p| p.into_inner()).slot = None;
+        self.hook_wait.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(message) = &error {
             let _ = self.tx.send(AgentEvent::Error {
                 message: message.clone(),
@@ -632,7 +646,7 @@ fn default_max_steps() -> usize {
 /// before the loop task starts, so a client can attach within the same
 /// tick the run begins.
 pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
-    let (tx, _rx) = broadcast::channel(512);
+    let (tx, _rx) = broadcast::channel(2048);
     let (stop_tx, stop_rx) = watch::channel(false);
     let shared = Arc::new(RunShared {
         meta,
@@ -652,13 +666,53 @@ pub fn spawn_run(state: &S, meta: RunMeta, live: RunLive) -> Arc<RunShared> {
             .build()
             .unwrap_or_default(),
     });
-    state
+    let mut runs = state
         .agent_runs
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(shared.meta.id.clone(), shared.clone());
-    tokio::spawn(engine_loop::run(state.clone(), shared.clone()));
+        .unwrap_or_else(|p| p.into_inner());
+    prune_terminal_runs(&mut runs);
+    runs.insert(shared.meta.id.clone(), shared.clone());
+    drop(runs);
+    let s_shared = shared.clone();
+    let state_owned = (*state).clone();
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let res = std::panic::AssertUnwindSafe(engine_loop::run(state_owned, s_shared.clone()))
+            .catch_unwind()
+            .await;
+        if res.is_err() && !s_shared.status().is_terminal() {
+            s_shared.mark_terminal(
+                RunStatus::Error,
+                None,
+                Some("run loop panicked unexpectedly".into()),
+            );
+        }
+    });
     shared
+}
+
+/// Evict oldest terminal runs if total stored runs exceeds `MAX_STORED_RUNS`.
+pub(crate) fn prune_terminal_runs(runs: &mut HashMap<String, Arc<RunShared>>) {
+    if runs.len() < MAX_STORED_RUNS {
+        return;
+    }
+    let mut terminal: Vec<(String, u64)> = runs
+        .iter()
+        .filter_map(|(id, r)| {
+            let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+            if live.status.is_terminal() {
+                Some((id.clone(), live.updated_at))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    terminal.sort_by_key(|(_, updated_at)| *updated_at);
+    let to_remove = (runs.len() + 1).saturating_sub(MAX_STORED_RUNS);
+    for (id, _) in terminal.into_iter().take(to_remove) {
+        runs.remove(&id);
+    }
 }
 
 /// `POST /api/agent/runs` — start a run. Returns `{id, status}`; follow the
@@ -767,6 +821,7 @@ pub(crate) async fn start(AxumState(state): AxumState<S>, Json(body): Json<Start
         usage: RunUsage::default(),
         last_meta: None,
         todo_rev: 0,
+        user_todo_rev: 0,
         todo_base_rev: 0,
     };
     // Worker critic spec (subagent runs only): `{model, system?}`.
@@ -859,20 +914,22 @@ pub(crate) async fn list(AxumState(state): AxumState<S>) -> Response {
     let mut out: Vec<Value> = runs
         .values()
         .map(|r| {
-            let snap = r.snapshot();
+            let meta = &r.meta;
+            let live = lock(&r.live);
+            let pending_approvals_count = live.pending_approvals.len();
             json!({
-                "id": snap.id,
-                "kind": snap.kind,
-                "label": snap.label,
-                "model": snap.model,
-                "status": snap.status,
-                "turns": snap.turns,
-                "maxSteps": snap.max_steps,
-                "createdAt": snap.created_at,
-                "updatedAt": snap.updated_at,
-                "stop": snap.stop,
-                "parent": snap.parent,
-                "pendingApprovals": snap.pending_approvals.len(),
+                "id": meta.id,
+                "kind": meta.kind,
+                "label": meta.label,
+                "model": meta.model,
+                "status": live.status,
+                "turns": live.turns,
+                "maxSteps": meta.max_steps,
+                "createdAt": meta.created_at,
+                "updatedAt": live.updated_at,
+                "stop": live.stop,
+                "parent": meta.parent,
+                "pendingApprovals": pending_approvals_count,
             })
         })
         .collect();
@@ -935,6 +992,13 @@ pub(crate) async fn approve(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     let approved = body.decision == "approve";
     if approved
         && body
@@ -968,7 +1032,9 @@ pub(crate) async fn approve(
         ApprovalDecision::Denied
     };
     let _ = sender.send(decision);
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ =
         r.tx.send(AgentEvent::ApprovalResolved { id: aid, approved });
     Json(json!({ "ok": true, "approved": approved })).into_response()
@@ -984,9 +1050,17 @@ pub(crate) struct ApproveBody {
 /// `POST /api/agent/runs/{id}/gates/{gid}` — resolve a pending risky/commit
 /// gate. Body: `{decision: "once"|"remember"|"deny"}` for a risky gate
 /// (`remember` runs it and records the normalized command for the rest of
-/// the run), `{decision: "approve"|"deny"}` for a commit gate. Unlike
-/// approvals, no one-shot token is involved — the dialog itself is the
-/// human gesture, and the command never leaves this machine.
+/// the run), `{decision: "approve"|"deny"}` for a commit gate.
+///
+/// Unlike `approve()` (ask-tier tool approvals), no token is required or
+/// consulted here: a gate's `GateDecision` carries no token downstream (it
+/// never reaches `enforce_perm` or any other real check — `bash`/`git_commit`
+/// aren't necessarily "ask" tier, since the risky/commit gates are a
+/// tier-independent safety net), so requiring one here would only be a
+/// non-functional formality. The actual authorization boundary is knowing
+/// this run's `id` and this gate's `gid`, both server-generated and
+/// delivered only to whoever is watching this specific run's events/snapshot
+/// — the same boundary `answer()` (ask_user) already relies on.
 pub(crate) async fn gate_decide(
     AxumState(state): AxumState<S>,
     Path((id, gid)): Path<(String, String)>,
@@ -1000,6 +1074,13 @@ pub(crate) async fn gate_decide(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     let mut gs = r.gate_state.lock().unwrap_or_else(|p| p.into_inner());
     let Some(slot) = gs.slot.take() else {
         return (
@@ -1045,7 +1126,9 @@ pub(crate) async fn gate_decide(
     };
     let _ = slot.tx.send(decision);
     drop(gs);
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::GateResolved {
         id: id_out,
         kind,
@@ -1056,6 +1139,11 @@ pub(crate) async fn gate_decide(
 #[derive(Debug, Deserialize)]
 pub(crate) struct GateDecideBody {
     pub(crate) decision: String,
+    /// Accepted for symmetry with `ApproveBody` but never consulted — see
+    /// the doc comment above `gate_decide` for why a gate carries no token.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) token: Option<String>,
 }
 
 /// Normalize a shell command for approved-command matching (the client's
@@ -1079,6 +1167,23 @@ pub(crate) async fn answer(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
+    {
+        let live = r.live.lock().unwrap_or_else(|p| p.into_inner());
+        if live.user_question.as_ref().map(|q| &q.id) != Some(&qid) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "no pending question with that id"})),
+            )
+                .into_response();
+        }
+    }
     let Some(sender) = r
         .question_tx
         .lock()
@@ -1092,7 +1197,9 @@ pub(crate) async fn answer(
             .into_response();
     };
     let _ = sender.send(body.answer.clone());
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::UserQuestionAnswered {
         id: qid,
         answer: body.answer,
@@ -1139,37 +1246,65 @@ pub(crate) async fn events(AxumState(state): AxumState<S>, Path(id): Path<String
 
 /// First frame is the snapshot (`event: state`); then one frame per
 /// [`AgentEvent`]. Ends when the run's channel closes or the client goes
-/// away.
+/// away. Handles lagged subscribers by re-emitting a state snapshot.
 async fn sse_pump(run: Arc<RunShared>, out: tokio::sync::mpsc::Sender<bytes::Bytes>) {
     let mut rx = run.tx.subscribe();
+    let mut seq: u64 = 1;
     let snap = run.snapshot();
     let first = sse_frame(
+        seq,
         "state",
         &serde_json::to_string(&AgentEvent::State {
             snapshot: Box::new(snap),
         })
         .unwrap_or_default(),
     );
+    seq += 1;
     if out.send(first).await.is_err() {
         return; // client is already gone
     }
-    while let Ok(ev) = rx.recv().await {
-        let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
-        let name = v
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("event")
-            .to_string();
-        if out.send(sse_frame(&name, &v.to_string())).await.is_err() {
-            return;
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let v = serde_json::to_value(&ev).unwrap_or(Value::Null);
+                let name = v
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("event")
+                    .to_string();
+                let frame = sse_frame(seq, &name, &v.to_string());
+                seq += 1;
+                if out.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, run_id = %run.meta.id, "SSE client lagged; sending state snapshot resync");
+                let snap = run.snapshot();
+                let frame = sse_frame(
+                    seq,
+                    "state",
+                    &serde_json::to_string(&AgentEvent::State {
+                        snapshot: Box::new(snap),
+                    })
+                    .unwrap_or_default(),
+                );
+                seq += 1;
+                if out.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
         }
     }
 }
 
-/// One SSE frame: `event: <name>`, then one `data:` line per line of the
-/// (single-line) JSON payload.
-fn sse_frame(name: &str, data: &str) -> bytes::Bytes {
+/// One SSE frame: `id: <seq>`, `event: <name>`, then `data:` lines.
+fn sse_frame(id: u64, name: &str, data: &str) -> bytes::Bytes {
     let mut out = String::new();
+    out.push_str(&format!("id: {id}\n"));
     out.push_str(&format!("event: {name}\n"));
     for line in data.split('\n') {
         out.push_str("data: ");
@@ -1263,6 +1398,13 @@ pub(crate) async fn hook_decision(
         )
             .into_response();
     };
+    if r.status().is_terminal() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "run is already terminal"})),
+        )
+            .into_response();
+    }
     // The id must be the pending one — a stale decision from an earlier pause
     // must not resolve the current one (two clients racing, a late reply).
     {
@@ -1303,7 +1445,9 @@ pub(crate) async fn hook_decision(
         let mut live = r.live.lock().unwrap_or_else(|p| p.into_inner());
         live.pending_hook = None;
     }
-    r.set_status(RunStatus::Running);
+    if !r.status().is_terminal() {
+        r.set_status(RunStatus::Running);
+    }
     let _ = r.tx.send(AgentEvent::HookResolved { id: hid, action });
     Json(json!({ "ok": true })).into_response()
 }
@@ -1350,6 +1494,7 @@ pub(crate) async fn todo_set(
     let items = clean_todo_items(body.get("todos").unwrap_or(&Value::Null));
     let mut live = lock(&r.live);
     live.todo = Some(Value::Array(items.clone()));
+    live.user_todo_rev += 1;
     live.todo_rev += 1;
     let rev = live.todo_rev;
     drop(live);
@@ -1437,6 +1582,7 @@ pub(crate) fn test_run(
             usage: RunUsage::default(),
             last_meta: None,
             todo_rev: 0,
+            user_todo_rev: 0,
             todo_base_rev: 0,
         }),
         tx,
@@ -1553,5 +1699,37 @@ mod tests {
         assert!(b.risky_gate && b.commit_gate);
         assert_eq!(b.approved_commands, vec!["git push".to_string()]);
         assert!(b.plan);
+    }
+
+    #[test]
+    fn sse_frame_includes_id_line() {
+        let frame = sse_frame(42, "state", "{\"hello\":\"world\"}");
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.starts_with("id: 42\nevent: state\ndata: {\"hello\":\"world\"}\n\n"));
+    }
+
+    #[test]
+    fn prune_terminal_runs_evicts_oldest_completed() {
+        let state = fresh();
+        let mut runs = HashMap::new();
+        for i in 0..(MAX_STORED_RUNS + 5) {
+            let shared = test_run(&state, "chat", &[], None);
+            let mut live = shared.live.lock().unwrap();
+            live.updated_at = i as u64;
+            live.status = RunStatus::Done;
+            drop(live);
+            runs.insert(format!("run_{i}"), shared);
+        }
+        assert_eq!(runs.len(), MAX_STORED_RUNS + 5);
+        prune_terminal_runs(&mut runs);
+        assert_eq!(runs.len(), MAX_STORED_RUNS - 1);
+        // The 6 oldest runs (updated_at 0..6) should have been evicted
+        for i in 0..6 {
+            assert!(!runs.contains_key(&format!("run_{i}")));
+        }
+        for i in 6..(MAX_STORED_RUNS + 5) {
+            assert!(runs.contains_key(&format!("run_{i}")));
+        }
+        let _ = std::fs::remove_dir_all(state.data_dir.clone());
     }
 }

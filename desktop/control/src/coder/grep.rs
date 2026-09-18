@@ -25,11 +25,18 @@ pub async fn grep(
             Json(json!({"error": "pattern required"})),
         ));
     }
+    let rel_root = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let search_root = if rel_root.is_empty() {
+        ws.clone()
+    } else {
+        within_ws(&ws, rel_root)?
+    };
+
     enforce_perm(
         &state,
         &perm_scope(&req),
         "grep",
-        None,
+        req.get("path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()),
         req.get("approvalToken").and_then(|v| v.as_str()),
     )
     .await?;
@@ -55,60 +62,94 @@ pub async fn grep(
         }
     };
 
-    let max_matches = req
-        .get("maxMatches")
+    let include_pattern = req.get("include").and_then(|v| v.as_str());
+    let include_matcher = if let Some(p) = include_pattern {
+        if !p.trim().is_empty() {
+            glob_matcher(p.trim()).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let offset = req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = req
+        .get("limit")
+        .or_else(|| req.get("maxMatches"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(2000) as usize;
+        .unwrap_or(200)
+        .clamp(1, 2000) as usize;
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut matches = Vec::new();
-        let walker = ignore::WalkBuilder::new(&ws).hidden(false).build();
+        let mut all_matches = Vec::new();
+        let walker = ignore::WalkBuilder::new(&search_root)
+            .hidden(false)
+            .max_filesize(Some(10 * 1024 * 1024))
+            .filter_entry(|e| {
+                if let Some(name) = e.file_name().to_str()
+                    && CODER_IGNORE.contains(&name) {
+                        return false;
+                    }
+                true
+            })
+            .build();
 
-        for result in walker {
-            if matches.len() >= max_matches {
-                break;
+        for entry in walker.flatten() {
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+                continue;
             }
 
-            if let Ok(entry) = result {
-                if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+            let path = entry.path();
+            let rel_path = path
+                .strip_prefix(&ws)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+
+            if let Some(ref matcher) = include_matcher
+                && !matcher.is_match(&rel_path) {
                     continue;
                 }
 
-                let path = entry.path();
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    let rel_path = path
-                        .strip_prefix(&ws)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    for (i, line) in content.lines().enumerate() {
-                        if matches.len() >= max_matches {
-                            break;
-                        }
-                        if re.is_match(line) {
-                            let mut text = line.to_string();
-                            if text.len() > 400 {
-                                text.truncate(400);
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let mut text = line.to_string();
+                        if text.len() > 400 {
+                            let mut cut = 400;
+                            while !text.is_char_boundary(cut) {
+                                cut -= 1;
                             }
-                            matches.push(json!({
-                                "file": rel_path,
-                                "line": i + 1,
-                                "text": text
-                            }));
+                            text.truncate(cut);
                         }
+                        all_matches.push(json!({
+                            "file": rel_path,
+                            "line": i + 1,
+                            "text": text
+                        }));
                     }
                 }
             }
         }
 
-        let truncated = matches.len() >= max_matches;
-        let count = matches.len();
+        let total = all_matches.len();
+        let sliced: Vec<Value> = all_matches
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+        let count = sliced.len();
+        let has_more = offset + count < total;
 
         json!({
-            "matches": matches,
-            "truncated": truncated,
-            "count": count
+            "matches": sliced,
+            "total": total,
+            "count": count,
+            "offset": offset,
+            "limit": limit,
+            "truncated": has_more,
+            "more": has_more
         })
     })
     .await
@@ -148,9 +189,6 @@ pub async fn glob(
         within_ws(&ws_root, rel_root)?
     };
     let base_rel = rel_of(&ws_root, &base);
-    // `globset` (ripgrep's matcher) with `literal_separator`, so `*` never
-    // crosses `/` — the same semantics as the sidecar's translator — plus
-    // real `[...]` classes and `{a,b}` alternates.
     let matcher = glob_matcher(&pattern).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -158,17 +196,18 @@ pub async fn glob(
         )
     })?;
     let files = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::new();
-        walk_files(&ws_root, &base_rel, &mut out, 4000);
-        out.into_iter()
+        let mut all_files = Vec::new();
+        walk_files(&ws_root, &base_rel, &mut all_files, usize::MAX);
+        all_files.sort();
+        all_files
+            .into_iter()
             .filter(|f| matcher.is_match(f))
+            .take(4000)
             .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
-    let mut files = files;
-    files.sort();
-    files.truncate(4000);
+
     Ok(Json(json!({"files": files})))
 }
 

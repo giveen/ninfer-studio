@@ -122,8 +122,9 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
       setDeepResearchMaxStepsState(c.chatDeepResearchMaxSteps ?? 5);
       setReflectionCritiqueMaxTokensState(c.chatReflectionCritiqueMaxTokens ?? 400);
       setComputerUseEnabledState(c.chatComputerUseEnabled ?? false);
-      setComputerUseDirState(c.chatComputerUseDir ?? '');
-      computerUseDirRef.current = c.chatComputerUseDir ?? '';
+      const initialDir = c.chatComputerUseDir || '/tmp';
+      setComputerUseDirState(initialDir);
+      computerUseDirRef.current = initialDir;
       try {
         const parsed = c.chatComputerUsePerms ? JSON.parse(c.chatComputerUsePerms) : null;
         if (parsed && typeof parsed === 'object') setComputerUsePermsState({ tools: parsed.tools ?? {}, denyPaths: parsed.denyPaths ?? [] });
@@ -182,9 +183,10 @@ export function ChatAgentProvider({ children }: { children: ReactNode }) {
     saveConfig({ chatComputerUseEnabled: v }).catch(() => {});
   }, []);
   const setComputerUseDir = useCallback((v: string) => {
-    setComputerUseDirState(v);
-    computerUseDirRef.current = v;
-    saveConfig({ chatComputerUseDir: v }).catch(() => {});
+    const dir = v || '/tmp';
+    setComputerUseDirState(dir);
+    computerUseDirRef.current = dir;
+    saveConfig({ chatComputerUseDir: dir }).catch(() => {});
   }, []);
   const setComputerUsePerms = useCallback((v: PermConfig) => {
     setComputerUsePermsState(v);
