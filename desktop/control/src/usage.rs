@@ -106,7 +106,11 @@ async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
     if let Some(v) = evt.decode_tok_per_sec {
         obj.insert("decodeTokPerSec".into(), json!(v));
     }
-    let line = Value::Object(obj).to_string();
+    // One buffer, one write: in append mode a single write syscall is what
+    // keeps concurrent appenders from interleaving, and splitting the
+    // trailing newline into a second write_all bought nothing.
+    let mut line = Value::Object(obj).to_string();
+    line.push('\n');
     let lock = mem_lock(state, "usage");
     let _guard = lock.lock().await;
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
@@ -116,7 +120,15 @@ async fn log_usage_event(state: &S, evt: UsageEvent) -> std::io::Result<()> {
         .open(usage_log_path(state))
         .await?;
     f.write_all(line.as_bytes()).await?;
-    f.write_all(b"\n").await
+    // tokio's File dispatches writes to a background blocking task and does
+    // NOT complete them on drop, so without this the bytes can still be in
+    // flight when the next `read_usage_events` opens the path — a
+    // just-logged event silently missing from /api/usage. That is what made
+    // stream_timing_feeds_average_speeds flaky in CI (slower filesystem,
+    // wider window): the two qwen events hadn't landed, so the only event
+    // the fold saw was the trailing "model-b" one. Same reason memstore.rs
+    // syncs its learnings append.
+    f.sync_all().await
 }
 
 /// `POST /api/usage/reset` — delete the usage log outright so the Usage tab
