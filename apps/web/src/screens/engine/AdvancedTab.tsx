@@ -1,6 +1,6 @@
-import { SlidersHorizontal, Terminal, Video } from 'lucide-react';
+import { Cpu, SlidersHorizontal, Terminal, Video } from 'lucide-react';
 import { Field, NumberField, SectionCard, SelectField, TextField, Toggle } from '../../components/ui';
-import { LOG_LEVELS } from '../../lib/presets';
+import { CUDA_SYNC_MODES, LOG_LEVELS } from '../../lib/presets';
 import type { EngineProfile } from '../../lib/types';
 
 interface AdvancedTabProps {
@@ -76,7 +76,7 @@ export function AdvancedTab({ profile, set, setU }: AdvancedTabProps) {
           <Field label="Stats interval (ms)" hint="Aggregate throughput report interval on stderr; 0 disables.">
             <NumberField value={profile.logStatsIntervalMs ?? null} onChange={(v) => set('logStatsIntervalMs', v)} onEmpty={() => setU('logStatsIntervalMs', undefined)} min={0} step={500} placeholder="5000" />
           </Field>
-          <Field label="Request log (JSONL file)" hint="Append full-precision server/request records (schema v20). Parent directory must exist.">
+          <Field label="Request log (JSONL file)" hint="Append full-precision server/request records (schema v25). Parent directory must exist.">
             <TextField value={profile.requestLogJsonl || ''} onChange={(v) => setU('requestLogJsonl', v || undefined)} placeholder="disabled" />
           </Field>
           <Field label="Response store records" hint="Maximum locally retained Responses objects (LRU).">
@@ -91,6 +91,14 @@ export function AdvancedTab({ profile, set, setU }: AdvancedTabProps) {
           <div className="flex items-end pb-1">
             <Toggle checked={!!profile.cors} onChange={(v) => set('cors', v)} label="Permissive browser CORS" hint="Adds permissive CORS headers for browser clients." />
           </div>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="CUDA" description="Device synchronization schedule for the engine process. Read at startup, so a change takes effect on the next engine start." icon={<Cpu size={15} />} collapsible defaultCollapsed>
+        <div className={grid3}>
+          <Field label="CUDA sync (NINFER_CUDA_SYNC)" hint="spin (engine default) prioritizes low latency at the cost of CPU while waiting on the GPU; blocking sleeps; yield yields the CPU; auto uses CUDA's scheduling heuristic. Values are validated at startup — an unrecognized value fails the engine launch.">
+            <SelectField value={profile.cudaSync || ''} onChange={(v) => setU('cudaSync', (v || undefined) as EngineProfile['cudaSync'])} options={[{ value: '', label: 'engine default (spin)' }, ...CUDA_SYNC_MODES.map((m) => ({ value: m, label: m }))]} />
+          </Field>
         </div>
       </SectionCard>
     </div>

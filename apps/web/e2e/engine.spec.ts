@@ -7,7 +7,7 @@ test.describe('Engine Screen', () => {
   });
 
   test('displays Engine management tabs', async ({ page }) => {
-    const tabs = ['Basics', 'Advanced', 'Profiles', 'Cloud', 'Usage', 'Performance'];
+    const tabs = ['Basics', 'Advanced', 'Profiles', 'Cloud', 'Usage', 'Performance', 'Metrics'];
 
     for (const tabName of tabs) {
       // Scoped to `main` (excludes the persistent sidebar rail) and via

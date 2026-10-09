@@ -26,7 +26,8 @@ Linux, WebView2 on Windows) for the
 - **Engine configuration** — every `ninfer-serve` option as a labeled, documented
   control: context/KV capacity & dtype (`bf16` / `int8` / `fp8` / `nvfp4` / `k8v4`),
   concurrency, speculative decoding (MTP / DFlash / DFlash2), vision & media budgets,
-  context-cache tiers, sampling defaults, logging — plus a live **generated launch
+  context-cache Host/Device budgets, the `NINFER_CUDA_SYNC` device-sync schedule,
+  sampling defaults, logging — plus a live **generated launch
   command** and one-click **presets**, including RTX 5090 presets calibrated
   from the engine's own measured KV density across the registered artifacts
   (192k long-context MTP, 128k bf16, C=4 nvfp4 serving, 96k low-latency, 128k MoE,
@@ -54,7 +55,10 @@ Linux, WebView2 on Windows) for the
   downloads.
 - **Chat** — streaming chat over the engine's OpenAI-compatible API: reasoning shown in
   a collapsible thinking block, per-message engine metrics (TTFT, prompt/decode tok/s,
-  cached tokens, MTP draft acceptance), sampling/thinking overrides per conversation,
+  cached tokens, MTP draft acceptance), sampling/thinking overrides and per-conversation
+  **structured-output** constraints (JSON object/schema via `response_format`; GBNF
+  grammar, literal choice, or regex via NInfer's `structured_outputs` — applied to
+  answer content only, and the non-JSON modes require tools off),
   image/video attachments rendered **inline in the transcript** (vision engines),
   model-emitted markdown images, live context-usage gauge (context window read straight
   from the engine, no manual `--max-context` bookkeeping), stop button, and persisted
@@ -98,6 +102,12 @@ Linux, WebView2 on Windows) for the
   cache-hit rate, and (for the local engine) GPU energy in kWh at a configurable
   price per kWh and currency symbol, plus per-model cloud $ cost from a cached
   OpenRouter-sourced pricing table.
+- **Live engine metrics** — an Engine → Metrics tab renders the engine's Prometheus
+  `GET /metrics` payload, proxied authenticated through the control plane: scheduler &
+  capacity, tokens, speculative decoding, context cache / Host transfers, constrained
+  decoding, requests & latency, with a grouped or raw view and 5 s auto-refresh. The
+  metric vocabulary belongs to the engine, so any family the running build publishes
+  renders (unrecognized ones fall through to "Other") and counters reset on restart.
 - **Suggested follow-ups** — after a reply completes, Chat asks the model for three
   short, one-click next questions shown as chips under the reply.
 - **Coder mode** — an agentic coding harness over the same engine: plan/act loop with
@@ -108,12 +118,15 @@ Linux, WebView2 on Windows) for the
   per-workspace memory bank — with a live **prefill/decode indicator** so the model
   thinking is never invisible. Safe Mode, Sandbox, and Commit Approval live in
   Settings > Safety & Permissions (shared live across screens), with per-workspace
-  tool permissions still in the Coder sidebar.
+  tool permissions still in the Coder sidebar. The Coder composer exposes the engine's
+  tool-constraint mode (`basic` engine framing vs. `auto` request-driven) and a
+  parallel-tool-calls toggle; built-in tools are declared with NInfer's strict argument
+  contract (closed-object parameter roots), external MCP tools are not.
 - **Tabbed Settings & Engine screens** — Settings splits into **Engine / Safety &
-  Permissions / Agent / About**; Engine itself splits into **Basics / Performance /
-  Advanced / Profiles** to cut down on scrolling through every `ninfer-serve` option
-  at once. A default permissions template in Settings seeds new Coder workspaces
-  without touching existing ones.
+  Permissions / Agent / Themes / About**; Engine itself splits into **Basics /
+  Performance / Advanced / Profiles / Cloud / Usage / Metrics** to cut down on scrolling
+  through every `ninfer-serve` option at once. A default permissions
+  template in Settings seeds new Coder workspaces without touching existing ones.
 - **Engine supervision** — starts/stops `ninfer-serve` from the UI, adopts
   already-running engines (never double-spawns), tails the engine log, reports GPU
   state via `nvidia-smi`, and **stops a running engine before Rebuild** so a fresh
@@ -162,6 +175,7 @@ single process supervises the engine.
 | `POST /api/engine/stop` | SIGTERM the child (8 s grace) or the adopted external pid |
 | `POST /api/engine/update` | `pull` (git pull --ff-only) or `build` (stops a running engine first, then cmake/Ninja) |
 | `GET /api/logs?n=400` | tail of the spawned engine's log |
+| `GET /api/engine/metrics` | authenticated passthrough of the engine's Prometheus `GET /metrics` text (`{ok, port, metrics}`), for the Metrics tab |
 | `GET /api/models` | scan `modelsDir` for `*.ninfer` + registered catalog |
 | `POST /api/models/download` | `hf download <repo> <file> --local-dir` (uses `HF_TOKEN` when set) |
 | `GET /api/gpu` | `nvidia-smi` memory/util/process list |
@@ -254,7 +268,7 @@ and each platform uploads its artifact into it.
 Trigger a release by pushing a version tag:
 
 ```bash
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.4.1 && git push origin v0.4.1
 ```
 
 (or run the workflow manually from the Actions tab). Windows artifacts are currently

@@ -20,7 +20,15 @@ import {
   PURE_DEDUP_TOOLS,
   READ_STREAK_TOOLS,
   type PermConfig,
+  withStrictSchema,
 } from './coderTools';
+import {
+  CHAT_TOOLS,
+  CHAT_BROWSER_TOOL,
+  CHAT_MEMORY_TOOL,
+  CHAT_SET_DIRECTORY_TOOL,
+  COMPUTER_USE_TOOLS,
+} from './chatHelpers';
 
 describe('coderTools', () => {
   describe('filterToolsByConfig', () => {
@@ -233,6 +241,44 @@ describe('coderTools', () => {
     it('PURE_DEDUP_TOOLS and READ_STREAK_TOOLS exclude every mutating tool', () => {
       for (const t of PURE_DEDUP_TOOLS) expect(MUTATING_TOOLS.has(t)).toBe(false);
       for (const t of READ_STREAK_TOOLS) expect(MUTATING_TOOLS.has(t)).toBe(false);
+    });
+  });
+
+  // NInfer's strict tool contract: a strict function's parameter root must be a
+  // closed object, otherwise the engine rejects the whole request with HTTP 400.
+  describe('strict built-in schemas', () => {
+    it('marks every built-in tool strict with a closed object root', () => {
+      expect(TOOLS.length).toBeGreaterThan(0);
+      for (const tool of TOOLS) {
+        expect(tool.function.strict, `${tool.function.name} strict`).toBe(true);
+        expect(tool.function.parameters.type, `${tool.function.name} root type`).toBe('object');
+        expect(tool.function.parameters.additionalProperties, `${tool.function.name} closed`).toBe(false);
+      }
+    });
+
+    it('is idempotent, so re-running the map cannot double-apply it', () => {
+      expect(TOOLS.map((t) => withStrictSchema(t))).toEqual(TOOLS);
+    });
+
+    it('leaves MCP tool schemas non-strict', () => {
+      const schema = mcpToolSchema({ name: 'echo', description: 'Echo', parameters: { type: 'object' } });
+      expect(schema.function.strict).toBeUndefined();
+      expect(schema.function.parameters.additionalProperties).toBeUndefined();
+    });
+
+    it('covers the Chat-side built-ins too (Computer Use, Agent Mode, Memory)', () => {
+      const builtins = [
+        ...CHAT_TOOLS,
+        ...COMPUTER_USE_TOOLS,
+        CHAT_BROWSER_TOOL,
+        CHAT_MEMORY_TOOL,
+        CHAT_SET_DIRECTORY_TOOL,
+      ];
+      expect(builtins.length).toBeGreaterThan(0);
+      for (const tool of builtins) {
+        expect(tool.function.strict, `${tool.function.name} strict`).toBe(true);
+        expect(tool.function.parameters.additionalProperties, `${tool.function.name} closed`).toBe(false);
+      }
     });
   });
 });

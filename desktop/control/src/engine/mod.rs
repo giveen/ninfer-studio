@@ -34,6 +34,6 @@ mod status;
 
 pub use discover::{DiscoveredEngine, discover_engines};
 pub use gpu::{VRAM_FLOOR_GIB, vram_status};
-pub use health::{engine_health, engine_model_info};
+pub use health::{engine_health, engine_metrics, engine_model_info};
 pub use launch::{fail_and_emit, public_engine, start_engine, stop_engine};
 pub use status::refresh_engine_status;

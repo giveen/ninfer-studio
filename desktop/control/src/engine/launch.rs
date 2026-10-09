@@ -207,6 +207,7 @@ async fn spawn_and_attach(
     artifact: &str,
     args: &[String],
     port: u16,
+    cuda_sync: Option<String>,
     log_file_path: String,
     log: tokio::fs::File,
 ) -> Value {
@@ -235,6 +236,16 @@ async fn spawn_and_attach(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // `NINFER_CUDA_SYNC` selects the device synchronization schedule and is applied
+    // by the Engine at startup. An unrecognized or empty value fails startup, so it
+    // is only forwarded when a value is actually configured.
+    if let Some(sync) = cuda_sync
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cmd.env("NINFER_CUDA_SYNC", sync);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -384,6 +395,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     };
 
     let args = build_serve_args(&profile, port);
+    let cuda_sync = profile.cuda_sync.clone();
 
     let (log_file_path, log) = match open_engine_log(state, port).await {
         Ok(v) => v,
@@ -396,6 +408,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         &artifact,
         &args,
         port,
+        cuda_sync,
         log_file_path,
         log,
     )

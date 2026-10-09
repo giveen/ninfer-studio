@@ -443,6 +443,8 @@ export function useCoderAgentLoop(opts: UseCoderAgentLoopOptions) {
           topP: opts.coderParams.topP,
           topK: opts.coderParams.topK,
           seed: opts.coderParams.seed,
+          toolConstraints: opts.coderParams.toolConstraints,
+          parallelToolCalls: opts.coderParams.parallelToolCalls,
           maxTokens: respMax,
         } as ChatParams;
 

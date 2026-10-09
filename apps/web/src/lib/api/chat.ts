@@ -2,7 +2,7 @@
 // the evidence-verified output reducer, and suggested follow-ups. Shared by
 // ChatScreen.tsx and (via lib/agentLoop) CoderScreen.tsx.
 
-import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta } from '../types';
+import type { ChatMessage, ChatParams, ChatAttachment, MessageMeta, StructuredOutput } from '../types';
 import { API_BASE, getJSON, postJSON, fetchStream, isAbortError } from './core';
 import type { CoderMemory, CoderLearningKind } from './coder';
 import { setLatestRequestMetrics } from '../liveMetrics';
@@ -11,6 +11,46 @@ import { getStatus } from './config';
 
 // ---------------------------------------------------------------------------
 // Streaming chat over OpenAI-compatible /v1/chat/completions (SSE)
+
+/** Map a conversation's structured-output setting onto engine request fields.
+ *
+ *  JSON mode and JSON Schema use the standard `response_format`; GBNF, choice
+ *  and regex use NInfer's `structured_outputs` extension. Only one constraint is
+ *  ever emitted, and a constraint whose text is unusable is dropped rather than
+ *  sent (the composer flags it inline) so a malformed schema cannot silently
+ *  change what the engine is asked to guarantee. */
+export function structuredOutputFields(so: StructuredOutput | undefined): Record<string, unknown> {
+  if (!so) return {};
+  switch (so.mode) {
+    case 'json_object':
+      return { response_format: { type: 'json_object' } };
+    case 'json_schema': {
+      let schema: unknown;
+      try {
+        schema = JSON.parse(so.schema || '');
+      } catch {
+        return {};
+      }
+      if (schema === null || typeof schema !== 'object') return {};
+      return {
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: so.name?.trim() || 'response',
+            schema,
+            ...(so.strict ? { strict: true } : {}),
+          },
+        },
+      };
+    }
+    case 'grammar':
+      return so.grammar.trim() ? { structured_outputs: { grammar: so.grammar } } : {};
+    case 'choice':
+      return so.choices.length > 0 ? { structured_outputs: { choice: so.choices } } : {};
+    case 'regex':
+      return { structured_outputs: { regex: so.pattern } };
+  }
+}
 // ---------------------------------------------------------------------------
 export interface ChatStreamCallbacks {
   onReasoningDelta?: (text: string) => void;
@@ -150,6 +190,15 @@ export function buildChatRequest(
   if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
   if (params.frequencyPenalty !== undefined) body.frequency_penalty = params.frequencyPenalty;
   if (params.seed !== undefined) body.seed = params.seed;
+  // Constrained decoding: the explicit composer control wins over anything a
+  // caller put in `extra`.
+  Object.assign(body, structuredOutputFields(params.structuredOutput));
+  // Tool constraints only apply to requests that actually carry tools. `basic`
+  // is the engine default, so only an explicit opt-out needs to be sent.
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    if (params.toolConstraints === 'auto') body.tool_constraints = 'auto';
+    if (params.parallelToolCalls === false) body.parallel_tool_calls = false;
+  }
   return body;
 }
 

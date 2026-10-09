@@ -175,34 +175,8 @@ pub fn build_serve_args(p: &EngineProfile, port: u16) -> Vec<String> {
     );
     kv(
         &mut a,
-        "--host-state-slots",
-        &p.host_state_slots
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    kv(
-        &mut a,
-        "--host-kv-mib",
-        &p.host_kv_mib.map(|v| v.to_string()).unwrap_or_default(),
-    );
-    kv(
-        &mut a,
-        "--max-private-continuations",
-        &p.max_private_continuations
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    kv(
-        &mut a,
-        "--max-shared-prefixes",
-        &p.max_shared_prefixes
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-    );
-    kv(
-        &mut a,
-        "--max-long-anchors-per-continuation",
-        &p.max_long_anchors_per_continuation
+        "--host-context-mib",
+        &p.host_context_mib
             .map(|v| v.to_string())
             .unwrap_or_default(),
     );

@@ -52,3 +52,16 @@ export interface LogResponse {
 export function getLogs(n = 400): Promise<LogResponse> {
   return getJSON<LogResponse>(`/api/logs?n=${encodeURIComponent(n)}`, 6000);
 }
+
+export interface EngineMetricsResult {
+  ok: boolean;
+  port?: number;
+  /** Raw Prometheus text-format 0.0.4 payload from the engine's `GET /metrics`. */
+  metrics?: string;
+  message?: string;
+}
+
+/** Live engine metrics, proxied (and API-key authenticated) by the control plane. */
+export function getEngineMetrics(): Promise<EngineMetricsResult> {
+  return getJSON<EngineMetricsResult>('/api/engine/metrics', 6000);
+}

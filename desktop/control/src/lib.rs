@@ -179,6 +179,10 @@ pub fn build_router(state: S, restrict_to_local: bool) -> Router {
             post(routes_engine::engine_update_cancel),
         )
         .route("/api/engine/args", post(routes_engine::engine_args))
+        .route(
+            "/api/engine/metrics",
+            get(routes_engine::engine_metrics_route),
+        )
         .route("/api/gpu", get(routes_data::gpu))
         // Coding harness — control-plane endpoints
         .route(
