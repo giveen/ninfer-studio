@@ -183,12 +183,12 @@ pub(crate) async fn route_port(state: &S, body: &[u8]) -> Result<u16, String> {
 ///
 /// Returns the re-serialized body, or `None` if neither source applies / on any
 /// parse error.
-/// Merge generic request parameters and map/sanitize reasoning_effort.
 ///
-/// Local engines reject the top-level `reasoning_effort` parameter with
-/// "unknown parameter: reasoning_effort", so for local requests we strip
-/// `reasoning_effort` and map it to `enable_thinking`. For remote/cloud requests,
-/// we preserve `reasoning_effort`.
+/// The engine accepts the protocol-level top-level `reasoning_effort` and derives
+/// thinking mode from it (`none` disables thinking, every other level enables it),
+/// so a local request forwards the level verbatim instead of collapsing it to an
+/// `enable_thinking` boolean — keeping low/medium/high/xhigh granularity. Remote
+/// and cloud targets keep the level too, for models that support it.
 pub(crate) fn sanitize_and_merge_request_params(
     body: &[u8],
     defaults_json: &str,
@@ -200,7 +200,6 @@ pub(crate) fn sanitize_and_merge_request_params(
         return None;
     };
 
-    let client_had_re = body_map.contains_key("reasoning_effort");
     let client_re = body_map.remove("reasoning_effort").and_then(|v| v.as_str().map(str::to_string));
 
     // 1. generic top-level defaults (client fields win)
@@ -214,16 +213,16 @@ pub(crate) fn sanitize_and_merge_request_params(
 
     // 2. reasoning effort handling
     if is_local {
-        // Local engine rejects top-level reasoning_effort: map to enable_thinking boolean
-        let effort_str = client_re.as_deref().or_else(|| {
+        // The engine derives thinking mode from the level, so an explicit level is
+        // enough: it also overrides the server's thinking default. A dedicated
+        // setting wins over a generic default for this key.
+        let effort = client_re.or_else(|| {
             let re_trimmed = reasoning_effort.trim();
-            if !re_trimmed.is_empty() && !client_had_re { Some(re_trimmed) } else { None }
+            (!re_trimmed.is_empty()).then(|| re_trimmed.to_string())
         });
-        if let Some(e) = effort_str {
-            let enable = e != "none";
-            body_map.entry("enable_thinking".to_string()).or_insert(serde_json::Value::Bool(enable));
+        if let Some(e) = effort {
+            body_map.insert("reasoning_effort".to_string(), serde_json::Value::String(e));
         }
-        body_map.remove("reasoning_effort");
     } else if let Some(e) = client_re {
         // Cloud target: keep/restore reasoning_effort for models that support it
         body_map.insert("reasoning_effort".to_string(), serde_json::Value::String(e));
@@ -466,26 +465,38 @@ mod tests {
     fn test_merge_default_request_params_precedence() {
         let body = br#"{"model":"llama3","temperature":0.7}"#;
 
-        // Dedicated reasoning_effort sets enable_thinking and strips top-level reasoning_effort
+        // A dedicated reasoning_effort forwards the level verbatim; the engine derives
+        // thinking mode from it, so no enable_thinking injection is needed.
         let res = sanitize_and_merge_request_params(body, "", "high", true).unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
-        assert_eq!(val["enable_thinking"], true);
-        assert!(val.get("reasoning_effort").is_none());
+        assert_eq!(val["reasoning_effort"], "high");
+        assert!(val.get("enable_thinking").is_none());
 
-        // Generic default merges non-conflicting fields
+        // Generic default merges non-conflicting fields, and the dedicated setting
+        // overrides the generic default for the same key.
         let defaults = r#"{"top_p":0.9,"reasoning_effort":"low"}"#;
         let res2 = sanitize_and_merge_request_params(body, defaults, "high", true).unwrap();
         let val2: Value = serde_json::from_slice(&res2).unwrap();
         assert_eq!(val2["top_p"], 0.9);
         assert_eq!(val2["temperature"], 0.7);
-        assert_eq!(val2["enable_thinking"], true);
-        assert!(val2.get("reasoning_effort").is_none());
+        assert_eq!(val2["reasoning_effort"], "high");
 
-        // Client explicit body strips top-level reasoning_effort before passing to local engine
+        // A client-supplied level wins over both the generic default and the setting.
         let client_re_body = br#"{"model":"llama3","reasoning_effort":"medium"}"#;
         let res3 = sanitize_and_merge_request_params(client_re_body, defaults, "high", true).unwrap();
         let val3: Value = serde_json::from_slice(&res3).unwrap();
-        assert!(val3.get("reasoning_effort").is_none());
+        assert_eq!(val3["reasoning_effort"], "medium");
+
+        // With no client level and no dedicated setting, a generic default survives.
+        let res4 = sanitize_and_merge_request_params(body, defaults, "", true).unwrap();
+        let val4: Value = serde_json::from_slice(&res4).unwrap();
+        assert_eq!(val4["reasoning_effort"], "low");
+
+        // With neither, the key stays absent and the engine default applies.
+        let res5 = sanitize_and_merge_request_params(body, "", "", true).unwrap();
+        let val5: Value = serde_json::from_slice(&res5).unwrap();
+        assert!(val5.get("reasoning_effort").is_none());
+        assert!(val5.get("enable_thinking").is_none());
     }
 
     #[test]
@@ -493,12 +504,11 @@ mod tests {
         let body = br#"{"model":"llama3"}"#;
         let bad_defaults = "{ invalid json ";
 
-        // Malformed default_request_params logs warning but doesn't abort enable_thinking injection
+        // Malformed default_request_params logs a warning but doesn't abort effort injection
         let res = sanitize_and_merge_request_params(body, bad_defaults, "medium", true).unwrap();
         let val: Value = serde_json::from_slice(&res).unwrap();
         assert_eq!(val["model"], "llama3");
-        assert_eq!(val["enable_thinking"], true);
-        assert!(val.get("reasoning_effort").is_none());
+        assert_eq!(val["reasoning_effort"], "medium");
     }
 }
 

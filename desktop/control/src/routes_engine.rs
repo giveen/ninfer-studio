@@ -3,8 +3,8 @@
 // Rust guideline compliant 2026-07-28
 
 use crate::engine::{
-    S, VRAM_FLOOR_GIB, discover_engines, engine_model_info, public_engine, refresh_engine_status,
-    start_engine, stop_engine,
+    S, VRAM_FLOOR_GIB, discover_engines, engine_metrics, engine_model_info, public_engine,
+    refresh_engine_status, start_engine, stop_engine,
 };
 use crate::gpu::{gpu_stats, gpu_value};
 use crate::models::{downloads_public, list_models};
@@ -287,11 +287,20 @@ pub(crate) async fn engine_args(
 
     // Mirror of the UI's dirty rule: only meaningful for a matching port, and
     // an unreadable argv (adopted external engine) must never read as "changed".
+    // `NINFER_CUDA_SYNC` is a spawn environment variable rather than an argv entry,
+    // so it is compared against the recorded start profile instead.
+    let cuda_sync_changed = {
+        let last = state.last_start.read().await;
+        last.as_ref()
+            .map(|ls| ls.profile.cuda_sync != profile.cuda_sync)
+            .unwrap_or(false)
+    };
     let dirty = if running && port_match {
         match running_args.as_deref().filter(|a| !a.is_empty()) {
             Some(ra) => {
                 let running_artifact = extract_artifact(ra);
-                !args_equal(ra, &form)
+                cuda_sync_changed
+                    || !args_equal(ra, &form)
                     || base_name(&artifact) != base_name(running_artifact.unwrap_or(""))
             }
             None => {
@@ -304,7 +313,9 @@ pub(crate) async fn engine_args(
                             Some(artifact.as_str())
                         };
                         let running_form = build_serve_args(&ls.profile, ls.port);
-                        ls.artifact.as_deref() != art_opt || !args_equal(&running_form, &form)
+                        cuda_sync_changed
+                            || ls.artifact.as_deref() != art_opt
+                            || !args_equal(&running_form, &form)
                     }
                     None => false,
                 }
@@ -336,6 +347,24 @@ pub(crate) async fn engine_args(
     }
 
     Ok(Json(res))
+}
+
+/// Live engine metrics (Prometheus text, parsed by the web UI).
+///
+/// Returns `{ ok: false }` when no engine is reachable on the active port so the
+/// panel can distinguish "engine down" from "engine up, not yet scraped".
+pub(crate) async fn engine_metrics_route(AxumState(state): AxumState<S>) -> Json<Value> {
+    let port = {
+        let eng = state.engine.read().await;
+        eng.port
+    };
+    let Some(port) = port else {
+        return Json(json!({ "ok": false, "message": "engine is not running" }));
+    };
+    match engine_metrics(&state, port).await {
+        Some(text) => Json(json!({ "ok": true, "port": port, "metrics": text })),
+        None => Json(json!({ "ok": false, "message": "engine /metrics is not reachable" })),
+    }
 }
 
 pub(crate) async fn engine_stop(

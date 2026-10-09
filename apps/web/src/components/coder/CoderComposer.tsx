@@ -25,6 +25,10 @@ export interface CoderParams {
   seed?: number;
   criticModel?: string;
   promptCache?: boolean;
+  /** Engine tool-constraint mode; `auto` opts out of the default basic structural constraints. */
+  toolConstraints?: 'basic' | 'auto';
+  /** Ask the engine for at most one tool call per turn. */
+  parallelToolCalls?: boolean;
   humanize?: boolean;
   voiceProfile?: string;
   reviewLens?: string;
@@ -291,6 +295,20 @@ export const CoderComposer: React.FC<CoderComposerProps> = ({
             </label>
             <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Mark the system prompt with cache_control so the engine can cache it across turns (prefix caching). Only enable if your engine supports it.">
               <Toggle checked={!!coderParams.promptCache} onChange={(v: boolean) => setCoderParams({ ...coderParams, promptCache: v })} /> prompt cache
+            </label>
+            <label className="flex items-center gap-1.5 text-[12px] text-mute" title="Engine tool-constraint mode. 'basic' (default) enforces tool framing and declared function names; 'auto' uses request-driven constraints, which keeps custom stop strings and free-form parameters usable with tools.">
+              tool constraints
+              <SelectField
+                value={coderParams.toolConstraints || 'basic'}
+                onChange={(v: string) => setCoderParams({ ...coderParams, toolConstraints: v as CoderParams['toolConstraints'] })}
+                options={[
+                  { value: 'basic', label: 'basic (default)' },
+                  { value: 'auto', label: 'auto' },
+                ]}
+              />
+            </label>
+            <label className="flex items-center gap-1.5 text-[12px] text-mute" title="On (default) the model may emit several tool calls in one turn; off asks the engine for at most one call per turn.">
+              <Toggle checked={coderParams.parallelToolCalls !== false} onChange={(v: boolean) => setCoderParams({ ...coderParams, parallelToolCalls: v })} /> parallel tool calls
             </label>
             <label className="flex items-center gap-1.5 text-[12px] text-mute">
               temp <NumberField value={coderParams.temperature ?? null} onChange={(v: number) => setCoderParams({ ...coderParams, temperature: v })} onEmpty={() => setCoderParams({ ...coderParams, temperature: undefined })} empty />

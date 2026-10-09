@@ -2,7 +2,41 @@
 // and permission-tier types that gate which of them a given run/subagent may
 // use. Pure data + predicates — no UI, no closure state.
 
-export const TOOLS = [
+/** One OpenAI-style function tool declaration. */
+export interface CoderTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: {
+      type: string;
+      /** Closed-object marker required by NInfer's strict tool contract. */
+      additionalProperties?: boolean;
+      [key: string]: unknown;
+    };
+    strict?: boolean;
+  };
+}
+
+/** Opt a built-in tool into NInfer's strict argument contract.
+ *
+ *  Strict tools must reduce to a closed object root (`additionalProperties:
+ *  false`); in exchange the engine constrains the generated arguments against
+ *  the declared properties. External MCP tools are deliberately NOT passed
+ *  through here: their schemas come from arbitrary third-party servers and may
+ *  use assertions NInfer rejects with HTTP 400. */
+export function withStrictSchema(tool: CoderTool): CoderTool {
+  return {
+    ...tool,
+    function: {
+      ...tool.function,
+      parameters: { ...tool.function.parameters, additionalProperties: false },
+      strict: true,
+    },
+  };
+}
+
+const RAW_TOOLS: CoderTool[] = [
   {
     type: "function",
     function: {
@@ -434,6 +468,9 @@ export const TOOLS = [
   }
 ];
 
+/** Built-in tool declarations sent to the engine, all in strict mode. */
+export const TOOLS: CoderTool[] = RAW_TOOLS.map(withStrictSchema);
+
 export type PermTier = 'allow' | 'ask' | 'deny';
 export interface PermConfig { tools: Record<string, PermTier>; denyPaths: string[]; approvedCommands?: string[]; }
 export const DEFAULT_PERMS: PermConfig = { tools: {}, denyPaths: [] };
@@ -551,16 +588,15 @@ export function mcpToolTier(perms: PermConfig, name: string): PermTier {
 }
 
 /** An LLM tool schema for one MCP catalog entry (same shape as TOOLS). */
-export function mcpToolSchema(t: { name: string; description: string; parameters: Record<string, unknown> }): {
-  type: 'function';
-  function: { name: string; description: string; parameters: Record<string, unknown> };
-} {
+export function mcpToolSchema(t: { name: string; description: string; parameters: Record<string, unknown> }): CoderTool {
   return {
     type: 'function',
     function: {
       name: t.name,
       description: t.description || `MCP tool ${t.name}`,
-      parameters: t.parameters && typeof t.parameters === 'object' ? t.parameters : { type: 'object', properties: {} },
+      parameters: (t.parameters && typeof t.parameters === 'object'
+        ? t.parameters
+        : { type: 'object', properties: {} }) as CoderTool['function']['parameters'],
     },
   };
 }

@@ -122,6 +122,58 @@ pub async fn engine_model_info_with_key(
     (model, max_context)
 }
 
+/// Fetch the engine's Prometheus `/metrics` payload as text.
+///
+/// The control plane is a thin authenticated passthrough here: the Engine owns
+/// the metric vocabulary, so the text is returned unparsed and the web UI
+/// renders whatever families the running build publishes.
+pub async fn engine_metrics(state: &State, port: u16) -> Option<String> {
+    let api_key = state.config.read().await.api_key.clone();
+    let api_key_opt = if api_key.is_empty() {
+        None
+    } else {
+        Some(api_key.as_str())
+    };
+    engine_metrics_with_key(port, api_key_opt).await
+}
+
+/// Fetch `/metrics` with an optional Bearer API key.
+pub async fn engine_metrics_with_key(port: u16, api_key: Option<&str>) -> Option<String> {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(ENGINE_PROBE_TIMEOUT_MS))
+        .build()
+    else {
+        tracing::error!("Failed to build reqwest HTTP client for engine metrics probe");
+        return None;
+    };
+    let mut req = client.get(format!("http://127.0.0.1:{port}/metrics"));
+    if let Some(key) = api_key
+        && !key.is_empty() {
+            req = req.bearer_auth(key);
+        }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => match r.text().await {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(port, error = %err, "Failed to read engine /metrics body");
+                None
+            }
+        },
+        Ok(r) => {
+            tracing::warn!(
+                port,
+                status = %r.status(),
+                "Engine /metrics probe returned non-success status code"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::debug!(port, error = %err, "Engine /metrics probe request failed");
+            None
+        }
+    }
+}
+
 /// Parse context size string with unit suffixes (e.g., "240k" -> 245,760, "1m" -> 1,048,576).
 fn parse_context_val(val: &str) -> Option<u64> {
     let val_trimmed = val.trim();
@@ -258,5 +310,38 @@ mod health_tests {
         let (model, max_len) = engine_model_info_with_key(port, Some("secret123")).await;
         assert_eq!(model, Some("qwen2.5-coder".to_string()));
         assert_eq!(max_len, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_probe_is_authenticated_and_returns_raw_text() {
+        const BODY: &str = "# HELP ninfer_engine_ready Engine readiness.\n\
+                            # TYPE ninfer_engine_ready gauge\n\
+                            ninfer_engine_ready 1\n";
+
+        async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
+            if headers
+                .get("authorization")
+                .is_some_and(|a| a == "Bearer secret123")
+            {
+                return (StatusCode::OK, BODY);
+            }
+            (StatusCode::UNAUTHORIZED, "")
+        }
+
+        let app = Router::new().route("/metrics", get(metrics_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        assert!(engine_metrics_with_key(port, None).await.is_none());
+        assert!(engine_metrics_with_key(port, Some("wrong")).await.is_none());
+        assert_eq!(
+            engine_metrics_with_key(port, Some("secret123"))
+                .await
+                .as_deref(),
+            Some(BODY)
+        );
     }
 }

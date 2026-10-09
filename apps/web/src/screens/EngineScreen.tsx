@@ -14,9 +14,10 @@ import { PerformanceTab } from './engine/PerformanceTab';
 import { AdvancedTab } from './engine/AdvancedTab';
 import { ProfilesTab } from './engine/ProfilesTab';
 import { UsageTrackerTab } from './engine/UsageTrackerTab';
+import { MetricsTab } from './engine/MetricsTab';
 import { CloudTab } from './engine/CloudTab';
 
-type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage' | 'cloud';
+type EngineTab = 'basics' | 'performance' | 'advanced' | 'profiles' | 'usage' | 'cloud' | 'metrics';
 
 export type EngineNotice = { tone: 'ok' | 'warn' | 'danger'; text: string };
 
@@ -27,6 +28,7 @@ const TABS: Array<{ id: EngineTab; label: string }> = [
   { id: 'profiles', label: 'Profiles' },
   { id: 'cloud', label: 'Cloud' },
   { id: 'usage', label: 'Usage' },
+  { id: 'metrics', label: 'Metrics' },
 ];
 
 const DEFAULT_PRESET = PRESETS.find((p) => p.id === 'default') ?? PRESETS[0];
@@ -561,6 +563,9 @@ export function EngineScreen({ status }: { status: StatusPayload | null }) {
         </div>
         <div role="tabpanel" id="panel-usage" aria-labelledby="tab-usage" className={cn(tab !== 'usage' && 'hidden')}>
           <UsageTrackerTab active={tab === 'usage'} />
+        </div>
+        <div role="tabpanel" id="panel-metrics" aria-labelledby="tab-metrics" className={cn(tab !== 'metrics' && 'hidden')}>
+          <MetricsTab active={tab === 'metrics'} />
         </div>
 
       </div>

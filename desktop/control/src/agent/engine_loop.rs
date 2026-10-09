@@ -242,10 +242,11 @@ pub fn build_request(
     if let Some(b) = enable_thinking {
         body["enable_thinking"] = json!(b);
     }
-    if cache_system
-        && let Some(e) = &effort {
-            body["reasoning_effort"] = json!(e);
-        }
+    // The engine accepts the protocol-level top-level reasoning_effort and derives
+    // thinking mode from it, so local and cloud requests send the level alike.
+    if let Some(e) = &effort {
+        body["reasoning_effort"] = json!(e);
+    }
     if let Some(p) = params.get("preserveThinking").filter(|v| !v.is_null()) {
         body["preserve_thinking"] = p.clone();
     }
@@ -1755,10 +1756,12 @@ mod tests {
         assert_eq!(req["messages"][2]["role"], "assistant");
         assert_eq!(req["messages"][2]["reasoning_content"], "hmm");
 
-        // local request (cache_system = false) strips top-level reasoning_effort
+        // local request (cache_system = false) still carries the effort level; only the
+        // system-message cache_control marker is cloud-only
         let req_local = build_request("m", Some("SYS"), &msgs, &params, &tools, false);
         assert_eq!(req_local["enable_thinking"], true);
-        assert!(req_local.get("reasoning_effort").is_none() || req_local["reasoning_effort"].is_null());
+        assert_eq!(req_local["reasoning_effort"], "high");
+        assert_eq!(req_local["messages"][0]["content"], "SYS");
         // system messages inside the transcript are skipped
         let msgs2 = vec![
             json!({ "role": "system", "content": "OLD" }),

@@ -1,5 +1,5 @@
 import { Gauge, Layers3, Zap } from 'lucide-react';
-import { Field, NumberField, SectionCard, Segmented, SelectField, Toggle, cn } from '../../components/ui';
+import { Field, NumberField, SectionCard, Segmented, SelectField, Toggle } from '../../components/ui';
 import { KV_DTYPE_OPTIONS } from '../../lib/presets';
 import type { AppSettings, EngineProfile } from '../../lib/types';
 
@@ -105,34 +105,21 @@ export function PerformanceTab({ profile, set, setU, settings, onReasoningEffort
         </div>
       </SectionCard>
 
-      <SectionCard title="KV cache & context cache" description="KV pool storage format, plus device/host checkpoint tiers for long-context reuse." icon={<Layers3 size={15} />} collapsible>
+      <SectionCard title="KV cache & context cache" description="KV pool storage format, plus the Device checkpoint tier and the shared Host budget for long-context reuse." icon={<Layers3 size={15} />} collapsible>
         <div className="space-y-4">
           <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
             <Field label="KV dtype" hint="KV-cache storage: bf16, int8, fp8, nvfp4, or k8v4 (INT8 group-64 KV is the published benchmark format).">
               <Segmented value={(profile.kvDtype as string) || 'bf16'} onChange={(v) => set('kvDtype', v as EngineProfile['kvDtype'])} options={[...KV_DTYPE_OPTIONS]} />
             </Field>
-            <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse" hint="Root-only Engine mode. Cannot be combined with explicit context-cache capacity flags." />
+            <Toggle checked={!!profile.noPrefixReuse} onChange={(v) => set('noPrefixReuse', v)} label="Disable prefix reuse" hint="Disables cross-request history reads and writes. Request pause/replay recovery remains available, and the capacity fields below stay valid." />
             <Toggle checked={!!profile.noCudaGraph} onChange={(v) => set('noCudaGraph', v)} label="Disable CUDA Graph decode" hint="Decode uses eager kernel launches instead of captured graphs." />
           </div>
-          {profile.noPrefixReuse && <p className="text-[12px] text-warn">Prefix reuse disabled: the context-cache tier options below are unavailable and will not be sent.</p>}
-          <div className={cn(grid3, profile.noPrefixReuse && 'pointer-events-none opacity-40')}>
-            <Field label="Device state slots" hint="Extra Device checkpoint StateImages beyond the active-lane guarantee (default = max-concurrency).">
+          <div className={grid3}>
+            <Field label="Device state slots" hint="Extra Device StateImages beyond max-concurrency. Total Device capacity is max-concurrency plus this (default = max-concurrency).">
               <NumberField value={profile.deviceStateSlots ?? null} onChange={(v) => set('deviceStateSlots', v)} onEmpty={() => setU('deviceStateSlots', undefined)} min={0} placeholder="= C" />
             </Field>
-            <Field label="Host state slots" hint="Pinned Host StateImage capacity for inactive continuations under Device pressure.">
-              <NumberField value={profile.hostStateSlots ?? null} onChange={(v) => set('hostStateSlots', v)} onEmpty={() => setU('hostStateSlots', undefined)} min={0} placeholder="8" />
-            </Field>
-            <Field label="Host KV (MiB)" hint="Shared pinned Host Main/Backend KV capacity beyond active StateImages.">
-              <NumberField value={profile.hostKvMib ?? null} onChange={(v) => set('hostKvMib', v)} onEmpty={() => setU('hostKvMib', undefined)} min={0} step={512} placeholder="8192" />
-            </Field>
-            <Field label="Max private continuations" hint="Private continuation descriptor capacity (default 2 × max-concurrency).">
-              <NumberField value={profile.maxPrivateContinuations ?? null} onChange={(v) => set('maxPrivateContinuations', v)} onEmpty={() => setU('maxPrivateContinuations', undefined)} min={0} placeholder="auto" />
-            </Field>
-            <Field label="Max shared prefixes" hint="Engine-wide shared stable-prefix descriptor capacity (default max(C, 4)).">
-              <NumberField value={profile.maxSharedPrefixes ?? null} onChange={(v) => set('maxSharedPrefixes', v)} onEmpty={() => setU('maxSharedPrefixes', undefined)} min={0} placeholder="auto" />
-            </Field>
-            <Field label="Long anchors / continuation" hint="Private long-anchor limit per continuation (default 2).">
-              <NumberField value={profile.maxLongAnchorsPerContinuation ?? null} onChange={(v) => set('maxLongAnchorsPerContinuation', v)} onEmpty={() => setU('maxLongAnchorsPerContinuation', undefined)} min={0} placeholder="2" />
+            <Field label="Host context (MiB)" hint="Shared pinned Host budget for StateImages, Main/Backend KV and pause snapshots, including in-flight destinations. 0 disables Host context backing; decimals resolving to whole bytes are accepted. Default: 8192 MiB plus eight native StateImages.">
+              <NumberField value={profile.hostContextMib ?? null} onChange={(v) => set('hostContextMib', v)} onEmpty={() => setU('hostContextMib', undefined)} min={0} step={512} placeholder="8192" />
             </Field>
           </div>
         </div>

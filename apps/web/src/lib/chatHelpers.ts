@@ -6,7 +6,7 @@ import { frameCompactedSummary } from './api';
 import { effectiveSystemPrompt } from './notai';
 import type { ChatMessage, ChatParams, Conversation, AppSettings } from './types';
 import type { CoderMemory } from './api/coder';
-import { TOOLS, mcpToolTier, type PermConfig } from './coderTools';
+import { TOOLS, mcpToolTier, withStrictSchema, type CoderTool, type PermConfig } from './coderTools';
 
 // Build the model context for a conversation. When compacted, prepend the summary
 // as leading context and keep only the messages added after compaction; the full
@@ -131,7 +131,7 @@ export const chatSystemWithCapabilities = (params: Parameters<typeof effectiveSy
   return [base, CHAT_CAPABILITIES, toolsAvailableBlock(toolNames ?? []), memoryBlock(memory), computerUseBlock(computerUseDir ?? '')].filter(Boolean).join('\n\n');
 };
 
-export const CHAT_TOOLS = [
+const RAW_CHAT_TOOLS: CoderTool[] = [
   {
     type: "function",
     function: {
@@ -158,11 +158,14 @@ export const CHAT_TOOLS = [
   }
 ];
 
+/** Built-in Chat tools (web_fetch, web_search), all in strict mode. */
+export const CHAT_TOOLS = RAW_CHAT_TOOLS.map(withStrictSchema);
+
 /** Agent Mode "research" tier adds this on top of CHAT_TOOLS — same schema
  *  as Coder's `browser` tool (coderTools.ts), workspace-independent (runs a
  *  sandboxed headless browser session, never touches the host filesystem),
  *  so it's safe to offer in Chat with no permission-tier gating. */
-export const CHAT_BROWSER_TOOL = {
+export const CHAT_BROWSER_TOOL = withStrictSchema({
   type: "function",
   function: {
     name: "browser",
@@ -182,12 +185,12 @@ export const CHAT_BROWSER_TOOL = {
       required: ["action"]
     }
   }
-};
+});
 
 /** Memory toggle adds this tool — exact schema copy of Coder's `memory_update`
  *  (coderTools.ts), routed by ChatScreen's registry to the global chat store
  *  (/api/chat/memory) instead of the per-workspace coder one. */
-export const CHAT_MEMORY_TOOL = {
+export const CHAT_MEMORY_TOOL = withStrictSchema({
   type: "function",
   function: {
     name: "memory_update",
@@ -201,14 +204,14 @@ export const CHAT_MEMORY_TOOL = {
       required: ["text", "kind"]
     }
   }
-};
+});
 
 /** Computer Use defaults to the OS temp dir (see `AppSettings::default` in
  *  the control plane) so it's useful the instant it's switched on — this
  *  tool is how the model honors "do that in my home folder instead"
  *  mid-conversation rather than requiring a trip to Settings. Takes effect
  *  immediately, including for later tool calls in the same turn. */
-export const CHAT_SET_DIRECTORY_TOOL = {
+export const CHAT_SET_DIRECTORY_TOOL = withStrictSchema({
   type: "function",
   function: {
     name: "set_directory",
@@ -219,7 +222,7 @@ export const CHAT_SET_DIRECTORY_TOOL = {
       required: ["path"]
     }
   }
-};
+});
 
 /** Computer Use's tool permission template: full parity with Coder's own
  *  Safety & Permissions grid (same TOOLS list) plus `set_directory`, which

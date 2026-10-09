@@ -207,11 +207,9 @@ export interface EngineProfile {
   kvDtype?: 'bf16' | 'int8' | 'fp8' | 'nvfp4' | 'k8v4';
   noPrefixReuse?: boolean;
   deviceStateSlots?: number;
-  hostStateSlots?: number;
-  hostKvMib?: number;
-  maxPrivateContinuations?: number;
-  maxSharedPrefixes?: number;
-  maxLongAnchorsPerContinuation?: number;
+  /** Shared pinned Host budget (MiB) for StateImages, KV and pause snapshots.
+   *  0 disables Host context backing; unset means 8192 MiB + 8 native StateImages. */
+  hostContextMib?: number;
 
   // speculative decoding
   spec?: '' | 'mtp' | 'dflash' | 'dflash2';
@@ -245,6 +243,8 @@ export interface EngineProfile {
   contextCostPresets?: string;
   cors?: boolean;
   noCudaGraph?: boolean;
+  /** NINFER_CUDA_SYNC for the engine process; unset uses the engine's `spin` default. */
+  cudaSync?: 'spin' | 'blocking' | 'yield' | 'auto';
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +332,20 @@ export interface Conversation {
   messages: ChatMessage[];
 }
 
+/** Output constraint applied to a conversation's requests.
+ *
+ *  Mirrors the engine's constrained-decoding contract: the JSON modes use the
+ *  standard `response_format` field, while grammar/choice/regex use NInfer's
+ *  `structured_outputs` extension. Exactly one constraint may be active, the
+ *  constraint applies to answer content (thinking is unaffected), and
+ *  grammar/choice/regex require tools to be off and reject custom stop strings. */
+export type StructuredOutput =
+  | { mode: 'json_object' }
+  | { mode: 'json_schema'; name: string; schema: string; strict?: boolean }
+  | { mode: 'grammar'; grammar: string }
+  | { mode: 'choice'; choices: string[] }
+  | { mode: 'regex'; pattern: string };
+
 export interface ChatParams {
   systemPrompt?: string;
   /** When on, inject the Not-Ai editorial contract so replies read like a real
@@ -355,6 +369,13 @@ export interface ChatParams {
   frequencyPenalty?: number;
   seed?: number;
   greedy?: boolean;
+  /** Structured/constrained output constraint for this conversation. Undefined = free text. */
+  structuredOutput?: StructuredOutput;
+  /** Tool-constraint mode when tools are present. `auto` opts out of the engine's
+   *  default `basic` structural constraints and uses request-driven generation. */
+  toolConstraints?: 'basic' | 'auto';
+  /** `false` asks the engine for at most one tool call per turn. */
+  parallelToolCalls?: boolean;
   primaryProvider?: 'ninfer' | 'cloud';
   primaryCloudModel?: string;
   subagentProvider?: 'ninfer' | 'cloud';

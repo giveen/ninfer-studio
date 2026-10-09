@@ -3,7 +3,7 @@
 
 import { useState } from 'react';
 import { Gauge, Save, X } from 'lucide-react';
-import type { ChatParams, SavedChatParams, AppSettings } from '../lib/types';
+import type { ChatParams, SavedChatParams, AppSettings, StructuredOutput } from '../lib/types';
 import { VOICE_PROFILES, type VoiceProfile } from '../lib/notai';
 import { formatTokens } from '../lib/format';
 import { DEFAULT_PARAMS } from '../lib/chatHelpers';
@@ -12,6 +12,36 @@ import { Button, cn, NumberField, SelectField, Toggle } from './ui';
 // ---------------------------------------------------------------------------
 // Composer parameter popover
 // ---------------------------------------------------------------------------
+
+type StructuredOutputMode = StructuredOutput['mode'];
+
+/** Seed value for a newly selected constraint mode, so the editor never opens empty. */
+function defaultStructuredOutput(mode: StructuredOutputMode): StructuredOutput {
+  switch (mode) {
+    case 'json_object':
+      return { mode: 'json_object' };
+    case 'json_schema':
+      return {
+        mode: 'json_schema',
+        name: 'response',
+        schema: '{\n  "type": "object",\n  "properties": {},\n  "additionalProperties": false\n}',
+      };
+    case 'grammar':
+      return { mode: 'grammar', grammar: 'root ::= "yes" | "no"' };
+    case 'choice':
+      return { mode: 'choice', choices: ['positive', 'neutral', 'negative'] };
+    case 'regex':
+      return { mode: 'regex', pattern: '(BUG|TASK)-[0-9]{4}' };
+  }
+}
+
+/** A blank line in the choice editor is a real candidate (an empty string permits
+ *  empty content); only the newline that ends the last line is dropped. */
+function choicesFromText(text: string): string[] {
+  const lines = text.split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
 export function ParamsPopover({
   params,
   setParams,
@@ -39,7 +69,23 @@ export function ParamsPopover({
   const row = 'grid grid-cols-[150px_1fr] items-center gap-3';
   const lab = 'text-[12px] text-mute';
   const num = 'w-24';
+  const fieldCls =
+    'w-full rounded-lg border border-line bg-inset px-2.5 py-2 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none';
   const [presetName, setPresetName] = useState('');
+  const so = params.structuredOutput;
+  // A schema the engine cannot parse is never sent (see structuredOutputFields);
+  // surface that here rather than letting the constraint silently disappear.
+  const schemaError =
+    so?.mode === 'json_schema' && so.schema.trim()
+      ? (() => {
+          try {
+            JSON.parse(so.schema);
+            return null;
+          } catch (e) {
+            return (e as Error).message;
+          }
+        })()
+      : null;
   return (
     <div className="w-[430px] rounded-xl border border-line bg-panel p-4 shadow-2xl">
       <div className="space-y-3.5">
@@ -233,6 +279,96 @@ export function ParamsPopover({
             placeholder="optional system instructions"
             className="w-full resize-y rounded-lg border border-line bg-inset px-2.5 py-2 text-[12.5px] text-ink placeholder:text-faint focus:border-accent/50 focus:outline-none"
           />
+        </div>
+        <div className="h-px bg-line" />
+        <div className="space-y-2">
+          <div className={row}>
+            <span className={lab}>Structured output</span>
+            <SelectField
+              value={so?.mode || ''}
+              onChange={(v) => set({ structuredOutput: v ? defaultStructuredOutput(v as StructuredOutputMode) : undefined })}
+              options={[
+                { value: '', label: 'off (free text)' },
+                { value: 'json_object', label: 'JSON object' },
+                { value: 'json_schema', label: 'JSON schema' },
+                { value: 'grammar', label: 'GBNF grammar' },
+                { value: 'choice', label: 'Choice (one literal)' },
+                { value: 'regex', label: 'Regex (whole answer)' },
+              ]}
+            />
+          </div>
+          {so?.mode === 'json_schema' && (
+            <>
+              <div className={row}>
+                <span className={lab}>Schema name</span>
+                <input
+                  value={so.name}
+                  onChange={(e) => set({ structuredOutput: { ...so, name: e.target.value } })}
+                  placeholder="response"
+                  className={fieldCls}
+                />
+              </div>
+              <textarea
+                value={so.schema}
+                onChange={(e) => set({ structuredOutput: { ...so, schema: e.target.value } })}
+                rows={5}
+                spellCheck={false}
+                placeholder='{"type":"object","properties":{...}}'
+                className={`${fieldCls} resize-y font-mono`}
+              />
+              {schemaError ? (
+                <p className="text-[11.5px] text-danger">
+                  Invalid JSON schema ({schemaError}). No constraint is sent until it parses.
+                </p>
+              ) : (
+                <div className={row}>
+                  <span className={lab} />
+                  <Toggle
+                    checked={!!so.strict}
+                    onChange={(v) => set({ structuredOutput: { ...so, strict: v } })}
+                    label="strict"
+                    hint="Also enforce the schema's assertion subset; the engine rejects unsupported assertions with HTTP 400."
+                  />
+                </div>
+              )}
+            </>
+          )}
+          {so?.mode === 'grammar' && (
+            <textarea
+              value={so.grammar}
+              onChange={(e) => set({ structuredOutput: { mode: 'grammar', grammar: e.target.value } })}
+              rows={5}
+              spellCheck={false}
+              placeholder={'root ::= "yes" | "no"'}
+              className={`${fieldCls} resize-y font-mono`}
+            />
+          )}
+          {so?.mode === 'choice' && (
+            <textarea
+              value={so.choices.join('\n')}
+              onChange={(e) => set({ structuredOutput: { mode: 'choice', choices: choicesFromText(e.target.value) } })}
+              rows={4}
+              spellCheck={false}
+              placeholder={'one candidate per line'}
+              className={`${fieldCls} resize-y font-mono`}
+            />
+          )}
+          {so?.mode === 'regex' && (
+            <input
+              value={so.pattern}
+              onChange={(e) => set({ structuredOutput: { mode: 'regex', pattern: e.target.value } })}
+              spellCheck={false}
+              placeholder="(BUG|TASK)-[0-9]{4}"
+              className={`${fieldCls} font-mono`}
+            />
+          )}
+          {so && (
+            <p className="text-[11.5px] text-faint">
+              Applied to answer content only; thinking is unaffected. GBNF, choice and regex are NInfer extensions (local
+              engine only) that require tools to be off and reject custom stop strings. The schema is not added to the
+              prompt — state the desired content in your message.
+            </p>
+          )}
         </div>
         <div className="h-px bg-line" />
         <div className="space-y-2">

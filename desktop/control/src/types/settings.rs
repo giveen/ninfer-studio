@@ -487,11 +487,10 @@ pub struct EngineProfile {
     pub kv_dtype: Option<String>,
     pub no_prefix_reuse: Option<bool>,
     pub device_state_slots: Option<u64>,
-    pub host_state_slots: Option<u64>,
-    pub host_kv_mib: Option<u64>,
-    pub max_private_continuations: Option<u64>,
-    pub max_shared_prefixes: Option<u64>,
-    pub max_long_anchors_per_continuation: Option<u64>,
+    /// Shared pinned Host budget (MiB) for StateImages, KV and pause snapshots,
+    /// including in-flight destinations. 0 disables Host context backing.
+    /// Engine default: 8192 MiB plus eight native StateImages.
+    pub host_context_mib: Option<u64>,
 
     // speculative decoding
     pub spec: Option<String>,
@@ -519,6 +518,9 @@ pub struct EngineProfile {
 
     // logging & misc
     pub log_level: Option<String>,
+    /// `NINFER_CUDA_SYNC` for the engine process: `spin` (engine default),
+    /// `blocking`, `yield`, or `auto`. Not a CLI flag — applied as spawn env.
+    pub cuda_sync: Option<String>,
     pub request_log_jsonl: Option<String>,
     pub response_store_max_records: Option<u64>,
     pub response_store_max_mib: Option<u64>,
@@ -549,14 +551,7 @@ impl fmt::Debug for EngineProfile {
             .field("kv_dtype", &self.kv_dtype)
             .field("no_prefix_reuse", &self.no_prefix_reuse)
             .field("device_state_slots", &self.device_state_slots)
-            .field("host_state_slots", &self.host_state_slots)
-            .field("host_kv_mib", &self.host_kv_mib)
-            .field("max_private_continuations", &self.max_private_continuations)
-            .field("max_shared_prefixes", &self.max_shared_prefixes)
-            .field(
-                "max_long_anchors_per_continuation",
-                &self.max_long_anchors_per_continuation,
-            )
+            .field("host_context_mib", &self.host_context_mib)
             .field("spec", &self.spec)
             .field("draft_tokens", &self.draft_tokens)
             .field("lm_head_draft", &self.lm_head_draft)
@@ -576,6 +571,7 @@ impl fmt::Debug for EngineProfile {
             .field("frequency_penalty", &self.frequency_penalty)
             .field("seed", &self.seed)
             .field("log_level", &self.log_level)
+            .field("cuda_sync", &self.cuda_sync)
             .field("request_log_jsonl", &self.request_log_jsonl)
             .field(
                 "response_store_max_records",
