@@ -268,7 +268,7 @@ and each platform uploads its artifact into it.
 Trigger a release by pushing a version tag:
 
 ```bash
-git tag v0.4.1 && git push origin v0.4.1
+git tag v0.4.2 && git push origin v0.4.2
 ```
 
 (or run the workflow manually from the Actions tab). Windows artifacts are currently
