@@ -173,10 +173,16 @@ async fn resolve_artifact(state: &S, port: u16, artifact: Option<String>) -> Res
     Ok(artifact)
 }
 
+/// The per-port engine log: the path (recorded into engine state for the UI)
+/// and the open handle the stdout/stderr pumps write into.
+struct EngineLog {
+    path: String,
+    file: tokio::fs::File,
+}
+
 /// Open (creating if needed) the per-port engine log file, rotating it first
-/// if it's grown too large. Returns the log path (recorded into engine state
-/// for the UI) and the open file handle for the stdout/stderr pumps.
-async fn open_engine_log(state: &S, port: u16) -> Result<(String, tokio::fs::File), Value> {
+/// if it's grown too large.
+async fn open_engine_log(state: &S, port: u16) -> Result<EngineLog, Value> {
     let log_file_path = log_path_for(&state.data_dir, port);
     let _ = tokio::fs::create_dir_all(&state.data_dir).await;
     rotate_log_if_large(&log_file_path).await;
@@ -191,7 +197,10 @@ async fn open_engine_log(state: &S, port: u16) -> Result<(String, tokio::fs::Fil
             let marker = format!("{}\n", super::log::ENGINE_START_MARKER);
             let _ = log.write_all(marker.as_bytes()).await;
             let _ = log.flush().await;
-            Ok((log_file_path, log))
+            Ok(EngineLog {
+                path: log_file_path,
+                file: log,
+            })
         }
         Err(_) => Err(json!({ "ok": false, "message": "could not open engine log file" })),
     }
@@ -208,8 +217,7 @@ async fn spawn_and_attach(
     args: &[String],
     port: u16,
     cuda_sync: Option<String>,
-    log_file_path: String,
-    log: tokio::fs::File,
+    log: EngineLog,
 ) -> Value {
     let epoch = {
         let mut eng = state.engine.write().await;
@@ -222,7 +230,7 @@ async fn spawn_and_attach(
         argv.extend(args.iter().cloned());
         eng.argv = Some(argv);
         eng.started_at = Some(now_ms());
-        eng.log_path = Some(log_file_path);
+        eng.log_path = Some(log.path.clone());
         eng.adopted = false;
         eng.fail_reason = None;
         eng.deadline = Some(now_ms() + ENGINE_START_TIMEOUT_MS);
@@ -260,8 +268,8 @@ async fn spawn_and_attach(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let log_clone_a = log.try_clone().await.ok();
-    let log_clone_b = log.try_clone().await.ok();
+    let log_clone_a = log.file.try_clone().await.ok();
+    let log_clone_b = log.file.try_clone().await.ok();
 
     if let Some(stdout) = stdout
         && let Some(mut la) = log_clone_a
@@ -284,7 +292,7 @@ async fn spawn_and_attach(
         *state.child.lock().await = Some(child);
     }
     {
-        *state.log_file.lock().await = Some(log);
+        *state.log_file.lock().await = Some(log.file);
     }
     {
         let mut eng = state.engine.write().await;
@@ -397,7 +405,7 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
     let args = build_serve_args(&profile, port);
     let cuda_sync = profile.cuda_sync.clone();
 
-    let (log_file_path, log) = match open_engine_log(state, port).await {
+    let log = match open_engine_log(state, port).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -409,7 +417,6 @@ pub async fn start_engine(state: &S, profile: EngineProfile, artifact: Option<St
         &args,
         port,
         cuda_sync,
-        log_file_path,
         log,
     )
     .await;
