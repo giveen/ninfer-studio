@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Activity, Code2, Cpu, MessagesSquare, Monitor, Moon, Settings2, Layers, Sun, Terminal, Command } from 'lucide-react';
 import { cn } from './components/ui';
 import { getCoderWorkspace, useStatus } from './lib/api';
@@ -9,12 +9,15 @@ import { CoderSafetyProvider } from './lib/coderSafety';
 import { ChatAgentProvider } from './lib/chatAgent';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ShortcutsModal } from './components/ShortcutsModal';
+import { ToastHost } from './components/ToastHost';
+import { OnboardingOverlay } from './components/OnboardingOverlay';
+import { pushToast } from './lib/toast';
 import { ChatScreen } from './screens/ChatScreen';
-import { EngineScreen } from './screens/EngineScreen';
-import { ModelsScreen } from './screens/ModelsScreen';
-import { SettingsScreen } from './screens/SettingsScreen';
-import { CoderScreen } from './screens/CoderScreen';
-import { LogScreen } from './screens/LogScreen';
+const EngineScreen = lazy(() => import('./screens/EngineScreen').then((m) => ({ default: m.EngineScreen })));
+const ModelsScreen = lazy(() => import('./screens/ModelsScreen').then((m) => ({ default: m.ModelsScreen })));
+const SettingsScreen = lazy(() => import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen })));
+const CoderScreen = lazy(() => import('./screens/CoderScreen').then((m) => ({ default: m.CoderScreen })));
+const LogScreen = lazy(() => import('./screens/LogScreen').then((m) => ({ default: m.LogScreen })));
 
 type Screen = 'chat' | 'code' | 'engine' | 'log' | 'models' | 'settings';
 
@@ -81,7 +84,18 @@ export function App() {
   const [coderWs, setCoderWs] = useState('');
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme);
   const [showShortcuts, setShowShortcuts] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => localStorage.getItem('ninfer_onboarding_dismissed') === '1');
   const { status, error } = useStatus(2500);
+  const artifacts = status?.artifacts ?? [];
+  const showOnboarding = artifacts.length === 0 && !onboardingDismissed;
+  const lastErrorRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (error && error !== lastErrorRef.current) {
+      lastErrorRef.current = error;
+      pushToast({ message: `Control plane unreachable: ${error}`, tone: 'error' });
+    }
+    if (!error) lastErrorRef.current = null;
+  }, [error]);
 
   useEffect(() => {
     initTheme();
@@ -226,27 +240,27 @@ export function App() {
               </div>
               <div className={cn('h-full', screen !== 'code' && 'hidden')}>
                 <ErrorBoundary name="Code Screen">
-                  <CoderScreen coderWs={coderWs} />
+                  <Suspense fallback={null}><CoderScreen coderWs={coderWs} /></Suspense>
                 </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'engine' && 'hidden')}>
                 <ErrorBoundary name="Engine Screen">
-                  <EngineScreen status={status} />
+                  <Suspense fallback={null}><EngineScreen status={status} /></Suspense>
                 </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'log' && 'hidden')}>
                 <ErrorBoundary name="Log Screen">
-                  <LogScreen status={status} active={screen === 'log'} />
+                  <Suspense fallback={null}><LogScreen status={status} active={screen === 'log'} /></Suspense>
                 </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'models' && 'hidden')}>
                 <ErrorBoundary name="Models Screen">
-                  <ModelsScreen status={status} onNavigate={setScreen} />
+                  <Suspense fallback={null}><ModelsScreen status={status} onNavigate={setScreen} /></Suspense>
                 </ErrorBoundary>
               </div>
               <div className={cn('h-full', screen !== 'settings' && 'hidden')}>
                 <ErrorBoundary name="Settings Screen">
-                  <SettingsScreen status={status} />
+                  <Suspense fallback={null}><SettingsScreen status={status} /></Suspense>
                 </ErrorBoundary>
               </div>
             </ChatAgentProvider>
@@ -255,6 +269,12 @@ export function App() {
       </div>
 
       <ShortcutsModal open={showShortcuts} onClose={() => setShowShortcuts(false)} />
+      <ToastHost />
+      <OnboardingOverlay
+        open={showOnboarding}
+        onNavigate={setScreen}
+        onDismiss={() => setOnboardingDismissed(true)}
+      />
     </div>
   );
 }

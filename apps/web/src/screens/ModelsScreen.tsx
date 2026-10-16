@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Download, ExternalLink, Layers, Play } from 'lucide-react';
 import { convertModel, downloadModel, saveConfig, saveProfileState, upgradeModel } from '../lib/api';
 import { formatBytes, formatTime } from '../lib/format';
@@ -109,6 +109,12 @@ export function ModelsScreen({ status, onNavigate }: { status: StatusPayload | n
   const runningArtifact = status?.engine?.artifact;
 
   const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [artifactQuery, setArtifactQuery] = useState('');
+  const filteredArtifacts = useMemo(() => {
+    const q = artifactQuery.trim().toLowerCase();
+    if (!q) return artifacts;
+    return artifacts.filter((a) => [a.file, a.model, a.weights, a.path].some((v) => String(v ?? '').toLowerCase().includes(q)));
+  }, [artifacts, artifactQuery]);
 
   const startDownload = async (repo: string, file: string) => {
     setCatalogError(null);
@@ -210,16 +216,29 @@ export function ModelsScreen({ status, onNavigate }: { status: StatusPayload | n
           title="Downloaded artifacts"
           description="Only explicitly registered .ninfer artifacts are loadable by the engine."
           icon={<Layers size={15} />}
-          actions={<Badge tone="accent">{artifacts.length} local</Badge>}
+          actions={
+            <div className="flex items-center gap-2">
+              <input
+                value={artifactQuery}
+                onChange={(e) => setArtifactQuery(e.target.value)}
+                placeholder="filter artifacts…"
+                aria-label="Filter artifacts"
+                className="w-36 rounded border border-line bg-inset px-2 py-0.5 text-[11px] outline-none placeholder:text-faint"
+              />
+              <Badge tone="accent">{filteredArtifacts.length}/{artifacts.length} local</Badge>
+            </div>
+          }
         >
           {artifacts.length === 0 ? (
             <div className="py-6 text-center">
               <p className="text-[13px] text-mute">No .ninfer artifacts in the models directory yet.</p>
               <p className="mt-1 text-[12px] text-faint">Download one from the catalog below — files land in your configured models directory.</p>
             </div>
+          ) : filteredArtifacts.length === 0 ? (
+            <p className="py-4 text-center text-[12.5px] text-mute">No artifacts match “{artifactQuery}”.</p>
           ) : (
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {artifacts.map((a) => (
+              {filteredArtifacts.map((a) => (
                 <div
                   key={a.file}
                   className={cn(

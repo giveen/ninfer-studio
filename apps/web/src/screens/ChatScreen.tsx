@@ -114,7 +114,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [showAllMessages, setShowAllMessages] = useState(false);
+  const [visibleMessageLimit, setVisibleMessageLimit] = useState(RECENT_MESSAGE_WINDOW);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findIndex, setFindIndex] = useState(0);
@@ -303,7 +303,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
     setAtBottom(true);
     setFindOpen(false);
     setFindQuery('');
-    setShowAllMessages(false);
+    setVisibleMessageLimit(RECENT_MESSAGE_WINDOW);
   }, [activeId]);
 
   useEffect(() => () => { if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current); }, []);
@@ -1247,8 +1247,14 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
   // rendered window would have no DOM node for scrollIntoView to find), so
   // opening it bypasses windowing entirely rather than needing special-cased
   // "expand to reveal this match" logic.
-  const windowingActive = !showAllMessages && !findOpen && messages.length > RECENT_MESSAGE_WINDOW;
-  const visibleStart = windowingActive ? messages.length - RECENT_MESSAGE_WINDOW : 0;
+  // Windowing: mount only the most recent `visibleMessageLimit` messages by
+  // default. "Load earlier" grows the window in fixed chunks so very long
+  // conversations don't mount thousands of markdown-highlighted rows at once,
+  // while find-in-conversation bypasses windowing entirely (matches need DOM
+  // nodes for scrollIntoView).
+  const windowSize = findOpen ? messages.length : Math.min(messages.length, visibleMessageLimit);
+  const windowingActive = windowSize < messages.length;
+  const visibleStart = messages.length - windowSize;
   const hiddenMessageCount = visibleStart;
 
   // The agent loop persists a per-turn "Context" note (date/time) into real
@@ -1662,10 +1668,10 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                 {hiddenMessageCount > 0 && (
                   <button
                     type="button"
-                    onClick={() => setShowAllMessages(true)}
+                    onClick={() => setVisibleMessageLimit((n) => Math.min(messages.length, n + RECENT_MESSAGE_WINDOW))}
                     className="mx-auto rounded-full border border-line bg-panel px-3 py-1.5 text-[11.5px] text-mute hover:border-accent/40 hover:text-ink"
                   >
-                    Show {hiddenMessageCount} earlier message{hiddenMessageCount === 1 ? '' : 's'}
+                    Show {Math.min(RECENT_MESSAGE_WINDOW, hiddenMessageCount)} earlier message{Math.min(RECENT_MESSAGE_WINDOW, hiddenMessageCount) === 1 ? '' : 's'} ({hiddenMessageCount} remaining)
                   </button>
                 )}
                 {messages.slice(visibleStart).map((m, sliceI) => {
@@ -1679,7 +1685,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   }
                   if (isCompactedMsg(m)) {
                     return (
-                      <div id={`msg-${i}`} key={i}>
+                      <div id={`msg-${i}`} key={i} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 220px' }}>
                         <MessageRow
                           m={{ ...m, displayName: m.displayName || 'Compaction Summary', collapsed: true }}
                           convId={activeId ?? ''}
@@ -1697,7 +1703,7 @@ function ChatScreenImpl({ status, onNavigate }: { status: StatusPayload | null; 
                   return (
                     <Fragment key={i}>
                       {showDivider && <CompactDivider />}
-                      <div id={`msg-${i}`}>
+                      <div id={`msg-${i}`} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 220px' }}>
                         <MessageRow
                           m={m}
                           convId={activeId ?? ''}

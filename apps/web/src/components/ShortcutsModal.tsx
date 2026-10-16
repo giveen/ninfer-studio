@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Command, X } from 'lucide-react';
 import { Button } from './ui';
 
@@ -44,10 +44,15 @@ export function ShortcutsModal({ open, onClose }: ShortcutsModalProps) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [open, onClose]);
 
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (open) setTimeout(() => closeRef.current?.focus(), 0);
+  }, [open]);
+
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+    <div role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
       <div className="relative w-full max-w-lg rounded-xl border border-line bg-panel p-5 shadow-2xl">
         <div className="flex items-center justify-between border-b border-line pb-3">
           <div className="flex items-center gap-2 font-semibold text-ink">
@@ -55,6 +60,7 @@ export function ShortcutsModal({ open, onClose }: ShortcutsModalProps) {
             <span>Keyboard Shortcuts</span>
           </div>
           <button
+            ref={closeRef}
             type="button"
             onClick={onClose}
             className="rounded p-1 text-faint hover:bg-panel2 hover:text-ink transition-colors"
