@@ -55,6 +55,7 @@ fn main() {
 
     // Shared flag (cloned into both the window-event handler and the setup).
     let engine_running = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "tray")]
     let engine_running_ev = engine_running.clone();
 
     tauri::Builder::default()
@@ -73,6 +74,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         // Close -> hide to tray (keep the engine alive) instead of quitting.
         .on_window_event(move |window, event| {
+            #[allow(unused_variables)]
             if let WindowEvent::CloseRequested { api, .. } = event {
                 #[cfg(feature = "tray")]
                 {

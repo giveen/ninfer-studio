@@ -24,6 +24,6 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
-    "knip": "^6.35.1"
+    "knip": "^6.41.0"
   }
 }
